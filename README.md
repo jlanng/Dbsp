@@ -148,6 +148,11 @@ examples/Incremental.TradeEnrichment trades ⋈ reference data, composed interac
                                        amendments, cancellations, and master-data changes (desk
                                        moves, re-ratings) are single UpsertAsync/DeleteAsync calls
                                        that re-attribute historical trades in microseconds
+benchmarks/Incremental.Benchmarks  BenchmarkDotNet suite (Z-set primitives, stateless pipeline,
+                                       join / sum / min / top-k delta cost vs state size), plus
+                                       `-- --assert`: CI performance contracts that check scaling
+                                       ratios (delta cost must not grow with state size) instead of
+                                       wall-clock numbers, so they hold on noisy shared runners
 examples/Incremental.TaxiAnalytics genuine big data: ~13M real NYC yellow-taxi trips (parquet, read
                                        via Parquet.Net, downloaded and cached on first run, ~50MB/month;
                                        `--months N`, `--synthetic`) through join + counts + revenue +
@@ -156,6 +161,21 @@ examples/Incremental.TaxiAnalytics genuine big data: ~13M real NYC yellow-taxi t
                                        ~1M rows/s bulk load; single-row updates in ~250 µs,
                                        thousands of × cheaper than a full recompute
 ```
+
+## Benchmarks
+
+```sh
+dotnet run -c Release --project benchmarks/Incremental.Benchmarks -- --filter '*'   # full BenchmarkDotNet suite
+dotnet run -c Release --project benchmarks/Incremental.Benchmarks -- --assert      # CI performance contracts
+```
+
+The `--assert` mode is what CI gates on. Shared runners are too noisy for absolute timing
+assertions, so each contract runs an identical fixed-size delta against a small and a 64×
+larger preloaded state (interleaved trials, medians) and fails if the large/small ratio
+exceeds a generous bound (1.5× allocations, 5× time). A regression from O(delta) to O(state)
+shows up as a ~64× ratio, so the check is high-signal without being flaky. The full suite
+runs on demand via the *Benchmarks* GitHub workflow (`workflow_dispatch`), which uploads
+the BenchmarkDotNet artifacts.
 
 ## Running with Redis
 

@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Build
+        run: dotnet build -c Release
+      - name: Test
+        run: dotnet test tests/Incremental.Tests -c Release --no-build
+
+  # Scaling assertions, not absolute timings: shared runners are too noisy to gate on
+  # wall-clock numbers, so this job asserts that a fixed-size delta costs about the same
+  # (bytes allocated, and time within a generous ratio) against small and large operator
+  # state. An O(delta) -> O(state) regression overshoots the bounds by ~10x either way.
+  perf-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Assert performance contracts
+        run: dotnet run -c Release --project benchmarks/Incremental.Benchmarks -- --assert

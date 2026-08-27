@@ -1,0 +1,25 @@
+# Full BenchmarkDotNet suite, run on demand. Results are informational (uploaded as an
+# artifact) — CI gating happens via the perf-contracts job in ci.yml, which asserts scaling
+# ratios that are robust to runner noise.
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+
+jobs:
+  benchmarks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Run benchmark suite
+        run: >
+          dotnet run -c Release --project benchmarks/Incremental.Benchmarks --
+          --filter '*' --job short --exporters json github
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results
+          path: BenchmarkDotNet.Artifacts/

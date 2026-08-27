@@ -1,4 +1,7 @@
 <Solution>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/Incremental.Benchmarks/Incremental.Benchmarks.csproj" />
+  </Folder>
   <Folder Name="/examples/">
     <Project Path="examples/Incremental.Example/Incremental.Example.csproj" />
     <Project Path="examples/Incremental.LogAnalytics/Incremental.LogAnalytics.csproj" />
