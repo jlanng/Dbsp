@@ -232,7 +232,7 @@ await AnsiConsole.Live(BuildLiveView()).AutoClear(false).StartAsync(async ctx =>
     {
         // Shaped exactly like the timed churn (random zones touch the big boroughs'
         // state), but inserted-then-retracted so the net effect on every view is zero.
-        var dryRun = new Trip(zoneRows[churnRng.Next(zoneRows.Count)].Id, Math.Round(5 + churnRng.NextDouble() * 145, 2));
+        var dryRun = new Trip(tripZones[churnRng.Next(tripZones.Count)], Math.Round(5 + churnRng.NextDouble() * 145, 2));
         await tripsIn.SendAsync(dryRun, +1);
         await circuit.StepAsync();
         await tripsIn.SendAsync(dryRun, -1);
@@ -264,14 +264,17 @@ await AnsiConsole.Live(BuildLiveView()).AutoClear(false).StartAsync(async ctx =>
         }
         else
         {
-            var zone = zoneRows[churnRng.Next(zoneRows.Count)];
+            // Sample the pickup zone from the empirical distribution (a random loaded
+            // row), so busy zones get churn as often as they do in reality and the
+            // top-zone counts visibly move.
+            var zoneId = tripZones[churnRng.Next(tripZones.Count)];
             var amount = churnRng.NextDouble() < 0.05
                 ? Math.Round(500 + churnRng.NextDouble() * 4500, 2) // the occasional surge fare
                 : Math.Round(5 + churnRng.NextDouble() * 145, 2);
-            trip = new Trip(zone.Id, amount);
+            trip = new Trip(zoneId, amount);
             insertedPool.Add(trip);
             weight = +1;
-            lastDescription = $"insert {amount:C} trip at {zone.Name}";
+            lastDescription = $"insert {amount:C} trip at {ZoneName(zoneId)}";
         }
 
         lastMicros = await ApplyUpdateAsync(trip, weight);
