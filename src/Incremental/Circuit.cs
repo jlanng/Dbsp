@@ -1,5 +1,6 @@
 using Incremental.Operators;
 using Incremental.Runtime;
+using Incremental.Storage;
 
 namespace Incremental;
 
@@ -39,6 +40,14 @@ public sealed class Circuit : IAsyncDisposable
     private bool _disposed;
     private Task? _pump;
 
+    // Checkpointing: staged operator state and the input offsets it reflects are committed
+    // together, every CheckpointInterval steps, once all workers' shards for those steps
+    // are complete — one commit point for the whole circuit.
+    private readonly ICheckpointStorageProvider? _checkpoint;
+    private Dictionary<string, long> _committedOffsets = new();
+    private int _stepsSinceCommit;
+    private bool _faulted;
+
     internal Circuit(
         NodeDefinition[] nodes,
         IReadOnlyList<InputRegistration> inputRegistrations,
@@ -49,6 +58,7 @@ public sealed class Circuit : IAsyncDisposable
         _nodes = nodes;
         _options = options;
         _watermarkClock = watermarkClock;
+        _checkpoint = options.Storage as ICheckpointStorageProvider;
         _barrier = new SpinBarrier(options.Workers);
 
         _workers = new Worker[options.Workers];
@@ -85,6 +95,18 @@ public sealed class Circuit : IAsyncDisposable
         if (_started)
             throw new InvalidOperationException("The circuit has already been started.");
         _started = true;
+
+        if (_checkpoint is not null)
+        {
+            // Recover before the first step: discard whatever a crashed run left staged and
+            // seed every input's position from the committed offsets, so records replayed
+            // with explicit offsets at or below the checkpoint are dropped as duplicates.
+            var offsets = _checkpoint.Recover();
+            foreach (var input in _inputs)
+                if (offsets.TryGetValue(input.Name, out var offset))
+                    input.SeedOffset(offset);
+            Volatile.Write(ref _committedOffsets, new Dictionary<string, long>(offsets));
+        }
 
         if (!RunsInline)
         {
@@ -162,25 +184,69 @@ public sealed class Circuit : IAsyncDisposable
         foreach (var input in _inputs)
             input.DrainInto(_workers, _options.MaxStepItemsPerInput);
 
-        if (RunsInline)
+        try
         {
-            RunWorkerStep(_workers[0]);
-        }
-        else
-        {
-            _stepDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            Volatile.Write(ref _workersRemaining, _workers.Length);
-            foreach (var worker in _workers)
-                worker.Go.Release();
+            if (RunsInline)
+            {
+                RunWorkerStep(_workers[0]);
+            }
+            else
+            {
+                _stepDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                Volatile.Write(ref _workersRemaining, _workers.Length);
+                foreach (var worker in _workers)
+                    worker.Go.Release();
 
-            await _stepDone.Task.ConfigureAwait(false);
+                await _stepDone.Task.ConfigureAwait(false);
+            }
+        }
+        catch
+        {
+            // A fault can leave the step's writes half-staged across workers; they must
+            // never reach a checkpoint, so commits (the final one on dispose included)
+            // stop here. The previous checkpoint remains the resume point.
+            _faulted = true;
+            throw;
         }
 
         // Freeze between steps so every worker sees one consistent watermark per step.
         _watermarkClock?.Freeze();
 
+        // Commit before publishing: durability should not wait on a slow output consumer.
+        // Output deltas are transient (consumers integrate them) and not checkpointed.
+        if (_checkpoint is not null && ++_stepsSinceCommit >= _options.CheckpointInterval)
+            CommitCheckpoint();
+
         foreach (var output in _outputs)
             await output.PublishAsync(_workers, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Atomically persists everything the steps since the last commit staged,
+    /// together with the input offsets those steps consumed. Runs on the coordinator
+    /// between steps, after every worker's shard is complete — the provider's single
+    /// commit covers the whole circuit.</summary>
+    private void CommitCheckpoint()
+    {
+        var offsets = new Dictionary<string, long>(_inputs.Length);
+        foreach (var input in _inputs)
+            if (input.ConsumedOffset >= 0)
+                offsets[input.Name] = input.ConsumedOffset;
+
+        _checkpoint!.Commit(offsets);
+        _stepsSinceCommit = 0;
+        Volatile.Write(ref _committedOffsets, offsets);
+    }
+
+    /// <summary>The offset of the last record on <paramref name="inputName"/> whose effects
+    /// are in the durably committed checkpoint, or null when nothing has been committed for
+    /// it (or <see cref="CircuitOptions.Storage"/> does not checkpoint). After a restart
+    /// this is where a producer should resume its source; records re-sent with explicit
+    /// offsets at or below it are dropped as duplicates.</summary>
+    public long? CommittedOffset(string inputName)
+    {
+        if (_inputs.All(p => p.Name != inputName))
+            throw new KeyNotFoundException($"No input named '{inputName}'.");
+        return Volatile.Read(ref _committedOffsets).TryGetValue(inputName, out var offset) ? offset : null;
     }
 
     private async Task PumpAsync()
@@ -327,6 +393,20 @@ public sealed class Circuit : IAsyncDisposable
         {
             foreach (var output in _outputs)
                 output.Complete(null);
+        }
+
+        // Steps still staged (CheckpointInterval > 1) commit on clean shutdown — but never
+        // after a fault, which may have left a step half-staged across workers.
+        if (_checkpoint is not null && !_faulted && _stepsSinceCommit > 0)
+        {
+            try
+            {
+                CommitCheckpoint();
+            }
+            catch
+            {
+                // Shutdown must complete; the previous checkpoint remains the resume point.
+            }
         }
 
         Volatile.Write(ref _stopping, true);

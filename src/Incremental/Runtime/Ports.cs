@@ -32,22 +32,35 @@ internal interface IInputPort
     object Handle { get; }
     bool HasPending { get; }
     bool IsCompleted { get; }
+
+    /// <summary>The offset of the last record consumed into a step: the producer's source
+    /// offset when records are stamped, a running record count otherwise. -1 when nothing
+    /// has been consumed (and no checkpoint was recovered).</summary>
+    long ConsumedOffset { get; }
+
     Task<bool> WaitToReadAsync(CancellationToken cancellationToken);
+
+    /// <summary>Seeds the input's position from a recovered checkpoint, before any step runs:
+    /// replayed records stamped at or below it are dropped, and unstamped records continue
+    /// the numbering from it.</summary>
+    void SeedOffset(long offset);
+
     void DrainInto(Worker[] workers, int maxItems);
     void CompleteWriter();
 }
 
 internal sealed class InputPort<T> : IInputPort where T : notnull
 {
-    private readonly Channel<WeightedValue<T>> _channel;
+    private readonly Channel<InputEntry<T>> _channel;
     private readonly int _nodeId;
+    private long _offset = -1;
 
     public InputPort(string name, int nodeId, CircuitOptions options,
-        Func<ChannelWriter<WeightedValue<T>>, object>? handleFactory = null)
+        Func<ChannelWriter<InputEntry<T>>, object>? handleFactory = null)
     {
         Name = name;
         _nodeId = nodeId;
-        _channel = Channel.CreateBounded<WeightedValue<T>>(new BoundedChannelOptions(options.InputChannelCapacity)
+        _channel = Channel.CreateBounded<InputEntry<T>>(new BoundedChannelOptions(options.InputChannelCapacity)
         {
             SingleReader = true,
             FullMode = BoundedChannelFullMode.Wait,
@@ -59,9 +72,12 @@ internal sealed class InputPort<T> : IInputPort where T : notnull
     public object Handle { get; }
     public bool HasPending => _channel.Reader.TryPeek(out _);
     public bool IsCompleted => _channel.Reader.Completion.IsCompleted;
+    public long ConsumedOffset => _offset;
 
     public Task<bool> WaitToReadAsync(CancellationToken cancellationToken) =>
         _channel.Reader.WaitToReadAsync(cancellationToken).AsTask();
+
+    public void SeedOffset(long offset) => _offset = offset;
 
     /// <summary>Moves up to <paramref name="maxItems"/> buffered records into the workers'
     /// input operators for the next step, round-robin. Keyed operators re-shard via exchange
@@ -73,10 +89,24 @@ internal sealed class InputPort<T> : IInputPort where T : notnull
         var drained = 0;
         while (drained < maxItems && _channel.Reader.TryRead(out var entry))
         {
+            drained++;
+            if (entry.Offset >= 0)
+            {
+                // Stamped records must advance the position: one at or below it — in
+                // particular one replayed after a restart, when the position starts at the
+                // committed checkpoint — is a duplicate and is dropped.
+                if (entry.Offset <= _offset)
+                    continue;
+                _offset = entry.Offset;
+            }
+            else
+            {
+                _offset++; // unstamped records are numbered as they are consumed
+            }
+
             buffers ??= new ZSet<T>?[workers.Length];
             (buffers[target] ??= new ZSet<T>()).Add(entry.Value, entry.Weight);
             target = (target + 1) % workers.Length;
-            drained++;
         }
 
         if (buffers is null)

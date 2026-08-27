@@ -2,30 +2,57 @@ using System.Threading.Channels;
 
 namespace Incremental;
 
+/// <summary>One queued input record: a weighted value plus the source offset the producer
+/// stamped it with, or -1 when none — the input then numbers records as it consumes them.</summary>
+internal readonly record struct InputEntry<T>(T Value, long Weight, long Offset) where T : notnull;
+
 /// <summary>
 /// Producer-side handle to a circuit input. Writes go through a bounded channel: when the
 /// circuit cannot keep up, the returned <see cref="ValueTask"/>s suspend until capacity
 /// frees up — backpressure is the await, there is nothing else to configure.
+///
+/// The overloads taking an <c>offset</c> stamp the record with its position in the source
+/// it was read from (e.g. a Kafka partition offset). Offsets must be non-negative and
+/// increase monotonically; a record whose offset is at or below the input's current
+/// position is dropped as a duplicate. With a checkpointing storage provider that position
+/// starts at the committed checkpoint after a restart, so a producer can replay its source
+/// from <see cref="Circuit.CommittedOffset"/> (or earlier) and already-processed records
+/// are ignored — exactly-once from the state's point of view.
 /// </summary>
 public sealed class InputHandle<T> where T : notnull
 {
-    private readonly ChannelWriter<WeightedValue<T>> _writer;
+    private readonly ChannelWriter<InputEntry<T>> _writer;
 
-    internal InputHandle(ChannelWriter<WeightedValue<T>> writer) => _writer = writer;
+    internal InputHandle(ChannelWriter<InputEntry<T>> writer) => _writer = writer;
 
     public ValueTask InsertAsync(T value, CancellationToken cancellationToken = default) =>
         SendAsync(value, 1, cancellationToken);
 
+    /// <summary>Inserts <paramref name="value"/> stamped with its source offset.</summary>
+    public ValueTask InsertAsync(T value, long offset, CancellationToken cancellationToken = default) =>
+        SendAsync(value, 1, offset, cancellationToken);
+
     public ValueTask RemoveAsync(T value, CancellationToken cancellationToken = default) =>
         SendAsync(value, -1, cancellationToken);
 
+    /// <summary>Retracts <paramref name="value"/>, stamped with its source offset.</summary>
+    public ValueTask RemoveAsync(T value, long offset, CancellationToken cancellationToken = default) =>
+        SendAsync(value, -1, offset, cancellationToken);
+
     public ValueTask SendAsync(T value, long weight, CancellationToken cancellationToken = default) =>
-        _writer.WriteAsync(new WeightedValue<T>(value, weight), cancellationToken);
+        _writer.WriteAsync(new InputEntry<T>(value, weight, -1), cancellationToken);
+
+    /// <summary>Sends a weighted record stamped with its source offset.</summary>
+    public ValueTask SendAsync(T value, long weight, long offset, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        return _writer.WriteAsync(new InputEntry<T>(value, weight, offset), cancellationToken);
+    }
 
     public async ValueTask SendAsync(IEnumerable<WeightedValue<T>> batch, CancellationToken cancellationToken = default)
     {
         foreach (var entry in batch)
-            await _writer.WriteAsync(entry, cancellationToken).ConfigureAwait(false);
+            await _writer.WriteAsync(new InputEntry<T>(entry.Value, entry.Weight, -1), cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Signals that no more data will arrive on this input. Once every input of a

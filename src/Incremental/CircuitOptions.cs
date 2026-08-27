@@ -26,4 +26,11 @@ public sealed class CircuitOptions
 
     /// <summary>Where stateful operators (join, aggregate, distinct) keep their state.</summary>
     public IStorageProvider Storage { get; init; } = new InMemoryStorageProvider();
+
+    /// <summary>Number of steps between checkpoint commits when <see cref="Storage"/> is an
+    /// <see cref="ICheckpointStorageProvider"/>. Each commit atomically persists the state
+    /// changes and input offsets of the steps since the previous one; a larger interval
+    /// amortizes commit cost at the price of a longer replay window after a crash. Ignored —
+    /// at zero cost — when the provider does not checkpoint.</summary>
+    public int CheckpointInterval { get; init; } = 1;
 }

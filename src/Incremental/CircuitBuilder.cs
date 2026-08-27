@@ -28,6 +28,7 @@ public sealed class CircuitBuilder
     {
         Options = options ?? new CircuitOptions();
         ArgumentOutOfRangeException.ThrowIfLessThan(Options.Workers, 1, nameof(Options.Workers));
+        ArgumentOutOfRangeException.ThrowIfLessThan(Options.CheckpointInterval, 1, nameof(Options.CheckpointInterval));
     }
 
     public CircuitOptions Options { get; }

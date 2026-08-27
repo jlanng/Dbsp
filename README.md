@@ -152,8 +152,8 @@ row re-attributes everything joined against it.
 so implementations never see cross-thread access to one store.
 
 - `InMemoryStorageProvider` (default) — heap dictionaries.
-- `RedisStorageProvider` (`Incremental.Storage.Redis`) — state in Redis hashes via
-  `HINCRBY`; survives restarts and can exceed the heap:
+- `RedisStorageProvider` (`Incremental.Storage.Redis`) — state in Redis hashes; survives
+  restarts, can exceed the heap, and checkpoints (below):
 
   ```csharp
   var redis = await ConnectionMultiplexer.ConnectAsync("localhost");
@@ -161,6 +161,23 @@ so implementations never see cross-thread access to one store.
   ```
 
 - Candidates that make sense next: RocksDB (large state, embedded, fast scans), SQLite.
+
+**Checkpointing and exactly-once restart.** A provider implementing
+`ICheckpointStorageProvider` (Redis does; `InMemoryCheckpointStorageProvider` is the
+in-process stand-in for testing) makes checkpoints of the circuit: operators stage their
+writes in per-store overlays, and every `CheckpointInterval` steps (default: every step) the
+circuit commits {all staged state changes + the input offsets those steps consumed}
+atomically — for Redis, one MULTI/EXEC transaction covering every worker's shard plus a
+`{prefix}:checkpoint` offsets marker, issued only after all workers have finished their
+steps. Either the whole checkpoint lands or none of it does, so durable state and offsets
+always agree, even across a crash mid-commit. Producers can stamp records with source
+offsets — `SendAsync(value, weight, offset)`, e.g. a Kafka partition offset; unstamped
+records are numbered as they are consumed. After a crash, rebuild the circuit against the
+same provider: the state is already there, `circuit.CommittedOffset("orders")` says where
+each input got to, and replayed records stamped at or below the checkpoint are dropped on
+arrival — resuming a log-style source is exactly-once from the state's point of view.
+(Output deltas are transient and not checkpointed: consumers re-derive views by
+integrating, they don't replay.)
 
 **Stepping modes.** By default a pump task steps the circuit whenever input is available.
 With `AutoStep = false` the circuit advances only on explicit `StepAsync()` calls — exact,
@@ -234,7 +251,10 @@ Scaffold — the semantics above are implemented and tested, with plenty of head
       storage provider; deleting the extremum no longer rescans the group)
 - [x] Batched/pipelined Redis access (operators drive batched store operations, so a step
       costs a handful of pipelined round trips instead of one per state touch)
-- [ ] Checkpointing input offsets with state for exactly-once restart (Redis provider)
+- [x] Checkpointing input offsets with state for exactly-once restart (staged writes
+      committed atomically with consumed offsets — Redis: one MULTI/EXEC per checkpoint;
+      producers stamp records with source offsets, replays below the checkpoint are
+      dropped; `InMemoryCheckpointStorageProvider` for testing the semantics)
 - [x] `TopK` (per-key ranking with retraction of displaced rows)
 - [x] Tumbling and hopping event-time windows (assignment; late data handled by deltas)
 - [x] Watermarks: late-event filtering and eviction of closed-key state (aggregate/TopK)

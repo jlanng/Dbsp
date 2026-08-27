@@ -22,6 +22,33 @@ public interface IStorageProvider
     IValueStore<TKey, TValue> CreateValueStore<TKey, TValue>(string name) where TKey : notnull;
 }
 
+/// <summary>
+/// A storage provider that checkpoints: operators' writes are staged (visible through the
+/// stores immediately, durable only on commit), and <see cref="Commit"/> persists everything
+/// staged since the previous commit atomically together with the input offsets whose records
+/// produced it — so durable state and offsets always agree. A circuit whose
+/// <see cref="CircuitOptions.Storage"/> implements this interface commits automatically every
+/// <see cref="CircuitOptions.CheckpointInterval"/> steps, after all workers' shards for those
+/// steps are complete: one commit point for the whole circuit. After a crash, rebuild the
+/// circuit against the same provider — <see cref="Circuit.Start"/> recovers the checkpoint,
+/// <see cref="Circuit.CommittedOffset"/> tells the producer where to resume each source, and
+/// replayed records stamped at or below the checkpoint are dropped, making the restart
+/// exactly-once from the state's point of view.
+/// </summary>
+public interface ICheckpointStorageProvider : IStorageProvider
+{
+    /// <summary>Discards any staged (uncommitted) writes and returns the input offsets of
+    /// the last committed checkpoint: input name → offset of the last record whose effects
+    /// are in durable state. Empty when no checkpoint exists. The circuit calls this once,
+    /// on <see cref="Circuit.Start"/>, before any step runs.</summary>
+    IReadOnlyDictionary<string, long> Recover();
+
+    /// <summary>Atomically persists all staged state changes together with
+    /// <paramref name="inputOffsets"/>: either the new checkpoint lands in full, or the
+    /// previous one remains intact.</summary>
+    void Commit(IReadOnlyDictionary<string, long> inputOffsets);
+}
+
 public interface IWeightStore<T> where T : notnull
 {
     /// <summary>Adds <paramref name="delta"/> to the weight of <paramref name="value"/> and returns the
