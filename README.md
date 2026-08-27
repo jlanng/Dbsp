@@ -62,6 +62,7 @@ deltas. Integrating an output's deltas reproduces the current state of that view
 | `AntiJoin` | Integrated left side plus per-key right-side row counts; a key whose match-presence flips retracts or re-asserts its left rows |
 | `LeftJoin` / `FullJoin` | Pure composition: inner join ⊕ mapped anti-join(s) — the Z-set algebra makes the union incremental for free |
 | `TumblingWindow` / `HoppingWindow` | Pure data transformation (flat-map): records join every window covering their event time; keying by `(window, …)` turns any aggregate into a windowed one. Late and deleted events correct their windows via ordinary deltas |
+| `SessionWindow` | Stateful, unlike the fixed windows: integrated events per session key, re-sessionized per touched key (never a full rescan). Rows whose session bounds change are retracted and re-asserted, so a bridging or late event merges sessions and a deletion shrinks or splits one — downstream aggregates correct themselves via the ordinary deltas |
 
 **Watermarks and eviction.** Correctness never depends on watermarks here — late events
 just produce correcting deltas. Watermarks serve one purpose: bounding state.
@@ -78,6 +79,24 @@ views.WithWatermark(v => v.At, allowedLateness: TimeSpan.FromSeconds(2))
      .IndexBy(w => (Window: w.WindowStart, Page: w.Value.Page))
      .WithEviction(key => key.Window + windowSize)
      .Count();
+```
+
+**Session windows.** `.SessionWindow(gap, v => v.At, v => v.UserId)` groups each key's
+events into sessions separated by at least `gap` of event-time inactivity; a session spans
+[first event, last event + gap), and an event exactly at a session's end starts a new one.
+Session assignment can't be a flat-map — which events share a session depends on which other
+events exist — so the operator sits downstream of an exchange on the session key (inserted
+automatically, like `IndexBy`) and re-sessionizes a key's integrated events whenever a step
+touches it, retracting the rows whose bounds changed. Keying the result by
+`(key, start, end)` turns any aggregate into a per-session one, and with a watermark a key's
+event state is dropped once the watermark passes its last event + gap:
+
+```csharp
+clicks.WithWatermark(c => c.At, lateness)
+      .SessionWindow(TimeSpan.FromMinutes(30), c => c.At, c => c.UserId)
+      .IndexBy(s => (User: s.Key, Start: s.Value.WindowStart, End: s.Value.WindowEnd))
+      .WithEviction(s => s.End)
+      .Count(); // clicks per session, corrected as sessions extend, merge, or split
 ```
 
 **Window-close notifications.** `.WindowCloses()` on a keyed stream is a first-class stream
@@ -225,7 +244,9 @@ Scaffold — the semantics above are implemented and tested, with plenty of head
       aggregate to publish finalized results)
 - [x] Watermark-driven eviction for join/anti-join/distinct state (keyed `Distinct`
       keeps its state grouped by key so the policy applies)
-- [ ] Session windows
+- [x] Session windows (per-key inactivity gap; a bridging or late event merges sessions and
+      a retraction splits them, all via ordinary deltas; key state evicted once the
+      watermark passes last event + gap)
 - [ ] Recursive/iterative circuits (DBSP fixed points) for transitive closure-style queries
 - [ ] Cooperative fault propagation across workers (a faulted worker currently poisons the
       circuit; disposal is required)
