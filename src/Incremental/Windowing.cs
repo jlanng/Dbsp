@@ -1,3 +1,5 @@
+using Incremental.Operators;
+
 namespace Incremental;
 
 /// <summary>A value assigned to one event-time window.</summary>
@@ -37,6 +39,53 @@ public static class WindowExtensions
         var sizeTicks = size.Ticks;
         var hopTicks = hop.Ticks;
         return stream.FlatMap(value => AssignWindows(value, eventTime(value).UtcTicks, sizeTicks, hopTicks));
+    }
+
+    /// <summary>
+    /// Groups events into per-key sessions separated by <paramref name="gap"/> of event-time
+    /// inactivity: consecutive events of a key belong to the same session while they are
+    /// strictly less than the gap apart, and a session spans [first event, last event + gap)
+    /// — an event exactly at a session's end starts a new one. Inserts the exchange on
+    /// <paramref name="sessionKey"/> (like <c>IndexBy</c>), so the stateful sessionization
+    /// runs on the worker owning each key. Unlike tumbling/hopping windows session assignment
+    /// is not a pure flat-map: an insertion can extend a session or merge two (a bridging or
+    /// late event), and a retraction can shrink or split one — the rows whose session bounds
+    /// changed are retracted and re-asserted, recomputing touched keys only. Key the result by
+    /// <c>(Key, WindowStart, WindowEnd)</c> to turn any aggregate into a per-session one.
+    /// Pair with <c>WithWatermark</c> upstream: a key's event state is then dropped once the
+    /// watermark passes its (last event + gap).
+    /// </summary>
+    public static KeyedZStream<TKey, Windowed<T>> SessionWindow<T, TKey>(
+        this ZStream<T> stream,
+        TimeSpan gap,
+        Func<T, DateTimeOffset> eventTime,
+        Func<T, TKey> sessionKey)
+        where T : notnull
+        where TKey : notnull =>
+        stream.IndexBy(sessionKey).SessionWindow(gap, eventTime);
+
+    /// <summary>Session windows over an already key-partitioned stream; see
+    /// <see cref="SessionWindow{T,TKey}(ZStream{T},TimeSpan,Func{T,DateTimeOffset},Func{T,TKey})"/>.
+    /// The stream's existing partitioning routes each key to one worker, so no extra
+    /// exchange is needed.</summary>
+    public static KeyedZStream<TKey, Windowed<TValue>> SessionWindow<TKey, TValue>(
+        this KeyedZStream<TKey, TValue> stream,
+        TimeSpan gap,
+        Func<TValue, DateTimeOffset> eventTime)
+        where TKey : notnull
+        where TValue : notnull
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(gap, TimeSpan.Zero, nameof(gap));
+        var builder = stream.Builder;
+        var gapTicks = gap.Ticks;
+        return new KeyedZStream<TKey, Windowed<TValue>>(
+            builder,
+            builder.AddNode(
+                "sessionWindow",
+                [stream.NodeId],
+                // The clock is read inside the factory (i.e. at Build), so a watermark
+                // declared on any input after this call still drives eviction.
+                ctx => new SessionWindowOperator<TKey, TValue>(ctx, gapTicks, eventTime, builder.WatermarkClock)));
     }
 
     private static IEnumerable<Windowed<T>> AssignWindows<T>(T value, long eventTicks, long sizeTicks, long hopTicks)
