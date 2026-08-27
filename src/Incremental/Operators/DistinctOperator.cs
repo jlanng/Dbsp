@@ -30,3 +30,44 @@ internal sealed class DistinctOperator<T> : IStepOperator where T : notnull
         return output;
     }
 }
+
+/// <summary>
+/// DISTINCT over an already key-partitioned stream. Semantically identical to
+/// <see cref="DistinctOperator{T}"/> over the (key, value) pairs, but the integrated weights
+/// are stored grouped by key, so a watermark-driven eviction policy can drop a closed key's
+/// state wholesale. Needs no extra exchange: the keyed stream's partitioning already routes
+/// equal pairs to the same worker.
+/// </summary>
+internal sealed class KeyedDistinctOperator<TKey, TValue> : IStepOperator
+    where TKey : notnull
+    where TValue : notnull
+{
+    private readonly IIndexedWeightStore<TKey, TValue> _integrated;
+    private readonly EvictionTracker<TKey>? _eviction;
+
+    public KeyedDistinctOperator(OperatorContext context, KeyEviction<TKey>? eviction)
+    {
+        _integrated = context.Storage.CreateIndexedWeightStore<TKey, TValue>(context.StateName("integrated"));
+        _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
+    }
+
+    public object Step(object?[] inputs)
+    {
+        var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
+        var output = new ZSet<KeyedValue<TKey, TValue>>();
+        foreach (var ((key, value), weight) in delta)
+        {
+            var after = _integrated.Update(key, value, weight);
+            var before = after - weight;
+            var change = (after > 0 ? 1 : 0) - (before > 0 ? 1 : 0);
+            if (change != 0)
+                output.Add(new KeyedValue<TKey, TValue>(key, value), change);
+            _eviction?.Track(key);
+        }
+
+        // Closed keys can never be touched again; their already-emitted presence stays final.
+        _eviction?.EvictClosed(_integrated.RemoveGroup);
+
+        return output;
+    }
+}

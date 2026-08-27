@@ -67,6 +67,8 @@ public sealed class RedisStorageProvider : IStorageProvider
             var stored = db.HashGet(key, serializer.Serialize(value));
             return stored.IsNull ? 0 : (long)stored;
         }
+
+        public void Remove(T value) => db.HashDelete(key, serializer.Serialize(value));
     }
 
     private sealed class RedisIndexedWeightStore<TKey, TValue>(IDatabase db, string baseKey, IStateSerializer serializer)

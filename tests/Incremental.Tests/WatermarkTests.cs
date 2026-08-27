@@ -77,8 +77,156 @@ public class WatermarkTests
         Assert.Equal(1, integrated.WeightOf(new KeyedValue<DateTimeOffset, long>(T0, 1)));
     }
 
+    [Fact]
+    public async Task Join_state_is_evicted_once_the_watermark_passes()
+    {
+        var storage = new EvictionRecordingStorage();
+        var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Storage = storage });
+        var users = builder.Input<(string User, DateTimeOffset At)>("users")
+            .WithWatermark(v => v.At, allowedLateness: TimeSpan.Zero)
+            .TumblingWindow(TimeSpan.FromSeconds(5), v => v.At)
+            .IndexBy(w => w.WindowStart)
+            .WithEviction(windowStart => windowStart.AddSeconds(5));
+        var pages = builder.Input<(string Page, DateTimeOffset At)>("pages")
+            .WithWatermark(v => v.At, allowedLateness: TimeSpan.Zero)
+            .TumblingWindow(TimeSpan.FromSeconds(5), v => v.At)
+            .IndexBy(w => w.WindowStart);
+        users.Join(pages, (window, user, page) => (window, user.Value.User, page.Value.Page))
+            .Output("joined");
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var userInput = circuit.Input<(string User, DateTimeOffset At)>("users");
+        var pageInput = circuit.Input<(string Page, DateTimeOffset At)>("pages");
+        var output = circuit.Output<(DateTimeOffset Window, string User, string Page)>("joined");
+
+        // Step 1 joins within window T0; no watermark is frozen yet, nothing evicts.
+        await userInput.InsertAsync(("alice", T0.AddSeconds(1)));
+        await pageInput.InsertAsync(("home", T0.AddSeconds(2)));
+        await circuit.StepAsync();
+        Assert.Empty(storage.RemovedKeys);
+
+        // Step 2 sees watermark T0+1s (< T0+5s): window T0's join state must survive.
+        await userInput.InsertAsync(("bob", T0.AddSeconds(7)));
+        await pageInput.InsertAsync(("about", T0.AddSeconds(8)));
+        await circuit.StepAsync();
+        Assert.Empty(storage.RemovedKeys);
+
+        // Step 3 sees watermark T0+7s (>= T0+5s): both sides of window T0 are deleted.
+        await userInput.InsertAsync(("carol", T0.AddSeconds(12)));
+        await pageInput.InsertAsync(("news", T0.AddSeconds(12)));
+        await circuit.StepAsync();
+        Assert.Equal(2, storage.RemovedKeys.Count(k => T0.Equals(k)));
+
+        // Eviction emits no retractions: the closed window's join rows stay final.
+        var integrated = new ZSet<(DateTimeOffset Window, string User, string Page)>();
+        while (output.Reader.TryRead(out var delta))
+            integrated.AddAll(delta);
+        Assert.Equal(1, integrated.WeightOf((T0, "alice", "home")));
+        Assert.Equal(1, integrated.WeightOf((T0.AddSeconds(5), "bob", "about")));
+        Assert.Equal(1, integrated.WeightOf((T0.AddSeconds(10), "carol", "news")));
+    }
+
+    [Fact]
+    public async Task AntiJoin_state_is_evicted_once_the_watermark_passes()
+    {
+        var storage = new EvictionRecordingStorage();
+        var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Storage = storage });
+        var users = builder.Input<(string User, DateTimeOffset At)>("users")
+            .WithWatermark(v => v.At, allowedLateness: TimeSpan.Zero)
+            .TumblingWindow(TimeSpan.FromSeconds(5), v => v.At)
+            .IndexBy(w => w.WindowStart)
+            .WithEviction(windowStart => windowStart.AddSeconds(5));
+        var blocks = builder.Input<(string Block, DateTimeOffset At)>("blocks")
+            .WithWatermark(v => v.At, allowedLateness: TimeSpan.Zero)
+            .TumblingWindow(TimeSpan.FromSeconds(5), v => v.At)
+            .IndexBy(w => w.WindowStart);
+        users.AntiJoin(blocks)
+            .MapValues(w => w.Value.User)
+            .Output("unmatched");
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var userInput = circuit.Input<(string User, DateTimeOffset At)>("users");
+        var blockInput = circuit.Input<(string Block, DateTimeOffset At)>("blocks");
+        var output = circuit.Output<KeyedValue<DateTimeOffset, string>>("unmatched");
+
+        // Step 1: window T0 has no right rows, so alice is emitted as unmatched.
+        await userInput.InsertAsync(("alice", T0.AddSeconds(1)));
+        await blockInput.InsertAsync(("b1", T0.AddSeconds(7)));
+        await circuit.StepAsync();
+        Assert.Empty(storage.RemovedKeys);
+
+        // Step 2: bob lands in window T0+5s, which is blocked, so nothing is emitted.
+        await userInput.InsertAsync(("bob", T0.AddSeconds(8)));
+        await blockInput.InsertAsync(("b2", T0.AddSeconds(12)));
+        await circuit.StepAsync();
+        Assert.Empty(storage.RemovedKeys);
+
+        // Step 3 sees watermark T0+8s (>= T0+5s): window T0's left rows and right row
+        // count are both deleted.
+        await userInput.InsertAsync(("carol", T0.AddSeconds(14)));
+        await blockInput.InsertAsync(("b3", T0.AddSeconds(14)));
+        await circuit.StepAsync();
+        Assert.Equal(2, storage.RemovedKeys.Count(k => T0.Equals(k)));
+
+        // Eviction emits no retractions: alice's unmatched row stays final; bob never appears.
+        var integrated = new ZSet<KeyedValue<DateTimeOffset, string>>();
+        while (output.Reader.TryRead(out var delta))
+            integrated.AddAll(delta);
+        Assert.Equal(1, integrated.WeightOf(new KeyedValue<DateTimeOffset, string>(T0, "alice")));
+        Assert.Equal(0, integrated.WeightOf(new KeyedValue<DateTimeOffset, string>(T0.AddSeconds(5), "bob")));
+    }
+
+    [Fact]
+    public async Task Keyed_distinct_state_is_evicted_once_the_watermark_passes()
+    {
+        var storage = new EvictionRecordingStorage();
+        var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Storage = storage });
+        builder.Input<(string User, DateTimeOffset At)>("views")
+            .WithWatermark(v => v.At, allowedLateness: TimeSpan.Zero)
+            .TumblingWindow(TimeSpan.FromSeconds(5), v => v.At)
+            .IndexBy(w => w.WindowStart)
+            .WithEviction(windowStart => windowStart.AddSeconds(5))
+            .MapValues(w => w.Value.User)
+            .Distinct()
+            .Output("distinctUsers");
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var input = circuit.Input<(string User, DateTimeOffset At)>("views");
+        var output = circuit.Output<KeyedValue<DateTimeOffset, string>>("distinctUsers");
+
+        // Step 1: alice appears twice in window T0 but is emitted once.
+        await input.InsertAsync(("alice", T0.AddSeconds(1)));
+        await input.InsertAsync(("alice", T0.AddSeconds(2)));
+        await circuit.StepAsync();
+        var delta = await output.Reader.ReadAsync();
+        Assert.Equal(1, delta.WeightOf(new KeyedValue<DateTimeOffset, string>(T0, "alice")));
+        Assert.Equal(1, delta.DistinctCount);
+        Assert.Empty(storage.RemovedKeys);
+
+        // Step 2 sees watermark T0+2s (< T0+5s): window T0 must survive. Freezes T0+7s.
+        await input.InsertAsync(("alice", T0.AddSeconds(7)));
+        await circuit.StepAsync();
+        Assert.Empty(storage.RemovedKeys);
+
+        // Step 3 sees watermark T0+7s (>= T0+5s): window T0's integrated weights are deleted.
+        await input.InsertAsync(("bob", T0.AddSeconds(12)));
+        await circuit.StepAsync();
+        Assert.Contains(T0, storage.RemovedKeys);
+
+        // Eviction emits no retractions: alice's presence in window T0 stays final.
+        var integrated = new ZSet<KeyedValue<DateTimeOffset, string>>();
+        integrated.AddAll(delta);
+        while (output.Reader.TryRead(out var later))
+            integrated.AddAll(later);
+        Assert.Equal(1, integrated.WeightOf(new KeyedValue<DateTimeOffset, string>(T0, "alice")));
+    }
+
     /// <summary>In-memory storage that records evicted keys: group removals from indexed
-    /// stores, and entry removals from value stores (how linear aggregates evict).</summary>
+    /// stores, entry removals from value stores (how linear aggregates evict), and entry
+    /// removals from weight stores (how the anti-join drops its right-side row counts).</summary>
     private sealed class EvictionRecordingStorage : IStorageProvider
     {
         private readonly InMemoryStorageProvider _inner = new();
@@ -90,7 +238,7 @@ public class WatermarkTests
         }
 
         public IWeightStore<T> CreateWeightStore<T>(string name) where T : notnull =>
-            _inner.CreateWeightStore<T>(name);
+            new RecordingWeights<T>(_inner.CreateWeightStore<T>(name), this);
 
         public IIndexedWeightStore<TKey, TValue> CreateIndexedWeightStore<TKey, TValue>(string name)
             where TKey : notnull
@@ -119,6 +267,21 @@ public class WatermarkTests
             {
                 owner.Record(key);
                 inner.RemoveGroup(key);
+            }
+        }
+
+        private sealed class RecordingWeights<T>(
+            IWeightStore<T> inner,
+            EvictionRecordingStorage owner) : IWeightStore<T>
+            where T : notnull
+        {
+            public long Update(T value, long delta) => inner.Update(value, delta);
+            public long WeightOf(T value) => inner.WeightOf(value);
+
+            public void Remove(T value)
+            {
+                owner.Record(value);
+                inner.Remove(value);
             }
         }
 

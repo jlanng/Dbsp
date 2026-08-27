@@ -117,11 +117,12 @@ public sealed class KeyedZStream<TKey, TValue> : ZStream<KeyedValue<TKey, TValue
     /// <summary>
     /// Attaches a watermark-driven eviction policy: once the circuit's watermark passes
     /// <paramref name="closesAt"/>(key), stateful operators downstream of this stream
-    /// (aggregations, TopK) delete everything they hold for that key. Already-emitted
-    /// results for the key remain final. Typical use with windowed keys:
-    /// <c>.WithEviction(k =&gt; k.Window + windowSize)</c>. Requires <c>WithWatermark</c> on
-    /// an upstream input. The policy is inherited by keyed streams derived from this one
-    /// with the same key type.
+    /// (aggregations, TopK, joins, anti-joins, keyed <see cref="Distinct"/>) delete
+    /// everything they hold for that key. Already-emitted results for the key remain final.
+    /// Typical use with windowed keys: <c>.WithEviction(k =&gt; k.Window + windowSize)</c>.
+    /// Requires <c>WithWatermark</c> on an upstream input. The policy is inherited by keyed
+    /// streams derived from this one with the same key type; a two-input operator (join,
+    /// anti-join) uses the left side's policy if it has one, otherwise the right's.
     /// </summary>
     public KeyedZStream<TKey, TValue> WithEviction(Func<TKey, DateTimeOffset> closesAt)
     {
@@ -139,12 +140,13 @@ public sealed class KeyedZStream<TKey, TValue> : ZStream<KeyedValue<TKey, TValue
         where TOut : notnull
     {
         RequireSameBuilder(right);
+        var eviction = _eviction ?? right._eviction;
         return new ZStream<TOut>(
             Builder,
             Builder.AddNode(
                 "join",
                 [NodeId, right.NodeId],
-                ctx => new JoinOperator<TKey, TValue, TRight, TOut>(ctx, resultSelector)));
+                ctx => new JoinOperator<TKey, TValue, TRight, TOut>(ctx, resultSelector, eviction)));
     }
 
     /// <summary>
@@ -156,10 +158,11 @@ public sealed class KeyedZStream<TKey, TValue> : ZStream<KeyedValue<TKey, TValue
         where TRight : notnull
     {
         RequireSameBuilder(right);
+        var eviction = _eviction ?? right._eviction;
         return new KeyedZStream<TKey, TValue>(
             Builder,
-            Builder.AddNode("antiJoin", [NodeId, right.NodeId], ctx => new AntiJoinOperator<TKey, TValue, TRight>(ctx)),
-            _eviction);
+            Builder.AddNode("antiJoin", [NodeId, right.NodeId], ctx => new AntiJoinOperator<TKey, TValue, TRight>(ctx, eviction)),
+            eviction);
     }
 
     /// <summary>Left outer join: <paramref name="matched"/> per matching right row, or one
@@ -231,6 +234,14 @@ public sealed class KeyedZStream<TKey, TValue> : ZStream<KeyedValue<TKey, TValue
             Builder.AddNode("topK", [NodeId], ctx => new TopKOperator<TKey, TValue, TOrder>(ctx, count, orderBy, descending, _eviction)),
             _eviction);
     }
+
+    /// <summary>Collapses the multiset to a set, like the unkeyed <see cref="ZStream{T}.Distinct"/>,
+    /// but keeps the result keyed and its state grouped by key so an eviction policy applies.
+    /// The stream is already partitioned by key, so no extra exchange is needed.</summary>
+    public new KeyedZStream<TKey, TValue> Distinct() =>
+        new(Builder,
+            Builder.AddNode("distinct", [NodeId], ctx => new KeyedDistinctOperator<TKey, TValue>(ctx, _eviction)),
+            _eviction);
 
     /// <summary>Transforms values while preserving the key and the partitioning.</summary>
     public KeyedZStream<TKey, TOut> MapValues<TOut>(Func<TValue, TOut> selector) where TOut : notnull =>

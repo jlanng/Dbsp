@@ -16,11 +16,13 @@ internal sealed class AntiJoinOperator<TKey, TLeft, TRight> : IStepOperator
 {
     private readonly IIndexedWeightStore<TKey, TLeft> _left;
     private readonly IWeightStore<TKey> _rightRowCount;
+    private readonly EvictionTracker<TKey>? _eviction;
 
-    public AntiJoinOperator(OperatorContext context)
+    public AntiJoinOperator(OperatorContext context, KeyEviction<TKey>? eviction)
     {
         _left = context.Storage.CreateIndexedWeightStore<TKey, TLeft>(context.StateName("left"));
         _rightRowCount = context.Storage.CreateWeightStore<TKey>(context.StateName("rightRows"));
+        _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
     }
 
     public object Step(object?[] inputs)
@@ -35,6 +37,7 @@ internal sealed class AntiJoinOperator<TKey, TLeft, TRight> : IStepOperator
 
         foreach (var (key, keyDelta) in rightKeyDeltas)
         {
+            _eviction?.Track(key);
             var before = _rightRowCount.WeightOf(key);
             var after = _rightRowCount.Update(key, keyDelta);
             var wasMatched = before > 0;
@@ -51,9 +54,19 @@ internal sealed class AntiJoinOperator<TKey, TLeft, TRight> : IStepOperator
         foreach (var ((key, leftValue), weight) in deltaLeft)
         {
             _left.Update(key, leftValue, weight);
+            _eviction?.Track(key);
             if (_rightRowCount.WeightOf(key) <= 0)
                 output.Add(new KeyedValue<TKey, TLeft>(key, leftValue), weight);
         }
+
+        // Closed keys can never flip again (the watermark drops their events), so both the
+        // integrated left rows and the right row count are deleted without retractions:
+        // rows already emitted as unmatched simply remain final.
+        _eviction?.EvictClosed(key =>
+        {
+            _left.RemoveGroup(key);
+            _rightRowCount.Remove(key);
+        });
 
         return output;
     }

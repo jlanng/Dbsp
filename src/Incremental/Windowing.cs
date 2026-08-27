@@ -9,8 +9,8 @@ public readonly record struct Windowed<T>(DateTimeOffset WindowStart, DateTimeOf
 /// (a flat-map): a record joins every window covering its event time, and downstream keyed
 /// aggregates over (window, ...) keys become windowed aggregates for free. Late or
 /// out-of-order events need no special machinery — they simply produce deltas that update
-/// the affected window's results, and deleted events retract from their windows.
-/// TODO: watermark-driven state eviction so closed windows can be garbage collected.
+/// the affected window's results, and deleted events retract from their windows. Pair with
+/// <c>WithWatermark</c> + <c>WithEviction</c> so closed windows' state is garbage collected.
 /// </summary>
 public static class WindowExtensions
 {
