@@ -35,18 +35,28 @@ internal sealed class AggregateOperator<TKey, TValue, TResult> : IStepOperator
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
         var output = new ZSet<KeyedValue<TKey, TResult>>();
 
-        var touched = new HashSet<TKey>();
+        var entries = new List<(TKey, TValue, long)>(delta.DistinctCount);
+        var touched = new List<TKey>();
+        var seen = new HashSet<TKey>();
         foreach (var ((key, value), weight) in delta)
         {
-            _groups.Update(key, value, weight);
-            touched.Add(key);
+            entries.Add((key, value, weight));
+            if (seen.Add(key))
+                touched.Add(key);
             _eviction?.Track(key);
         }
+        _groups.UpdateAll(entries);
 
-        foreach (var key in touched)
+        var groups = _groups.GetGroups(touched);
+        var lastResults = _lastEmitted.TryGetAll(touched);
+        var puts = new List<(TKey, TResult)>();
+        var removes = new List<TKey>();
+
+        for (var i = 0; i < touched.Count; i++)
         {
-            var group = _groups.GetGroup(key);
-            var hadPrevious = _lastEmitted.TryGet(key, out var previous);
+            var key = touched[i];
+            var group = groups[i];
+            var (hadPrevious, previous) = lastResults[i];
 
             if (group.Count == 0)
             {
@@ -54,7 +64,7 @@ internal sealed class AggregateOperator<TKey, TValue, TResult> : IStepOperator
                 if (hadPrevious)
                 {
                     output.Add(new KeyedValue<TKey, TResult>(key, previous!), -1);
-                    _lastEmitted.Remove(key);
+                    removes.Add(key);
                 }
                 continue;
             }
@@ -66,17 +76,20 @@ internal sealed class AggregateOperator<TKey, TValue, TResult> : IStepOperator
             if (hadPrevious)
                 output.Add(new KeyedValue<TKey, TResult>(key, previous!), -1);
             output.Add(new KeyedValue<TKey, TResult>(key, next), 1);
-            _lastEmitted.Put(key, next);
+            puts.Add((key, next));
         }
+
+        _lastEmitted.PutAll(puts);
+        _lastEmitted.RemoveAll(removes);
 
         // Closed keys can never be touched again (their events are dropped at the
         // watermark), so their state is deleted without emitting retractions: results
         // already published for them simply remain final.
-        _eviction?.EvictClosed(key =>
+        if (_eviction?.DrainClosed() is { Count: > 0 } closed)
         {
-            _groups.RemoveGroup(key);
-            _lastEmitted.Remove(key);
-        });
+            _groups.RemoveGroups(closed);
+            _lastEmitted.RemoveAll(closed);
+        }
 
         return output;
     }

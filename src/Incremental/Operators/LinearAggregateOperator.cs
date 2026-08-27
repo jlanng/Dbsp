@@ -38,11 +38,22 @@ internal sealed class LinearAggregateOperator<TKey, TValue, TResult> : IStepOper
             perKey[key] = (entry.Rows + weight, _aggregate.Combine(entry.Acc, _aggregate.Map(value, weight)));
         }
 
-        foreach (var (key, change) in perKey)
+        var keys = new List<TKey>(perKey.Count);
+        foreach (var (key, _) in perKey)
         {
+            keys.Add(key);
             _eviction?.Track(key);
+        }
 
-            var had = _state.TryGet(key, out var previous);
+        var states = _state.TryGetAll(keys);
+        var puts = new List<(TKey, (long, TResult))>();
+        var removes = new List<TKey>();
+
+        for (var i = 0; i < keys.Count; i++)
+        {
+            var key = keys[i];
+            var change = perKey[key];
+            var (had, previous) = states[i];
             var rows = (had ? previous.Rows : 0) + change.Rows;
             var acc = had ? _aggregate.Combine(previous.Acc, change.Acc) : change.Acc;
 
@@ -59,12 +70,16 @@ internal sealed class LinearAggregateOperator<TKey, TValue, TResult> : IStepOper
             }
 
             if (rows == 0)
-                _state.Remove(key);
+                removes.Add(key);
             else
-                _state.Put(key, (rows, acc));
+                puts.Add((key, (rows, acc)));
         }
 
-        _eviction?.EvictClosed(_state.Remove);
+        _state.PutAll(puts);
+        _state.RemoveAll(removes);
+
+        if (_eviction?.DrainClosed() is { Count: > 0 } closed)
+            _state.RemoveAll(closed);
 
         return output;
     }

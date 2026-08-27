@@ -174,7 +174,8 @@ Scaffold — the semantics above are implemented and tested, with plenty of head
 - [x] Tournament trees for `MIN`/`MAX` over large groups (`Min`/`Max` maintain a
       hash-partitioned reduction tree in ordinary indexed stores, so it works over any
       storage provider; deleting the extremum no longer rescans the group)
-- [ ] Batched/pipelined Redis access (currently one round trip per state touch)
+- [x] Batched/pipelined Redis access (operators drive batched store operations, so a step
+      costs a handful of pipelined round trips instead of one per state touch)
 - [ ] Checkpointing input offsets with state for exactly-once restart (Redis provider)
 - [x] `TopK` (per-key ranking with retraction of displaced rows)
 - [x] Tumbling and hopping event-time windows (assignment; late data handled by deltas)

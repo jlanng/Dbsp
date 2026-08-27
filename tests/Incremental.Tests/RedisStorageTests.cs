@@ -1,4 +1,5 @@
 using StackExchange.Redis;
+using Incremental.Storage;
 using Incremental.Storage.Redis;
 
 namespace Incremental.Tests;
@@ -120,5 +121,69 @@ public class RedisStorageTests
         delta = await output.Reader.ReadAsync();
         Assert.Equal(-1, delta.WeightOf(new KeyedValue<string, int>("k", 3)));
         Assert.Equal(1, delta.WeightOf(new KeyedValue<string, int>("k", 5)));
+    }
+
+    private static RedisStorageProvider FreshProvider(ConnectionMultiplexer redis) =>
+        new(redis, new RedisStorageOptions { KeyPrefix = $"sp-test:{Guid.NewGuid():N}" });
+
+    [SkippableFact]
+    public void Weight_store_batches_pipeline_and_drop_zeroed_entries()
+    {
+        using var redis = ConnectOrSkip();
+        var store = FreshProvider(redis).CreateWeightStore<string>("batch");
+
+        var results = store.UpdateAll([("a", 2), ("b", 3), ("c", 1)]);
+        Assert.Equal([2, 3, 1], results);
+
+        // "b" ends at zero and must be dropped; "c" passes through zero across duplicate
+        // entries but ends non-zero and must survive.
+        results = store.UpdateAll([("b", -3), ("c", -1), ("c", 4)]);
+        Assert.Equal([0, 0, 4], results);
+
+        Assert.Equal([2, 0, 4, 0], store.WeightOfAll(["a", "b", "c", "missing"]));
+        // A dropped entry re-added starts from zero, proving the hash field was deleted.
+        Assert.Equal(7, store.Update("b", 7));
+
+        store.RemoveAll(["a", "c"]);
+        Assert.Equal([0, 7, 0], store.WeightOfAll(["a", "b", "c"]));
+    }
+
+    [SkippableFact]
+    public void Indexed_store_batches_span_groups()
+    {
+        using var redis = ConnectOrSkip();
+        var store = FreshProvider(redis).CreateIndexedWeightStore<string, string>("batch");
+
+        var results = store.UpdateAll([("g1", "x", 1), ("g1", "y", 2), ("g2", "x", 3), ("g1", "y", -2)]);
+        Assert.Equal([1, 2, 3, 0], results);
+
+        var groups = store.GetGroups(["g1", "g2", "empty"]);
+        var g1 = Assert.Single(groups[0]);
+        Assert.Equal(new WeightedValue<string>("x", 1), g1);
+        var g2 = Assert.Single(groups[1]);
+        Assert.Equal(new WeightedValue<string>("x", 3), g2);
+        Assert.Empty(groups[2]);
+
+        store.RemoveGroups(["g1", "g2"]);
+        Assert.All(store.GetGroups(["g1", "g2"]), g => Assert.Empty(g));
+    }
+
+    [SkippableFact]
+    public void Value_store_batches_round_trip()
+    {
+        using var redis = ConnectOrSkip();
+        var store = FreshProvider(redis).CreateValueStore<string, (int A, string B)>("batch");
+
+        store.PutAll([("k1", (1, "one")), ("k2", (2, "two"))]);
+
+        var results = store.TryGetAll(["k1", "missing", "k2"]);
+        Assert.Equal((true, (1, "one")), results[0]);
+        Assert.False(results[1].Found);
+        Assert.Equal((true, (2, "two")), results[2]);
+
+        store.RemoveAll(["k1", "missing"]);
+        results = store.TryGetAll(["k1", "k2"]);
+        Assert.False(results[0].Found);
+        Assert.True(results[1].Found);
     }
 }

@@ -43,24 +43,47 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
         var output = new ZSet<KeyedValue<TKey, TValue>>();
 
+        var entries = new List<(TKey, TValue, long)>(delta.DistinctCount);
+        var touchedKeys = new List<TKey>();
         var touched = new Dictionary<TKey, List<WeightedValue<TValue>>>();
         foreach (var ((key, value), weight) in delta)
         {
-            _groups.Update(key, value, weight);
+            entries.Add((key, value, weight));
             if (!touched.TryGetValue(key, out var rows))
+            {
                 touched[key] = rows = [];
+                touchedKeys.Add(key);
+            }
             rows.Add(new WeightedValue<TValue>(value, weight));
             _eviction?.Track(key);
         }
+        _groups.UpdateAll(entries);
 
         var comparer = Comparer<TOrder>.Default;
-        foreach (var (key, deltaRows) in touched)
+        var lastResults = _lastEmitted.TryGetAll(touchedKeys);
+
+        var rerankKeys = new List<TKey>();
+        var rerankPrevious = new List<WeightedValue<TValue>[]?>();
+        for (var i = 0; i < touchedKeys.Count; i++)
         {
-            if (_lastEmitted.TryGet(key, out var emitted) && TopUnaffected(emitted, deltaRows, comparer))
+            var (hadPrevious, emitted) = lastResults[i];
+            if (hadPrevious && TopUnaffected(emitted!, touched[touchedKeys[i]], comparer))
                 continue;
+            rerankKeys.Add(touchedKeys[i]);
+            rerankPrevious.Add(hadPrevious ? emitted : null);
+        }
+
+        var groups = _groups.GetGroups(rerankKeys);
+        var puts = new List<(TKey, WeightedValue<TValue>[])>();
+        var removes = new List<TKey>();
+
+        for (var i = 0; i < rerankKeys.Count; i++)
+        {
+            var key = rerankKeys[i];
+            var previous = rerankPrevious[i];
 
             var ranked = new List<(TOrder Order, WeightedValue<TValue> Entry)>();
-            foreach (var entry in _groups.GetGroup(key))
+            foreach (var entry in groups[i])
                 if (entry.Weight > 0)
                     ranked.Add((_orderBy(entry.Value), entry));
             ranked.Sort((a, b) => _direction * comparer.Compare(a.Order, b.Order));
@@ -76,29 +99,31 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
                 remaining -= take;
             }
 
-            var hadPrevious = _lastEmitted.TryGet(key, out var previous);
             foreach (var (value, weight) in top)
                 output.Add(new KeyedValue<TKey, TValue>(key, value), weight);
-            if (hadPrevious)
-                foreach (var (value, weight) in previous!)
+            if (previous is not null)
+                foreach (var (value, weight) in previous)
                     output.Add(new KeyedValue<TKey, TValue>(key, value), -weight);
 
             if (top.Count == 0)
             {
-                if (hadPrevious)
-                    _lastEmitted.Remove(key);
+                if (previous is not null)
+                    removes.Add(key);
             }
-            else if (!hadPrevious || !top.SequenceEqual(previous!))
+            else if (previous is null || !top.SequenceEqual(previous))
             {
-                _lastEmitted.Put(key, [.. top]);
+                puts.Add((key, [.. top]));
             }
         }
 
-        _eviction?.EvictClosed(key =>
+        _lastEmitted.PutAll(puts);
+        _lastEmitted.RemoveAll(removes);
+
+        if (_eviction?.DrainClosed() is { Count: > 0 } closed)
         {
-            _groups.RemoveGroup(key);
-            _lastEmitted.Remove(key);
-        });
+            _groups.RemoveGroups(closed);
+            _lastEmitted.RemoveAll(closed);
+        }
 
         return output;
     }
