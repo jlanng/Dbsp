@@ -63,6 +63,7 @@ deltas. Integrating an output's deltas reproduces the current state of that view
 | `LeftJoin` / `FullJoin` | Pure composition: inner join ⊕ mapped anti-join(s) — the Z-set algebra makes the union incremental for free |
 | `TumblingWindow` / `HoppingWindow` | Pure data transformation (flat-map): records join every window covering their event time; keying by `(window, …)` turns any aggregate into a windowed one. Late and deleted events correct their windows via ordinary deltas |
 | `SessionWindow` | Stateful, unlike the fixed windows: integrated events per session key, re-sessionized per touched key (never a full rescan). Rows whose session bounds change are retracted and re-asserted, so a bridging or late event merges sessions and a deletion shrinks or splits one — downstream aggregates correct themselves via the ordinary deltas |
+| `Recurse` | Fixed-point subcircuit (DBSP recursion), iterated to convergence within each step; the loop's `Join`/`Distinct` state is profiled by inner iteration (incremental in both time dimensions), so the emitted delta is exactly the change between successive fixed points — retractions included, cyclic derivations unwound in well-founded order |
 
 **Watermarks and eviction.** Correctness never depends on watermarks here — late events
 just produce correcting deltas. Watermarks serve one purpose: bounding state.
@@ -117,6 +118,31 @@ windowed.WindowCloses()
         .Join(counts, (window, closedAt, count) => (window, count))
         .Output("finalCounts"); // one (window, count) row per window, once it is final
 ```
+
+**Recursion (fixed points).** `.Recurse(body)` closes a stream over itself and computes the
+least fixed point `X = Distinct(seed ∪ body(X))` — the DBSP recursive circuit, with the
+stream it is called on as the seed and `Distinct` as the built-in stabilizer. Transitive
+closure is the classic shape:
+
+```csharp
+var closure = edges.Recurse(paths =>
+    paths.IndexBy(p => p.To)
+         .Join(edges.IndexBy(e => e.From), (_, p, e) => (p.From, e.To)));
+```
+
+Within every outer step the subcircuit iterates to convergence — a feedback edge (z⁻¹ over
+iterations) circulates the loop delta, outer streams referenced by the body enter at
+iteration 0 only (δ0), and the loop stops when no delta circulates on any worker — then
+emits the net change of the new fixed point versus the previous step's, so downstream sees
+ordinary incremental deltas. The stateful operators inside a loop (`Join`, `Distinct`) are
+incremental in *both* time dimensions: their state remembers at which iteration each row's
+weight arrived, which is what makes deletions unwind derivations in well-founded order — 
+deleting an edge retracts exactly the paths with no remaining acyclic derivation, even when
+paths "support themselves" around a cycle. Workers iterate in lockstep (the convergence
+decision is a global all-workers reduction on the exchange barrier), so the body's joins
+shuffle correctly mid-loop, and a `maxIterations` guard (default 10 000) faults the circuit
+if a non-monotone body never converges. Bodies may use the linear operators plus
+`IndexBy`/`Join`/`Distinct`; aggregations and the like are rejected at definition time.
 
 **Exchange (multi-threading).** `CircuitOptions.Workers = N` runs N worker threads, each
 owning its own instance of every operator and its own shard of all operator state.
@@ -267,7 +293,11 @@ Scaffold — the semantics above are implemented and tested, with plenty of head
 - [x] Session windows (per-key inactivity gap; a bridging or late event merges sessions and
       a retraction splits them, all via ordinary deltas; key state evicted once the
       watermark passes last event + gap)
-- [ ] Recursive/iterative circuits (DBSP fixed points) for transitive closure-style queries
+- [x] Recursive/iterative circuits (DBSP fixed points) for transitive closure-style queries
+      (`Recurse`: per-step fixed-point iteration with a hard-wired `Distinct` stabilizer;
+      loop `Join`/`Distinct` state is iteration-profiled so retractions unwind cyclic
+      derivations correctly; lockstep multi-worker iteration with a global convergence
+      barrier; `maxIterations` guard)
 - [ ] Cooperative fault propagation across workers (a faulted worker currently poisons the
       circuit; disposal is required)
 - [ ] Cross-process exchange (workers on different machines) behind the same operator
