@@ -146,6 +146,20 @@ public sealed class KeyedZStream<TKey, TValue> : ZStream<KeyedValue<TKey, TValue
         where TProjected : notnull =>
         Aggregate(Aggregates.Max(selector));
 
+    /// <summary>
+    /// Keeps only the top <paramref name="count"/> rows per key, ranked by
+    /// <paramref name="orderBy"/> (largest first by default). The output carries the rows
+    /// themselves: when membership changes, displaced rows are retracted and newly ranked
+    /// rows asserted. Multiplicities count toward K; ties are broken arbitrarily.
+    /// </summary>
+    public KeyedZStream<TKey, TValue> TopK<TOrder>(int count, Func<TValue, TOrder> orderBy, bool descending = true)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(count, 1, nameof(count));
+        return new KeyedZStream<TKey, TValue>(
+            Builder,
+            Builder.AddNode("topK", [NodeId], ctx => new TopKOperator<TKey, TValue, TOrder>(ctx, count, orderBy, descending)));
+    }
+
     /// <summary>Transforms values while preserving the key and the partitioning.</summary>
     public KeyedZStream<TKey, TOut> MapValues<TOut>(Func<TValue, TOut> selector) where TOut : notnull =>
         new(Builder, Builder.AddNode(

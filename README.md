@@ -56,6 +56,8 @@ deltas. Integrating an output's deltas reproduces the current state of that view
 | `Join` | Bilinear: Δ(L ⋈ R) = ΔL ⋈ R + (L + ΔL) ⋈ ΔR, probing integrated per-side state |
 | `Aggregate` (`Count`, `Sum`, `Min`, `Max`, `Fold`, custom) | Integrated group state per key; recomputes touched groups, retracts the stale result (-1) and asserts the new one (+1). Correct for non-invertible aggregates (`MIN` under deletion) |
 | `Distinct` | Integrated weight per value; emits only presence transitions |
+| `TopK` | Integrated group per key; re-ranks touched groups and emits only membership changes (displaced rows retracted). Multiplicities count toward K |
+| `TumblingWindow` / `HoppingWindow` | Pure data transformation (flat-map): records join every window covering their event time; keying by `(window, …)` turns any aggregate into a windowed one. Late and deleted events correct their windows via ordinary deltas |
 
 **Exchange (multi-threading).** `CircuitOptions.Workers = N` runs N worker threads, each
 owning its own instance of every operator and its own shard of all operator state.
@@ -98,10 +100,21 @@ deterministic step boundaries for tests and batch jobs.
 ## Project layout
 
 ```
-src/StreamProcessor                  core: Z-sets, builder API, operators, runtime, in-memory storage
-src/StreamProcessor.Storage.Redis    Redis-backed IStorageProvider
-tests/StreamProcessor.Tests          xunit: Z-set algebra, per-step delta semantics, multi-worker runs
-examples/StreamProcessor.Example     joined + aggregated order analytics with live retraction
+src/StreamProcessor                    core: Z-sets, builder API, operators, windows, runtime, in-memory storage
+src/StreamProcessor.Storage.Redis      Redis-backed IStorageProvider
+tests/StreamProcessor.Tests            xunit: Z-set algebra, per-step delta semantics, multi-worker runs,
+                                       Redis integration (auto-skipped when Redis is down)
+examples/StreamProcessor.Example       joined + aggregated order analytics with live retraction
+examples/StreamProcessor.LogAnalytics  simulated clickstream → 5s tumbling windows → counts → live top-3
+                                       per window; `--redis` keeps operator state in Redis
+```
+
+## Running with Redis
+
+```sh
+docker compose up -d        # starts Redis on localhost:6379
+dotnet test                 # Redis integration tests now run instead of skipping
+dotnet run --project examples/StreamProcessor.LogAnalytics -- --redis
 ```
 
 ## Status / roadmap
@@ -112,7 +125,10 @@ Scaffold — the semantics above are implemented and tested, with plenty of head
       tournament trees for `MIN`/`MAX` over large groups
 - [ ] Batched/pipelined Redis access (currently one round trip per state touch)
 - [ ] Checkpointing input offsets with state for exactly-once restart (Redis provider)
-- [ ] Anti-join / outer join, `TopK`, windowed operators over event time + watermarks
+- [x] `TopK` (per-key ranking with retraction of displaced rows)
+- [x] Tumbling and hopping event-time windows (assignment; late data handled by deltas)
+- [ ] Watermarks: window-close notifications and eviction of closed-window state
+- [ ] Anti-join / outer join, session windows
 - [ ] Recursive/iterative circuits (DBSP fixed points) for transitive closure-style queries
 - [ ] Cooperative fault propagation across workers (a faulted worker currently poisons the
       circuit; disposal is required)

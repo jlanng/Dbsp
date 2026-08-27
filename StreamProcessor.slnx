@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/examples/">
     <Project Path="examples/StreamProcessor.Example/StreamProcessor.Example.csproj" />
+    <Project Path="examples/StreamProcessor.LogAnalytics/StreamProcessor.LogAnalytics.csproj" />
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/StreamProcessor.Storage.Redis/StreamProcessor.Storage.Redis.csproj" />
