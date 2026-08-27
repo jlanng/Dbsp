@@ -132,7 +132,9 @@ AnsiConsole.WriteLine();
 
 // ── build the circuit from the selections ───────────────────────────────────────
 
-var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Workers = 2 });
+// Single worker: the per-step work here is tiny, so multi-worker exchange barriers would
+// only add thread-handoff latency (TaxiAnalytics is the parallelism showcase).
+var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Workers = 1 });
 
 var tradeStream = builder.KeyedInput<long, Trade>("trades", t => t.Id);
 var enriched = tradeStream.Map(t => new EnrichedTrade(
@@ -250,6 +252,10 @@ AnsiConsole.MarkupLine(interactive
 var rng = new Random(11);
 long nextTradeId = 1;
 var liveIds = new List<long>();
+// Live-trade counts per trader/counterparty, so master-data notices can report how many
+// historical trades one upsert re-attributed (the group-level delta count hides this).
+var tradesByTrader = new Dictionary<int, int>();
+var tradesByCpty = new Dictionary<int, int>();
 long tradesInserted = 0, tradesCancelled = 0, tradesAmended = 0;
 long stepCount = 0, stepTicks = 0;
 double lastStepMicros = 0;
@@ -297,10 +303,12 @@ await AnsiConsole.Live(BuildLiveView()).AutoClear(false).StartAsync(async ctx =>
 
         // A burst of new trades, the odd amendment, the odd cancellation — the keyed
         // trade input makes both a single call.
-        for (var i = 0; i < 8; i++)
+        for (var i = 0; i < 25; i++)
         {
             var trade = RandomTrade();
             liveIds.Add(trade.Id);
+            tradesByTrader[trade.TraderId] = tradesByTrader.GetValueOrDefault(trade.TraderId) + 1;
+            tradesByCpty[trade.CounterpartyId] = tradesByCpty.GetValueOrDefault(trade.CounterpartyId) + 1;
             tradesInserted++;
             await tradeInput.UpsertAsync(trade);
         }
@@ -309,6 +317,11 @@ await AnsiConsole.Live(BuildLiveView()).AutoClear(false).StartAsync(async ctx =>
             var victimId = liveIds[rng.Next(liveIds.Count)];
             if (rng.NextDouble() < 0.5)
             {
+                if (tradeInput.TryGetCurrent(victimId, out var cancelled))
+                {
+                    tradesByTrader[cancelled.TraderId]--;
+                    tradesByCpty[cancelled.CounterpartyId]--;
+                }
                 await tradeInput.DeleteAsync(victimId);
                 liveIds.Remove(victimId);
                 tradesCancelled++;
@@ -335,8 +348,10 @@ await AnsiConsole.Live(BuildLiveView()).AutoClear(false).StartAsync(async ctx =>
                     traders[traders.IndexOf(trader)] = moved;
                     await circuit.KeyedInput<int, TraderRow>("traders").UpsertAsync(moved);
                     var (micros, deltaRows) = await StepTimedAsync();
-                    Notice($"[yellow]master data:[/] {trader.Name} moved {oldDesk} → {newDesk.Name} — " +
-                           $"one upsert re-attributed their history in [bold]{micros:N0} µs[/] ({deltaRows} delta rows)");
+                    var affected = tradesByTrader.GetValueOrDefault(trader.Id);
+                    Notice($"[yellow]master data:[/] {trader.Name} moved {oldDesk} → {newDesk.Name} — one upsert " +
+                           $"re-attributed [bold]{affected:N0} historical trades[/] in [bold green]{micros:N0} µs[/] " +
+                           $"(collapsing to {deltaRows} group-level delta rows)");
                 }
             }
             else if (useCpty && cols.Contains(ColRating))
@@ -349,8 +364,10 @@ await AnsiConsole.Live(BuildLiveView()).AutoClear(false).StartAsync(async ctx =>
                     counterparties[counterparties.IndexOf(cpty)] = changed;
                     await circuit.KeyedInput<int, Counterparty>("counterparties").UpsertAsync(changed);
                     var (micros, deltaRows) = await StepTimedAsync();
-                    Notice($"[yellow]master data:[/] {cpty.Name} re-rated {cpty.Rating} → {newRating} — " +
-                           $"one upsert re-attributed their trades in [bold]{micros:N0} µs[/] ({deltaRows} delta rows)");
+                    var affected = tradesByCpty.GetValueOrDefault(cpty.Id);
+                    Notice($"[yellow]master data:[/] {cpty.Name} re-rated {cpty.Rating} → {newRating} — one upsert " +
+                           $"re-attributed [bold]{affected:N0} historical trades[/] in [bold green]{micros:N0} µs[/] " +
+                           $"(collapsing to {deltaRows} group-level delta rows)");
                 }
             }
         }
