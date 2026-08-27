@@ -3,6 +3,7 @@
     <Project Path="examples/StreamProcessor.Example/StreamProcessor.Example.csproj" />
     <Project Path="examples/StreamProcessor.LogAnalytics/StreamProcessor.LogAnalytics.csproj" />
     <Project Path="examples/StreamProcessor.TaxiAnalytics/StreamProcessor.TaxiAnalytics.csproj" />
+    <Project Path="examples/StreamProcessor.TradeEnrichment/StreamProcessor.TradeEnrichment.csproj" />
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/StreamProcessor.Storage.Redis/StreamProcessor.Storage.Redis.csproj" />
