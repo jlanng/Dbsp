@@ -54,7 +54,8 @@ deltas. Integrating an output's deltas reproduces the current state of that view
 | --- | --- |
 | `Map` / `Filter` / `FlatMap` / `Plus` / `Minus` / `Negate` | Linear — applied to the delta directly, stateless |
 | `Join` | Bilinear: Δ(L ⋈ R) = ΔL ⋈ R + (L + ΔL) ⋈ ΔR, probing integrated per-side state |
-| `Aggregate` (`Count`, `Sum`, `Min`, `Max`, `Fold`, custom) | Integrated group state per key; recomputes touched groups, retracts the stale result (-1) and asserts the new one (+1). Correct for non-invertible aggregates (`MIN` under deletion) |
+| `Count` / `Sum` (`AggregateLinear`) | Linear aggregates: folded straight from the delta, state is one (row count, accumulator) pair per key — no group contents stored, update cost independent of group size |
+| `Aggregate` (`Min`, `Max`, `Fold`, custom) | Integrated group state per key; recomputes touched groups, retracts the stale result (-1) and asserts the new one (+1). Correct for non-invertible aggregates (`MIN` under deletion) |
 | `Distinct` | Integrated weight per value; emits only presence transitions |
 | `TopK` | Integrated group per key; re-ranks touched groups and emits only membership changes (displaced rows retracted). Multiplicities count toward K |
 | `AntiJoin` | Integrated left side plus per-key right-side row counts; a key whose match-presence flips retracts or re-asserts its left rows |
@@ -128,6 +129,11 @@ examples/StreamProcessor.LogAnalytics  simulated clickstream → 5s tumbling win
                                        per window, rendered as an in-place Spectre.Console dashboard
                                        (bar gauges per window, watermark in the header);
                                        `--redis` keeps operator state in Redis
+examples/StreamProcessor.TaxiAnalytics genuine big data: ~3M real NYC yellow-taxi trips (downloaded and
+                                       cached on first run, ~50MB/month; `--months N`, `--synthetic`)
+                                       through join + counts + revenue + top-5 zones per borough, then
+                                       single-row updates timed against a naive full recompute —
+                                       ~1M rows/s bulk load, per-update speedups of hundreds of ×
 ```
 
 ## Running with Redis
@@ -142,8 +148,9 @@ dotnet run --project examples/StreamProcessor.LogAnalytics -- --redis
 
 Scaffold — the semantics above are implemented and tested, with plenty of headroom:
 
-- [ ] Linear-aggregate fast path (`COUNT`/`SUM` from the delta alone, no group scan) and
-      tournament trees for `MIN`/`MAX` over large groups
+- [x] Linear-aggregate fast path: `COUNT`/`SUM` maintained from the delta alone with O(keys)
+      state (`ILinearAggregate`); custom linear aggregates via `AggregateLinear`
+- [ ] Tournament trees for `MIN`/`MAX` over large groups
 - [ ] Batched/pipelined Redis access (currently one round trip per state touch)
 - [ ] Checkpointing input offsets with state for exactly-once restart (Redis provider)
 - [x] `TopK` (per-key ranking with retraction of displaced rows)
