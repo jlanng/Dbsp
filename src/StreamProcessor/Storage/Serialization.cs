@@ -11,12 +11,16 @@ public interface IStateSerializer
 
 public sealed class JsonStateSerializer : IStateSerializer
 {
+    // IncludeFields so ValueTuple keys/values round-trip (tuples expose fields, not properties).
+    // Must be initialized before Instance below — static initializers run in declaration order.
+    private static readonly JsonSerializerOptions DefaultOptions = new() { IncludeFields = true };
+
     public static JsonStateSerializer Instance { get; } = new();
 
     private readonly JsonSerializerOptions _options;
 
     public JsonStateSerializer(JsonSerializerOptions? options = null) =>
-        _options = options ?? JsonSerializerOptions.Default;
+        _options = options ?? DefaultOptions;
 
     public string Serialize<T>(T value) => JsonSerializer.Serialize(value, _options);
 
