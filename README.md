@@ -1,4 +1,4 @@
-# StreamProcessor
+# Incremental
 
 An incremental stream processing library for .NET, built on the ideas of
 [DBSP](https://arxiv.org/abs/2203.16684) (the theory behind Feldera): every collection is a
@@ -110,7 +110,7 @@ row re-attributes everything joined against it.
 so implementations never see cross-thread access to one store.
 
 - `InMemoryStorageProvider` (default) — heap dictionaries.
-- `RedisStorageProvider` (`StreamProcessor.Storage.Redis`) — state in Redis hashes via
+- `RedisStorageProvider` (`Incremental.Storage.Redis`) — state in Redis hashes via
   `HINCRBY`; survives restarts and can exceed the heap:
 
   ```csharp
@@ -127,16 +127,16 @@ deterministic step boundaries for tests and batch jobs.
 ## Project layout
 
 ```
-src/StreamProcessor                    core: Z-sets, builder API, operators, windows, runtime, in-memory storage
-src/StreamProcessor.Storage.Redis      Redis-backed IStorageProvider
-tests/StreamProcessor.Tests            xunit: Z-set algebra, per-step delta semantics, multi-worker runs,
+src/Incremental                    core: Z-sets, builder API, operators, windows, runtime, in-memory storage
+src/Incremental.Storage.Redis      Redis-backed IStorageProvider
+tests/Incremental.Tests            xunit: Z-set algebra, per-step delta semantics, multi-worker runs,
                                        Redis integration (auto-skipped when Redis is down)
-examples/StreamProcessor.Example       joined + aggregated order analytics with live retraction
-examples/StreamProcessor.LogAnalytics  simulated clickstream → 5s tumbling windows → counts → live top-3
+examples/Incremental.Example       joined + aggregated order analytics with live retraction
+examples/Incremental.LogAnalytics  simulated clickstream → 5s tumbling windows → counts → live top-3
                                        per window, rendered as an in-place Spectre.Console dashboard
                                        (bar gauges per window, watermark in the header);
                                        `--redis` keeps operator state in Redis
-examples/StreamProcessor.TradeEnrichment trades ⋈ reference data, composed interactively: pick which
+examples/Incremental.TradeEnrichment trades ⋈ reference data, composed interactively: pick which
                                        enrichment columns to join (grouped by table: instrument;
                                        trader → desk, a two-hop join; counterparty) and which
                                        dimensions to group by — no dimensions gives a top-trades
@@ -144,7 +144,7 @@ examples/StreamProcessor.TradeEnrichment trades ⋈ reference data, composed int
                                        amendments, cancellations, and master-data changes (desk
                                        moves, re-ratings) are single UpsertAsync/DeleteAsync calls
                                        that re-attribute historical trades in microseconds
-examples/StreamProcessor.TaxiAnalytics genuine big data: ~3M real NYC yellow-taxi trips (parquet, read
+examples/Incremental.TaxiAnalytics genuine big data: ~3M real NYC yellow-taxi trips (parquet, read
                                        via Parquet.Net, downloaded and cached on first run, ~50MB/month;
                                        `--months N`, `--synthetic`) through join + counts + revenue +
                                        top-5 zones per borough; narrated phases, then continuous
@@ -157,7 +157,7 @@ examples/StreamProcessor.TaxiAnalytics genuine big data: ~3M real NYC yellow-tax
 ```sh
 docker compose up -d        # starts Redis on localhost:6379
 dotnet test                 # Redis integration tests now run instead of skipping
-dotnet run --project examples/StreamProcessor.LogAnalytics -- --redis
+dotnet run --project examples/Incremental.LogAnalytics -- --redis
 ```
 
 ## Status / roadmap

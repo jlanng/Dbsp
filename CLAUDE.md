@@ -1,12 +1,12 @@
-# StreamProcessor
+# Incremental
 
 DBSP-style incremental stream processing library for .NET (net10.0, SDK pinned via mise.toml).
 
 ## Commands
 - Build: `dotnet build`
-- Test: `dotnet test tests/StreamProcessor.Tests` (Redis tests skip unless `docker compose up -d` has run)
-- Examples: `dotnet run --project examples/StreamProcessor.Example`,
-  `dotnet run --project examples/StreamProcessor.LogAnalytics [-- --redis]`
+- Test: `dotnet test tests/Incremental.Tests` (Redis tests skip unless `docker compose up -d` has run)
+- Examples: `dotnet run --project examples/Incremental.Example`,
+  `dotnet run --project examples/Incremental.LogAnalytics [-- --redis]`
 
 ## Architecture invariants
 - Streams carry `ZSet<T>` **deltas** (value → signed weight); operators must be fully
