@@ -166,6 +166,19 @@ A slow consumer fills its output channel, which stalls step publishing, which st
 draining, which fills the input channels, which suspends producers inside `InsertAsync`.
 No configuration, no dropped data.
 
+**Faults.** When any worker throws mid-step (a user delegate, a storage error), the fault
+propagates cooperatively instead of poisoning the circuit: the faulting worker poisons the
+exchange barrier, so peers blocked mid-shuffle — recursion-loop iterations included — bail
+out of the step rather than deadlock, and the circuit moves to a terminal faulted state
+within that step. The faulting `StepAsync` throws the original exception (an
+`AggregateException` when several workers fault in the same step), consumers' `ReadAllAsync`
+observes it after the pre-fault deltas, producers blocked in `InsertAsync` are released with
+a `CircuitFaultedException` (original fault as its inner) instead of hanging, and
+`Circuit.Fault` exposes it; `DisposeAsync` of a faulted circuit completes quietly. A faulted
+circuit's in-memory state is unusable — the faulting step is half-applied — but that step is
+never committed, so with a checkpointing storage provider the last committed checkpoint is
+intact: rebuild the circuit against the same provider to recover exactly-once (below).
+
 **Keyed inputs.** `builder.KeyedInput<K,V>(name, keySelector)` declares an input with
 upsert/delete-by-key semantics: the handle tracks the current row per key, so
 `UpsertAsync(row)` emits the retraction of the previous version automatically and
@@ -298,6 +311,9 @@ Scaffold — the semantics above are implemented and tested, with plenty of head
       loop `Join`/`Distinct` state is iteration-profiled so retractions unwind cyclic
       derivations correctly; lockstep multi-worker iteration with a global convergence
       barrier; `maxIterations` guard)
-- [ ] Cooperative fault propagation across workers (a faulted worker currently poisons the
-      circuit; disposal is required)
+- [x] Cooperative fault propagation across workers (a fault poisons the exchange barrier so
+      peers bail out of the step instead of deadlocking; the circuit becomes terminally
+      faulted within the step — original exception on the step, the output channels, and
+      `Circuit.Fault`; producers released with `CircuitFaultedException`; the committed
+      checkpoint untouched, so rebuild-from-checkpoint is the recovery story)
 - [ ] Cross-process exchange (workers on different machines) behind the same operator

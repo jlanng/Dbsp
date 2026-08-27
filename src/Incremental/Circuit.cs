@@ -54,7 +54,15 @@ public sealed class Circuit : IAsyncDisposable
     private readonly ICheckpointStorageProvider? _checkpoint;
     private Dictionary<string, long> _committedOffsets = new();
     private int _stepsSinceCommit;
-    private bool _faulted;
+
+    // Fault propagation: a worker that throws mid-step records its exception here and
+    // poisons the exchange barrier, so peers blocked mid-shuffle bail out instead of
+    // deadlocking on a participant that will never arrive. The last worker to leave the
+    // step surfaces what was recorded (aggregated when several faulted together) on the
+    // pending step, and the coordinator then moves the circuit to its terminal faulted
+    // state — _fault is the first (or aggregated) exception, null while healthy.
+    private readonly List<Exception> _stepFaults = [];
+    private Exception? _fault;
 
     internal Circuit(
         NodeDefinition[] nodes,
@@ -195,6 +203,9 @@ public sealed class Circuit : IAsyncDisposable
 
     private async Task RunStepAsync(CancellationToken cancellationToken)
     {
+        if (Volatile.Read(ref _fault) is { } fault)
+            throw new CircuitFaultedException(fault);
+
         foreach (var input in _inputs)
             input.DrainInto(_workers, _options.MaxStepItemsPerInput);
 
@@ -213,26 +224,60 @@ public sealed class Circuit : IAsyncDisposable
 
                 await _stepDone.Task.ConfigureAwait(false);
             }
+
+            // Freeze between steps so every worker sees one consistent watermark per step.
+            _watermarkClock?.Freeze();
+
+            // Commit before publishing: durability should not wait on a slow output consumer.
+            // Output deltas are transient (consumers integrate them) and not checkpointed.
+            // A commit failure is a fault like any other: the provider's atomicity keeps the
+            // previous checkpoint intact, and the circuit must not run on unsure durability.
+            if (_checkpoint is not null && ++_stepsSinceCommit >= _options.CheckpointInterval)
+                CommitCheckpoint();
         }
-        catch
+        catch (Exception ex)
         {
-            // A fault can leave the step's writes half-staged across workers; they must
-            // never reach a checkpoint, so commits (the final one on dispose included)
-            // stop here. The previous checkpoint remains the resume point.
-            _faulted = true;
+            FaultCircuit(ex);
             throw;
         }
 
-        // Freeze between steps so every worker sees one consistent watermark per step.
-        _watermarkClock?.Freeze();
-
-        // Commit before publishing: durability should not wait on a slow output consumer.
-        // Output deltas are transient (consumers integrate them) and not checkpointed.
-        if (_checkpoint is not null && ++_stepsSinceCommit >= _options.CheckpointInterval)
-            CommitCheckpoint();
-
         foreach (var output in _outputs)
             await output.PublishAsync(_workers, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>The exception that faulted the circuit — the original worker fault, an
+    /// <see cref="AggregateException"/> when several workers faulted in the same step — or
+    /// null while the circuit is healthy. A faulted circuit's in-memory state is unusable
+    /// (the faulting step is half-applied); with a checkpointing storage provider the last
+    /// committed checkpoint is untouched, so rebuild the circuit against the same provider
+    /// to recover.</summary>
+    public Exception? Fault => Volatile.Read(ref _fault);
+
+    /// <summary>Moves the circuit to its terminal faulted state, on the coordinator, once
+    /// every worker has left the faulting step: the step's half-staged effects will never be
+    /// committed (see the fault check in <see cref="CommitCheckpoint"/> callers and
+    /// <see cref="DisposeAsync"/>), producers are released with a
+    /// <see cref="CircuitFaultedException"/> instead of blocking on channels no step will
+    /// drain again, consumers' reads observe the original fault after the pre-fault deltas,
+    /// and worker threads exit. The step that faulted still throws the original exception;
+    /// later <see cref="StepAsync"/> calls throw <see cref="CircuitFaultedException"/>.
+    /// <see cref="DisposeAsync"/> of a faulted circuit completes quietly — the fault has
+    /// already surfaced on the step, the handles, and <see cref="Fault"/>.</summary>
+    private void FaultCircuit(Exception exception)
+    {
+        Interlocked.CompareExchange(ref _fault, exception, null);
+        var fault = _fault!;
+
+        foreach (var input in _inputs)
+            input.Fail(new CircuitFaultedException(fault));
+        foreach (var output in _outputs)
+            output.Complete(fault);
+
+        // Workers parked between steps exit now; ones still unwinding out of the faulting
+        // step exit when they next park. Normal disposal releases again — harmless.
+        Volatile.Write(ref _stopping, true);
+        foreach (var worker in _workers)
+            worker.Go.Release();
     }
 
     /// <summary>Atomically persists everything the steps since the last commit staged,
@@ -317,18 +362,43 @@ public sealed class Circuit : IAsyncDisposable
             try
             {
                 RunWorkerStep(worker);
-                if (Interlocked.Decrement(ref _workersRemaining) == 0)
-                    _stepDone.TrySetResult();
+            }
+            catch (BarrierPoisonedException)
+            {
+                // A peer faulted and poisoned the barrier: bail out of the step promptly.
+                // The peer recorded the real exception; this worker just stops shuffling.
             }
             catch (Exception ex)
             {
-                // A faulted worker poisons the circuit: it leaves the exchange barrier so
-                // peers don't deadlock mid-shuffle, and the failure surfaces on the pending
-                // step. The circuit must be disposed after a fault.
-                // TODO: cooperative fault propagation so peers finish the step cleanly.
-                _barrier.RemoveParticipant();
-                _stepDone.TrySetException(ex);
-                return;
+                // This worker faulted: record the exception, then poison the barrier —
+                // in that order, so a peer released by the poison can never find the
+                // fault list empty. Peers blocked mid-shuffle unwind via the poison;
+                // peers that already finished the step are parked and are released by
+                // the coordinator's fault transition.
+                lock (_stepFaults)
+                    _stepFaults.Add(ex);
+                _barrier.Poison();
+            }
+
+            // Every worker — clean, faulted, or bailed — leaves the step through this
+            // decrement, so the last one out sees every fault recorded this step and can
+            // surface them (aggregated if several workers faulted together) on the pending
+            // step. The coordinator then runs the circuit-wide fault transition; this
+            // thread loops around, parks, and exits via the _stopping release it sends.
+            if (Interlocked.Decrement(ref _workersRemaining) == 0)
+            {
+                Exception? fault;
+                lock (_stepFaults)
+                    fault = _stepFaults.Count switch
+                    {
+                        0 => null,
+                        1 => _stepFaults[0],
+                        _ => new AggregateException(_stepFaults),
+                    };
+                if (fault is null)
+                    _stepDone.TrySetResult();
+                else
+                    _stepDone.TrySetException(fault);
             }
         }
     }
@@ -433,7 +503,10 @@ public sealed class Circuit : IAsyncDisposable
     }
 
     /// <summary>Completes all inputs, drains and processes everything still buffered,
-    /// completes the outputs, and stops the workers.</summary>
+    /// completes the outputs, and stops the workers. Disposing a faulted circuit does not
+    /// rethrow: the fault already surfaced on the faulting step, the handles, and
+    /// <see cref="Fault"/> — disposal just skips draining and the final checkpoint commit
+    /// (the faulting step must never be committed) and completes quietly.</summary>
     public async ValueTask DisposeAsync()
     {
         if (_disposed)
@@ -454,7 +527,7 @@ public sealed class Circuit : IAsyncDisposable
                 // Failures were already forwarded to the output channels.
             }
         }
-        else if (_started)
+        else if (_started && Volatile.Read(ref _fault) is null)
         {
             try
             {
@@ -474,13 +547,15 @@ public sealed class Circuit : IAsyncDisposable
         }
         else
         {
+            // Never started, or faulted (the fault transition already completed the
+            // outputs with the fault; TryComplete makes this a no-op then).
             foreach (var output in _outputs)
                 output.Complete(null);
         }
 
         // Steps still staged (CheckpointInterval > 1) commit on clean shutdown — but never
         // after a fault, which may have left a step half-staged across workers.
-        if (_checkpoint is not null && !_faulted && _stepsSinceCommit > 0)
+        if (_checkpoint is not null && Volatile.Read(ref _fault) is null && _stepsSinceCommit > 0)
         {
             try
             {

@@ -40,19 +40,45 @@ public sealed class InputHandle<T> where T : notnull
         SendAsync(value, -1, offset, cancellationToken);
 
     public ValueTask SendAsync(T value, long weight, CancellationToken cancellationToken = default) =>
-        _writer.WriteAsync(new InputEntry<T>(value, weight, -1), cancellationToken);
+        WriteAsync(new InputEntry<T>(value, weight, -1), cancellationToken);
 
     /// <summary>Sends a weighted record stamped with its source offset.</summary>
     public ValueTask SendAsync(T value, long weight, long offset, CancellationToken cancellationToken = default)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
-        return _writer.WriteAsync(new InputEntry<T>(value, weight, offset), cancellationToken);
+        return WriteAsync(new InputEntry<T>(value, weight, offset), cancellationToken);
     }
 
     public async ValueTask SendAsync(IEnumerable<WeightedValue<T>> batch, CancellationToken cancellationToken = default)
     {
         foreach (var entry in batch)
-            await _writer.WriteAsync(new InputEntry<T>(entry.Value, entry.Weight, -1), cancellationToken).ConfigureAwait(false);
+            await WriteAsync(new InputEntry<T>(entry.Value, entry.Weight, -1), cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>The channel write, with the fault path surfaced as what it is: when the
+    /// circuit faults it completes each input's channel with a
+    /// <see cref="CircuitFaultedException"/>, and this unwraps the resulting channel-closed
+    /// error so producers — blocked mid-write on a full channel included — see that
+    /// exception (original fault as its inner) rather than a bare closed-channel error.
+    /// A channel completed normally (via <see cref="Complete"/> or circuit disposal) still
+    /// throws <see cref="ChannelClosedException"/>. The synchronous completion path stays
+    /// allocation-free.</summary>
+    private ValueTask WriteAsync(InputEntry<T> entry, CancellationToken cancellationToken)
+    {
+        var write = _writer.WriteAsync(entry, cancellationToken);
+        return write.IsCompletedSuccessfully ? write : Awaited(write);
+
+        static async ValueTask Awaited(ValueTask write)
+        {
+            try
+            {
+                await write.ConfigureAwait(false);
+            }
+            catch (ChannelClosedException ex) when (ex.InnerException is CircuitFaultedException fault)
+            {
+                throw new CircuitFaultedException(fault.InnerException!);
+            }
+        }
     }
 
     /// <summary>Signals that no more data will arrive on this input. Once every input of a
