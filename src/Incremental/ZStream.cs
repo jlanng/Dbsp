@@ -132,6 +132,44 @@ public sealed class KeyedZStream<TKey, TValue> : ZStream<KeyedValue<TKey, TValue
         return new KeyedZStream<TKey, TValue>(Builder, NodeId, new KeyEviction<TKey>(clock, closesAt));
     }
 
+    /// <summary>
+    /// A stream of window-close notifications: emits each key of this stream exactly once,
+    /// with weight +1, in the first step whose watermark has passed
+    /// <paramref name="closesAt"/>(key). Closed means what it means for eviction: the
+    /// watermark admits no further events for the key, so its results are final —
+    /// notifications are never retracted, and a window whose contents were fully retracted
+    /// still closes. The value carried is the key's close deadline. The result stays
+    /// partitioned by key (each key is announced by the worker owning it), so it can be
+    /// joined with the window's aggregate to publish finalized results — the join emits
+    /// them in the same step its state for the key is evicted. Requires
+    /// <c>WithWatermark</c> on an upstream input. With <c>AutoStep</c>, a notification
+    /// whose deadline passes on the final batch is flushed by one last step before the
+    /// outputs complete.
+    /// </summary>
+    public KeyedZStream<TKey, DateTimeOffset> WindowCloses(Func<TKey, DateTimeOffset> closesAt)
+    {
+        var clock = Builder.WatermarkClock
+            ?? throw new InvalidOperationException(
+                "WindowCloses requires an event-time watermark; call WithWatermark on an input stream first.");
+        return WindowCloses(new KeyEviction<TKey>(clock, closesAt));
+    }
+
+    /// <summary>Window-close notifications at the deadline of the eviction policy attached
+    /// by <see cref="WithEviction"/>: keys are announced final at the same watermark the
+    /// stateful operators drop their state.</summary>
+    public KeyedZStream<TKey, DateTimeOffset> WindowCloses()
+    {
+        var policy = _eviction
+            ?? throw new InvalidOperationException(
+                "WindowCloses without a deadline requires an eviction policy; call WithEviction first or pass closesAt explicitly.");
+        return WindowCloses(policy);
+    }
+
+    private KeyedZStream<TKey, DateTimeOffset> WindowCloses(KeyEviction<TKey> policy) =>
+        new(Builder,
+            Builder.AddNode("windowClose", [NodeId], _ => new WindowCloseOperator<TKey, TValue>(policy)),
+            policy);
+
     /// <summary>Incremental equi-join on the shared key.</summary>
     public ZStream<TOut> Join<TRight, TOut>(
         KeyedZStream<TKey, TRight> right,
