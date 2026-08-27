@@ -19,6 +19,14 @@ const int MaxBlotterRows = 12;
 
 var interactive = !Console.IsInputRedirected && AnsiConsole.Profile.Capabilities.Interactive;
 
+// Non-interactive knobs (CI / soak testing): --ticks N to run longer, --blotter to skip
+// dimensions and exercise the top-trades blotter.
+var tickIndex = Array.IndexOf(args, "--ticks");
+var maxTicks = tickIndex >= 0 && tickIndex + 1 < args.Length && int.TryParse(args[tickIndex + 1], out var parsedTicks)
+    ? parsedTicks
+    : 120;
+var forceBlotter = args.Contains("--blotter");
+
 AnsiConsole.Write(new Panel(new Rows(
         new Markup("A live trade stream is enriched by joining the reference [bold]columns[/] you choose, then grouped by dimensions you choose — the circuit is composed from your selections."),
         new Markup("[green]▪[/] Every input is a keyed input: amendments and reference changes are [bold]UpsertAsync[/] calls, and the handle emits the retraction of the old row itself."),
@@ -111,8 +119,10 @@ if (interactive)
 }
 else
 {
-    chosenDims = [ColDesk, ColAssetClass];
-    AnsiConsole.MarkupLine($"[grey]non-interactive input: grouping by {string.Join(" · ", chosenDims)}[/]");
+    chosenDims = forceBlotter ? [] : [ColDesk, ColAssetClass];
+    AnsiConsole.MarkupLine(forceBlotter
+        ? "[grey]non-interactive input: blotter mode[/]"
+        : $"[grey]non-interactive input: grouping by {string.Join(" · ", chosenDims)}[/]");
 }
 var dims = dimensionCatalog.Where(d => chosenDims.Contains(d.Name)).ToList();
 var blotterMode = dims.Count == 0;
@@ -247,7 +257,7 @@ long DrainOutputs()
 
 AnsiConsole.MarkupLine(interactive
     ? "[bold]Streaming — press any key to stop.[/]"
-    : "[grey]non-interactive input: stopping after 120 ticks[/]");
+    : $"[grey]non-interactive input: stopping after {maxTicks} ticks[/]");
 
 var rng = new Random(11);
 long nextTradeId = 1;
@@ -259,6 +269,9 @@ var tradesByCpty = new Dictionary<int, int>();
 long tradesInserted = 0, tradesCancelled = 0, tradesAmended = 0;
 long stepCount = 0, stepTicks = 0;
 double lastStepMicros = 0;
+// Rolling window of recent step times: the display shows p50/p99, which stays legible
+// where a raw "last step" readout makes every GC or scheduler blip jarring.
+var recentStepMicros = new double[512];
 var notices = new Queue<string>();
 void Notice(string text)
 {
@@ -276,6 +289,7 @@ async Task<(double Micros, long DeltaRows)> StepTimedAsync()
     stepCount++;
     stepTicks += timer.Elapsed.Ticks;
     lastStepMicros = timer.Elapsed.TotalMicroseconds;
+    recentStepMicros[(stepCount - 1) % recentStepMicros.Length] = lastStepMicros;
     return (timer.Elapsed.TotalMicroseconds, deltaRows);
 }
 
@@ -292,7 +306,7 @@ Trade RandomTrade()
 var ticks = 0;
 await AnsiConsole.Live(BuildLiveView()).AutoClear(false).StartAsync(async ctx =>
 {
-    while (interactive || ticks < 120)
+    while (interactive || ticks < maxTicks)
     {
         if (interactive && Console.KeyAvailable)
         {
@@ -314,7 +328,8 @@ await AnsiConsole.Live(BuildLiveView()).AutoClear(false).StartAsync(async ctx =>
         }
         if (liveIds.Count > 50 && rng.NextDouble() < 0.35)
         {
-            var victimId = liveIds[rng.Next(liveIds.Count)];
+            var victimIndex = rng.Next(liveIds.Count);
+            var victimId = liveIds[victimIndex];
             if (rng.NextDouble() < 0.5)
             {
                 if (tradeInput.TryGetCurrent(victimId, out var cancelled))
@@ -323,7 +338,9 @@ await AnsiConsole.Live(BuildLiveView()).AutoClear(false).StartAsync(async ctx =>
                     tradesByCpty[cancelled.CounterpartyId]--;
                 }
                 await tradeInput.DeleteAsync(victimId);
-                liveIds.Remove(victimId);
+                // Swap-remove: List.Remove would be a linear scan and liveIds keeps growing.
+                liveIds[victimIndex] = liveIds[^1];
+                liveIds.RemoveAt(liveIds.Count - 1);
                 tradesCancelled++;
             }
             else if (tradeInput.TryGetCurrent(victimId, out var victim))
@@ -393,7 +410,7 @@ IRenderable BuildLiveView()
         new Markup(
             $"[grey]trades[/] [bold]{tradesInserted,8:N0}[/]   [grey]live[/] {tradeInput.Count,7:N0}   " +
             $"[grey]amended[/] {tradesAmended,5:N0}   [grey]cancelled[/] {tradesCancelled,5:N0}   " +
-            $"[grey]step[/] [bold green]{lastStepMicros,7:N0} µs[/]   [grey]avg[/] {avgMicros,7:N0} µs"),
+            $"[grey]step p50[/] [bold green]{StepPercentile(0.50),7:N0} µs[/]   [grey]p99[/] {StepPercentile(0.99),7:N0} µs   [grey]avg[/] {avgMicros,7:N0} µs"),
     };
     foreach (var notice in notices.Reverse())
         renderables.Add(new Markup(notice));
@@ -454,6 +471,16 @@ IRenderable BuildBlotterTable()
         table.AddRow(cells.ToArray());
     }
     return table;
+}
+
+double StepPercentile(double quantile)
+{
+    var window = (int)Math.Min(stepCount, recentStepMicros.Length);
+    if (window == 0)
+        return 0;
+    var sorted = recentStepMicros.AsSpan(0, window).ToArray();
+    Array.Sort(sorted);
+    return sorted[Math.Min(window - 1, (int)(quantile * window))];
 }
 
 static string Money(double value) => Math.Abs(value) switch
