@@ -80,6 +80,25 @@ views.WithWatermark(v => v.At, allowedLateness: TimeSpan.FromSeconds(2))
      .Count();
 ```
 
+**Window-close notifications.** `.WindowCloses()` on a keyed stream is a first-class stream
+that announces each key exactly once — with weight +1, never retracted — when the watermark
+passes its deadline (the attached eviction policy's, or an explicit
+`.WindowCloses(key => closesAt)`). Closed means what it means for eviction: no further
+events for the key can be admitted, so its results are final. The notifications stay
+partitioned by key (the worker owning a key announces it), so joining them with the
+window's aggregate publishes finalized results in the same step the state is evicted:
+
+```csharp
+var windowed = views.WithWatermark(v => v.At, lateness)
+                    .TumblingWindow(windowSize, v => v.At)
+                    .IndexBy(w => w.WindowStart)
+                    .WithEviction(window => window + windowSize);
+var counts = windowed.Count();
+windowed.WindowCloses()
+        .Join(counts, (window, closedAt, count) => (window, count))
+        .Output("finalCounts"); // one (window, count) row per window, once it is final
+```
+
 **Exchange (multi-threading).** `CircuitOptions.Workers = N` runs N worker threads, each
 owning its own instance of every operator and its own shard of all operator state.
 `IndexBy` inserts an *exchange* operator — the DBSP/timely-dataflow shuffle — which
@@ -201,7 +220,9 @@ Scaffold — the semantics above are implemented and tested, with plenty of head
 - [x] Tumbling and hopping event-time windows (assignment; late data handled by deltas)
 - [x] Watermarks: late-event filtering and eviction of closed-key state (aggregate/TopK)
 - [x] Anti-join, left and full outer joins
-- [ ] Window-close notifications (emit "window X is final" for downstream consumers)
+- [x] Window-close notifications (`WindowCloses`: a keyed stream announcing each window
+      final, exactly once, when the watermark passes its deadline; joins with the window's
+      aggregate to publish finalized results)
 - [x] Watermark-driven eviction for join/anti-join/distinct state (keyed `Distinct`
       keeps its state grouped by key so the policy applies)
 - [ ] Session windows

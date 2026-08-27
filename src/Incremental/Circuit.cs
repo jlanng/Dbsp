@@ -211,6 +211,11 @@ public sealed class Circuit : IAsyncDisposable
                         waits[i] = null;
             }
 
+            // The watermark freezes only after the last data-bearing step, so emissions it
+            // unlocks (window-close notifications) need one final step to reach the outputs.
+            if (_watermarkClock is not null && !cancellationToken.IsCancellationRequested)
+                await RunStepAsync(cancellationToken).ConfigureAwait(false);
+
             foreach (var output in _outputs)
                 output.Complete(null);
         }
@@ -305,6 +310,9 @@ public sealed class Circuit : IAsyncDisposable
             try
             {
                 while (_inputs.Any(p => p.HasPending))
+                    await RunStepAsync(CancellationToken.None).ConfigureAwait(false);
+                // As in the pump: flush watermark-driven emissions unlocked by the last step.
+                if (_watermarkClock is not null)
                     await RunStepAsync(CancellationToken.None).ConfigureAwait(false);
                 foreach (var output in _outputs)
                     output.Complete(null);
