@@ -147,13 +147,13 @@ examples/Incremental.TradeEnrichment trades ⋈ reference data, composed interac
                                        amendments, cancellations, and master-data changes (desk
                                        moves, re-ratings) are single UpsertAsync/DeleteAsync calls
                                        that re-attribute historical trades in microseconds
-examples/Incremental.TaxiAnalytics genuine big data: ~3M real NYC yellow-taxi trips (parquet, read
+examples/Incremental.TaxiAnalytics genuine big data: ~13M real NYC yellow-taxi trips (parquet, read
                                        via Parquet.Net, downloaded and cached on first run, ~50MB/month;
                                        `--months N`, `--synthetic`) through join + counts + revenue +
                                        top-5 zones per borough; narrated phases, then continuous
                                        single-row churn with a live view until you press a key —
-                                       ~1M rows/s bulk load; single-row updates in ~300 µs, ~900×
-                                       cheaper than a full recompute
+                                       ~1M rows/s bulk load; single-row updates in ~250 µs,
+                                       thousands of × cheaper than a full recompute
 ```
 
 ## Running with Redis
