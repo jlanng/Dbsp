@@ -7,9 +7,10 @@ namespace Incremental;
 /// Z-set model watermarks are not needed for correctness — late events simply produce
 /// deltas that correct their windows — so here they serve exactly one purpose: bounding
 /// state. <c>WithWatermark</c> drops events that are later than the allowed lateness, and
-/// <see cref="KeyedZStream{TKey,TValue}.WithEviction"/> lets downstream aggregations drop
-/// per-key state once the watermark passes the key's deadline, which is what keeps an
-/// indefinitely running windowed pipeline's memory bounded.
+/// <see cref="KeyedZStream{TKey,TValue}.WithEviction"/> lets downstream stateful operators
+/// (aggregations, TopK, joins, anti-joins, keyed distinct) drop per-key state once the
+/// watermark passes the key's deadline, which is what keeps an indefinitely running
+/// windowed pipeline's memory bounded.
 /// </summary>
 public static class WatermarkExtensions
 {

@@ -18,12 +18,14 @@ internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IStepOperator
     private readonly IIndexedWeightStore<TKey, TLeft> _left;
     private readonly IIndexedWeightStore<TKey, TRight> _right;
     private readonly Func<TKey, TLeft, TRight, TOut> _resultSelector;
+    private readonly EvictionTracker<TKey>? _eviction;
 
-    public JoinOperator(OperatorContext context, Func<TKey, TLeft, TRight, TOut> resultSelector)
+    public JoinOperator(OperatorContext context, Func<TKey, TLeft, TRight, TOut> resultSelector, KeyEviction<TKey>? eviction)
     {
         _left = context.Storage.CreateIndexedWeightStore<TKey, TLeft>(context.StateName("left"));
         _right = context.Storage.CreateIndexedWeightStore<TKey, TRight>(context.StateName("right"));
         _resultSelector = resultSelector;
+        _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
     }
 
     public object Step(object?[] inputs)
@@ -39,7 +41,10 @@ internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IStepOperator
 
         // Integrate ΔL, so the pass below also covers the ΔL ⋈ ΔR cross term.
         foreach (var ((key, left), leftWeight) in deltaLeft)
+        {
             _left.Update(key, left, leftWeight);
+            _eviction?.Track(key);
+        }
 
         // (L + ΔL) ⋈ ΔR
         foreach (var ((key, right), rightWeight) in deltaRight)
@@ -47,7 +52,18 @@ internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IStepOperator
                 output.Add(_resultSelector(key, left, right), checked(leftWeight * rightWeight));
 
         foreach (var ((key, right), rightWeight) in deltaRight)
+        {
             _right.Update(key, right, rightWeight);
+            _eviction?.Track(key);
+        }
+
+        // Closed keys can never be probed again (the watermark drops their events), so
+        // both sides' state for them is deleted; results already emitted remain final.
+        _eviction?.EvictClosed(key =>
+        {
+            _left.RemoveGroup(key);
+            _right.RemoveGroup(key);
+        });
 
         return output;
     }

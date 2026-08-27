@@ -30,6 +30,9 @@ public interface IWeightStore<T> where T : notnull
 
     /// <summary>The current weight of <paramref name="value"/>, or 0 if absent.</summary>
     long WeightOf(T value);
+
+    /// <summary>Drops <paramref name="value"/> regardless of its weight (watermark-driven eviction). No-op if absent.</summary>
+    void Remove(T value);
 }
 
 public interface IIndexedWeightStore<TKey, TValue>

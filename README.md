@@ -178,7 +178,9 @@ Scaffold — the semantics above are implemented and tested, with plenty of head
 - [x] Watermarks: late-event filtering and eviction of closed-key state (aggregate/TopK)
 - [x] Anti-join, left and full outer joins
 - [ ] Window-close notifications (emit "window X is final" for downstream consumers)
-- [ ] Watermark-driven eviction for join/anti-join/distinct state; session windows
+- [x] Watermark-driven eviction for join/anti-join/distinct state (keyed `Distinct`
+      keeps its state grouped by key so the policy applies)
+- [ ] Session windows
 - [ ] Recursive/iterative circuits (DBSP fixed points) for transitive closure-style queries
 - [ ] Cooperative fault propagation across workers (a faulted worker currently poisons the
       circuit; disposal is required)

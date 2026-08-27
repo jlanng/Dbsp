@@ -34,6 +34,8 @@ public sealed class InMemoryStorageProvider : IStorageProvider
         }
 
         public long WeightOf(T value) => _weights.GetValueOrDefault(value);
+
+        public void Remove(T value) => _weights.Remove(value);
     }
 
     private sealed class InMemoryIndexedWeightStore<TKey, TValue> : IIndexedWeightStore<TKey, TValue>
