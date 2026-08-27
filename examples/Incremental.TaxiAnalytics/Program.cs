@@ -296,7 +296,8 @@ async Task<double> ApplyUpdateAsync(string title, Trip trip, long weight, bool n
         var tripsNow = countsView.Single(e => e.Value.Key == borough).Value.Value;
         var revenueNow = revenueView.Single(e => e.Value.Key == borough).Value.Value;
         AnsiConsole.MarkupLine(
-            $"  [bold]{Markup.Escape(title)}[/] → step took [bold green]{timer.Elapsed.TotalMicroseconds:N0} µs[/], " +
+            $"  [bold]{Markup.Escape(title)}[/] → step took [bold green]{timer.Elapsed.TotalMicroseconds:N0} µs[/] " +
+            $"([bold]{naiveDuration.TotalMicroseconds / timer.Elapsed.TotalMicroseconds:N0}× faster than naive[/]), " +
             $"{deltaRows} delta rows emitted; {borough} is now {tripsNow:N0} trips / {revenueNow:C0}");
     }
     return timer.Elapsed.TotalMicroseconds;
@@ -336,8 +337,9 @@ IRenderable BuildLiveView()
 
     return new Rows(
         new Markup(
-            $"[grey]updates[/] [bold]{churnApplied,7:N0}[/]   [grey]step[/] [bold green]{lastMicros,8:N0} µs[/]   " +
-            $"[grey]avg[/] {avgMicros,8:N0} µs   [grey]saved vs naive:[/] [bold]{Math.Max(0, savedSoFar.TotalSeconds),7:N1} s[/]"),
+            $"[grey]updates[/] [bold]{churnApplied,7:N0}[/]   [grey]step[/] [bold green]{lastMicros,8:N0} µs[/] " +
+            $"[bold]({(lastMicros > 0 ? naiveDuration.TotalMicroseconds / lastMicros : 0),6:N0}× vs naive)[/]   " +
+            $"[grey]avg[/] {avgMicros,8:N0} µs   [grey]saved:[/] [bold]{Math.Max(0, savedSoFar.TotalSeconds),7:N1} s[/]"),
         new Markup($"[grey]last:[/] {Markup.Escape(lastDescription)}"),
         table);
 }
