@@ -87,4 +87,38 @@ public class RedisStorageTests
         Assert.Equal(-1, delta.WeightOf(new KeyedValue<string, (string, string, int)>("g", ("g", "a", 1))));
         Assert.Equal(1, delta.WeightOf(new KeyedValue<string, (string, string, int)>("g", ("g", "b", 2))));
     }
+
+    [SkippableFact]
+    public async Task Min_tournament_tree_round_trips_through_redis()
+    {
+        using var redis = ConnectOrSkip();
+        var storage = new RedisStorageProvider(redis, new RedisStorageOptions
+        {
+            KeyPrefix = $"sp-test:{Guid.NewGuid():N}",
+        });
+
+        var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Storage = storage });
+        builder.Input<(string Key, int Value)>("readings")
+            .IndexBy(r => r.Key)
+            .Min(r => r.Value)
+            .Output("minimums");
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var input = circuit.Input<(string Key, int Value)>("readings");
+        var output = circuit.Output<KeyedValue<string, int>>("minimums");
+
+        await input.InsertAsync(("k", 5));
+        await input.InsertAsync(("k", 3));
+        await circuit.StepAsync();
+        var delta = await output.Reader.ReadAsync();
+        Assert.Equal(1, delta.WeightOf(new KeyedValue<string, int>("k", 3)));
+
+        // Deleting the minimum forces the tree walk to read buckets back out of Redis.
+        await input.RemoveAsync(("k", 3));
+        await circuit.StepAsync();
+        delta = await output.Reader.ReadAsync();
+        Assert.Equal(-1, delta.WeightOf(new KeyedValue<string, int>("k", 3)));
+        Assert.Equal(1, delta.WeightOf(new KeyedValue<string, int>("k", 5)));
+    }
 }

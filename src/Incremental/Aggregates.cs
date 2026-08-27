@@ -47,6 +47,8 @@ public static class Aggregates
             return sum;
         });
 
+    /// <summary>MIN by full-group recompute. <see cref="KeyedZStream{TKey,TValue}.Min{TProjected}"/>
+    /// uses the tournament-tree operator instead; this exists for use with <c>Aggregate</c>.</summary>
     public static IAggregateFunction<TValue, TProjected> Min<TValue, TProjected>(Func<TValue, TProjected> selector)
         where TValue : notnull
         where TProjected : notnull =>

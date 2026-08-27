@@ -212,13 +212,22 @@ public sealed class KeyedZStream<TKey, TValue> : ZStream<KeyedValue<TKey, TValue
         where TNumber : INumber<TNumber> =>
         AggregateLinear(LinearAggregates.Sum(selector));
 
+    /// <summary>Grouped MIN maintained by a tournament tree: an update — including deleting
+    /// the current minimum — touches a fixed number of small buckets instead of rescanning
+    /// the group, so cost is independent of group size. The general recompute path remains
+    /// available as <c>Aggregate(Aggregates.Min(...))</c>.</summary>
     public KeyedZStream<TKey, TProjected> Min<TProjected>(Func<TValue, TProjected> selector)
         where TProjected : notnull =>
-        Aggregate(Aggregates.Min(selector));
+        new(Builder,
+            Builder.AddNode("min", [NodeId], ctx => new ExtremumOperator<TKey, TValue, TProjected>(ctx, selector, sign: -1, _eviction)),
+            _eviction);
 
+    /// <summary>Grouped MAX maintained by a tournament tree; see <see cref="Min{TProjected}"/>.</summary>
     public KeyedZStream<TKey, TProjected> Max<TProjected>(Func<TValue, TProjected> selector)
         where TProjected : notnull =>
-        Aggregate(Aggregates.Max(selector));
+        new(Builder,
+            Builder.AddNode("max", [NodeId], ctx => new ExtremumOperator<TKey, TValue, TProjected>(ctx, selector, sign: +1, _eviction)),
+            _eviction);
 
     /// <summary>
     /// Keeps only the top <paramref name="count"/> rows per key, ranked by
