@@ -17,95 +17,146 @@ public sealed class RedisStorageOptions
 
 /// <summary>
 /// Keeps operator state in Redis hashes, which makes it survive process restarts and lets
-/// state grow beyond the heap. Weight maps use HINCRBY for atomic weight arithmetic.
+/// state grow beyond the heap — and checkpoints it: writes are staged in per-store overlays
+/// (reads merge the overlay over committed state) and <see cref="Commit"/> flushes every
+/// staged write plus the input offsets it reflects in a single MULTI/EXEC transaction, so
+/// durable state and offsets always agree, even across a crash mid-commit. Flushed weights
+/// are absolute (HSET, not HINCRBY), so a commit can never half-apply or double-apply.
 ///
 /// Layout (all under <see cref="RedisStorageOptions.KeyPrefix"/>):
 ///   weight store       {prefix}:{store}            hash: serialized value → weight
 ///   indexed store      {prefix}:{store}:{key}      hash: serialized value → weight, one hash per group
 ///   value store        {prefix}:{store}            hash: serialized key → serialized value
+///   checkpoint         {prefix}:checkpoint         hash: input name → committed offset
 ///
 /// Store names already encode the node and worker id, so concurrent workers never share a
-/// store. The batch operations pipeline all commands for a call into a single round trip
-/// (variadic commands like HMGET/HDEL/DEL where one command covers the batch); operators
-/// drive them with everything a step touches, so per-step latency is O(waves), not O(rows).
-/// TODO: snapshot input channel offsets alongside state for exactly-once restarts.
+/// store. The batch operations still cost one pipelined round trip per wave (HMGET/HGETALL
+/// for the committed values the overlay doesn't hold); overlays are dropped once committed,
+/// so memory is bounded by the state touched between checkpoints.
 /// </summary>
-public sealed class RedisStorageProvider : IStorageProvider
+public sealed class RedisStorageProvider : ICheckpointStorageProvider
 {
     private readonly IDatabase _db;
     private readonly RedisStorageOptions _options;
+    private readonly string _checkpointKey;
+    private readonly List<IStagedStore> _stores = [];
 
     public RedisStorageProvider(IConnectionMultiplexer connection, RedisStorageOptions? options = null)
     {
         _options = options ?? new RedisStorageOptions();
         _db = connection.GetDatabase(_options.Database);
+        _checkpointKey = $"{_options.KeyPrefix}:checkpoint";
     }
 
     public IWeightStore<T> CreateWeightStore<T>(string name) where T : notnull =>
-        new RedisWeightStore<T>(_db, $"{_options.KeyPrefix}:{name}", _options.Serializer);
+        Track(new RedisWeightStore<T>(_db, $"{_options.KeyPrefix}:{name}", _options.Serializer));
 
     public IIndexedWeightStore<TKey, TValue> CreateIndexedWeightStore<TKey, TValue>(string name)
         where TKey : notnull
         where TValue : notnull =>
-        new RedisIndexedWeightStore<TKey, TValue>(_db, $"{_options.KeyPrefix}:{name}", _options.Serializer);
+        Track(new RedisIndexedWeightStore<TKey, TValue>(_db, $"{_options.KeyPrefix}:{name}", _options.Serializer));
 
     public IValueStore<TKey, TValue> CreateValueStore<TKey, TValue>(string name) where TKey : notnull =>
-        new RedisValueStore<TKey, TValue>(_db, $"{_options.KeyPrefix}:{name}", _options.Serializer);
+        Track(new RedisValueStore<TKey, TValue>(_db, $"{_options.KeyPrefix}:{name}", _options.Serializer));
+
+    public IReadOnlyDictionary<string, long> Recover()
+    {
+        lock (_stores)
+        {
+            foreach (var store in _stores)
+                store.Discard();
+        }
+
+        var entries = _db.HashGetAll(_checkpointKey);
+        var offsets = new Dictionary<string, long>(entries.Length);
+        foreach (var entry in entries)
+            offsets[entry.Name!] = (long)entry.Value;
+        return offsets;
+    }
+
+    public void Commit(IReadOnlyDictionary<string, long> inputOffsets)
+    {
+        lock (_stores)
+        {
+            var transaction = _db.CreateTransaction();
+            foreach (var store in _stores)
+                store.Flush(transaction);
+
+            if (inputOffsets.Count > 0)
+            {
+                var marker = new HashEntry[inputOffsets.Count];
+                var i = 0;
+                foreach (var (input, offset) in inputOffsets)
+                    marker[i++] = new HashEntry(input, offset);
+                _ = transaction.HashSetAsync(_checkpointKey, marker);
+            }
+
+            // MULTI/EXEC: the commands travel as one unit and Redis applies them on EXEC,
+            // so a crash anywhere before that leaves the previous checkpoint fully intact.
+            if (!transaction.Execute())
+                throw new InvalidOperationException("The checkpoint commit transaction was rejected by Redis.");
+
+            foreach (var store in _stores)
+                store.Discard(); // the overlays' content is now the committed state
+        }
+    }
+
+    private TStore Track<TStore>(TStore store) where TStore : IStagedStore
+    {
+        lock (_stores)
+            _stores.Add(store);
+        return store;
+    }
+
+    /// <summary>Staged-overlay store: <see cref="Flush"/> queues every staged write into the
+    /// commit transaction; <see cref="Discard"/> drops the overlay and read cache — after a
+    /// successful commit (the overlay has become committed state) and on
+    /// <see cref="RedisStorageProvider.Recover"/> (rolling back a crashed run).</summary>
+    private interface IStagedStore
+    {
+        void Flush(ITransaction transaction);
+        void Discard();
+    }
 
     private sealed class RedisWeightStore<T>(IDatabase db, string key, IStateSerializer serializer)
-        : IWeightStore<T> where T : notnull
+        : IWeightStore<T>, IStagedStore where T : notnull
     {
+        // Absolute weights staged since the last commit (0 = delete at flush), and committed
+        // weights read from Redis this interval (0 = known absent). Lookups go staged →
+        // cache → HGET; both maps are dropped on commit, bounding them to the interval.
+        private readonly Dictionary<RedisValue, long> _staged = [];
+        private readonly Dictionary<RedisValue, long> _cache = [];
+
         public long Update(T value, long delta)
         {
-            var field = serializer.Serialize(value);
-            var updated = db.HashIncrement(key, field, delta);
-            if (updated == 0)
-                db.HashDelete(key, field);
+            var field = Field(value);
+            var updated = WeightOf(field) + delta;
+            _staged[field] = updated;
             return updated;
         }
 
-        public long WeightOf(T value)
-        {
-            var stored = db.HashGet(key, serializer.Serialize(value));
-            return stored.IsNull ? 0 : (long)stored;
-        }
+        public long WeightOf(T value) => WeightOf(Field(value));
 
-        public void Remove(T value) => db.HashDelete(key, serializer.Serialize(value));
+        public void Remove(T value) => _staged[Field(value)] = 0;
 
         public long[] UpdateAll(IReadOnlyList<(T Value, long Delta)> entries)
         {
             if (entries.Count == 0)
                 return [];
 
-            var batch = db.CreateBatch();
             var fields = new RedisValue[entries.Count];
-            var tasks = new Task<long>[entries.Count];
             for (var i = 0; i < entries.Count; i++)
-            {
-                fields[i] = serializer.Serialize(entries[i].Value);
-                tasks[i] = batch.HashIncrementAsync(key, fields[i], entries[i].Delta);
-            }
-            batch.Execute();
-            Task.WaitAll(tasks);
+                fields[i] = Field(entries[i].Value);
+            Prefetch(fields);
 
             var results = new long[entries.Count];
-            // A field's final weight is its last entry's result — only fields that *end* at
-            // zero are deleted, so a duplicate value whose running weight passes through
-            // zero is not dropped by mistake.
-            var final = new Dictionary<RedisValue, long>(entries.Count);
             for (var i = 0; i < entries.Count; i++)
             {
-                results[i] = tasks[i].Result;
-                final[fields[i]] = results[i];
+                // Sequential local arithmetic: a duplicate value whose running weight
+                // passes through zero within the batch resolves correctly by construction.
+                results[i] = WeightOf(fields[i]) + entries[i].Delta;
+                _staged[fields[i]] = results[i];
             }
-
-            var zeroed = new List<RedisValue>();
-            foreach (var (field, weight) in final)
-                if (weight == 0)
-                    zeroed.Add(field);
-            if (zeroed.Count > 0)
-                db.HashDelete(key, [.. zeroed]);
-
             return results;
         }
 
@@ -116,97 +167,141 @@ public sealed class RedisStorageProvider : IStorageProvider
 
             var fields = new RedisValue[values.Count];
             for (var i = 0; i < values.Count; i++)
-                fields[i] = serializer.Serialize(values[i]);
+                fields[i] = Field(values[i]);
+            Prefetch(fields);
 
-            var stored = db.HashGet(key, fields);
             var results = new long[values.Count];
             for (var i = 0; i < values.Count; i++)
-                results[i] = stored[i].IsNull ? 0 : (long)stored[i];
+                results[i] = WeightOf(fields[i]);
             return results;
         }
 
         public void RemoveAll(IReadOnlyList<T> values)
         {
-            if (values.Count == 0)
+            foreach (var value in values)
+                Remove(value);
+        }
+
+        public void Flush(ITransaction transaction)
+        {
+            List<RedisValue>? deletes = null;
+            List<HashEntry>? sets = null;
+            foreach (var (field, weight) in _staged)
+            {
+                if (weight == 0)
+                    (deletes ??= []).Add(field);
+                else
+                    (sets ??= []).Add(new HashEntry(field, weight));
+            }
+            if (deletes is not null)
+                _ = transaction.HashDeleteAsync(key, [.. deletes]);
+            if (sets is not null)
+                _ = transaction.HashSetAsync(key, [.. sets]);
+        }
+
+        public void Discard()
+        {
+            _staged.Clear();
+            _cache.Clear();
+        }
+
+        private RedisValue Field(T value) => serializer.Serialize(value);
+
+        private long WeightOf(RedisValue field)
+        {
+            if (_staged.TryGetValue(field, out var staged))
+                return staged;
+            if (_cache.TryGetValue(field, out var cached))
+                return cached;
+            var stored = db.HashGet(key, field);
+            return _cache[field] = stored.IsNull ? 0 : (long)stored;
+        }
+
+        /// <summary>One HMGET round trip for the batch's fields whose committed weight is unknown.</summary>
+        private void Prefetch(RedisValue[] fields)
+        {
+            HashSet<RedisValue>? seen = null;
+            List<RedisValue>? missing = null;
+            foreach (var field in fields)
+                if (!_staged.ContainsKey(field) && !_cache.ContainsKey(field) && (seen ??= []).Add(field))
+                    (missing ??= []).Add(field);
+            if (missing is null)
                 return;
 
-            var fields = new RedisValue[values.Count];
-            for (var i = 0; i < values.Count; i++)
-                fields[i] = serializer.Serialize(values[i]);
-            db.HashDelete(key, fields);
+            var stored = db.HashGet(key, [.. missing]);
+            for (var i = 0; i < missing.Count; i++)
+                _cache[missing[i]] = stored[i].IsNull ? 0 : (long)stored[i];
         }
     }
 
     private sealed class RedisIndexedWeightStore<TKey, TValue>(IDatabase db, string baseKey, IStateSerializer serializer)
-        : IIndexedWeightStore<TKey, TValue>
+        : IIndexedWeightStore<TKey, TValue>, IStagedStore
         where TKey : notnull
         where TValue : notnull
     {
-        private string GroupKey(TKey key) => $"{baseKey}:{serializer.Serialize(key)}";
+        private readonly Dictionary<RedisKey, Group> _groups = [];
+
+        /// <summary>Per-group overlay over the committed hash. Reads check Staged, then the
+        /// Cleared tombstone, then Cache (FullyCached marks it complete), then Redis.</summary>
+        private sealed class Group
+        {
+            public bool Cleared;                                       // RemoveGroup: committed entries are gone
+            public readonly Dictionary<RedisValue, long> Staged = [];  // absolute weights; 0 = delete
+            public readonly Dictionary<RedisValue, long> Cache = [];   // committed weights read so far (0 = absent)
+            public bool FullyCached;                                   // Cache holds the whole committed group
+        }
 
         public long Update(TKey key, TValue value, long delta)
         {
             var groupKey = GroupKey(key);
-            var field = serializer.Serialize(value);
-            var updated = db.HashIncrement(groupKey, field, delta);
-            if (updated == 0)
-                db.HashDelete(groupKey, field);
+            var group = GroupFor(groupKey);
+            var field = (RedisValue)serializer.Serialize(value);
+            var updated = WeightOf(groupKey, group, field) + delta;
+            group.Staged[field] = updated;
             return updated;
         }
 
         public IReadOnlyList<WeightedValue<TValue>> GetGroup(TKey key)
         {
-            var entries = db.HashGetAll(GroupKey(key));
-            return Materialize(entries);
+            var groupKey = GroupKey(key);
+            var group = GroupFor(groupKey);
+            if (!group.Cleared && !group.FullyCached)
+            {
+                foreach (var entry in db.HashGetAll(groupKey))
+                    group.Cache[entry.Name] = (long)entry.Value;
+                group.FullyCached = true;
+            }
+            return Materialize(group);
         }
 
-        public void RemoveGroup(TKey key) => db.KeyDelete(GroupKey(key));
+        public void RemoveGroup(TKey key)
+        {
+            var group = GroupFor(GroupKey(key));
+            group.Cleared = true;
+            group.Staged.Clear();
+            group.Cache.Clear();
+        }
 
         public long[] UpdateAll(IReadOnlyList<(TKey Key, TValue Value, long Delta)> entries)
         {
             if (entries.Count == 0)
                 return [];
 
-            var batch = db.CreateBatch();
-            var addresses = new (RedisKey Group, RedisValue Field)[entries.Count];
-            var tasks = new Task<long>[entries.Count];
+            var addresses = new (RedisKey GroupKey, Group Group, RedisValue Field)[entries.Count];
             for (var i = 0; i < entries.Count; i++)
             {
-                addresses[i] = (GroupKey(entries[i].Key), serializer.Serialize(entries[i].Value));
-                tasks[i] = batch.HashIncrementAsync(addresses[i].Group, addresses[i].Field, entries[i].Delta);
+                var groupKey = GroupKey(entries[i].Key);
+                addresses[i] = (groupKey, GroupFor(groupKey), serializer.Serialize(entries[i].Value));
             }
-            batch.Execute();
-            Task.WaitAll(tasks);
+            Prefetch(addresses);
 
             var results = new long[entries.Count];
-            // Final weight per (group, field) — see RedisWeightStore.UpdateAll.
-            var final = new Dictionary<(RedisKey, RedisValue), long>(entries.Count);
             for (var i = 0; i < entries.Count; i++)
             {
-                results[i] = tasks[i].Result;
-                final[addresses[i]] = results[i];
+                var (groupKey, group, field) = addresses[i];
+                results[i] = WeightOf(groupKey, group, field) + entries[i].Delta;
+                group.Staged[field] = results[i];
             }
-
-            Dictionary<RedisKey, List<RedisValue>>? zeroed = null;
-            foreach (var ((group, field), weight) in final)
-            {
-                if (weight != 0)
-                    continue;
-                zeroed ??= [];
-                if (!zeroed.TryGetValue(group, out var fields))
-                    zeroed[group] = fields = [];
-                fields.Add(field);
-            }
-            if (zeroed is not null)
-            {
-                var cleanup = db.CreateBatch();
-                var deletes = new List<Task>(zeroed.Count);
-                foreach (var (group, fields) in zeroed)
-                    deletes.Add(cleanup.HashDeleteAsync(group, [.. fields]));
-                cleanup.Execute();
-                Task.WaitAll([.. deletes]);
-            }
-
             return results;
         }
 
@@ -215,48 +310,159 @@ public sealed class RedisStorageProvider : IStorageProvider
             if (keys.Count == 0)
                 return [];
 
-            var batch = db.CreateBatch();
-            var tasks = new Task<HashEntry[]>[keys.Count];
+            var groups = new Group[keys.Count];
+            HashSet<Group>? loading = null;
+            List<(Group Group, Task<HashEntry[]> Entries)>? loads = null;
+            IBatch? batch = null;
             for (var i = 0; i < keys.Count; i++)
-                tasks[i] = batch.HashGetAllAsync(GroupKey(keys[i]));
-            batch.Execute();
-            Task.WaitAll(tasks);
+            {
+                var groupKey = GroupKey(keys[i]);
+                var group = GroupFor(groupKey);
+                groups[i] = group;
+                if (group.Cleared || group.FullyCached || !(loading ??= []).Add(group))
+                    continue;
+                batch ??= db.CreateBatch();
+                (loads ??= []).Add((group, batch.HashGetAllAsync(groupKey)));
+            }
+
+            if (loads is not null)
+            {
+                batch!.Execute();
+                Task.WaitAll(loads.Select(l => (Task)l.Entries).ToArray());
+                foreach (var (group, entries) in loads)
+                {
+                    foreach (var entry in entries.Result)
+                        group.Cache[entry.Name] = (long)entry.Value;
+                    group.FullyCached = true;
+                }
+            }
 
             var results = new IReadOnlyList<WeightedValue<TValue>>[keys.Count];
             for (var i = 0; i < keys.Count; i++)
-                results[i] = Materialize(tasks[i].Result);
+                results[i] = Materialize(groups[i]);
             return results;
         }
 
         public void RemoveGroups(IReadOnlyList<TKey> keys)
         {
-            if (keys.Count == 0)
-                return;
-
-            var groupKeys = new RedisKey[keys.Count];
-            for (var i = 0; i < keys.Count; i++)
-                groupKeys[i] = GroupKey(keys[i]);
-            db.KeyDelete(groupKeys);
+            foreach (var key in keys)
+                RemoveGroup(key);
         }
 
-        private IReadOnlyList<WeightedValue<TValue>> Materialize(HashEntry[] entries)
+        public void Flush(ITransaction transaction)
         {
-            if (entries.Length == 0)
-                return [];
+            foreach (var (groupKey, group) in _groups)
+            {
+                // A cleared group is deleted wholesale; staged survivors are re-asserted
+                // after it (MULTI preserves command order).
+                if (group.Cleared)
+                    _ = transaction.KeyDeleteAsync(groupKey);
 
-            var group = new WeightedValue<TValue>[entries.Length];
-            for (var i = 0; i < entries.Length; i++)
-                group[i] = new WeightedValue<TValue>(serializer.Deserialize<TValue>(entries[i].Name!), (long)entries[i].Value);
-            return group;
+                List<RedisValue>? deletes = null;
+                List<HashEntry>? sets = null;
+                foreach (var (field, weight) in group.Staged)
+                {
+                    if (weight == 0)
+                        (deletes ??= []).Add(field);
+                    else
+                        (sets ??= []).Add(new HashEntry(field, weight));
+                }
+                if (!group.Cleared && deletes is not null)
+                    _ = transaction.HashDeleteAsync(groupKey, [.. deletes]);
+                if (sets is not null)
+                    _ = transaction.HashSetAsync(groupKey, [.. sets]);
+            }
+        }
+
+        public void Discard() => _groups.Clear();
+
+        private RedisKey GroupKey(TKey key) => $"{baseKey}:{serializer.Serialize(key)}";
+
+        private Group GroupFor(RedisKey groupKey) =>
+            _groups.TryGetValue(groupKey, out var group) ? group : _groups[groupKey] = new Group();
+
+        private long WeightOf(RedisKey groupKey, Group group, RedisValue field)
+        {
+            if (group.Staged.TryGetValue(field, out var staged))
+                return staged;
+            if (group.Cleared)
+                return 0;
+            if (group.Cache.TryGetValue(field, out var cached))
+                return cached;
+            if (group.FullyCached)
+                return 0;
+            var stored = db.HashGet(groupKey, field);
+            return group.Cache[field] = stored.IsNull ? 0 : (long)stored;
+        }
+
+        /// <summary>One pipelined round trip (HMGET per touched group) for the committed
+        /// weights the batch needs but neither the overlay nor the cache holds.</summary>
+        private void Prefetch((RedisKey GroupKey, Group Group, RedisValue Field)[] addresses)
+        {
+            Dictionary<RedisKey, (Group Group, List<RedisValue> Fields, HashSet<RedisValue> Seen)>? missing = null;
+            foreach (var (groupKey, group, field) in addresses)
+            {
+                if (group.Staged.ContainsKey(field) || group.Cleared || group.FullyCached || group.Cache.ContainsKey(field))
+                    continue;
+                missing ??= [];
+                if (!missing.TryGetValue(groupKey, out var pending))
+                    missing[groupKey] = pending = (group, [], []);
+                if (pending.Seen.Add(field))
+                    pending.Fields.Add(field);
+            }
+            if (missing is null)
+                return;
+
+            var batch = db.CreateBatch();
+            var reads = new List<(Group Group, List<RedisValue> Fields, Task<RedisValue[]> Stored)>(missing.Count);
+            foreach (var (groupKey, (group, fields, _)) in missing)
+                reads.Add((group, fields, batch.HashGetAsync(groupKey, [.. fields])));
+            batch.Execute();
+            Task.WaitAll(reads.Select(r => (Task)r.Stored).ToArray());
+
+            foreach (var (group, fields, stored) in reads)
+                for (var i = 0; i < fields.Count; i++)
+                    group.Cache[fields[i]] = stored.Result[i].IsNull ? 0 : (long)stored.Result[i];
+        }
+
+        private IReadOnlyList<WeightedValue<TValue>> Materialize(Group group)
+        {
+            var merged = new Dictionary<RedisValue, long>();
+            if (!group.Cleared)
+                foreach (var (field, weight) in group.Cache)
+                    if (weight != 0)
+                        merged[field] = weight;
+            foreach (var (field, weight) in group.Staged)
+            {
+                if (weight == 0)
+                    merged.Remove(field);
+                else
+                    merged[field] = weight;
+            }
+
+            if (merged.Count == 0)
+                return [];
+            var result = new WeightedValue<TValue>[merged.Count];
+            var i = 0;
+            foreach (var (field, weight) in merged)
+                result[i++] = new WeightedValue<TValue>(serializer.Deserialize<TValue>(field!), weight);
+            return result;
         }
     }
 
     private sealed class RedisValueStore<TKey, TValue>(IDatabase db, string key, IStateSerializer serializer)
-        : IValueStore<TKey, TValue> where TKey : notnull
+        : IValueStore<TKey, TValue>, IStagedStore where TKey : notnull
     {
+        // Serialized values staged since the last commit (Null = remove at flush), and
+        // committed values read from Redis this interval (Null = known absent).
+        private readonly Dictionary<RedisValue, RedisValue> _staged = [];
+        private readonly Dictionary<RedisValue, RedisValue> _cache = [];
+
         public bool TryGet(TKey k, [MaybeNullWhen(false)] out TValue value)
         {
-            var stored = db.HashGet(key, serializer.Serialize(k));
+            var field = Field(k);
+            if (!_staged.TryGetValue(field, out var stored) && !_cache.TryGetValue(field, out stored))
+                stored = _cache[field] = db.HashGet(key, field);
             if (stored.IsNull)
             {
                 value = default;
@@ -266,10 +472,9 @@ public sealed class RedisStorageProvider : IStorageProvider
             return true;
         }
 
-        public void Put(TKey k, TValue value) =>
-            db.HashSet(key, serializer.Serialize(k), serializer.Serialize(value));
+        public void Put(TKey k, TValue value) => _staged[Field(k)] = serializer.Serialize(value);
 
-        public void Remove(TKey k) => db.HashDelete(key, serializer.Serialize(k));
+        public void Remove(TKey k) => _staged[Field(k)] = RedisValue.Null;
 
         public (bool Found, TValue? Value)[] TryGetAll(IReadOnlyList<TKey> keys)
         {
@@ -278,37 +483,65 @@ public sealed class RedisStorageProvider : IStorageProvider
 
             var fields = new RedisValue[keys.Count];
             for (var i = 0; i < keys.Count; i++)
-                fields[i] = serializer.Serialize(keys[i]);
+                fields[i] = Field(keys[i]);
 
-            var stored = db.HashGet(key, fields);
+            HashSet<RedisValue>? seen = null;
+            List<RedisValue>? missing = null;
+            foreach (var field in fields)
+                if (!_staged.ContainsKey(field) && !_cache.ContainsKey(field) && (seen ??= []).Add(field))
+                    (missing ??= []).Add(field);
+            if (missing is not null)
+            {
+                var stored = db.HashGet(key, [.. missing]);
+                for (var i = 0; i < missing.Count; i++)
+                    _cache[missing[i]] = stored[i];
+            }
+
             var results = new (bool, TValue?)[keys.Count];
             for (var i = 0; i < keys.Count; i++)
-                results[i] = stored[i].IsNull
-                    ? (false, default)
-                    : (true, serializer.Deserialize<TValue>(stored[i]!));
+            {
+                if (!_staged.TryGetValue(fields[i], out var stored))
+                    stored = _cache[fields[i]];
+                results[i] = stored.IsNull ? (false, default) : (true, serializer.Deserialize<TValue>(stored!));
+            }
             return results;
         }
 
         public void PutAll(IReadOnlyList<(TKey Key, TValue Value)> pairs)
         {
-            if (pairs.Count == 0)
-                return;
-
-            var entries = new HashEntry[pairs.Count];
-            for (var i = 0; i < pairs.Count; i++)
-                entries[i] = new HashEntry(serializer.Serialize(pairs[i].Key), serializer.Serialize(pairs[i].Value));
-            db.HashSet(key, entries);
+            foreach (var (k, value) in pairs)
+                Put(k, value);
         }
 
         public void RemoveAll(IReadOnlyList<TKey> keys)
         {
-            if (keys.Count == 0)
-                return;
-
-            var fields = new RedisValue[keys.Count];
-            for (var i = 0; i < keys.Count; i++)
-                fields[i] = serializer.Serialize(keys[i]);
-            db.HashDelete(key, fields);
+            foreach (var k in keys)
+                Remove(k);
         }
+
+        public void Flush(ITransaction transaction)
+        {
+            List<RedisValue>? deletes = null;
+            List<HashEntry>? sets = null;
+            foreach (var (field, value) in _staged)
+            {
+                if (value.IsNull)
+                    (deletes ??= []).Add(field);
+                else
+                    (sets ??= []).Add(new HashEntry(field, value));
+            }
+            if (deletes is not null)
+                _ = transaction.HashDeleteAsync(key, [.. deletes]);
+            if (sets is not null)
+                _ = transaction.HashSetAsync(key, [.. sets]);
+        }
+
+        public void Discard()
+        {
+            _staged.Clear();
+            _cache.Clear();
+        }
+
+        private RedisValue Field(TKey k) => serializer.Serialize(k);
     }
 }
