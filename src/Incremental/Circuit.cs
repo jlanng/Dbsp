@@ -19,8 +19,12 @@ public sealed class Circuit : IAsyncDisposable
     private readonly IInputPort[] _inputs;
     private readonly IOutputPort[] _outputs;
     private readonly Worker[] _workers;
-    private readonly Barrier _barrier;
+    private readonly SpinBarrier _barrier;
     private readonly WatermarkClock? _watermarkClock;
+
+    // Single-worker circuits run their steps inline on the coordinator: no worker thread,
+    // no handoff — the cheapest engine for small or latency-sensitive workloads.
+    private bool RunsInline => _workers.Length == 1;
 
     // Exchange scratch space: _mailboxes[node][sender] holds the fragments (indexed by
     // target worker) that `sender` produced for that exchange node this step. The exchange
@@ -45,7 +49,7 @@ public sealed class Circuit : IAsyncDisposable
         _nodes = nodes;
         _options = options;
         _watermarkClock = watermarkClock;
-        _barrier = new Barrier(options.Workers);
+        _barrier = new SpinBarrier(options.Workers);
 
         _workers = new Worker[options.Workers];
         for (var w = 0; w < options.Workers; w++)
@@ -82,15 +86,18 @@ public sealed class Circuit : IAsyncDisposable
             throw new InvalidOperationException("The circuit has already been started.");
         _started = true;
 
-        foreach (var worker in _workers)
+        if (!RunsInline)
         {
-            var thread = new Thread(() => WorkerLoop(worker))
+            foreach (var worker in _workers)
             {
-                IsBackground = true,
-                Name = $"circuit-worker-{worker.Id}",
-            };
-            worker.Thread = thread;
-            thread.Start();
+                var thread = new Thread(() => WorkerLoop(worker))
+                {
+                    IsBackground = true,
+                    Name = $"circuit-worker-{worker.Id}",
+                };
+                worker.Thread = thread;
+                thread.Start();
+            }
         }
 
         if (_options.AutoStep)
@@ -155,12 +162,19 @@ public sealed class Circuit : IAsyncDisposable
         foreach (var input in _inputs)
             input.DrainInto(_workers, _options.MaxStepItemsPerInput);
 
-        _stepDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        Volatile.Write(ref _workersRemaining, _workers.Length);
-        foreach (var worker in _workers)
-            worker.Go.Release();
+        if (RunsInline)
+        {
+            RunWorkerStep(_workers[0]);
+        }
+        else
+        {
+            _stepDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Volatile.Write(ref _workersRemaining, _workers.Length);
+            foreach (var worker in _workers)
+                worker.Go.Release();
 
-        await _stepDone.Task.ConfigureAwait(false);
+            await _stepDone.Task.ConfigureAwait(false);
+        }
 
         // Freeze between steps so every worker sees one consistent watermark per step.
         _watermarkClock?.Freeze();
@@ -315,6 +329,5 @@ public sealed class Circuit : IAsyncDisposable
 
         _shutdown.Cancel();
         _shutdown.Dispose();
-        _barrier.Dispose();
     }
 }
