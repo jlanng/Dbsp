@@ -7,9 +7,10 @@ namespace Incremental.Operators;
 /// last emitted result per key; when a step touches a key, the aggregate is recomputed over
 /// that group and the output delta retracts the stale result (-1) and asserts the new one (+1).
 /// Recomputing per touched group keeps every aggregate — including non-invertible ones like
-/// MIN/MAX — correct under deletions.
-/// TODO: fast path for linear aggregates (COUNT/SUM can be maintained from the delta alone),
-/// and tournament-tree maintenance for MIN/MAX over very large groups.
+/// MIN/MAX — correct under deletions. This is the general path: linear aggregates
+/// (COUNT/SUM) have <see cref="LinearAggregateOperator{TKey,TValue,TResult}"/> and MIN/MAX
+/// have <see cref="ExtremumOperator{TKey,TValue,TProjected}"/>, both of which avoid storing
+/// or rescanning group contents.
 /// </summary>
 internal sealed class AggregateOperator<TKey, TValue, TResult> : IStepOperator
     where TKey : notnull

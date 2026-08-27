@@ -55,7 +55,8 @@ deltas. Integrating an output's deltas reproduces the current state of that view
 | `Map` / `Filter` / `FlatMap` / `Plus` / `Minus` / `Negate` | Linear — applied to the delta directly, stateless |
 | `Join` | Bilinear: Δ(L ⋈ R) = ΔL ⋈ R + (L + ΔL) ⋈ ΔR, probing integrated per-side state |
 | `Count` / `Sum` (`AggregateLinear`) | Linear aggregates: folded straight from the delta, state is one (row count, accumulator) pair per key — no group contents stored, update cost independent of group size |
-| `Aggregate` (`Min`, `Max`, `Fold`, custom) | Integrated group state per key; recomputes touched groups, retracts the stale result (-1) and asserts the new one (+1). Correct for non-invertible aggregates (`MIN` under deletion) |
+| `Min` / `Max` | Tournament tree per key: values are hash-partitioned into leaf buckets, each level above holds its children's extrema, the root's extremum is the result. Updates — deleting the current minimum included — touch a fixed number of ≤16-entry buckets and propagate up only while a bucket's extremum changes, so cost is independent of group size |
+| `Aggregate` (`Fold`, custom) | Integrated group state per key; recomputes touched groups, retracts the stale result (-1) and asserts the new one (+1). Correct for any non-invertible aggregate under deletion |
 | `Distinct` | Integrated weight per value; emits only presence transitions |
 | `TopK` | Integrated group per key; emits only membership changes (displaced rows retracted). A threshold short-circuit skips the re-rank whenever a key's delta rows all fall strictly below the current K-th entry, so steady-state cost is O(delta) even for huge groups. Multiplicities count toward K |
 | `AntiJoin` | Integrated left side plus per-key right-side row counts; a key whose match-presence flips retracts or re-asserts its left rows |
@@ -170,7 +171,9 @@ Scaffold — the semantics above are implemented and tested, with plenty of head
 
 - [x] Linear-aggregate fast path: `COUNT`/`SUM` maintained from the delta alone with O(keys)
       state (`ILinearAggregate`); custom linear aggregates via `AggregateLinear`
-- [ ] Tournament trees for `MIN`/`MAX` over large groups
+- [x] Tournament trees for `MIN`/`MAX` over large groups (`Min`/`Max` maintain a
+      hash-partitioned reduction tree in ordinary indexed stores, so it works over any
+      storage provider; deleting the extremum no longer rescans the group)
 - [ ] Batched/pipelined Redis access (currently one round trip per state touch)
 - [ ] Checkpointing input offsets with state for exactly-once restart (Redis provider)
 - [x] `TopK` (per-key ranking with retraction of displaced rows)
