@@ -104,6 +104,38 @@ public class WindowingAndTopKTests
     }
 
     [Fact]
+    public async Task TopK_below_cutoff_changes_are_absorbed_silently_but_integrated()
+    {
+        var builder = ManualBuilder();
+        builder.Input<(string Grp, string Name, int Score)>("scores")
+            .IndexBy(s => s.Grp)
+            .TopK(2, s => s.Score)
+            .Output("top");
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var input = circuit.Input<(string Grp, string Name, int Score)>("scores");
+        var output = circuit.Output<KeyedValue<string, (string Grp, string Name, int Score)>>("top");
+
+        await input.InsertAsync(("g", "a", 30));
+        await input.InsertAsync(("g", "b", 20));
+        await circuit.StepAsync();
+        _ = await output.Reader.ReadAsync();
+
+        // Strictly below the cutoff (20) with a full top: the short-circuit path — no delta.
+        await input.InsertAsync(("g", "c", 10));
+        await circuit.StepAsync();
+        Assert.False(output.Reader.TryRead(out _));
+
+        // But the group state was still integrated: deleting a top row promotes c correctly.
+        await input.RemoveAsync(("g", "a", 30));
+        await circuit.StepAsync();
+        var delta = await output.Reader.ReadAsync();
+        Assert.Equal(-1, delta.WeightOf(new KeyedValue<string, (string, string, int)>("g", ("g", "a", 30))));
+        Assert.Equal(1, delta.WeightOf(new KeyedValue<string, (string, string, int)>("g", ("g", "c", 10))));
+    }
+
+    [Fact]
     public async Task TopK_counts_multiplicity_toward_k()
     {
         var builder = ManualBuilder();
