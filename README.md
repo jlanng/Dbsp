@@ -129,10 +129,11 @@ examples/StreamProcessor.LogAnalytics  simulated clickstream → 5s tumbling win
                                        per window, rendered as an in-place Spectre.Console dashboard
                                        (bar gauges per window, watermark in the header);
                                        `--redis` keeps operator state in Redis
-examples/StreamProcessor.TaxiAnalytics genuine big data: ~3M real NYC yellow-taxi trips (downloaded and
-                                       cached on first run, ~50MB/month; `--months N`, `--synthetic`)
-                                       through join + counts + revenue + top-5 zones per borough, then
-                                       single-row updates timed against a naive full recompute —
+examples/StreamProcessor.TaxiAnalytics genuine big data: ~3M real NYC yellow-taxi trips (parquet, read
+                                       via Parquet.Net, downloaded and cached on first run, ~50MB/month;
+                                       `--months N`, `--synthetic`) through join + counts + revenue +
+                                       top-5 zones per borough; narrated phases, then continuous
+                                       single-row churn with a live view until you press a key —
                                        ~1M rows/s bulk load, per-update speedups of hundreds of ×
 ```
 
