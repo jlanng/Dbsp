@@ -98,6 +98,13 @@ A slow consumer fills its output channel, which stalls step publishing, which st
 draining, which fills the input channels, which suspends producers inside `InsertAsync`.
 No configuration, no dropped data.
 
+**Keyed inputs.** `builder.KeyedInput<K,V>(name, keySelector)` declares an input with
+upsert/delete-by-key semantics: the handle tracks the current row per key, so
+`UpsertAsync(row)` emits the retraction of the previous version automatically and
+`DeleteAsync(key)` retracts the current one. This is the natural way to feed reference /
+master data (and any stream whose rows are amended in place) — one upsert to a reference
+row re-attributes everything joined against it.
+
 **Storage.** Stateful operators keep their state behind `IStorageProvider`
 (`IWeightStore`, `IIndexedWeightStore`, `IValueStore`), created per operator *per worker*
 so implementations never see cross-thread access to one store.
@@ -130,11 +137,13 @@ examples/StreamProcessor.LogAnalytics  simulated clickstream → 5s tumbling win
                                        (bar gauges per window, watermark in the header);
                                        `--redis` keeps operator state in Redis
 examples/StreamProcessor.TradeEnrichment trades ⋈ reference data, composed interactively: pick which
-                                       enrichments to join (instrument; trader → desk, a two-hop
-                                       join; counterparty) and which dimensions to group by — no
-                                       dimensions gives a top-trades blotter instead. Live churn with
-                                       amendments/cancellations, and master-data changes (desk moves,
-                                       re-ratings) that re-attribute historical trades in microseconds
+                                       enrichment columns to join (grouped by table: instrument;
+                                       trader → desk, a two-hop join; counterparty) and which
+                                       dimensions to group by — no dimensions gives a top-trades
+                                       blotter instead. Every input is a keyed upsert input:
+                                       amendments, cancellations, and master-data changes (desk
+                                       moves, re-ratings) are single UpsertAsync/DeleteAsync calls
+                                       that re-attribute historical trades in microseconds
 examples/StreamProcessor.TaxiAnalytics genuine big data: ~3M real NYC yellow-taxi trips (parquet, read
                                        via Parquet.Net, downloaded and cached on first run, ~50MB/month;
                                        `--months N`, `--synthetic`) through join + counts + revenue +
