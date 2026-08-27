@@ -54,6 +54,17 @@ circuit.Start();
 var input = circuit.Input<PageView>("views");
 var topPages = circuit.Output<KeyedValue<DateTimeOffset, KeyedValue<(DateTimeOffset Window, string Page), long>>>("top-pages");
 
+AnsiConsole.Write(new Panel(new Rows(
+        new Markup("A simulated clickstream flows through an incremental (DBSP-style) circuit:"),
+        new Markup("[bold]  page views ─▶ 5s windows ─▶ count per (window, page) ─▶ top 3 per window[/]"),
+        new Text(""),
+        new Markup("[green]▪[/] Nothing below is ever recomputed. Each update is a [bold]delta[/]: when a count changes, the stale total is retracted and the new one asserted, and the TopK stage re-ranks each window's leaderboard from those deltas alone."),
+        new Markup("[green]▪[/] The top (newest) window's bars grow live; older windows freeze once the [bold]watermark[/] (max event time seen − 2s allowed lateness, shown in the header) passes their end. Their operator state is then evicted — the pipeline could run forever in constant memory."),
+        new Markup("[green]▪[/] Two worker threads process the stream in parallel; the [bold]IndexBy[/] stages hash-shard records by key (DBSP's exchange operator), so each worker owns its slice of state.")))
+    .Header("[bold] what you're watching [/]")
+    .Padding(1, 0)
+    .BorderColor(Color.Grey));
+
 var runFor = TimeSpan.FromSeconds(20);
 var stopwatch = Stopwatch.StartNew();
 long eventsSent = 0;
