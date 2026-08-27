@@ -35,38 +35,59 @@ internal sealed class AntiJoinOperator<TKey, TLeft, TRight> : IStepOperator
         foreach (var ((key, _), weight) in deltaRight)
             rightKeyDeltas[key] = rightKeyDeltas.GetValueOrDefault(key) + weight;
 
+        var countEntries = new List<(TKey, long)>(rightKeyDeltas.Count);
         foreach (var (key, keyDelta) in rightKeyDeltas)
         {
+            countEntries.Add((key, keyDelta));
             _eviction?.Track(key);
-            var before = _rightRowCount.WeightOf(key);
-            var after = _rightRowCount.Update(key, keyDelta);
+        }
+
+        var after = _rightRowCount.UpdateAll(countEntries);
+        var flipped = new List<TKey>();
+        var flipSigns = new List<long>();
+        for (var i = 0; i < countEntries.Count; i++)
+        {
+            var (key, keyDelta) = countEntries[i];
+            var before = after[i] - keyDelta;
             var wasMatched = before > 0;
-            var isMatched = after > 0;
+            var isMatched = after[i] > 0;
             if (wasMatched == isMatched)
                 continue;
-
-            // Presence flipped: every integrated left row for this key changes sides.
-            var sign = isMatched ? -1 : +1;
-            foreach (var (leftValue, leftWeight) in _left.GetGroup(key))
-                output.Add(new KeyedValue<TKey, TLeft>(key, leftValue), sign * leftWeight);
+            flipped.Add(key);
+            flipSigns.Add(isMatched ? -1 : +1);
         }
 
+        // Presence flipped: every integrated left row for these keys changes sides.
+        var flippedGroups = _left.GetGroups(flipped);
+        for (var i = 0; i < flipped.Count; i++)
+            foreach (var (leftValue, leftWeight) in flippedGroups[i])
+                output.Add(new KeyedValue<TKey, TLeft>(flipped[i], leftValue), flipSigns[i] * leftWeight);
+
+        var leftEntries = new List<(TKey, TLeft, long)>(deltaLeft.DistinctCount);
+        var leftKeys = new List<TKey>();
+        var matchIndex = new Dictionary<TKey, int>();
         foreach (var ((key, leftValue), weight) in deltaLeft)
         {
-            _left.Update(key, leftValue, weight);
+            leftEntries.Add((key, leftValue, weight));
             _eviction?.Track(key);
-            if (_rightRowCount.WeightOf(key) <= 0)
-                output.Add(new KeyedValue<TKey, TLeft>(key, leftValue), weight);
+            if (matchIndex.TryAdd(key, leftKeys.Count))
+                leftKeys.Add(key);
         }
+
+        _left.UpdateAll(leftEntries);
+        var rightCounts = _rightRowCount.WeightOfAll(leftKeys);
+        foreach (var (key, leftValue, weight) in leftEntries)
+            if (rightCounts[matchIndex[key]] <= 0)
+                output.Add(new KeyedValue<TKey, TLeft>(key, leftValue), weight);
 
         // Closed keys can never flip again (the watermark drops their events), so both the
         // integrated left rows and the right row count are deleted without retractions:
         // rows already emitted as unmatched simply remain final.
-        _eviction?.EvictClosed(key =>
+        if (_eviction?.DrainClosed() is { Count: > 0 } closed)
         {
-            _left.RemoveGroup(key);
-            _rightRowCount.Remove(key);
-        });
+            _left.RemoveGroups(closed);
+            _rightRowCount.RemoveAll(closed);
+        }
 
         return output;
     }

@@ -19,11 +19,17 @@ internal sealed class DistinctOperator<T> : IStepOperator where T : notnull
     {
         var delta = (ZSet<T>)inputs[0]!;
         var output = new ZSet<T>();
+
+        var entries = new List<(T, long)>(delta.DistinctCount);
         foreach (var (value, weight) in delta)
+            entries.Add((value, weight));
+
+        var after = _integrated.UpdateAll(entries);
+        for (var i = 0; i < entries.Count; i++)
         {
-            var before = _integrated.WeightOf(value);
-            var after = _integrated.Update(value, weight);
-            var change = (after > 0 ? 1 : 0) - (before > 0 ? 1 : 0);
+            var (value, weight) = entries[i];
+            var before = after[i] - weight;
+            var change = (after[i] > 0 ? 1 : 0) - (before > 0 ? 1 : 0);
             if (change != 0)
                 output.Add(value, change);
         }
@@ -55,18 +61,27 @@ internal sealed class KeyedDistinctOperator<TKey, TValue> : IStepOperator
     {
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
         var output = new ZSet<KeyedValue<TKey, TValue>>();
+
+        var entries = new List<(TKey, TValue, long)>(delta.DistinctCount);
         foreach (var ((key, value), weight) in delta)
         {
-            var after = _integrated.Update(key, value, weight);
-            var before = after - weight;
-            var change = (after > 0 ? 1 : 0) - (before > 0 ? 1 : 0);
-            if (change != 0)
-                output.Add(new KeyedValue<TKey, TValue>(key, value), change);
+            entries.Add((key, value, weight));
             _eviction?.Track(key);
         }
 
+        var after = _integrated.UpdateAll(entries);
+        for (var i = 0; i < entries.Count; i++)
+        {
+            var (key, value, weight) = entries[i];
+            var before = after[i] - weight;
+            var change = (after[i] > 0 ? 1 : 0) - (before > 0 ? 1 : 0);
+            if (change != 0)
+                output.Add(new KeyedValue<TKey, TValue>(key, value), change);
+        }
+
         // Closed keys can never be touched again; their already-emitted presence stays final.
-        _eviction?.EvictClosed(_integrated.RemoveGroup);
+        if (_eviction?.DrainClosed() is { Count: > 0 } closed)
+            _integrated.RemoveGroups(closed);
 
         return output;
     }

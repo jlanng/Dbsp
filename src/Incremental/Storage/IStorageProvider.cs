@@ -33,6 +33,33 @@ public interface IWeightStore<T> where T : notnull
 
     /// <summary>Drops <paramref name="value"/> regardless of its weight (watermark-driven eviction). No-op if absent.</summary>
     void Remove(T value);
+
+    /// <summary>Batched <see cref="Update"/>: applies every entry in order and returns the resulting
+    /// weights, aligned with the input. Providers with per-call latency override this to issue one
+    /// round trip for the whole batch.</summary>
+    long[] UpdateAll(IReadOnlyList<(T Value, long Delta)> entries)
+    {
+        var results = new long[entries.Count];
+        for (var i = 0; i < entries.Count; i++)
+            results[i] = Update(entries[i].Value, entries[i].Delta);
+        return results;
+    }
+
+    /// <summary>Batched <see cref="WeightOf"/>, aligned with the input.</summary>
+    long[] WeightOfAll(IReadOnlyList<T> values)
+    {
+        var results = new long[values.Count];
+        for (var i = 0; i < values.Count; i++)
+            results[i] = WeightOf(values[i]);
+        return results;
+    }
+
+    /// <summary>Batched <see cref="Remove"/>.</summary>
+    void RemoveAll(IReadOnlyList<T> values)
+    {
+        foreach (var value in values)
+            Remove(value);
+    }
 }
 
 public interface IIndexedWeightStore<TKey, TValue>
@@ -48,6 +75,33 @@ public interface IIndexedWeightStore<TKey, TValue>
 
     /// <summary>Drops the entire group for <paramref name="key"/> (watermark-driven eviction). No-op if absent.</summary>
     void RemoveGroup(TKey key);
+
+    /// <summary>Batched <see cref="Update"/>: applies every entry in order and returns the resulting
+    /// weights, aligned with the input. Providers with per-call latency override this to issue one
+    /// round trip for the whole batch.</summary>
+    long[] UpdateAll(IReadOnlyList<(TKey Key, TValue Value, long Delta)> entries)
+    {
+        var results = new long[entries.Count];
+        for (var i = 0; i < entries.Count; i++)
+            results[i] = Update(entries[i].Key, entries[i].Value, entries[i].Delta);
+        return results;
+    }
+
+    /// <summary>Batched <see cref="GetGroup"/>, aligned with the input.</summary>
+    IReadOnlyList<WeightedValue<TValue>>[] GetGroups(IReadOnlyList<TKey> keys)
+    {
+        var results = new IReadOnlyList<WeightedValue<TValue>>[keys.Count];
+        for (var i = 0; i < keys.Count; i++)
+            results[i] = GetGroup(keys[i]);
+        return results;
+    }
+
+    /// <summary>Batched <see cref="RemoveGroup"/>.</summary>
+    void RemoveGroups(IReadOnlyList<TKey> keys)
+    {
+        foreach (var key in keys)
+            RemoveGroup(key);
+    }
 }
 
 public interface IValueStore<TKey, TValue> where TKey : notnull
@@ -55,4 +109,29 @@ public interface IValueStore<TKey, TValue> where TKey : notnull
     bool TryGet(TKey key, [MaybeNullWhen(false)] out TValue value);
     void Put(TKey key, TValue value);
     void Remove(TKey key);
+
+    /// <summary>Batched <see cref="TryGet"/>, aligned with the input. <c>Value</c> is default
+    /// when <c>Found</c> is false. Providers with per-call latency override this to issue one
+    /// round trip for the whole batch.</summary>
+    (bool Found, TValue? Value)[] TryGetAll(IReadOnlyList<TKey> keys)
+    {
+        var results = new (bool, TValue?)[keys.Count];
+        for (var i = 0; i < keys.Count; i++)
+            results[i] = (TryGet(keys[i], out var value), value);
+        return results;
+    }
+
+    /// <summary>Batched <see cref="Put"/>.</summary>
+    void PutAll(IReadOnlyList<(TKey Key, TValue Value)> pairs)
+    {
+        foreach (var (key, value) in pairs)
+            Put(key, value);
+    }
+
+    /// <summary>Batched <see cref="Remove"/>.</summary>
+    void RemoveAll(IReadOnlyList<TKey> keys)
+    {
+        foreach (var key in keys)
+            Remove(key);
+    }
 }

@@ -111,14 +111,18 @@ internal sealed class EvictionTracker<TKey>(KeyEviction<TKey> policy) where TKey
             _deadlines.Enqueue(key, policy.ClosesAt(key).UtcTicks);
     }
 
-    public void EvictClosed(Action<TKey> evict)
+    /// <summary>Removes and returns every tracked key whose deadline the watermark has passed,
+    /// as one list so callers can evict their state in a single batched store call.</summary>
+    public List<TKey> DrainClosed()
     {
         var watermark = policy.Clock.FrozenTicks;
+        var closed = new List<TKey>();
         while (_deadlines.TryPeek(out var key, out var deadline) && deadline <= watermark)
         {
             _deadlines.Dequeue();
             _tracked.Remove(key);
-            evict(key);
+            closed.Add(key);
         }
+        return closed;
     }
 }

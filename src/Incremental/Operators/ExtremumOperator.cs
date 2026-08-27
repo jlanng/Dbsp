@@ -57,77 +57,88 @@ internal sealed class ExtremumOperator<TKey, TValue, TProjected> : IStepOperator
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
         var output = new ZSet<KeyedValue<TKey, TProjected>>();
 
-        var perKey = new Dictionary<TKey, Dictionary<uint, List<WeightedValue<TProjected>>>>();
+        // Level-major walk (all keys advance together) so each level is one batched read
+        // and one batched write against the store, regardless of how many keys the delta
+        // touches: changes holds the pending entries per (key, slot) bucket at the
+        // current level.
+        var changes = new Dictionary<(TKey Key, uint Slot), List<WeightedValue<TProjected>>>();
         foreach (var ((key, value), weight) in delta)
         {
             var projected = _selector(value);
             var slot = (uint)StableHash.Of(projected) & LeafMask;
-            if (!perKey.TryGetValue(key, out var slots))
-                perKey[key] = slots = [];
-            if (!slots.TryGetValue(slot, out var rows))
-                slots[slot] = rows = [];
+            if (!changes.TryGetValue((key, slot), out var rows))
+                changes[(key, slot)] = rows = [];
             rows.Add(new WeightedValue<TProjected>(projected, weight));
             _eviction?.Track(key);
         }
 
         var comparer = Comparer<TProjected>.Default;
-        foreach (var (key, leafChanges) in perKey)
+        for (byte level = 0; level <= RootLevel && changes.Count > 0; level++)
         {
-            var changes = leafChanges;
-            for (byte level = 0; level <= RootLevel; level++)
+            var buckets = new List<ExtremumSlot<TKey>>(changes.Count);
+            var bucketEntries = new List<List<WeightedValue<TProjected>>>(changes.Count);
+            foreach (var ((key, slot), entries) in changes)
             {
-                Dictionary<uint, List<WeightedValue<TProjected>>>? parentChanges = null;
-                foreach (var (slot, entries) in changes)
-                {
-                    var bucket = new ExtremumSlot<TKey>(key, level, slot);
-                    var before = _tree.GetGroup(bucket);
-                    var hadOld = TryExtremum(before, comparer, out var oldBest);
-
-                    var merged = new Dictionary<TProjected, long>(before.Count + entries.Count);
-                    foreach (var (v, w) in before)
-                        merged[v] = w;
-                    foreach (var (v, w) in entries)
-                    {
-                        _tree.Update(bucket, v, w);
-                        var updated = merged.GetValueOrDefault(v) + w;
-                        if (updated == 0)
-                            merged.Remove(v);
-                        else
-                            merged[v] = updated;
-                    }
-                    var hasNew = TryExtremum(merged, comparer, out var newBest);
-
-                    if (hadOld == hasNew && (!hadOld || EqualityComparer<TProjected>.Default.Equals(oldBest!, newBest!)))
-                        continue; // extremum unchanged: nothing propagates past this bucket
-
-                    if (level == RootLevel)
-                    {
-                        // The root's extremum is the emitted result, so its old value is
-                        // exactly what was published last — no separate result store needed.
-                        if (hadOld)
-                            output.Add(new KeyedValue<TKey, TProjected>(key, oldBest!), -1);
-                        if (hasNew)
-                            output.Add(new KeyedValue<TKey, TProjected>(key, newBest!), 1);
-                    }
-                    else
-                    {
-                        parentChanges ??= [];
-                        var parentSlot = slot >> BitsPerLevel;
-                        if (!parentChanges.TryGetValue(parentSlot, out var list))
-                            parentChanges[parentSlot] = list = [];
-                        if (hadOld)
-                            list.Add(new WeightedValue<TProjected>(oldBest!, -1));
-                        if (hasNew)
-                            list.Add(new WeightedValue<TProjected>(newBest!, 1));
-                    }
-                }
-                if (parentChanges is null)
-                    break;
-                changes = parentChanges;
+                buckets.Add(new ExtremumSlot<TKey>(key, level, slot));
+                bucketEntries.Add(entries);
             }
+
+            var befores = _tree.GetGroups(buckets);
+            var updates = new List<(ExtremumSlot<TKey>, TProjected, long)>();
+            var parentChanges = new Dictionary<(TKey Key, uint Slot), List<WeightedValue<TProjected>>>();
+
+            for (var i = 0; i < buckets.Count; i++)
+            {
+                var bucket = buckets[i];
+                var before = befores[i];
+                var hadOld = TryExtremum(before, comparer, out var oldBest);
+
+                var merged = new Dictionary<TProjected, long>(before.Count + bucketEntries[i].Count);
+                foreach (var (v, w) in before)
+                    merged[v] = w;
+                foreach (var (v, w) in bucketEntries[i])
+                {
+                    updates.Add((bucket, v, w));
+                    var updated = merged.GetValueOrDefault(v) + w;
+                    if (updated == 0)
+                        merged.Remove(v);
+                    else
+                        merged[v] = updated;
+                }
+                var hasNew = TryExtremum(merged, comparer, out var newBest);
+
+                if (hadOld == hasNew && (!hadOld || EqualityComparer<TProjected>.Default.Equals(oldBest!, newBest!)))
+                    continue; // extremum unchanged: nothing propagates past this bucket
+
+                if (level == RootLevel)
+                {
+                    // The root's extremum is the emitted result, so its old value is
+                    // exactly what was published last — no separate result store needed.
+                    if (hadOld)
+                        output.Add(new KeyedValue<TKey, TProjected>(bucket.Key, oldBest!), -1);
+                    if (hasNew)
+                        output.Add(new KeyedValue<TKey, TProjected>(bucket.Key, newBest!), 1);
+                }
+                else
+                {
+                    var parent = (bucket.Key, bucket.Slot >> BitsPerLevel);
+                    if (!parentChanges.TryGetValue(parent, out var list))
+                        parentChanges[parent] = list = [];
+                    if (hadOld)
+                        list.Add(new WeightedValue<TProjected>(oldBest!, -1));
+                    if (hasNew)
+                        list.Add(new WeightedValue<TProjected>(newBest!, 1));
+                }
+            }
+
+            // Buckets at one level are disjoint from the next level's reads, so the
+            // whole level's updates flush as one wave after its reads.
+            _tree.UpdateAll(updates);
+            changes = parentChanges;
         }
 
-        _eviction?.EvictClosed(RemoveTree);
+        if (_eviction?.DrainClosed() is { Count: > 0 } closed)
+            RemoveTrees(closed);
 
         return output;
     }
@@ -166,20 +177,33 @@ internal sealed class ExtremumOperator<TKey, TValue, TProjected> : IStepOperator
         return found;
     }
 
-    private void RemoveTree(TKey key) => RemoveSubtree(key, RootLevel, 0);
-
-    private void RemoveSubtree(TKey key, byte level, uint slot)
+    /// <summary>Deletes the whole tree of every closed key, walking all trees down together:
+    /// one batched read + one batched delete per level, since a bucket's entries identify
+    /// its non-empty children (leaf buckets need no read — they have no children).</summary>
+    private void RemoveTrees(List<TKey> keys)
     {
-        var bucket = new ExtremumSlot<TKey>(key, level, slot);
-        var entries = _tree.GetGroup(bucket);
-        _tree.RemoveGroup(bucket);
-        if (level == 0)
-            return;
-        foreach (var (value, _) in entries)
+        var buckets = new List<ExtremumSlot<TKey>>(keys.Count);
+        foreach (var key in keys)
+            buckets.Add(new ExtremumSlot<TKey>(key, RootLevel, 0));
+
+        for (var level = RootLevel; level >= 1 && buckets.Count > 0; level--)
         {
-            var leafSlot = (uint)StableHash.Of(value) & LeafMask;
-            RemoveSubtree(key, (byte)(level - 1), leafSlot >> (BitsPerLevel * (level - 1)));
+            var entriesPerBucket = _tree.GetGroups(buckets);
+            _tree.RemoveGroups(buckets);
+
+            var children = new List<ExtremumSlot<TKey>>();
+            for (var i = 0; i < buckets.Count; i++)
+            {
+                foreach (var (value, _) in entriesPerBucket[i])
+                {
+                    var leafSlot = (uint)StableHash.Of(value) & LeafMask;
+                    children.Add(new ExtremumSlot<TKey>(buckets[i].Key, (byte)(level - 1), leafSlot >> (BitsPerLevel * (level - 1))));
+                }
+            }
+            buckets = children;
         }
+
+        _tree.RemoveGroups(buckets);
     }
 }
 
