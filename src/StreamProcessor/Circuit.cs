@@ -97,6 +97,18 @@ public sealed class Circuit : IAsyncDisposable
             _pump = Task.Run(PumpAsync);
     }
 
+    /// <summary>The circuit's current event-time watermark: the frozen value as of the end
+    /// of the last step, or null when no <c>WithWatermark</c> source exists or none has
+    /// seen data yet.</summary>
+    public DateTimeOffset? CurrentWatermark
+    {
+        get
+        {
+            var ticks = _watermarkClock?.FrozenTicks ?? long.MinValue;
+            return ticks == long.MinValue ? null : new DateTimeOffset(ticks, TimeSpan.Zero);
+        }
+    }
+
     public InputHandle<T> Input<T>(string name) where T : notnull
     {
         var port = _inputs.FirstOrDefault(p => p.Name == name)

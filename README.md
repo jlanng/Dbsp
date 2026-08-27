@@ -125,7 +125,9 @@ tests/StreamProcessor.Tests            xunit: Z-set algebra, per-step delta sema
                                        Redis integration (auto-skipped when Redis is down)
 examples/StreamProcessor.Example       joined + aggregated order analytics with live retraction
 examples/StreamProcessor.LogAnalytics  simulated clickstream → 5s tumbling windows → counts → live top-3
-                                       per window; `--redis` keeps operator state in Redis
+                                       per window, rendered as an in-place Spectre.Console dashboard
+                                       (bar gauges per window, watermark in the header);
+                                       `--redis` keeps operator state in Redis
 ```
 
 ## Running with Redis

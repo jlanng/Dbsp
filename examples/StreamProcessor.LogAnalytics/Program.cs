@@ -1,19 +1,25 @@
+using System.Diagnostics;
+using Spectre.Console;
+using Spectre.Console.Rendering;
 using StackExchange.Redis;
 using StreamProcessor;
 using StreamProcessor.Storage;
 using StreamProcessor.Storage.Redis;
 
-// Live log analytics over a simulated clickstream:
+// Live log analytics over a simulated clickstream, rendered as an in-place TUI dashboard:
 //
 //   page views ──▶ 5s tumbling windows ──▶ count per (window, page) ──▶ top 3 pages per window
 //
 // Every stage is incremental: as views stream in, the counts stream retracts stale totals,
-// and the TopK stage re-ranks each window's leaderboard from those deltas alone.
+// and the TopK stage re-ranks each window's leaderboard from those deltas alone. The
+// watermark bounds state: events more than 2s late are dropped, and closed windows'
+// operator state is evicted, so the pipeline runs in constant memory.
 //
 // Run with --redis to keep all operator state in Redis (start it with `docker compose up -d`).
 
 IStorageProvider storage = new InMemoryStorageProvider();
 ConnectionMultiplexer? redis = null;
+var storageLabel = "in-memory";
 if (args.Contains("--redis"))
 {
     redis = await ConnectionMultiplexer.ConnectAsync("localhost:6379");
@@ -21,11 +27,7 @@ if (args.Contains("--redis"))
     {
         KeyPrefix = $"loganalytics:{Guid.NewGuid():N}",
     });
-    Console.WriteLine("Operator state: Redis (localhost:6379)");
-}
-else
-{
-    Console.WriteLine("Operator state: in-memory (pass --redis to use Redis)");
+    storageLabel = "redis";
 }
 
 var builder = new CircuitBuilder(new CircuitOptions { Workers = 2, Storage = storage });
@@ -33,9 +35,6 @@ var builder = new CircuitBuilder(new CircuitOptions { Workers = 2, Storage = sto
 var windowSize = TimeSpan.FromSeconds(5);
 var views = builder.Input<PageView>("views");
 
-// The watermark bounds state: events more than 2s late are dropped, and once the watermark
-// passes a window's end, both the per-page counts and the leaderboard state for that window
-// are evicted — this pipeline can run forever in constant memory.
 var viewsPerPage = views
     .WithWatermark(v => v.At, allowedLateness: TimeSpan.FromSeconds(2))
     .TumblingWindow(windowSize, v => v.At)
@@ -55,38 +54,77 @@ circuit.Start();
 var input = circuit.Input<PageView>("views");
 var topPages = circuit.Output<KeyedValue<DateTimeOffset, KeyedValue<(DateTimeOffset Window, string Page), long>>>("top-pages");
 
-// Integrate the output deltas and reprint a window's leaderboard whenever it changes.
+var runFor = TimeSpan.FromSeconds(20);
+var stopwatch = Stopwatch.StartNew();
+long eventsSent = 0;
+
+// Renderer: integrate the output deltas and redraw the dashboard in place.
 var renderer = Task.Run(async () =>
 {
     var integrated = new ZSet<KeyedValue<DateTimeOffset, KeyedValue<(DateTimeOffset Window, string Page), long>>>();
-    await foreach (var delta in topPages.ReadAllAsync())
-    {
-        integrated.AddAll(delta);
-        foreach (var window in delta.Select(entry => entry.Value.Key).Distinct().Order())
+    await AnsiConsole.Live(new Markup("[grey]waiting for data…[/]"))
+        .AutoClear(false)
+        .StartAsync(async ctx =>
         {
-            var board = integrated
-                .Where(entry => entry.Value.Key == window)
-                .OrderByDescending(entry => entry.Value.Value.Value)
-                .Select((entry, rank) => $"{rank + 1}. {entry.Value.Value.Key.Page} ({entry.Value.Value.Value})");
-            Console.WriteLine($"{window:HH:mm:ss} | {string.Join("   ", board)}");
-        }
-    }
+            var lastRefresh = 0L;
+            await foreach (var delta in topPages.ReadAllAsync())
+            {
+                integrated.AddAll(delta);
+                if (stopwatch.ElapsedMilliseconds - lastRefresh < 100)
+                    continue;
+                lastRefresh = stopwatch.ElapsedMilliseconds;
+                ctx.UpdateTarget(BuildDashboard(integrated));
+            }
+            ctx.UpdateTarget(BuildDashboard(integrated));
+        });
 });
 
-// Simulate a skewed clickstream in real time for ~12 seconds.
+// Simulate a skewed clickstream in real time.
 string[] pages = ["/home", "/pricing", "/docs", "/blog", "/about", "/careers", "/status"];
 var rng = new Random(42);
-var until = DateTimeOffset.UtcNow.AddSeconds(12);
-while (DateTimeOffset.UtcNow < until)
+while (stopwatch.Elapsed < runFor)
 {
     var page = pages[(int)(pages.Length * rng.NextDouble() * rng.NextDouble())];
     await input.InsertAsync(new PageView(page, DateTimeOffset.UtcNow));
-    await Task.Delay(TimeSpan.FromMilliseconds(10));
+    Interlocked.Increment(ref eventsSent);
+    await Task.Delay(TimeSpan.FromMilliseconds(8));
 }
 
 input.Complete();
 await renderer;
 await circuit.DisposeAsync();
 redis?.Dispose();
+
+IRenderable BuildDashboard(ZSet<KeyedValue<DateTimeOffset, KeyedValue<(DateTimeOffset Window, string Page), long>>> integrated)
+{
+    var renderables = new List<IRenderable>
+    {
+        new Markup(
+            $"[bold]live page views[/] [grey]({storageLabel} state, 2 workers)[/]   " +
+            $"[grey]elapsed[/] {stopwatch.Elapsed:mm\\:ss}   " +
+            $"[grey]events[/] {Interlocked.Read(ref eventsSent):N0}   " +
+            $"[grey]watermark[/] {(circuit.CurrentWatermark is { } wm ? wm.ToString("HH:mm:ss") : "—")}"),
+    };
+
+    var colors = new[] { Color.Green, Color.Yellow, Color.Orange1 };
+    var windows = integrated
+        .GroupBy(entry => entry.Value.Key)
+        .OrderByDescending(group => group.Key)
+        .Take(3);
+
+    foreach (var group in windows)
+    {
+        var chart = new BarChart()
+            .Width(64)
+            .Label($"[bold]{group.Key:HH:mm:ss} – {group.Key + windowSize:HH:mm:ss}[/]")
+            .LeftAlignLabel();
+        var rank = 0;
+        foreach (var entry in group.OrderByDescending(e => e.Value.Value.Value))
+            chart.AddItem(entry.Value.Value.Key.Page, entry.Value.Value.Value, colors[Math.Min(rank++, colors.Length - 1)]);
+        renderables.Add(new Padder(chart, new Padding(0, 1, 0, 0)));
+    }
+
+    return new Rows(renderables);
+}
 
 record PageView(string Page, DateTimeOffset At);
