@@ -32,6 +32,11 @@ public sealed class CircuitBuilder
 
     public CircuitOptions Options { get; }
 
+    /// <summary>The circuit's shared event-time clock; created by the first <c>WithWatermark</c>.</summary>
+    internal WatermarkClock? WatermarkClock { get; private set; }
+
+    internal WatermarkClock GetOrCreateWatermarkClock() => WatermarkClock ??= new WatermarkClock(Options.Workers);
+
     /// <summary>Declares a named input. Feed it after <see cref="Build"/> via <see cref="Circuit.Input{T}"/>.</summary>
     public ZStream<T> Input<T>(string name) where T : notnull
     {
@@ -71,7 +76,7 @@ public sealed class CircuitBuilder
     {
         ThrowIfBuilt();
         _built = true;
-        return new Circuit([.. _nodes], _inputs, _outputs, Options);
+        return new Circuit([.. _nodes], _inputs, _outputs, Options, WatermarkClock);
     }
 
     private void ThrowIfBuilt()

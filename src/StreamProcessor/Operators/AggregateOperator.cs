@@ -19,12 +19,14 @@ internal sealed class AggregateOperator<TKey, TValue, TResult> : IStepOperator
     private readonly IIndexedWeightStore<TKey, TValue> _groups;
     private readonly IValueStore<TKey, TResult> _lastEmitted;
     private readonly IAggregateFunction<TValue, TResult> _aggregate;
+    private readonly EvictionTracker<TKey>? _eviction;
 
-    public AggregateOperator(OperatorContext context, IAggregateFunction<TValue, TResult> aggregate)
+    public AggregateOperator(OperatorContext context, IAggregateFunction<TValue, TResult> aggregate, KeyEviction<TKey>? eviction)
     {
         _groups = context.Storage.CreateIndexedWeightStore<TKey, TValue>(context.StateName("groups"));
         _lastEmitted = context.Storage.CreateValueStore<TKey, TResult>(context.StateName("results"));
         _aggregate = aggregate;
+        _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
     }
 
     public object Step(object?[] inputs)
@@ -37,6 +39,7 @@ internal sealed class AggregateOperator<TKey, TValue, TResult> : IStepOperator
         {
             _groups.Update(key, value, weight);
             touched.Add(key);
+            _eviction?.Track(key);
         }
 
         foreach (var key in touched)
@@ -64,6 +67,15 @@ internal sealed class AggregateOperator<TKey, TValue, TResult> : IStepOperator
             output.Add(new KeyedValue<TKey, TResult>(key, next), 1);
             _lastEmitted.Put(key, next);
         }
+
+        // Closed keys can never be touched again (their events are dropped at the
+        // watermark), so their state is deleted without emitting retractions: results
+        // already published for them simply remain final.
+        _eviction?.EvictClosed(key =>
+        {
+            _groups.RemoveGroup(key);
+            _lastEmitted.Remove(key);
+        });
 
         return output;
     }

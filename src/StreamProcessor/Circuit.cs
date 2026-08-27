@@ -20,6 +20,7 @@ public sealed class Circuit : IAsyncDisposable
     private readonly IOutputPort[] _outputs;
     private readonly Worker[] _workers;
     private readonly Barrier _barrier;
+    private readonly WatermarkClock? _watermarkClock;
 
     // Exchange scratch space: _mailboxes[node][sender] holds the fragments (indexed by
     // target worker) that `sender` produced for that exchange node this step. The exchange
@@ -38,10 +39,12 @@ public sealed class Circuit : IAsyncDisposable
         NodeDefinition[] nodes,
         IReadOnlyList<InputRegistration> inputRegistrations,
         IReadOnlyList<OutputRegistration> outputRegistrations,
-        CircuitOptions options)
+        CircuitOptions options,
+        WatermarkClock? watermarkClock)
     {
         _nodes = nodes;
         _options = options;
+        _watermarkClock = watermarkClock;
         _barrier = new Barrier(options.Workers);
 
         _workers = new Worker[options.Workers];
@@ -135,6 +138,9 @@ public sealed class Circuit : IAsyncDisposable
             worker.Go.Release();
 
         await _stepDone.Task.ConfigureAwait(false);
+
+        // Freeze between steps so every worker sees one consistent watermark per step.
+        _watermarkClock?.Freeze();
 
         foreach (var output in _outputs)
             await output.PublishAsync(_workers, cancellationToken).ConfigureAwait(false);

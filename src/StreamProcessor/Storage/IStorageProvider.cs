@@ -42,6 +42,9 @@ public interface IIndexedWeightStore<TKey, TValue>
 
     /// <summary>All values (with weights) currently grouped under <paramref name="key"/>. Empty if none.</summary>
     IReadOnlyList<WeightedValue<TValue>> GetGroup(TKey key);
+
+    /// <summary>Drops the entire group for <paramref name="key"/> (watermark-driven eviction). No-op if absent.</summary>
+    void RemoveGroup(TKey key);
 }
 
 public interface IValueStore<TKey, TValue> where TKey : notnull

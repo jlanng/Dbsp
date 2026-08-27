@@ -72,6 +72,8 @@ public sealed class InMemoryStorageProvider : IStorageProvider
                 result[i++] = new WeightedValue<TValue>(kv.Key, kv.Value);
             return result;
         }
+
+        public void RemoveGroup(TKey key) => _groups.Remove(key);
     }
 
     private sealed class InMemoryValueStore<TKey, TValue> : IValueStore<TKey, TValue> where TKey : notnull
