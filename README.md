@@ -57,7 +57,26 @@ deltas. Integrating an output's deltas reproduces the current state of that view
 | `Aggregate` (`Count`, `Sum`, `Min`, `Max`, `Fold`, custom) | Integrated group state per key; recomputes touched groups, retracts the stale result (-1) and asserts the new one (+1). Correct for non-invertible aggregates (`MIN` under deletion) |
 | `Distinct` | Integrated weight per value; emits only presence transitions |
 | `TopK` | Integrated group per key; re-ranks touched groups and emits only membership changes (displaced rows retracted). Multiplicities count toward K |
+| `AntiJoin` | Integrated left side plus per-key right-side row counts; a key whose match-presence flips retracts or re-asserts its left rows |
+| `LeftJoin` / `FullJoin` | Pure composition: inner join ⊕ mapped anti-join(s) — the Z-set algebra makes the union incremental for free |
 | `TumblingWindow` / `HoppingWindow` | Pure data transformation (flat-map): records join every window covering their event time; keying by `(window, …)` turns any aggregate into a windowed one. Late and deleted events correct their windows via ordinary deltas |
+
+**Watermarks and eviction.** Correctness never depends on watermarks here — late events
+just produce correcting deltas. Watermarks serve one purpose: bounding state.
+`WithWatermark(v => v.At, allowedLateness)` declares an event-time source; the circuit's
+watermark advances to (max event time seen − lateness), min across sources, frozen between
+steps so all workers agree, and events below it are dropped. Downstream,
+`.WithEviction(key => closesAt)` on a keyed stream lets aggregations and TopK delete a
+key's state once the watermark passes its deadline — already-emitted results stay final,
+and a windowed pipeline runs forever in constant memory:
+
+```csharp
+views.WithWatermark(v => v.At, allowedLateness: TimeSpan.FromSeconds(2))
+     .TumblingWindow(windowSize, v => v.At)
+     .IndexBy(w => (Window: w.WindowStart, Page: w.Value.Page))
+     .WithEviction(key => key.Window + windowSize)
+     .Count();
+```
 
 **Exchange (multi-threading).** `CircuitOptions.Workers = N` runs N worker threads, each
 owning its own instance of every operator and its own shard of all operator state.
@@ -127,8 +146,10 @@ Scaffold — the semantics above are implemented and tested, with plenty of head
 - [ ] Checkpointing input offsets with state for exactly-once restart (Redis provider)
 - [x] `TopK` (per-key ranking with retraction of displaced rows)
 - [x] Tumbling and hopping event-time windows (assignment; late data handled by deltas)
-- [ ] Watermarks: window-close notifications and eviction of closed-window state
-- [ ] Anti-join / outer join, session windows
+- [x] Watermarks: late-event filtering and eviction of closed-key state (aggregate/TopK)
+- [x] Anti-join, left and full outer joins
+- [ ] Window-close notifications (emit "window X is final" for downstream consumers)
+- [ ] Watermark-driven eviction for join/anti-join/distinct state; session windows
 - [ ] Recursive/iterative circuits (DBSP fixed points) for transitive closure-style queries
 - [ ] Cooperative fault propagation across workers (a faulted worker currently poisons the
       circuit; disposal is required)

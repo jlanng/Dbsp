@@ -30,15 +30,22 @@ else
 
 var builder = new CircuitBuilder(new CircuitOptions { Workers = 2, Storage = storage });
 
+var windowSize = TimeSpan.FromSeconds(5);
 var views = builder.Input<PageView>("views");
 
+// The watermark bounds state: events more than 2s late are dropped, and once the watermark
+// passes a window's end, both the per-page counts and the leaderboard state for that window
+// are evicted — this pipeline can run forever in constant memory.
 var viewsPerPage = views
-    .TumblingWindow(TimeSpan.FromSeconds(5), v => v.At)
+    .WithWatermark(v => v.At, allowedLateness: TimeSpan.FromSeconds(2))
+    .TumblingWindow(windowSize, v => v.At)
     .IndexBy(w => (Window: w.WindowStart, Page: w.Value.Page))
+    .WithEviction(key => key.Window + windowSize)
     .Count();
 
 viewsPerPage
     .IndexBy(count => count.Key.Window)
+    .WithEviction(window => window + windowSize)
     .TopK(3, count => count.Value)
     .Output("top-pages");
 

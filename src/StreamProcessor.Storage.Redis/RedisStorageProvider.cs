@@ -97,6 +97,8 @@ public sealed class RedisStorageProvider : IStorageProvider
                 group[i] = new WeightedValue<TValue>(serializer.Deserialize<TValue>(entries[i].Name!), (long)entries[i].Value);
             return group;
         }
+
+        public void RemoveGroup(TKey key) => db.KeyDelete(GroupKey(key));
     }
 
     private sealed class RedisValueStore<TKey, TValue>(IDatabase db, string key, IStateSerializer serializer)

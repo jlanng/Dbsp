@@ -19,14 +19,16 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
     private readonly Func<TValue, TOrder> _orderBy;
     private readonly int _count;
     private readonly int _direction; // -1: largest first (descending), +1: smallest first
+    private readonly EvictionTracker<TKey>? _eviction;
 
-    public TopKOperator(OperatorContext context, int count, Func<TValue, TOrder> orderBy, bool descending)
+    public TopKOperator(OperatorContext context, int count, Func<TValue, TOrder> orderBy, bool descending, KeyEviction<TKey>? eviction)
     {
         _groups = context.Storage.CreateIndexedWeightStore<TKey, TValue>(context.StateName("groups"));
         _lastEmitted = context.Storage.CreateValueStore<TKey, WeightedValue<TValue>[]>(context.StateName("emitted"));
         _orderBy = orderBy;
         _count = count;
         _direction = descending ? -1 : 1;
+        _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
     }
 
     public object Step(object?[] inputs)
@@ -39,6 +41,7 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
         {
             _groups.Update(key, value, weight);
             touched.Add(key);
+            _eviction?.Track(key);
         }
 
         var comparer = Comparer<TOrder>.Default;
@@ -78,6 +81,12 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
                 _lastEmitted.Put(key, [.. top]);
             }
         }
+
+        _eviction?.EvictClosed(key =>
+        {
+            _groups.RemoveGroup(key);
+            _lastEmitted.Remove(key);
+        });
 
         return output;
     }
