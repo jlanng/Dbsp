@@ -76,6 +76,7 @@ public static class WindowExtensions
         where TValue : notnull
     {
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(gap, TimeSpan.Zero, nameof(gap));
+        stream.Builder.RequireOutsideRecursion("SessionWindow");
         var builder = stream.Builder;
         var gapTicks = gap.Ticks;
         return new KeyedZStream<TKey, Windowed<TValue>>(

@@ -13,6 +13,23 @@ internal sealed class NodeDefinition
 }
 
 /// <summary>
+/// A contiguous range of nodes the scheduler iterates to a fixed point within each outer
+/// step (a <c>Recurse</c> subcircuit): [<see cref="Start"/> = feedback node … body …
+/// stabilizing distinct = <see cref="ResultNode"/> … <see cref="End"/> = exit node]. Node
+/// ids are assigned in creation order, so the range is contiguous and id order remains the
+/// topological order within an iteration; the only back-edge — result to feedback — is
+/// handed across iterations by the scheduler, never read through a slot.
+/// </summary>
+internal sealed class LoopRegion
+{
+    public required int Index { get; init; }
+    public required int Start { get; init; }
+    public required int End { get; init; }
+    public required int ResultNode { get; init; }
+    public required int MaxIterations { get; init; }
+}
+
+/// <summary>
 /// Declares the dataflow graph of a circuit: inputs, operators, and outputs. Streams are
 /// handles into the graph under construction; <see cref="Build"/> freezes it into a runnable
 /// <see cref="Circuit"/>.
@@ -22,6 +39,8 @@ public sealed class CircuitBuilder
     private readonly List<NodeDefinition> _nodes = [];
     private readonly List<InputRegistration> _inputs = [];
     private readonly List<OutputRegistration> _outputs = [];
+    private readonly List<LoopRegion> _loopRegions = [];
+    private RecursionScope? _scope;
     private bool _built;
 
     public CircuitBuilder(CircuitOptions? options = null)
@@ -42,6 +61,7 @@ public sealed class CircuitBuilder
     public ZStream<T> Input<T>(string name) where T : notnull
     {
         ThrowIfBuilt();
+        RequireOutsideRecursion("Input");
         if (_inputs.Any(i => i.Name == name))
             throw new ArgumentException($"An input named '{name}' already exists.", nameof(name));
 
@@ -58,6 +78,7 @@ public sealed class CircuitBuilder
         where TValue : notnull
     {
         ThrowIfBuilt();
+        RequireOutsideRecursion("KeyedInput");
         if (_inputs.Any(i => i.Name == name))
             throw new ArgumentException($"An input named '{name}' already exists.", nameof(name));
 
@@ -69,6 +90,22 @@ public sealed class CircuitBuilder
     internal int AddNode(string kind, int[] inputs, Func<OperatorContext, IStepOperator> factory, bool isExchange = false)
     {
         ThrowIfBuilt();
+        foreach (var input in inputs)
+            RequireVisible(input);
+
+        // Inside a Recurse body, a reference to a stream defined outside the loop goes
+        // through an import node (DBSP's δ0): the outer delta enters the iteration domain
+        // at iteration 0 only. One import per outer node per loop.
+        if (_scope is { } scope)
+            for (var i = 0; i < inputs.Length; i++)
+                if (inputs[i] < scope.Start)
+                    inputs[i] = scope.ImportOf(inputs[i], this);
+
+        return AddNodeCore(kind, inputs, factory, isExchange);
+    }
+
+    private int AddNodeCore(string kind, int[] inputs, Func<OperatorContext, IStepOperator> factory, bool isExchange)
+    {
         var id = _nodes.Count;
         _nodes.Add(new NodeDefinition
         {
@@ -84,16 +121,71 @@ public sealed class CircuitBuilder
     internal void AddOutput<T>(string name, int nodeId) where T : notnull
     {
         ThrowIfBuilt();
+        RequireOutsideRecursion("Output");
+        RequireVisible(nodeId);
         if (_outputs.Any(o => o.Name == name))
             throw new ArgumentException($"An output named '{name}' already exists.", nameof(name));
         _outputs.Add(new OutputRegistration<T> { Name = name, NodeId = nodeId });
+    }
+
+    /// <summary>Streams defined inside a Recurse body carry per-iteration deltas that are
+    /// meaningless outside the loop; only the stream Recurse returns is visible downstream.</summary>
+    private void RequireVisible(int nodeId)
+    {
+        if (_loopRegions.Any(r => nodeId >= r.Start && nodeId < r.End))
+            throw new InvalidOperationException(
+                "A stream defined inside a Recurse body cannot be used outside its loop; use the stream Recurse returns.");
+    }
+
+    internal bool InRecursionScope => _scope is not null;
+
+    internal void RequireOutsideRecursion(string operation)
+    {
+        if (_scope is not null)
+            throw new NotSupportedException(
+                $"{operation} is not supported inside a Recurse body. A loop body may use Map, Filter, FlatMap, " +
+                "Plus, Minus, Negate, IndexBy, MapValues, Values, Join, and Distinct.");
+    }
+
+    internal RecursionScope OpenRecursionScope()
+    {
+        ThrowIfBuilt();
+        if (_scope is not null)
+            throw new NotSupportedException("Nested Recurse is not supported.");
+        return _scope = new RecursionScope(_nodes.Count);
+    }
+
+    internal void CloseRecursionScope(RecursionScope scope, int resultNode, int exitNode, int maxIterations)
+    {
+        _scope = null;
+        _loopRegions.Add(new LoopRegion
+        {
+            Index = _loopRegions.Count,
+            Start = scope.Start,
+            End = exitNode,
+            ResultNode = resultNode,
+            MaxIterations = maxIterations,
+        });
+    }
+
+    internal sealed class RecursionScope(int start)
+    {
+        private readonly Dictionary<int, int> _imports = [];
+
+        /// <summary>First node id of the loop region (the feedback node).</summary>
+        public int Start { get; } = start;
+
+        public int ImportOf(int outerNode, CircuitBuilder builder) =>
+            _imports.TryGetValue(outerNode, out var import)
+                ? import
+                : _imports[outerNode] = builder.AddNodeCore("loopImport", [outerNode], _ => new LoopImportOperator(), isExchange: false);
     }
 
     public Circuit Build()
     {
         ThrowIfBuilt();
         _built = true;
-        return new Circuit([.. _nodes], _inputs, _outputs, Options, WatermarkClock);
+        return new Circuit([.. _nodes], [.. _loopRegions], _inputs, _outputs, Options, WatermarkClock);
     }
 
     private void ThrowIfBuilt()

@@ -29,6 +29,7 @@ public static class WatermarkExtensions
         where T : notnull
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(allowedLateness, TimeSpan.Zero, nameof(allowedLateness));
+        stream.Builder.RequireOutsideRecursion("WithWatermark");
         var clock = stream.Builder.GetOrCreateWatermarkClock();
         var tracker = clock.RegisterTracker(allowedLateness.Ticks);
         return new ZStream<T>(

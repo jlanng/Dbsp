@@ -56,7 +56,52 @@ public class ZStream<T> where T : notnull
                 _ => new ExchangeOperator<T>(static v => EqualityComparer<T>.Default.GetHashCode(v)),
                 isExchange: true);
         }
-        return new ZStream<T>(Builder, Builder.AddNode("distinct", [upstream], ctx => new DistinctOperator<T>(ctx)));
+        // Inside a Recurse body the operator must be incremental in the iteration dimension
+        // too; see RecursionOperators.cs.
+        var inLoop = Builder.InRecursionScope;
+        return new ZStream<T>(Builder, Builder.AddNode("distinct", [upstream],
+            ctx => inLoop ? new LoopDistinctOperator<T>(ctx) : (IStepOperator)new DistinctOperator<T>(ctx)));
+    }
+
+    /// <summary>
+    /// Closes the stream over itself and computes the least fixed point
+    /// <c>X = Distinct(this ∪ body(X))</c> — the DBSP recursive circuit, with this stream as
+    /// the seed and <c>Distinct</c> as the built-in stabilizer. <paramref name="body"/>
+    /// receives the recursive stream and may use the linear operators plus
+    /// <c>IndexBy</c>/<c>Join</c>/<c>Distinct</c>; it may also reference other streams of
+    /// the circuit (they are imported into the loop automatically). Within every outer step
+    /// the subcircuit iterates until no delta circulates on any worker — workers iterate in
+    /// lockstep, so exchanges inside the body stay barrier-aligned — and the result stream
+    /// carries the net change of the new fixed point versus the previous step's, so
+    /// downstream operators see ordinary incremental deltas. Retractions flow through like
+    /// any other delta: deleting a seed or imported row retracts exactly the derived rows
+    /// that no longer have a well-founded derivation, cyclic derivations included. The
+    /// classic use is transitive closure:
+    /// <code>
+    /// var closure = edges.Map(e =&gt; (e.From, e.To))
+    ///     .Recurse(paths =&gt; paths
+    ///         .IndexBy(p =&gt; p.To)
+    ///         .Join(edges.IndexBy(e =&gt; e.From), (_, p, e) =&gt; (p.From, e.To)));
+    /// </code>
+    /// </summary>
+    /// <param name="body">The monotone step of the recursion, applied to the recursive stream.</param>
+    /// <param name="maxIterations">Iterations allowed per outer step before the circuit
+    /// faults with <see cref="InvalidOperationException"/> — a guard against bodies that
+    /// never converge (e.g. non-monotone ones that oscillate).</param>
+    public ZStream<T> Recurse(Func<ZStream<T>, ZStream<T>> body, int maxIterations = 10_000)
+    {
+        ArgumentNullException.ThrowIfNull(body);
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxIterations, 1, nameof(maxIterations));
+
+        var scope = Builder.OpenRecursionScope();
+        var feedback = new ZStream<T>(Builder, Builder.AddNode("loopFeedback", [], _ => new LoopFeedbackOperator<T>()));
+        var bodyResult = body(feedback);
+        ArgumentNullException.ThrowIfNull(bodyResult);
+        RequireSameBuilder(bodyResult);
+        var stabilized = Plus(bodyResult).Distinct();
+        var exit = Builder.AddNode("loopExit", [stabilized.NodeId], _ => new LoopExitOperator<T>());
+        Builder.CloseRecursionScope(scope, stabilized.NodeId, exit, maxIterations);
+        return new ZStream<T>(Builder, exit);
     }
 
     /// <summary>
@@ -126,6 +171,7 @@ public sealed class KeyedZStream<TKey, TValue> : ZStream<KeyedValue<TKey, TValue
     /// </summary>
     public KeyedZStream<TKey, TValue> WithEviction(Func<TKey, DateTimeOffset> closesAt)
     {
+        Builder.RequireOutsideRecursion("WithEviction");
         var clock = Builder.WatermarkClock
             ?? throw new InvalidOperationException(
                 "WithEviction requires an event-time watermark; call WithWatermark on an input stream first.");
@@ -165,10 +211,13 @@ public sealed class KeyedZStream<TKey, TValue> : ZStream<KeyedValue<TKey, TValue
         return WindowCloses(policy);
     }
 
-    private KeyedZStream<TKey, DateTimeOffset> WindowCloses(KeyEviction<TKey> policy) =>
-        new(Builder,
+    private KeyedZStream<TKey, DateTimeOffset> WindowCloses(KeyEviction<TKey> policy)
+    {
+        Builder.RequireOutsideRecursion("WindowCloses");
+        return new(Builder,
             Builder.AddNode("windowClose", [NodeId], _ => new WindowCloseOperator<TKey, TValue>(policy)),
             policy);
+    }
 
     /// <summary>Incremental equi-join on the shared key.</summary>
     public ZStream<TOut> Join<TRight, TOut>(
@@ -179,6 +228,19 @@ public sealed class KeyedZStream<TKey, TValue> : ZStream<KeyedValue<TKey, TValue
     {
         RequireSameBuilder(right);
         var eviction = _eviction ?? right._eviction;
+        if (Builder.InRecursionScope)
+        {
+            // Inside a Recurse body the join must be incremental in the iteration dimension
+            // too; see RecursionOperators.cs. Eviction has no meaning there.
+            if (eviction is not null)
+                Builder.RequireOutsideRecursion("Join on a stream with WithEviction");
+            return new ZStream<TOut>(
+                Builder,
+                Builder.AddNode(
+                    "loopJoin",
+                    [NodeId, right.NodeId],
+                    ctx => new LoopJoinOperator<TKey, TValue, TRight, TOut>(ctx, resultSelector)));
+        }
         return new ZStream<TOut>(
             Builder,
             Builder.AddNode(
@@ -195,6 +257,7 @@ public sealed class KeyedZStream<TKey, TValue> : ZStream<KeyedValue<TKey, TValue
     public KeyedZStream<TKey, TValue> AntiJoin<TRight>(KeyedZStream<TKey, TRight> right)
         where TRight : notnull
     {
+        Builder.RequireOutsideRecursion("AntiJoin");
         RequireSameBuilder(right);
         var eviction = _eviction ?? right._eviction;
         return new KeyedZStream<TKey, TValue>(
@@ -230,19 +293,25 @@ public sealed class KeyedZStream<TKey, TValue> : ZStream<KeyedValue<TKey, TValue
     /// <summary>Grouped aggregation. The result stream carries one (key, result) row per key,
     /// with the previous result retracted whenever it changes.</summary>
     public KeyedZStream<TKey, TResult> Aggregate<TResult>(IAggregateFunction<TValue, TResult> aggregate)
-        where TResult : notnull =>
-        new(Builder,
+        where TResult : notnull
+    {
+        Builder.RequireOutsideRecursion("Aggregate");
+        return new(Builder,
             Builder.AddNode("aggregate", [NodeId], ctx => new AggregateOperator<TKey, TValue, TResult>(ctx, aggregate, _eviction)),
             _eviction);
+    }
 
     /// <summary>Grouped aggregation for a linear aggregate (COUNT, SUM, …): maintained from
     /// deltas alone with O(1) state per key — no group contents are stored, so update cost
     /// is independent of group size.</summary>
     public KeyedZStream<TKey, TResult> AggregateLinear<TResult>(ILinearAggregate<TValue, TResult> aggregate)
-        where TResult : notnull =>
-        new(Builder,
+        where TResult : notnull
+    {
+        Builder.RequireOutsideRecursion("AggregateLinear");
+        return new(Builder,
             Builder.AddNode("aggregateLinear", [NodeId], ctx => new LinearAggregateOperator<TKey, TValue, TResult>(ctx, aggregate, _eviction)),
             _eviction);
+    }
 
     public KeyedZStream<TKey, long> Count() => AggregateLinear(LinearAggregates.Count<TValue>());
 
@@ -255,17 +324,23 @@ public sealed class KeyedZStream<TKey, TValue> : ZStream<KeyedValue<TKey, TValue
     /// the group, so cost is independent of group size. The general recompute path remains
     /// available as <c>Aggregate(Aggregates.Min(...))</c>.</summary>
     public KeyedZStream<TKey, TProjected> Min<TProjected>(Func<TValue, TProjected> selector)
-        where TProjected : notnull =>
-        new(Builder,
+        where TProjected : notnull
+    {
+        Builder.RequireOutsideRecursion("Min");
+        return new(Builder,
             Builder.AddNode("min", [NodeId], ctx => new ExtremumOperator<TKey, TValue, TProjected>(ctx, selector, sign: -1, _eviction)),
             _eviction);
+    }
 
     /// <summary>Grouped MAX maintained by a tournament tree; see <see cref="Min{TProjected}"/>.</summary>
     public KeyedZStream<TKey, TProjected> Max<TProjected>(Func<TValue, TProjected> selector)
-        where TProjected : notnull =>
-        new(Builder,
+        where TProjected : notnull
+    {
+        Builder.RequireOutsideRecursion("Max");
+        return new(Builder,
             Builder.AddNode("max", [NodeId], ctx => new ExtremumOperator<TKey, TValue, TProjected>(ctx, selector, sign: +1, _eviction)),
             _eviction);
+    }
 
     /// <summary>
     /// Keeps only the top <paramref name="count"/> rows per key, ranked by
@@ -275,6 +350,7 @@ public sealed class KeyedZStream<TKey, TValue> : ZStream<KeyedValue<TKey, TValue
     /// </summary>
     public KeyedZStream<TKey, TValue> TopK<TOrder>(int count, Func<TValue, TOrder> orderBy, bool descending = true)
     {
+        Builder.RequireOutsideRecursion("TopK");
         ArgumentOutOfRangeException.ThrowIfLessThan(count, 1, nameof(count));
         return new KeyedZStream<TKey, TValue>(
             Builder,
@@ -285,10 +361,22 @@ public sealed class KeyedZStream<TKey, TValue> : ZStream<KeyedValue<TKey, TValue
     /// <summary>Collapses the multiset to a set, like the unkeyed <see cref="ZStream{T}.Distinct"/>,
     /// but keeps the result keyed and its state grouped by key so an eviction policy applies.
     /// The stream is already partitioned by key, so no extra exchange is needed.</summary>
-    public new KeyedZStream<TKey, TValue> Distinct() =>
-        new(Builder,
+    public new KeyedZStream<TKey, TValue> Distinct()
+    {
+        if (Builder.InRecursionScope)
+        {
+            // Iteration-aware distinct over the (key, value) pairs; the key partitioning
+            // already routes equal pairs to the same worker. Eviction has no meaning here.
+            if (_eviction is not null)
+                Builder.RequireOutsideRecursion("Distinct on a stream with WithEviction");
+            return new(Builder,
+                Builder.AddNode("distinct", [NodeId], ctx => new LoopDistinctOperator<KeyedValue<TKey, TValue>>(ctx)),
+                eviction: null);
+        }
+        return new(Builder,
             Builder.AddNode("distinct", [NodeId], ctx => new KeyedDistinctOperator<TKey, TValue>(ctx, _eviction)),
             _eviction);
+    }
 
     /// <summary>Transforms values while preserving the key and the partitioning.</summary>
     public KeyedZStream<TKey, TOut> MapValues<TOut>(Func<TValue, TOut> selector) where TOut : notnull =>

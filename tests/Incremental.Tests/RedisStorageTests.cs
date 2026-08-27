@@ -169,6 +169,42 @@ public class RedisStorageTests
     }
 
     [SkippableFact]
+    public async Task Recursive_closure_with_redis_state()
+    {
+        // The loop operators' state is iteration-profiled — (row, iteration) tuple members
+        // for the join, per-value iteration profiles for the distinct — and must round-trip
+        // through the serializer. Deletion exercises reading the profiles back.
+        using var redis = ConnectOrSkip();
+
+        var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Storage = FreshProvider(redis) });
+        var edges = builder.Input<(string From, string To)>("edges");
+        edges.Recurse(paths => paths
+                .IndexBy(p => p.To)
+                .Join(edges.IndexBy(e => e.From), (_, p, e) => (p.From, e.To)))
+            .Output("closure");
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var input = circuit.Input<(string From, string To)>("edges");
+        var output = circuit.Output<(string From, string To)>("closure");
+
+        await input.InsertAsync(("a", "b"));
+        await input.InsertAsync(("b", "c"));
+        await circuit.StepAsync();
+        var delta = await output.Reader.ReadAsync();
+        Assert.Equal(1, delta.WeightOf(("a", "b")));
+        Assert.Equal(1, delta.WeightOf(("b", "c")));
+        Assert.Equal(1, delta.WeightOf(("a", "c")));
+
+        await input.RemoveAsync(("b", "c"));
+        await circuit.StepAsync();
+        delta = await output.Reader.ReadAsync();
+        Assert.Equal(-1, delta.WeightOf(("b", "c")));
+        Assert.Equal(-1, delta.WeightOf(("a", "c")));
+        Assert.Equal(2, delta.DistinctCount);
+    }
+
+    [SkippableFact]
     public void Value_store_batches_round_trip()
     {
         using var redis = ConnectOrSkip();

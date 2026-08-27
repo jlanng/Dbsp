@@ -17,6 +17,14 @@ public sealed class Circuit : IAsyncDisposable
 {
     private readonly NodeDefinition[] _nodes;
     private readonly CircuitOptions _options;
+
+    // Recurse loop regions, looked up by their first node. Per region, one convergence flag
+    // per worker: each iteration every worker writes whether its shard still has work, the
+    // exchange barrier makes the writes visible, and every worker reads all flags — so the
+    // continue/stop decision is global and identical on all workers, keeping them iterating
+    // in lockstep (which the exchanges inside the loop rely on for barrier alignment).
+    private readonly LoopRegion?[] _loopStarts;
+    private readonly bool[][] _loopContinue;
     private readonly IInputPort[] _inputs;
     private readonly IOutputPort[] _outputs;
     private readonly Worker[] _workers;
@@ -50,6 +58,7 @@ public sealed class Circuit : IAsyncDisposable
 
     internal Circuit(
         NodeDefinition[] nodes,
+        LoopRegion[] loopRegions,
         IReadOnlyList<InputRegistration> inputRegistrations,
         IReadOnlyList<OutputRegistration> outputRegistrations,
         CircuitOptions options,
@@ -57,6 +66,11 @@ public sealed class Circuit : IAsyncDisposable
     {
         _nodes = nodes;
         _options = options;
+
+        _loopStarts = new LoopRegion?[nodes.Length];
+        foreach (var region in loopRegions)
+            _loopStarts[region.Start] = region;
+        _loopContinue = loopRegions.Select(_ => new bool[options.Workers]).ToArray();
         _watermarkClock = watermarkClock;
         _checkpoint = options.Storage as ICheckpointStorageProvider;
         _barrier = new SpinBarrier(options.Workers);
@@ -321,32 +335,101 @@ public sealed class Circuit : IAsyncDisposable
 
     private void RunWorkerStep(Worker worker)
     {
-        var slots = worker.Slots;
-        for (var n = 0; n < _nodes.Length; n++)
+        var n = 0;
+        while (n < _nodes.Length)
         {
-            var node = _nodes[n];
-            var op = worker.Operators[n];
-
-            if (node.IsExchange && _workers.Length > 1)
+            if (_loopStarts[n] is { } region)
             {
-                var exchange = (IExchangeStepOperator)op;
-                _mailboxes[n][worker.Id] = exchange.Partition(slots[node.Inputs[0]], _workers.Length);
-
-                _barrier.SignalAndWait();
-
-                var incoming = new object?[_workers.Length];
-                for (var sender = 0; sender < _workers.Length; sender++)
-                    incoming[sender] = _mailboxes[n][sender][worker.Id];
-                slots[n] = exchange.Merge(incoming);
+                RunLoop(worker, region);
+                n = region.End + 1;
             }
             else
             {
-                var inputs = new object?[node.Inputs.Length];
-                for (var i = 0; i < node.Inputs.Length; i++)
-                    inputs[i] = slots[node.Inputs[i]];
-                slots[n] = op.Step(inputs);
+                RunNode(worker, n);
+                n++;
             }
         }
+    }
+
+    private void RunNode(Worker worker, int n)
+    {
+        var slots = worker.Slots;
+        var node = _nodes[n];
+        var op = worker.Operators[n];
+
+        if (node.IsExchange && _workers.Length > 1)
+        {
+            var exchange = (IExchangeStepOperator)op;
+            _mailboxes[n][worker.Id] = exchange.Partition(slots[node.Inputs[0]], _workers.Length);
+
+            _barrier.SignalAndWait();
+
+            var incoming = new object?[_workers.Length];
+            for (var sender = 0; sender < _workers.Length; sender++)
+                incoming[sender] = _mailboxes[n][sender][worker.Id];
+            slots[n] = exchange.Merge(incoming);
+        }
+        else
+        {
+            var inputs = new object?[node.Inputs.Length];
+            for (var i = 0; i < node.Inputs.Length; i++)
+                inputs[i] = slots[node.Inputs[i]];
+            slots[n] = op.Step(inputs);
+        }
+    }
+
+    /// <summary>
+    /// Runs a Recurse region to its fixed point for this step. Every worker executes the
+    /// same iterations over the same nodes — exchanges inside the loop keep their barrier
+    /// alignment because the continue/stop decision is a global reduction, not a local one:
+    /// the loop stops only when no worker has a circulating delta or pending
+    /// iteration-profile work. The feedback node hands each iteration's stabilized delta to
+    /// the next; the exit node accumulates them into the step's outer delta.
+    /// </summary>
+    private void RunLoop(Worker worker, LoopRegion region)
+    {
+        var operators = worker.Operators;
+        for (var n = region.Start; n <= region.End; n++)
+            (operators[n] as ILoopOperator)?.BeginOuterStep();
+
+        var feedback = (ILoopFeedbackOperator)operators[region.Start];
+        var flags = _loopContinue[region.Index];
+
+        for (var iteration = 0; ; iteration++)
+        {
+            for (var n = region.Start; n <= region.End; n++)
+                (operators[n] as ILoopOperator)?.BeginIteration(iteration);
+
+            for (var n = region.Start; n <= region.End; n++)
+                RunNode(worker, n);
+
+            feedback.SetPending(worker.Slots[region.ResultNode]);
+
+            var more = feedback.PendingIsNonEmpty;
+            for (var n = region.Start; n <= region.End && !more; n++)
+                more = operators[n] is ILoopOperator op && op.HasPendingWork(iteration);
+
+            if (_workers.Length > 1)
+            {
+                flags[worker.Id] = more;
+                _barrier.SignalAndWait(); // own flag written before anyone reads
+                more = false;
+                for (var w = 0; w < flags.Length; w++)
+                    more |= flags[w];
+                _barrier.SignalAndWait(); // all flags read before anyone writes the next iteration's
+            }
+
+            if (!more)
+                break;
+
+            if (iteration + 1 >= region.MaxIterations)
+                throw new InvalidOperationException(
+                    $"Recurse did not reach a fixed point within {region.MaxIterations} iterations. " +
+                    "The loop body may not converge (is it monotone?); otherwise raise maxIterations.");
+        }
+
+        for (var n = region.Start; n <= region.End; n++)
+            (operators[n] as ILoopOperator)?.EndOuterStep();
     }
 
     /// <summary>Completes all inputs, drains and processes everything still buffered,
