@@ -129,6 +129,12 @@ examples/StreamProcessor.LogAnalytics  simulated clickstream → 5s tumbling win
                                        per window, rendered as an in-place Spectre.Console dashboard
                                        (bar gauges per window, watermark in the header);
                                        `--redis` keeps operator state in Redis
+examples/StreamProcessor.TradeEnrichment trades ⋈ reference data, composed interactively: pick which
+                                       enrichments to join (instrument; trader → desk, a two-hop
+                                       join; counterparty) and which dimensions to group by — no
+                                       dimensions gives a top-trades blotter instead. Live churn with
+                                       amendments/cancellations, and master-data changes (desk moves,
+                                       re-ratings) that re-attribute historical trades in microseconds
 examples/StreamProcessor.TaxiAnalytics genuine big data: ~3M real NYC yellow-taxi trips (parquet, read
                                        via Parquet.Net, downloaded and cached on first run, ~50MB/month;
                                        `--months N`, `--synthetic`) through join + counts + revenue +
