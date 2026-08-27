@@ -1,14 +1,15 @@
 using System.Diagnostics;
 using Parquet;
 using Spectre.Console;
+using Spectre.Console.Rendering;
 using StreamProcessor;
 
 // The point of incremental computation, demonstrated on genuine big data.
 //
-// Millions of real NYC yellow-taxi trips flow through a join + three aggregations. Then a
-// SINGLE trip is inserted (and another cancelled) and the circuit updates every result in
-// microseconds — while recomputing the same answers from the raw rows takes a full pass
-// over all of them, every time anything changes.
+// Millions of real NYC yellow-taxi trips flow through a join + three aggregations; then
+// single-row changes stream in continuously and every result stays up to date for
+// microseconds per change — while recomputing the same answers from the raw rows costs a
+// full pass over all of them, every time anything changes.
 //
 //   trips ──▶ join zones ──▶ trips & revenue per borough
 //                        └─▶ count per zone ──▶ top 5 zones per borough
@@ -25,14 +26,19 @@ for (var i = 0; i < args.Length; i++)
 }
 
 AnsiConsole.Write(new Panel(new Rows(
-        new Markup("Millions of real NYC taxi trips are pushed through an incremental circuit — a zone join feeding per-borough trip counts, revenue sums, and a top-5-zones ranking."),
-        new Markup("Then [bold]one trip is inserted and one cancelled[/]. Watch the cost: the circuit touches only what changed, while a from-scratch recompute has to scan every raw row again."),
-        new Markup("[grey]COUNT/SUM use linear aggregates: their state is one accumulator per borough — not the rows — so update cost is independent of data volume.[/]")))
+        new Markup("Millions of real NYC taxi trips are pushed through an incremental circuit — a zone join feeding per-borough trip counts, revenue sums, and a top-5-zones ranking. Then single-row changes stream in and you watch what each one costs."),
+        new Text(""),
+        new Markup("[green]▪[/] [bold]1 · bulk load[/] — every row becomes a +1-weighted delta; the circuit builds all four views in one pass."),
+        new Markup("[green]▪[/] [bold]2 · naive baseline[/] — the same views computed from the raw rows, timed. That's the cost of [italic]every[/] refresh without incrementality."),
+        new Markup("[green]▪[/] [bold]3 · one-row updates[/] — an insert and a cancellation, timed through the circuit. Only the affected borough's state is touched."),
+        new Markup("[green]▪[/] [bold]4 · continuous churn[/] — random trips inserted and cancelled until you stop it, with running totals of the time saved."),
+        new Text(""),
+        new Markup("[grey]Data: NYC TLC yellow-taxi trip records (public parquet files, cached in ./data), read with the Parquet.Net library — only the two columns used (pickup zone, total amount) are decoded.[/]")))
     .Header("[bold] incremental computation vs. big data [/]")
     .Padding(1, 0)
     .BorderColor(Color.Grey));
 
-// ── 1. Acquire data ─────────────────────────────────────────────────────────────
+// ── acquire data ────────────────────────────────────────────────────────────────
 
 var zoneRows = new List<ZoneInfo>();
 var tripZones = new List<int>(4_000_000);
@@ -55,8 +61,9 @@ if (synthetic)
 
 var totalRows = tripZones.Count;
 AnsiConsole.MarkupLine($"[grey]dataset:[/] {totalRows:N0} trips, {zoneRows.Count} zones{(synthetic ? " [grey](synthetic)[/]" : "")}");
+AnsiConsole.WriteLine();
 
-// ── 2. Build the circuit ────────────────────────────────────────────────────────
+// ── build the circuit ───────────────────────────────────────────────────────────
 
 var builder = new CircuitBuilder(new CircuitOptions
 {
@@ -105,7 +112,13 @@ long DrainOutputs()
     return deltaRows;
 }
 
-// ── 3. Bulk load ────────────────────────────────────────────────────────────────
+// ── 1 · bulk load ───────────────────────────────────────────────────────────────
+
+AnsiConsole.Write(new Rule("[bold]1 · bulk load[/]").LeftJustified());
+AnsiConsole.MarkupLine(
+    "[grey]Trips are inserted as +1-weighted deltas and the circuit is stepped every 250k rows. " +
+    "Each step pushes only that batch through join and aggregates — the join probes its integrated " +
+    "state, and COUNT/SUM fold the batch into one accumulator per borough.[/]");
 
 await zonesIn.SendAsync(zoneRows.Select(z => new WeightedValue<ZoneInfo>(z, 1)));
 await circuit.StepAsync();
@@ -150,7 +163,13 @@ AnsiConsole.WriteLine();
 
 RenderResults();
 
-// ── 4. The naive baseline: what every update costs without incrementality ───────
+// ── 2 · the naive baseline ──────────────────────────────────────────────────────
+
+AnsiConsole.Write(new Rule("[bold]2 · the naive baseline[/]").LeftJustified());
+AnsiConsole.MarkupLine(
+    "[grey]The same four views computed the way a batch job or dashboard query would: " +
+    "one pass over every raw row, rebuilding the dictionaries from scratch. Without " +
+    "incrementality this cost is paid on every refresh, however small the change.[/]");
 
 var naiveDuration = TimeSpan.MaxValue;
 for (var run = 0; run < 2; run++)
@@ -158,34 +177,98 @@ for (var run = 0; run < 2; run++)
     var d = TimeNaiveRecompute();
     if (d < naiveDuration) naiveDuration = d;
 }
+AnsiConsole.MarkupLine($"  full recompute over {totalRows:N0} rows: [bold]{naiveDuration.TotalMilliseconds:N1} ms[/]");
+AnsiConsole.WriteLine();
 
-// ── 5. Single-row updates through the circuit ───────────────────────────────────
+// ── 3 · one-row updates ─────────────────────────────────────────────────────────
+
+AnsiConsole.Write(new Rule("[bold]3 · now change one row[/]").LeftJustified());
+AnsiConsole.MarkupLine(
+    "[grey]A single trip is inserted, then cancelled (weight -1). Watch the join emit one " +
+    "delta, the borough's COUNT and SUM fold it into their accumulators, and TopK re-rank " +
+    "one small group — a handful of delta rows, whatever the dataset size.[/]");
 
 // Warm the step path so timings measure work, not first-call effects.
 for (var i = 0; i < 3; i++)
     await circuit.StepAsync();
 
-AnsiConsole.Write(new Rule("[bold]now change one row[/]").LeftJustified());
+var updateCount = 0L;
+var updateTicks = 0L;
 
 var jfk = zoneRows.First(z => z.Name.Contains("JFK")).Id;
-var updateTimings = new List<TimeSpan>
+await ApplyUpdateAsync("insert a $10,000 trip at JFK", new Trip(jfk, 10_000.00), +1, narrate: true);
+await ApplyUpdateAsync("the ride is cancelled (retract it)", new Trip(jfk, 10_000.00), -1, narrate: true);
+AnsiConsole.WriteLine();
+
+// ── 4 · continuous churn ────────────────────────────────────────────────────────
+
+var interactive = !Console.IsInputRedirected;
+AnsiConsole.Write(new Rule("[bold]4 · continuous churn[/]").LeftJustified());
+AnsiConsole.MarkupLine(
+    $"[grey]Random trips now stream in (1 in 4 cancels an earlier one) and every view stays " +
+    $"current. {(interactive ? "[bold]Press any key to stop.[/]" : "Non-interactive input: stopping after 30 updates.")}[/]");
+
+var churnRng = new Random(7);
+var insertedPool = new List<Trip>();
+var lastDescription = "warming up…";
+var lastMicros = 0.0;
+var maxChurnUpdates = interactive ? long.MaxValue : 30;
+var churnApplied = 0L;
+
+await AnsiConsole.Live(BuildLiveView()).AutoClear(false).StartAsync(async ctx =>
 {
-    await ApplyUpdateAsync("insert a $10,000 trip at JFK", new Trip(jfk, 10_000.00), +1),
-    await ApplyUpdateAsync("the ride is cancelled (retract it)", new Trip(jfk, 10_000.00), -1),
-    await ApplyUpdateAsync("insert a $25.50 trip at Newark Airport", new Trip(1, 25.50), +1),
-};
+    while (churnApplied < maxChurnUpdates)
+    {
+        if (interactive && Console.KeyAvailable)
+        {
+            Console.ReadKey(intercept: true);
+            break;
+        }
 
-// ── 6. The comparison ───────────────────────────────────────────────────────────
+        Trip trip;
+        long weight;
+        if (insertedPool.Count > 0 && churnRng.NextDouble() < 0.25)
+        {
+            var index = churnRng.Next(insertedPool.Count);
+            trip = insertedPool[index];
+            insertedPool.RemoveAt(index);
+            weight = -1;
+            lastDescription = $"cancel {trip.Total:C} trip at {ZoneName(trip.Zone)}";
+        }
+        else
+        {
+            var zone = zoneRows[churnRng.Next(zoneRows.Count)];
+            var amount = churnRng.NextDouble() < 0.05
+                ? Math.Round(500 + churnRng.NextDouble() * 4500, 2) // the occasional surge fare
+                : Math.Round(5 + churnRng.NextDouble() * 145, 2);
+            trip = new Trip(zone.Id, amount);
+            insertedPool.Add(trip);
+            weight = +1;
+            lastDescription = $"insert {amount:C} trip at {zone.Name}";
+        }
 
-var avgIncremental = TimeSpan.FromTicks((long)updateTimings.Average(t => t.Ticks));
+        lastMicros = await ApplyUpdateAsync(lastDescription, trip, weight, narrate: false);
+        churnApplied++;
+        ctx.UpdateTarget(BuildLiveView());
+        await Task.Delay(250);
+    }
+});
+
+// ── the punchline ───────────────────────────────────────────────────────────────
+
+var avgIncremental = TimeSpan.FromTicks(updateTicks / Math.Max(1, updateCount));
 var speedup = naiveDuration.TotalMicroseconds / avgIncremental.TotalMicroseconds;
+var naiveEquivalent = naiveDuration * updateCount;
+var actualSpent = TimeSpan.FromTicks(updateTicks);
 
 AnsiConsole.Write(new Panel(new Rows(
-        new Markup($"bulk load               [bold]{totalRows / loadTimer.Elapsed.TotalSeconds,12:N0}[/] rows/s"),
-        new Markup($"one-row update (circuit) [bold]{avgIncremental.TotalMicroseconds,11:N0}[/] µs   touches only the affected borough"),
-        new Markup($"one-row update (naive)   [bold]{naiveDuration.TotalMilliseconds,11:N1}[/] ms   full pass over {totalRows:N0} raw rows"),
+        new Markup($"bulk load                [bold]{totalRows / loadTimer.Elapsed.TotalSeconds,12:N0}[/] rows/s"),
+        new Markup($"one-row update (circuit) [bold]{avgIncremental.TotalMicroseconds,12:N0}[/] µs   avg over {updateCount} updates"),
+        new Markup($"one-row update (naive)   [bold]{naiveDuration.TotalMilliseconds,12:N1}[/] ms   full pass over {totalRows:N0} raw rows"),
         new Text(""),
-        new Markup($"[bold green]incremental is {speedup:N0}× cheaper per update[/] — and the gap grows with the data.")))
+        new Markup($"[bold green]incremental is {speedup:N0}× cheaper per update[/] — keeping these views current through " +
+                   $"{updateCount} changes cost {actualSpent.TotalMilliseconds:N0} ms instead of {naiveEquivalent.TotalSeconds:N1} s, " +
+                   "and the gap grows with the data.")))
     .Header("[bold] the punchline [/]")
     .Padding(1, 0)
     .BorderColor(Color.Green));
@@ -195,22 +278,67 @@ return;
 
 // ────────────────────────────────────────────────────────────────────────────────
 
-async Task<TimeSpan> ApplyUpdateAsync(string title, Trip trip, long weight)
+async Task<double> ApplyUpdateAsync(string title, Trip trip, long weight, bool narrate)
 {
     await tripsIn.SendAsync(trip, weight);
     var timer = Stopwatch.StartNew();
     await circuit.StepAsync();
     timer.Stop();
     var deltaRows = DrainOutputs();
+    updateCount++;
+    updateTicks += timer.Elapsed.Ticks;
 
-    var borough = zoneRows.First(z => z.Id == trip.Zone).Borough;
-    var tripsNow = countsView.Single(e => e.Value.Key == borough).Value.Value;
-    var revenueNow = revenueView.Single(e => e.Value.Key == borough).Value.Value;
-    AnsiConsole.MarkupLine(
-        $"  [bold]{Markup.Escape(title)}[/] → step took [bold green]{timer.Elapsed.TotalMicroseconds:N0} µs[/], " +
-        $"{deltaRows} delta rows emitted; {borough} is now {tripsNow:N0} trips / {revenueNow:C0}");
-    return timer.Elapsed;
+    if (narrate)
+    {
+        var borough = zoneRows.First(z => z.Id == trip.Zone).Borough;
+        var tripsNow = countsView.Single(e => e.Value.Key == borough).Value.Value;
+        var revenueNow = revenueView.Single(e => e.Value.Key == borough).Value.Value;
+        AnsiConsole.MarkupLine(
+            $"  [bold]{Markup.Escape(title)}[/] → step took [bold green]{timer.Elapsed.TotalMicroseconds:N0} µs[/], " +
+            $"{deltaRows} delta rows emitted; {borough} is now {tripsNow:N0} trips / {revenueNow:C0}");
+    }
+    return timer.Elapsed.TotalMicroseconds;
 }
+
+IRenderable BuildLiveView()
+{
+    var avgMicros = updateCount == 0 ? 0 : TimeSpan.FromTicks(updateTicks / updateCount).TotalMicroseconds;
+    var savedSoFar = naiveDuration * churnApplied - TimeSpan.FromTicks(updateTicks);
+
+    var table = new Table().Border(TableBorder.Rounded);
+    table.AddColumn("borough");
+    table.AddColumn(new TableColumn("trips").RightAligned());
+    table.AddColumn(new TableColumn("revenue").RightAligned());
+    table.AddColumn("busiest zone");
+
+    var busiest = topZonesView
+        .GroupBy(e => e.Value.Key)
+        .ToDictionary(
+            g => g.Key,
+            g => g.OrderByDescending(e => e.Value.Value.Value)
+                .Select(e => $"{e.Value.Value.Key.Name} ({e.Value.Value.Value:N0})")
+                .FirstOrDefault(""));
+
+    foreach (var entry in countsView.OrderByDescending(e => e.Value.Value))
+    {
+        var borough = entry.Value.Key;
+        var revenue = revenueView.SingleOrDefault(e => e.Value.Key == borough).Value.Value;
+        table.AddRow(
+            Markup.Escape(borough),
+            $"{entry.Value.Value:N0}",
+            $"{revenue:C0}",
+            Markup.Escape(busiest.GetValueOrDefault(borough, "")));
+    }
+
+    return new Rows(
+        new Markup(
+            $"[grey]updates[/] {churnApplied:N0}   [grey]last[/] {Markup.Escape(lastDescription)} " +
+            $"([bold green]{lastMicros:N0} µs[/])   [grey]avg[/] {avgMicros:N0} µs   " +
+            $"[grey]vs naive recompute each time:[/] [bold]{Math.Max(0, savedSoFar.TotalSeconds):N1} s saved[/]"),
+        table);
+}
+
+string ZoneName(int zoneId) => zoneRows.FirstOrDefault(z => z.Id == zoneId)?.Name ?? $"zone {zoneId}";
 
 TimeSpan TimeNaiveRecompute()
 {
@@ -304,6 +432,9 @@ async Task DownloadAsync(HttpClient http, string url, string path)
     });
 }
 
+// Parquet ingestion (via the Parquet.Net library): open the file, walk its row groups, and
+// decode only the two columns this demo uses — columnar storage means the other ~17 columns
+// are never even read off disk.
 async Task ReadTripsParquetAsync(string path)
 {
     using var reader = await ParquetReader.CreateAsync(path);
