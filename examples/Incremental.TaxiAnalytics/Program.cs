@@ -14,10 +14,10 @@ using Incremental;
 //   trips ──▶ join zones ──▶ trips & revenue per borough
 //                        └─▶ count per zone ──▶ top 5 zones per borough
 //
-// Usage: [--months N]   load N months of 2024 data (default 1, ≈3M rows / ≈50MB each)
+// Usage: [--months N]   load N months of 2024 data (default 4, ≈12.7M rows; ≈50MB download each)
 //        [--synthetic]  skip the download, generate similar data locally
 
-var months = 1;
+var months = 4;
 var synthetic = false;
 for (var i = 0; i < args.Length; i++)
 {
@@ -228,11 +228,21 @@ await AnsiConsole.Live(BuildLiveView()).AutoClear(false).StartAsync(async ctx =>
     // first step after an idle gap pays extra for waking parked cores and cold caches,
     // and that cost belongs here rather than in the first displayed reading.
     await Task.Delay(200);
-    await tripsIn.SendAsync(warmupTrip, +1);
-    await circuit.StepAsync();
-    await tripsIn.SendAsync(warmupTrip, -1);
-    await circuit.StepAsync();
+    for (var i = 0; i < 8; i++)
+    {
+        // Shaped exactly like the timed churn (random zones touch the big boroughs'
+        // state), but inserted-then-retracted so the net effect on every view is zero.
+        var dryRun = new Trip(zoneRows[churnRng.Next(zoneRows.Count)].Id, Math.Round(5 + churnRng.NextDouble() * 145, 2));
+        await tripsIn.SendAsync(dryRun, +1);
+        await circuit.StepAsync();
+        await tripsIn.SendAsync(dryRun, -1);
+        await circuit.StepAsync();
+    }
     DrainOutputs();
+    // Match the churn cadence before the first timed update: a step fired immediately
+    // after the hot dry-run burst measures ~4× slower than one following the same idle
+    // gap the real updates get (scheduler state after a burst differs from steady state).
+    await Task.Delay(250);
 
     while (churnApplied < maxChurnUpdates)
     {
