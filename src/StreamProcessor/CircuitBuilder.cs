@@ -49,6 +49,22 @@ public sealed class CircuitBuilder
         return new ZStream<T>(this, nodeId);
     }
 
+    /// <summary>Declares a named input with upsert/delete-by-key semantics: after
+    /// <see cref="Build"/>, <see cref="Circuit.KeyedInput{TKey,TValue}"/> returns a handle
+    /// whose <c>UpsertAsync</c> retracts the previous row for the key automatically.</summary>
+    public ZStream<TValue> KeyedInput<TKey, TValue>(string name, Func<TValue, TKey> keySelector)
+        where TKey : notnull
+        where TValue : notnull
+    {
+        ThrowIfBuilt();
+        if (_inputs.Any(i => i.Name == name))
+            throw new ArgumentException($"An input named '{name}' already exists.", nameof(name));
+
+        var nodeId = AddNode($"input[{name}]", [], _ => new InputOperator<TValue>());
+        _inputs.Add(new KeyedInputRegistration<TKey, TValue> { Name = name, NodeId = nodeId, KeySelector = keySelector });
+        return new ZStream<TValue>(this, nodeId);
+    }
+
     internal int AddNode(string kind, int[] inputs, Func<OperatorContext, IStepOperator> factory, bool isExchange = false)
     {
         ThrowIfBuilt();

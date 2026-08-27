@@ -117,6 +117,17 @@ public sealed class Circuit : IAsyncDisposable
             ?? throw new InvalidOperationException($"Input '{name}' does not carry elements of type {typeof(T).Name}.");
     }
 
+    public KeyedInputHandle<TKey, TValue> KeyedInput<TKey, TValue>(string name)
+        where TKey : notnull
+        where TValue : notnull
+    {
+        var port = _inputs.FirstOrDefault(p => p.Name == name)
+            ?? throw new KeyNotFoundException($"No input named '{name}'.");
+        return port.Handle as KeyedInputHandle<TKey, TValue>
+            ?? throw new InvalidOperationException(
+                $"Input '{name}' is not a keyed input of ({typeof(TKey).Name}, {typeof(TValue).Name}); declare it with CircuitBuilder.KeyedInput.");
+    }
+
     public OutputHandle<T> Output<T>(string name) where T : notnull
     {
         var port = _outputs.FirstOrDefault(p => p.Name == name)

@@ -15,6 +15,17 @@ internal sealed class InputRegistration<T> : InputRegistration where T : notnull
     public override IInputPort CreatePort(CircuitOptions options) => new InputPort<T>(Name, NodeId, options);
 }
 
+internal sealed class KeyedInputRegistration<TKey, TValue> : InputRegistration
+    where TKey : notnull
+    where TValue : notnull
+{
+    public required Func<TValue, TKey> KeySelector { get; init; }
+
+    public override IInputPort CreatePort(CircuitOptions options) =>
+        new InputPort<TValue>(Name, NodeId, options,
+            writer => new KeyedInputHandle<TKey, TValue>(new InputHandle<TValue>(writer), KeySelector));
+}
+
 internal interface IInputPort
 {
     string Name { get; }
@@ -31,7 +42,8 @@ internal sealed class InputPort<T> : IInputPort where T : notnull
     private readonly Channel<WeightedValue<T>> _channel;
     private readonly int _nodeId;
 
-    public InputPort(string name, int nodeId, CircuitOptions options)
+    public InputPort(string name, int nodeId, CircuitOptions options,
+        Func<ChannelWriter<WeightedValue<T>>, object>? handleFactory = null)
     {
         Name = name;
         _nodeId = nodeId;
@@ -40,7 +52,7 @@ internal sealed class InputPort<T> : IInputPort where T : notnull
             SingleReader = true,
             FullMode = BoundedChannelFullMode.Wait,
         });
-        Handle = new InputHandle<T>(_channel.Writer);
+        Handle = handleFactory?.Invoke(_channel.Writer) ?? new InputHandle<T>(_channel.Writer);
     }
 
     public string Name { get; }
