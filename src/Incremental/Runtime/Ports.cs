@@ -47,6 +47,11 @@ internal interface IInputPort
 
     void DrainInto(Worker[] workers, int maxItems);
     void CompleteWriter();
+
+    /// <summary>Completes the input's channel with <paramref name="error"/> (the fault path):
+    /// producers blocked on a full channel are released with it, and further sends fail fast
+    /// instead of filling a channel no step will ever drain again.</summary>
+    void Fail(Exception error);
 }
 
 internal sealed class InputPort<T> : IInputPort where T : notnull
@@ -118,6 +123,8 @@ internal sealed class InputPort<T> : IInputPort where T : notnull
     }
 
     public void CompleteWriter() => _channel.Writer.TryComplete();
+
+    public void Fail(Exception error) => _channel.Writer.TryComplete(error);
 }
 
 internal abstract class OutputRegistration
