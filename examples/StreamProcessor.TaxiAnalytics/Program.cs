@@ -305,11 +305,13 @@ IRenderable BuildLiveView()
     var avgMicros = updateCount == 0 ? 0 : TimeSpan.FromTicks(updateTicks / updateCount).TotalMicroseconds;
     var savedSoFar = naiveDuration * churnApplied - TimeSpan.FromTicks(updateTicks);
 
+    // Fixed-width slots keep every number anchored in place; the variable-length
+    // description gets its own line so nothing shifts around it.
     var table = new Table().Border(TableBorder.Rounded);
-    table.AddColumn("borough");
-    table.AddColumn(new TableColumn("trips").RightAligned());
-    table.AddColumn(new TableColumn("revenue").RightAligned());
-    table.AddColumn("busiest zone");
+    table.AddColumn(new TableColumn("borough").Width(14));
+    table.AddColumn(new TableColumn("trips").RightAligned().Width(10));
+    table.AddColumn(new TableColumn("revenue").RightAligned().Width(12));
+    table.AddColumn(new TableColumn("busiest zone").Width(36));
 
     var busiest = topZonesView
         .GroupBy(e => e.Value.Key)
@@ -324,19 +326,22 @@ IRenderable BuildLiveView()
         var borough = entry.Value.Key;
         var revenue = revenueView.SingleOrDefault(e => e.Value.Key == borough).Value.Value;
         table.AddRow(
-            Markup.Escape(borough),
+            Markup.Escape(Truncate(borough, 14)),
             $"{entry.Value.Value:N0}",
             $"{revenue:C0}",
-            Markup.Escape(busiest.GetValueOrDefault(borough, "")));
+            Markup.Escape(Truncate(busiest.GetValueOrDefault(borough, ""), 36)));
     }
 
     return new Rows(
         new Markup(
-            $"[grey]updates[/] {churnApplied:N0}   [grey]last[/] {Markup.Escape(lastDescription)} " +
-            $"([bold green]{lastMicros:N0} µs[/])   [grey]avg[/] {avgMicros:N0} µs   " +
-            $"[grey]vs naive recompute each time:[/] [bold]{Math.Max(0, savedSoFar.TotalSeconds):N1} s saved[/]"),
+            $"[grey]updates[/] [bold]{churnApplied,7:N0}[/]   [grey]step[/] [bold green]{lastMicros,8:N0} µs[/]   " +
+            $"[grey]avg[/] {avgMicros,8:N0} µs   [grey]saved vs naive:[/] [bold]{Math.Max(0, savedSoFar.TotalSeconds),7:N1} s[/]"),
+        new Markup($"[grey]last:[/] {Markup.Escape(lastDescription)}"),
         table);
 }
+
+static string Truncate(string value, int width) =>
+    value.Length <= width ? value : value[..(width - 1)] + "…";
 
 string ZoneName(int zoneId) => zoneRows.FirstOrDefault(z => z.Id == zoneId)?.Name ?? $"zone {zoneId}";
 
