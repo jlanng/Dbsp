@@ -7,6 +7,9 @@ DBSP-style incremental stream processing library for .NET (net10.0, SDK pinned v
 - Test: `dotnet test tests/Incremental.Tests` (Redis tests skip unless `docker compose up -d` has run)
 - Examples: `dotnet run --project examples/Incremental.Example`,
   `dotnet run --project examples/Incremental.LogAnalytics [-- --redis]`
+- Benchmarks: `dotnet run -c Release --project benchmarks/Incremental.Benchmarks -- --filter '*'`
+  (BenchmarkDotNet); `-- --assert` runs the CI performance contracts — scaling-ratio
+  assertions (delta cost vs state size), which is what `.github/workflows/ci.yml` gates on
 
 ## Architecture invariants
 - Streams carry `ZSet<T>` **deltas** (value → signed weight); operators must be fully

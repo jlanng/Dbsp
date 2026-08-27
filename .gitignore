@@ -7,3 +7,4 @@ artifacts/
 *.DotSettings
 TestResults/
 data/
+BenchmarkDotNet.Artifacts/
