@@ -74,7 +74,8 @@ var builder = new CircuitBuilder(new CircuitOptions
 });
 
 var trips = builder.Input<Trip>("trips");
-var zones = builder.Input<ZoneInfo>("zones");
+// Zones are master data: a keyed input, so a corrected zone row would be one UpsertAsync.
+var zones = builder.KeyedInput<int, ZoneInfo>("zones", z => z.Id);
 
 var enriched = trips
     .IndexBy(t => t.Zone)
@@ -94,7 +95,7 @@ await using var circuit = builder.Build();
 circuit.Start();
 
 var tripsIn = circuit.Input<Trip>("trips");
-var zonesIn = circuit.Input<ZoneInfo>("zones");
+var zonesIn = circuit.KeyedInput<int, ZoneInfo>("zones");
 var countsOut = circuit.Output<KeyedValue<string, long>>("trips-per-borough");
 var revenueOut = circuit.Output<KeyedValue<string, double>>("revenue-per-borough");
 var topZonesOut = circuit.Output<KeyedValue<string, KeyedValue<(string Borough, string Name), long>>>("top-zones");
@@ -120,7 +121,8 @@ AnsiConsole.MarkupLine(
     "Each step pushes only that batch through join and aggregates — the join probes its integrated " +
     "state, and COUNT/SUM fold the batch into one accumulator per borough.[/]");
 
-await zonesIn.SendAsync(zoneRows.Select(z => new WeightedValue<ZoneInfo>(z, 1)));
+foreach (var zone in zoneRows)
+    await zonesIn.UpsertAsync(zone);
 await circuit.StepAsync();
 DrainOutputs();
 
