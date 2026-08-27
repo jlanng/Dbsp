@@ -194,11 +194,20 @@ public sealed class KeyedZStream<TKey, TValue> : ZStream<KeyedValue<TKey, TValue
             Builder.AddNode("aggregate", [NodeId], ctx => new AggregateOperator<TKey, TValue, TResult>(ctx, aggregate, _eviction)),
             _eviction);
 
-    public KeyedZStream<TKey, long> Count() => Aggregate(Aggregates.Count<TValue>());
+    /// <summary>Grouped aggregation for a linear aggregate (COUNT, SUM, …): maintained from
+    /// deltas alone with O(1) state per key — no group contents are stored, so update cost
+    /// is independent of group size.</summary>
+    public KeyedZStream<TKey, TResult> AggregateLinear<TResult>(ILinearAggregate<TValue, TResult> aggregate)
+        where TResult : notnull =>
+        new(Builder,
+            Builder.AddNode("aggregateLinear", [NodeId], ctx => new LinearAggregateOperator<TKey, TValue, TResult>(ctx, aggregate, _eviction)),
+            _eviction);
+
+    public KeyedZStream<TKey, long> Count() => AggregateLinear(LinearAggregates.Count<TValue>());
 
     public KeyedZStream<TKey, TNumber> Sum<TNumber>(Func<TValue, TNumber> selector)
         where TNumber : INumber<TNumber> =>
-        Aggregate(Aggregates.Sum(selector));
+        AggregateLinear(LinearAggregates.Sum(selector));
 
     public KeyedZStream<TKey, TProjected> Min<TProjected>(Func<TValue, TProjected> selector)
         where TProjected : notnull =>

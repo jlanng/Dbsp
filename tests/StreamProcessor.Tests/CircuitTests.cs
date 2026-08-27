@@ -108,6 +108,41 @@ public class CircuitTests
     }
 
     [Fact]
+    public async Task Sum_is_linear_and_retracts_a_vanished_group()
+    {
+        var builder = ManualBuilder();
+        builder.Input<(string Region, int Amount)>("orders")
+            .IndexBy(o => o.Region)
+            .Sum(o => o.Amount)
+            .Output("revenue");
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var input = circuit.Input<(string Region, int Amount)>("orders");
+        var output = circuit.Output<KeyedValue<string, int>>("revenue");
+
+        await input.InsertAsync(("emea", 10));
+        await input.InsertAsync(("emea", 5));
+        await circuit.StepAsync();
+        var delta = await output.Reader.ReadAsync();
+        Assert.Equal(1, delta.WeightOf(new KeyedValue<string, int>("emea", 15)));
+
+        await input.RemoveAsync(("emea", 5));
+        await circuit.StepAsync();
+        delta = await output.Reader.ReadAsync();
+        Assert.Equal(-1, delta.WeightOf(new KeyedValue<string, int>("emea", 15)));
+        Assert.Equal(1, delta.WeightOf(new KeyedValue<string, int>("emea", 10)));
+
+        // The last row disappears: the result is retracted, not reported as 0. The row
+        // count in the linear state is what detects this — the accumulator alone cannot.
+        await input.RemoveAsync(("emea", 10));
+        await circuit.StepAsync();
+        delta = await output.Reader.ReadAsync();
+        Assert.Equal(-1, delta.WeightOf(new KeyedValue<string, int>("emea", 10)));
+        Assert.Equal(1, delta.DistinctCount);
+    }
+
+    [Fact]
     public async Task Min_recovers_after_deleting_the_minimum()
     {
         var builder = ManualBuilder();

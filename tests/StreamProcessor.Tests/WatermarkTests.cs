@@ -58,17 +58,17 @@ public class WatermarkTests
         // Step 1 populates window T0; the watermark freezes at T0+1s afterwards.
         await input.InsertAsync(("home", T0.AddSeconds(1)));
         await circuit.StepAsync();
-        Assert.Empty(storage.RemovedGroups);
+        Assert.Empty(storage.RemovedKeys);
 
         // Step 2 sees watermark T0+1s (< T0+5s): window T0 must survive. Freezes T0+7s.
         await input.InsertAsync(("home", T0.AddSeconds(7)));
         await circuit.StepAsync();
-        Assert.Empty(storage.RemovedGroups);
+        Assert.Empty(storage.RemovedKeys);
 
         // Step 3 sees watermark T0+7s (>= T0+5s): window T0's state is deleted.
         await input.InsertAsync(("home", T0.AddSeconds(12)));
         await circuit.StepAsync();
-        Assert.Contains(T0, storage.RemovedGroups);
+        Assert.Contains(T0, storage.RemovedKeys);
 
         // Eviction emits no retractions: the closed window's published count stays final.
         var integrated = new ZSet<KeyedValue<DateTimeOffset, long>>();
@@ -77,15 +77,16 @@ public class WatermarkTests
         Assert.Equal(1, integrated.WeightOf(new KeyedValue<DateTimeOffset, long>(T0, 1)));
     }
 
-    /// <summary>In-memory storage that records which groups get evicted.</summary>
+    /// <summary>In-memory storage that records evicted keys: group removals from indexed
+    /// stores, and entry removals from value stores (how linear aggregates evict).</summary>
     private sealed class EvictionRecordingStorage : IStorageProvider
     {
         private readonly InMemoryStorageProvider _inner = new();
-        private readonly List<object> _removedGroups = [];
+        private readonly List<object> _removedKeys = [];
 
-        public IReadOnlyList<object> RemovedGroups
+        public IReadOnlyList<object> RemovedKeys
         {
-            get { lock (_removedGroups) return [.. _removedGroups]; }
+            get { lock (_removedKeys) return [.. _removedKeys]; }
         }
 
         public IWeightStore<T> CreateWeightStore<T>(string name) where T : notnull =>
@@ -94,18 +95,18 @@ public class WatermarkTests
         public IIndexedWeightStore<TKey, TValue> CreateIndexedWeightStore<TKey, TValue>(string name)
             where TKey : notnull
             where TValue : notnull =>
-            new Recording<TKey, TValue>(_inner.CreateIndexedWeightStore<TKey, TValue>(name), this);
+            new RecordingIndexed<TKey, TValue>(_inner.CreateIndexedWeightStore<TKey, TValue>(name), this);
 
         public IValueStore<TKey, TValue> CreateValueStore<TKey, TValue>(string name) where TKey : notnull =>
-            _inner.CreateValueStore<TKey, TValue>(name);
+            new RecordingValues<TKey, TValue>(_inner.CreateValueStore<TKey, TValue>(name), this);
 
         private void Record(object key)
         {
-            lock (_removedGroups)
-                _removedGroups.Add(key);
+            lock (_removedKeys)
+                _removedKeys.Add(key);
         }
 
-        private sealed class Recording<TKey, TValue>(
+        private sealed class RecordingIndexed<TKey, TValue>(
             IIndexedWeightStore<TKey, TValue> inner,
             EvictionRecordingStorage owner) : IIndexedWeightStore<TKey, TValue>
             where TKey : notnull
@@ -118,6 +119,23 @@ public class WatermarkTests
             {
                 owner.Record(key);
                 inner.RemoveGroup(key);
+            }
+        }
+
+        private sealed class RecordingValues<TKey, TValue>(
+            IValueStore<TKey, TValue> inner,
+            EvictionRecordingStorage owner) : IValueStore<TKey, TValue>
+            where TKey : notnull
+        {
+            public bool TryGet(TKey key, [System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out TValue value) =>
+                inner.TryGet(key, out value);
+
+            public void Put(TKey key, TValue value) => inner.Put(key, value);
+
+            public void Remove(TKey key)
+            {
+                owner.Record(key);
+                inner.Remove(key);
             }
         }
     }
