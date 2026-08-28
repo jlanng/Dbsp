@@ -48,6 +48,16 @@ public sealed class CircuitBuilder
         Options = options ?? new CircuitOptions();
         ArgumentOutOfRangeException.ThrowIfLessThan(Options.Workers, 1, nameof(Options.Workers));
         ArgumentOutOfRangeException.ThrowIfLessThan(Options.CheckpointInterval, 1, nameof(Options.CheckpointInterval));
+        if (Options.Cluster is { } cluster)
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThan(cluster.ProcessCount, 1, nameof(Options.Cluster));
+            ArgumentOutOfRangeException.ThrowIfNegative(cluster.ProcessIndex, nameof(Options.Cluster));
+            ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(cluster.ProcessIndex, cluster.ProcessCount, nameof(Options.Cluster));
+            if (Options.AutoStep)
+                throw new NotSupportedException(
+                    "Clustered circuits require AutoStep = false: processes run their steps in lockstep, so step " +
+                    "initiation is explicit — call StepAsync on every process for every step.");
+        }
     }
 
     public CircuitOptions Options { get; }
@@ -184,6 +194,11 @@ public sealed class CircuitBuilder
     public Circuit Build()
     {
         ThrowIfBuilt();
+        if (Options.Cluster is not null && _loopRegions.Count > 0)
+            throw new NotSupportedException(
+                "Recurse is not supported in clustered circuits: the per-iteration convergence decision is a global " +
+                "reduction, which would need a cross-process round trip every loop iteration. Run recursive circuits " +
+                "on a single process (Workers may still be > 1).");
         _built = true;
         return new Circuit([.. _nodes], [.. _loopRegions], _inputs, _outputs, Options, WatermarkClock);
     }

@@ -155,6 +155,60 @@ run inline on the coordinator (no worker thread, no handoff — hundreds-of-µs 
 latency for small workloads), while multi-worker exchanges synchronize on a spinning
 barrier rather than kernel block/wake, since mid-step the workers are already hot.
 
+**Cross-process exchange (clustering).** The same shuffle spans machines, behind the same
+operator API: the circuit definition is built unchanged on every process — user code
+(`IndexBy`/`Join`/aggregations) never learns the cluster exists — and only
+`CircuitOptions.Cluster` declares the process's place in a static topology. Each of the N
+processes hosts a contiguous slice of the global worker set (process p owns global workers
+[p·Workers, (p+1)·Workers)), every exchange hash-partitions by key across all Workers × N
+of them, and shards bound for a remote worker are serialized (the storage serializer's
+JSON — a delta batch is just (value, weight) pairs, retractions included) and shipped as
+length-prefixed frames over a transport: `TcpExchangeTransport` (plain sockets, no
+dependencies; each process gets the shared endpoint list and its own index, connections are
+retried until the mesh is up) or `InMemoryExchangeTransport` for tests.
+
+```csharp
+// process 0 of 2 — process 1 runs the identical code with processIndex: 1
+var options = new CircuitOptions
+{
+    Workers  = 4,                     // local workers; the cluster has global workers 0..7
+    AutoStep = false,                 // clustered circuits step explicitly, in lockstep
+    Cluster  = new ClusterOptions
+    {
+        Transport = new TcpExchangeTransport(
+            processIndex: 0,
+            endpoints: ["hostA:9000", "hostB:9000"]),
+    },
+};
+```
+
+Steps are lockstep: every process calls `StepAsync` for every step (hence
+`AutoStep = false`), each draining its own inputs — an input is declared everywhere and may
+be fed on any process; feed each source where its producer lives. A step aligns at two
+points. Mid-step, a worker cannot proceed past an exchange until every peer's shards for
+that (step, exchange) have arrived; empty shards are still sent, so the per-peer frame
+sequence is dense and alignment never depends on data being present — frames arrive in send
+order, which is the same deterministic node order on every process, and a mismatch faults
+loudly as a desync instead of merging the wrong step's data. At the end of the step the
+processes exchange step-end frames carrying their watermark observations, so the frozen
+watermark is the same global min-reduction everywhere and eviction/window-close decisions
+stay consistent cluster-wide. Output handles carry the deltas the local workers produced;
+consume every process's handle (or key the final operator so the rows you care about land
+on one process) for the full stream. Backpressure crosses the wire too: send queues are
+bounded, so a slow peer — or its slow output consumer — stalls the cluster's step instead
+of buffering unboundedly.
+
+A peer disconnecting or faulting poisons the local circuit through the ordinary fault path
+(a descriptive exception on the step, the handles, and `Circuit.Fault`) — never a hang.
+Checkpointing stays per process: each commits its own shards' state and its own inputs'
+offsets, under keys carrying the process index plus a step marker, so processes sharing one
+physical store never clobber each other; lockstep steps and equal `CheckpointInterval`s
+mean every process commits the same step boundaries, and after a crash all processes must
+resume from the same committed step — compare `Circuit.CommittedStep` across processes
+before feeding data (there is deliberately no distributed commit protocol). `Recurse` is
+not supported in clustered circuits — the per-iteration convergence decision would need a
+cross-process round trip every loop iteration — and is rejected at `Build()`.
+
 **Backpressure.** Everything between producer and consumer is a bounded
 `System.Threading.Channels` channel:
 
@@ -225,7 +279,8 @@ deterministic step boundaries for tests and batch jobs.
 ## Project layout
 
 ```
-src/Incremental                    core: Z-sets, builder API, operators, windows, runtime, in-memory storage
+src/Incremental                    core: Z-sets, builder API, operators, windows, runtime, in-memory
+                                       storage, cluster transports (TCP + in-memory)
 src/Incremental.Storage.Redis      Redis-backed IStorageProvider
 tests/Incremental.Tests            xunit: Z-set algebra, per-step delta semantics, multi-worker runs,
                                        Redis integration (auto-skipped when Redis is down)
@@ -281,7 +336,9 @@ dotnet run --project examples/Incremental.LogAnalytics -- --redis
 
 ## Status / roadmap
 
-Scaffold — the semantics above are implemented and tested, with plenty of headroom:
+The semantics above are implemented and tested, and the roadmap below is fully ticked —
+what remains is headroom (more storage backends, more operators, cluster tooling), not
+missing semantics:
 
 - [x] Linear-aggregate fast path: `COUNT`/`SUM` maintained from the delta alone with O(keys)
       state (`ILinearAggregate`); custom linear aggregates via `AggregateLinear`
@@ -316,4 +373,10 @@ Scaffold — the semantics above are implemented and tested, with plenty of head
       faulted within the step — original exception on the step, the output channels, and
       `Circuit.Fault`; producers released with `CircuitFaultedException`; the committed
       checkpoint untouched, so rebuild-from-checkpoint is the recovery story)
-- [ ] Cross-process exchange (workers on different machines) behind the same operator
+- [x] Cross-process exchange (workers on different machines) behind the same operator API
+      (`CircuitOptions.Cluster`: N processes × M workers as contiguous slices of one global
+      worker set; exchanges hash-partition across all of them and ship remote shards as
+      length-prefixed frames over a transport — TCP over plain sockets, in-memory for
+      tests; explicit lockstep steps with dense per-exchange frame alignment, globally
+      min-reduced watermarks, cross-process fault propagation, per-process checkpoints
+      keyed by process index; `Recurse` + cluster is rejected at build time)

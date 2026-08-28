@@ -47,7 +47,7 @@ public class ZStream<T> where T : notnull
     public ZStream<T> Distinct()
     {
         var upstream = NodeId;
-        if (Builder.Options.Workers > 1)
+        if (Builder.Options.IsSharded)
         {
             // Distinct state is per-value; route equal values to the same worker.
             upstream = Builder.AddNode(
@@ -117,7 +117,7 @@ public class ZStream<T> where T : notnull
             _ => new MapOperator<T, KeyedValue<TKey, T>>(v => new KeyedValue<TKey, T>(keySelector(v), v)));
 
         var node = keyed;
-        if (Builder.Options.Workers > 1)
+        if (Builder.Options.IsSharded)
         {
             node = Builder.AddNode(
                 "exchange",
