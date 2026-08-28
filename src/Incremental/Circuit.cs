@@ -1,3 +1,4 @@
+using Incremental.Cluster;
 using Incremental.Operators;
 using Incremental.Runtime;
 using Incremental.Storage;
@@ -36,9 +37,19 @@ public sealed class Circuit : IAsyncDisposable
     private bool RunsInline => _workers.Length == 1;
 
     // Exchange scratch space: _mailboxes[node][sender] holds the fragments (indexed by
-    // target worker) that `sender` produced for that exchange node this step. The exchange
-    // barrier makes writes visible before anyone reads.
+    // target worker — GLOBAL worker in a cluster) that `sender` produced for that exchange
+    // node this step. The exchange barrier makes writes visible before anyone reads.
     private readonly object[][][] _mailboxes;
+
+    // Cross-process exchange (null when not clustered): the runtime shipping remote-bound
+    // shards, plus scratch space _remoteShards[node][peerProcess] holding the shards each
+    // peer sent this step (indexed by local worker), filled by the designated worker
+    // between the two exchange barriers. _stepNumber stamps every frame so a desync faults
+    // loudly instead of silently merging the wrong step's data.
+    private readonly ClusterRuntime? _cluster;
+    private readonly object[][][] _remoteShards;
+    private long _stepNumber;
+    private long _committedStepMarker = -1;
 
     private readonly CancellationTokenSource _shutdown = new();
     private TaskCompletionSource _stepDone = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -82,6 +93,7 @@ public sealed class Circuit : IAsyncDisposable
         _watermarkClock = watermarkClock;
         _checkpoint = options.Storage as ICheckpointStorageProvider;
         _barrier = new SpinBarrier(options.Workers);
+        _cluster = options.Cluster is { } cluster ? new ClusterRuntime(cluster.Transport, options.Workers, _barrier) : null;
 
         _workers = new Worker[options.Workers];
         for (var w = 0; w < options.Workers; w++)
@@ -93,6 +105,7 @@ public sealed class Circuit : IAsyncDisposable
                 {
                     WorkerId = w,
                     WorkerCount = options.Workers,
+                    GlobalWorkerId = (_cluster?.FirstGlobalWorker ?? 0) + w,
                     Storage = options.Storage,
                     NodeName = nodes[n].Name,
                 };
@@ -102,10 +115,16 @@ public sealed class Circuit : IAsyncDisposable
         }
 
         _mailboxes = new object[nodes.Length][][];
+        _remoteShards = new object[nodes.Length][][];
         for (var n = 0; n < nodes.Length; n++)
+        {
             _mailboxes[n] = nodes[n].IsExchange
                 ? Enumerable.Range(0, options.Workers).Select(_ => Array.Empty<object>()).ToArray()
                 : [];
+            _remoteShards[n] = nodes[n].IsExchange && _cluster is not null
+                ? new object[_cluster.ProcessCount][]
+                : [];
+        }
 
         _inputs = inputRegistrations.Select(r => r.CreatePort(options)).ToArray();
         _outputs = outputRegistrations.Select(r => r.CreatePort(options)).ToArray();
@@ -123,11 +142,11 @@ public sealed class Circuit : IAsyncDisposable
             // Recover before the first step: discard whatever a crashed run left staged and
             // seed every input's position from the committed offsets, so records replayed
             // with explicit offsets at or below the checkpoint are dropped as duplicates.
-            var offsets = _checkpoint.Recover();
+            var offsets = FilterOwnOffsets(_checkpoint.Recover());
             foreach (var input in _inputs)
                 if (offsets.TryGetValue(input.Name, out var offset))
                     input.SeedOffset(offset);
-            Volatile.Write(ref _committedOffsets, new Dictionary<string, long>(offsets));
+            Volatile.Write(ref _committedOffsets, offsets);
         }
 
         if (!RunsInline)
@@ -206,6 +225,19 @@ public sealed class Circuit : IAsyncDisposable
         if (Volatile.Read(ref _fault) is { } fault)
             throw new CircuitFaultedException(fault);
 
+        try
+        {
+            // Connect the cluster mesh before the first step (peers may start in any order).
+            if (_cluster is not null)
+                await _cluster.EnsureStartedAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            FaultCircuit(ex);
+            throw;
+        }
+
+        _stepNumber++;
         foreach (var input in _inputs)
             input.DrainInto(_workers, _options.MaxStepItemsPerInput);
 
@@ -213,7 +245,14 @@ public sealed class Circuit : IAsyncDisposable
         {
             if (RunsInline)
             {
-                RunWorkerStep(_workers[0]);
+                // Clustered inline steps block on remote frames mid-step; that must never
+                // happen synchronously on the caller's thread (StepAsync would not even
+                // return its task until the whole step — including remote waits — finished,
+                // deadlocking a caller that steps several co-hosted processes together).
+                if (_cluster is not null)
+                    await Task.Run(() => RunWorkerStep(_workers[0])).ConfigureAwait(false);
+                else
+                    RunWorkerStep(_workers[0]);
             }
             else
             {
@@ -224,6 +263,11 @@ public sealed class Circuit : IAsyncDisposable
 
                 await _stepDone.Task.ConfigureAwait(false);
             }
+
+            // End-of-step alignment across processes: every process finishes this step, and
+            // watermark observations are min-reduced globally, before anyone freezes.
+            if (_cluster is not null)
+                await _cluster.AwaitStepEndsAsync(_stepNumber, _watermarkClock).ConfigureAwait(false);
 
             // Freeze between steps so every worker sees one consistent watermark per step.
             _watermarkClock?.Freeze();
@@ -268,6 +312,10 @@ public sealed class Circuit : IAsyncDisposable
         Interlocked.CompareExchange(ref _fault, exception, null);
         var fault = _fault!;
 
+        // Peers must learn promptly (Fault frame, backstopped by disconnect) and local
+        // waits on cluster traffic must release; idempotent when a worker poisoned already.
+        _cluster?.Poison(fault);
+
         foreach (var input in _inputs)
             input.Fail(new CircuitFaultedException(fault));
         foreach (var output in _outputs)
@@ -291,9 +339,68 @@ public sealed class Circuit : IAsyncDisposable
             if (input.ConsumedOffset >= 0)
                 offsets[input.Name] = input.ConsumedOffset;
 
-        _checkpoint!.Commit(offsets);
+        if (_cluster is { } cluster)
+        {
+            // Each process commits only its own shards and its own inputs' offsets, under
+            // keys that carry the process index — plus a step marker — so processes sharing
+            // one physical store never clobber each other. Cross-process consistency is by
+            // lockstep, not 2PC: with the same CheckpointInterval every process commits the
+            // same steps, and after a crash all processes must resume from the same
+            // committed step (compare CommittedStep across processes before feeding data).
+            var prefixed = new Dictionary<string, long>(offsets.Count + 1);
+            foreach (var (name, offset) in offsets)
+                prefixed[$"p{cluster.ProcessIndex}:{name}"] = offset;
+            prefixed[$"p{cluster.ProcessIndex}:{StepMarkerKey}"] = _stepNumber;
+            _checkpoint!.Commit(prefixed);
+            Volatile.Write(ref _committedStepMarker, _stepNumber);
+        }
+        else
+        {
+            _checkpoint!.Commit(offsets);
+        }
+
         _stepsSinceCommit = 0;
         Volatile.Write(ref _committedOffsets, offsets);
+    }
+
+    private const string StepMarkerKey = "$step";
+
+    /// <summary>Clustered circuits: the step number this process's last committed checkpoint
+    /// reflects — the recovered marker until the first new commit, then the current run's
+    /// step count as of each commit; null before any commit (or when not clustered). After a
+    /// crash, compare it across processes before feeding data: state exchanged mid-step
+    /// makes shards interdependent, so a consistent resume requires every process to have
+    /// committed the same step.</summary>
+    public long? CommittedStep
+    {
+        get
+        {
+            var marker = Volatile.Read(ref _committedStepMarker);
+            return marker < 0 ? null : marker;
+        }
+    }
+
+    /// <summary>Strips a recovered offsets dictionary down to this process's entries. On a
+    /// single process the committed keys are the input names themselves; in a cluster they
+    /// are prefixed with the process index (see <see cref="CommitCheckpoint"/>).</summary>
+    private Dictionary<string, long> FilterOwnOffsets(IReadOnlyDictionary<string, long> recovered)
+    {
+        if (_cluster is not { } cluster)
+            return new Dictionary<string, long>(recovered);
+
+        var prefix = $"p{cluster.ProcessIndex}:";
+        var offsets = new Dictionary<string, long>();
+        foreach (var (key, value) in recovered)
+        {
+            if (!key.StartsWith(prefix, StringComparison.Ordinal))
+                continue;
+            var name = key[prefix.Length..];
+            if (name == StepMarkerKey)
+                Volatile.Write(ref _committedStepMarker, value);
+            else
+                offsets[name] = value;
+        }
+        return offsets;
     }
 
     /// <summary>The offset of the last record on <paramref name="inputName"/> whose effects
@@ -378,6 +485,9 @@ public sealed class Circuit : IAsyncDisposable
                 lock (_stepFaults)
                     _stepFaults.Add(ex);
                 _barrier.Poison();
+                // Remote peers must not wait on shards this worker will never ship, and the
+                // designated worker may be blocked on inbound cluster traffic.
+                _cluster?.Poison(ex);
             }
 
             // Every worker — clean, faulted, or bailed — leaves the step through this
@@ -427,16 +537,46 @@ public sealed class Circuit : IAsyncDisposable
         var node = _nodes[n];
         var op = worker.Operators[n];
 
-        if (node.IsExchange && _workers.Length > 1)
+        if (node.IsExchange && (_workers.Length > 1 || _cluster is not null))
         {
+            // Partition across the GLOBAL worker set (equal to the local one when not
+            // clustered); the barrier makes every local worker's fragments visible.
             var exchange = (IExchangeStepOperator)op;
-            _mailboxes[n][worker.Id] = exchange.Partition(slots[node.Inputs[0]], _workers.Length);
+            _mailboxes[n][worker.Id] = exchange.Partition(slots[node.Inputs[0]], _cluster?.GlobalWorkers ?? _workers.Length);
 
             _barrier.SignalAndWait();
 
-            var incoming = new object?[_workers.Length];
+            if (_cluster is { } cluster)
+            {
+                // The designated worker ships the remote-bound shards and collects the
+                // inbound ones while its local peers hold at the second barrier. Every
+                // (step, node) sends exactly one frame to every peer — empty shards
+                // included — so the per-peer frame sequence is dense and step/exchange
+                // alignment never depends on data being present.
+                if (worker.Id == 0)
+                {
+                    var step = _stepNumber;
+                    for (var p = 0; p < cluster.ProcessCount; p++)
+                        if (p != cluster.ProcessIndex)
+                            cluster.SendShards(step, n, p,
+                                exchange.SerializeShards(_mailboxes[n], p * _workers.Length, _workers.Length));
+                    for (var p = 0; p < cluster.ProcessCount; p++)
+                        if (p != cluster.ProcessIndex)
+                            _remoteShards[n][p] = exchange.DeserializeShards(cluster.ReceiveShards(step, n, p));
+                }
+                _barrier.SignalAndWait();
+            }
+
+            var myShard = (_cluster?.FirstGlobalWorker ?? 0) + worker.Id;
+            var peerCount = _cluster is null ? 0 : _cluster.ProcessCount - 1;
+            var incoming = new object?[_workers.Length + peerCount];
+            var i = 0;
             for (var sender = 0; sender < _workers.Length; sender++)
-                incoming[sender] = _mailboxes[n][sender][worker.Id];
+                incoming[i++] = _mailboxes[n][sender][myShard];
+            if (_cluster is { } c)
+                for (var p = 0; p < c.ProcessCount; p++)
+                    if (p != c.ProcessIndex)
+                        incoming[i++] = _remoteShards[n][p][worker.Id];
             slots[n] = exchange.Merge(incoming);
         }
         else
@@ -527,8 +667,11 @@ public sealed class Circuit : IAsyncDisposable
                 // Failures were already forwarded to the output channels.
             }
         }
-        else if (_started && Volatile.Read(ref _fault) is null)
+        else if (_started && Volatile.Read(ref _fault) is null && _cluster is null)
         {
+            // Clustered circuits skip this implicit draining: an extra step here could
+            // never be matched by the peers (steps are lockstep) — run the final steps
+            // explicitly on every process before disposing.
             try
             {
                 while (_inputs.Any(p => p.HasPending))
@@ -547,8 +690,9 @@ public sealed class Circuit : IAsyncDisposable
         }
         else
         {
-            // Never started, or faulted (the fault transition already completed the
-            // outputs with the fault; TryComplete makes this a no-op then).
+            // Never started, faulted (the fault transition already completed the outputs
+            // with the fault; TryComplete makes this a no-op then), or clustered (no
+            // implicit steps — the user stepped every process explicitly).
             foreach (var output in _outputs)
                 output.Complete(null);
         }
@@ -572,6 +716,9 @@ public sealed class Circuit : IAsyncDisposable
             worker.Go.Release();
         foreach (var worker in _workers)
             worker.Thread?.Join(TimeSpan.FromSeconds(1));
+
+        if (_cluster is not null)
+            await _cluster.DisposeAsync().ConfigureAwait(false);
 
         _shutdown.Cancel();
         _shutdown.Dispose();

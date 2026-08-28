@@ -37,6 +37,38 @@ internal sealed class WatermarkClock(int workers)
             Volatile.Write(ref slot, eventTicks);
     }
 
+    /// <summary>Cluster support: this process's max event time seen per tracker
+    /// (<see cref="long.MinValue"/> where a source has seen nothing), in tracker
+    /// registration order — deterministic, since every process builds the same circuit.
+    /// Collected by the coordinator after all local workers finish a step.</summary>
+    public long[] CollectMaxSeen()
+    {
+        var result = new long[_trackers.Count];
+        for (var t = 0; t < _trackers.Count; t++)
+        {
+            var maxSeen = long.MinValue;
+            var slots = _trackers[t].MaxSeenTicks;
+            for (var w = 0; w < slots.Length; w++)
+                maxSeen = Math.Max(maxSeen, Volatile.Read(ref slots[w]));
+            result[t] = maxSeen;
+        }
+        return result;
+    }
+
+    /// <summary>Cluster support: folds a peer process's <see cref="CollectMaxSeen"/> in
+    /// before <see cref="Freeze"/>, so the frozen watermark is the same global min-reduction
+    /// on every process.</summary>
+    public void ObserveRemote(long[] maxSeenPerTracker)
+    {
+        if (maxSeenPerTracker.Length != _trackers.Count)
+            throw new InvalidOperationException(
+                "Cluster desync: a peer process reported a different number of watermark sources; " +
+                "every process must run the same circuit definition.");
+        for (var t = 0; t < maxSeenPerTracker.Length; t++)
+            if (maxSeenPerTracker[t] != long.MinValue)
+                Observe(t, 0, maxSeenPerTracker[t]);
+    }
+
     /// <summary>Called by the coordinator between steps, after all workers finish.</summary>
     public void Freeze()
     {

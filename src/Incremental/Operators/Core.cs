@@ -10,8 +10,13 @@ public sealed class OperatorContext
     public required IStorageProvider Storage { get; init; }
     public required string NodeName { get; init; }
 
-    /// <summary>A store name unique to this node, worker, and purpose.</summary>
-    public string StateName(string suffix) => $"{NodeName}.{suffix}.w{WorkerId}";
+    /// <summary>The worker's id in the global worker set: equal to <see cref="WorkerId"/> on
+    /// a single process, offset by the process's slice in a clustered circuit — which keeps
+    /// state store names distinct when processes share one physical store.</summary>
+    public int GlobalWorkerId { get; init; }
+
+    /// <summary>A store name unique to this node, worker, and purpose (cluster-wide).</summary>
+    public string StateName(string suffix) => $"{NodeName}.{suffix}.w{GlobalWorkerId}";
 }
 
 /// <summary>
@@ -36,6 +41,16 @@ internal interface IExchangeStepOperator : IStepOperator
 {
     object[] Partition(object? input, int parts);
     object Merge(object?[] parts);
+
+    /// <summary>Cluster path: merges every local sender's fragments for the
+    /// <paramref name="count"/> partitions starting at <paramref name="firstShard"/> (a peer
+    /// process's contiguous global-worker range) and serializes them for the wire, one shard
+    /// per local worker of the receiving process.</summary>
+    byte[] SerializeShards(object[][] senderFragments, int firstShard, int count);
+
+    /// <summary>Inverse of <see cref="SerializeShards"/>: the received shards as Z-sets,
+    /// indexed by the receiving process's local worker id.</summary>
+    object[] DeserializeShards(byte[] payload);
 }
 
 /// <summary>Entry point of a circuit: emits whatever batch the coordinator staged for this worker.</summary>
@@ -145,5 +160,31 @@ internal sealed class ExchangeOperator<T>(Func<T, int> routingHash) : IExchangeS
         foreach (var part in parts)
             merged.AddAll((ZSet<T>)part!);
         return merged;
+    }
+
+    // Wire encoding reuses the storage serializer (JSON with fields included, so tuple keys
+    // round-trip): a delta batch is just (value, weight) pairs, one array per target worker.
+
+    public byte[] SerializeShards(object[][] senderFragments, int firstShard, int count)
+    {
+        var shards = new WeightedValue<T>[count][];
+        for (var k = 0; k < count; k++)
+        {
+            var merged = new ZSet<T>();
+            foreach (var fragments in senderFragments)
+                merged.AddAll((ZSet<T>)fragments[firstShard + k]);
+            shards[k] = [.. merged];
+        }
+        return System.Text.Encoding.UTF8.GetBytes(JsonStateSerializer.Instance.Serialize(shards));
+    }
+
+    public object[] DeserializeShards(byte[] payload)
+    {
+        var shards = JsonStateSerializer.Instance.Deserialize<WeightedValue<T>[][]>(
+            System.Text.Encoding.UTF8.GetString(payload));
+        var result = new object[shards.Length];
+        for (var k = 0; k < shards.Length; k++)
+            result[k] = new ZSet<T>(shards[k]);
+        return result;
     }
 }
