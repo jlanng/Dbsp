@@ -380,3 +380,7 @@ missing semantics:
       tests; explicit lockstep steps with dense per-exchange frame alignment, globally
       min-reduced watermarks, cross-process fault propagation, per-process checkpoints
       keyed by process index; `Recurse` + cluster is rejected at build time)
+- [ ] Build all singing, all dancing demo showing all features
+- [ ] Remove redis dependency from core assembly.
+- [ ] Investigate off-heap in-processs storage to reduce GC
+- [ ] Investigate higher order APIs with more user friendly or domain specific applications
