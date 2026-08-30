@@ -149,20 +149,38 @@ internal sealed class PlusOperator<T> : IStepOperator where T : notnull
 /// state must route every key to the worker whose shard holds it.</summary>
 internal sealed class ExchangeOperator<T>(Func<T, uint> routingHash) : IExchangeStepOperator where T : notnull
 {
+    /// <summary>Stand-in for a shard this step routed nothing to. Fragments are read-only
+    /// once <see cref="Partition"/> returns — peers only merge them, and the cluster path only
+    /// serializes them — so every empty shard shares this one instance instead of allocating a
+    /// Z-set to hold nothing. Never hand it downstream: it must not reach an operator slot,
+    /// where an operator could take it for its own delta.</summary>
+    private static readonly ZSet<T> EmptyShard = new();
+
+    // Reused across steps rather than reallocated: the fragment array is fixed-size (the
+    // global worker count cannot change mid-run), and the previous step's fragments are dead
+    // by the time this worker repartitions. Every worker runs every node in the same order,
+    // so between one step's Merge (which reads peers' arrays, after the exchange barrier) and
+    // the next Partition on this node there is always at least that barrier plus the step
+    // boundary — and, for an exchange inside a Recurse region, the loop's own flag barriers.
+    private ZSet<T>[]? _fragments;
+
     // Single-worker fast path: no shuffle, pass the delta through untouched.
     public object Step(object?[] inputs) => inputs[0]!;
 
     public object[] Partition(object? input, int parts)
     {
-        var delta = (ZSet<T>)input!;
-        var fragments = new ZSet<T>[parts];
-        for (var i = 0; i < parts; i++)
-            fragments[i] = new ZSet<T>();
+        var fragments = _fragments is { } cached && cached.Length == parts
+            ? cached
+            : _fragments = new ZSet<T>[parts];
+        Array.Fill(fragments, EmptyShard);
 
-        foreach (var (value, weight) in delta)
+        foreach (var (value, weight) in (ZSet<T>)input!)
         {
             var target = (int)(routingHash(value) % (uint)parts);
-            fragments[target].Add(value, weight);
+            var fragment = fragments[target];
+            if (ReferenceEquals(fragment, EmptyShard))
+                fragments[target] = fragment = new ZSet<T>();
+            fragment.Add(value, weight);
         }
         return fragments;
     }
@@ -171,7 +189,8 @@ internal sealed class ExchangeOperator<T>(Func<T, uint> routingHash) : IExchange
     {
         var merged = new ZSet<T>();
         foreach (var part in parts)
-            merged.AddAll((ZSet<T>)part!);
+            if (part is ZSet<T> { IsEmpty: false } fragment)
+                merged.AddAll(fragment);
         return merged;
     }
 
@@ -185,7 +204,8 @@ internal sealed class ExchangeOperator<T>(Func<T, uint> routingHash) : IExchange
         {
             var merged = new ZSet<T>();
             foreach (var fragments in senderFragments)
-                merged.AddAll((ZSet<T>)fragments[firstShard + k]);
+                if (fragments[firstShard + k] is ZSet<T> { IsEmpty: false } fragment)
+                    merged.AddAll(fragment);
             shards[k] = [.. merged];
         }
         return System.Text.Encoding.UTF8.GetBytes(JsonStateSerializer.Instance.Serialize(shards));

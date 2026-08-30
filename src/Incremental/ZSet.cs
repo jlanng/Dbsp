@@ -76,13 +76,42 @@ public sealed class ZSet<T> : IEnumerable<WeightedValue<T>> where T : notnull
         return result;
     }
 
-    public IEnumerator<WeightedValue<T>> GetEnumerator()
+    /// <summary>Allocation-free enumeration. <c>foreach</c> binds to this by pattern rather
+    /// than through <see cref="IEnumerable{T}"/>, so iterating a Z-set — which every operator
+    /// does several times per step, most often over an empty shard — costs nothing. The
+    /// interface implementations below still allocate an iterator; they exist for LINQ and
+    /// other <c>IEnumerable</c> consumers, which are never on the step path.</summary>
+    public Enumerator GetEnumerator() => new(_weights);
+
+    IEnumerator<WeightedValue<T>> IEnumerable<WeightedValue<T>>.GetEnumerator() => Enumerate();
+
+    IEnumerator IEnumerable.GetEnumerator() => Enumerate();
+
+    private IEnumerator<WeightedValue<T>> Enumerate()
     {
         foreach (var kv in _weights)
             yield return new WeightedValue<T>(kv.Key, kv.Value);
     }
 
-    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+    /// <summary>A by-value cursor over the Z-set's entries, wrapping the underlying
+    /// dictionary's own struct enumerator.</summary>
+    public struct Enumerator
+    {
+        private Dictionary<T, long>.Enumerator _inner;
+
+        internal Enumerator(Dictionary<T, long> weights) => _inner = weights.GetEnumerator();
+
+        public WeightedValue<T> Current { get; private set; }
+
+        public bool MoveNext()
+        {
+            if (!_inner.MoveNext())
+                return false;
+            var (value, weight) = _inner.Current;
+            Current = new WeightedValue<T>(value, weight);
+            return true;
+        }
+    }
 
     public override string ToString() =>
         "{" + string.Join(", ", _weights.Select(kv => $"{kv.Key} => {kv.Value:+#;-#;0}")) + "}";
