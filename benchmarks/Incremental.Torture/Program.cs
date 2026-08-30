@@ -183,6 +183,8 @@ var workingSet = Environment.WorkingSet;
 var seconds = wall.Elapsed.TotalSeconds;
 var workerCpu = cpu1.WorkerSeconds - cpu0.WorkerSeconds;
 var processCpu = cpu1.ProcessSeconds - cpu0.ProcessSeconds;
+var gcCpu = cpu1.GcSeconds - cpu0.GcSeconds;
+var producerCpu = cpu1.ProducerSeconds - cpu0.ProducerSeconds;
 var saturation = workerCpu / (seconds * options.Workers);
 
 stopProducer.Cancel();
@@ -195,8 +197,10 @@ Console.WriteLine($"  throughput      {records / seconds:N0} records/s   ({recor
 Console.WriteLine($"  steps           {steps / seconds:N0}/s   {records / (double)Math.Max(1, steps):N0} records/step   " +
                   $"{seconds / Math.Max(1, steps) * 1e6:N0} us/step");
 Console.WriteLine($"  worker CPU      {workerCpu:F2}s over {seconds:F1}s x {options.Workers} = {saturation:P0} saturated");
-Console.WriteLine($"  process CPU     {processCpu:F2}s ({processCpu / seconds:F2} cores)");
-Console.WriteLine($"  CPU per record  {processCpu / records * 1e6:F2} us   (workers only: {workerCpu / records * 1e6:F2} us)");
+Console.WriteLine($"  process CPU     {processCpu:F2}s ({processCpu / seconds:F2} cores)   " +
+                  $"= workers {workerCpu:F1}s + GC {gcCpu:F1}s + producer {producerCpu:F1}s + other {processCpu - workerCpu - gcCpu - producerCpu:F1}s");
+Console.WriteLine($"  CPU per record  {processCpu / records * 1e6:F2} us   (workers {workerCpu / records * 1e6:F2}, " +
+                  $"GC {gcCpu / records * 1e6:F2}, rest {(processCpu - workerCpu - gcCpu) / records * 1e6:F2})");
 Console.WriteLine($"  allocated       {allocated / (double)records:N0} B/record   {allocated / seconds / (1024 * 1024):N0} MB/s" +
                   $"   (producer share {Volatile.Read(ref producerAllocated) / (double)Math.Max(1, Volatile.Read(ref producedOrders)):N0} B/order)");
 Console.WriteLine($"  GC              gen0 {gc1.Item1 - gc0.Item1}   gen1 {gc1.Item2 - gc0.Item2}   gen2 {gc1.Item3 - gc0.Item3}" +
