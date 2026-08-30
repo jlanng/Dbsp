@@ -147,14 +147,19 @@ internal sealed class EvictionTracker<TKey>(KeyEviction<TKey> policy) where TKey
     /// as one list so callers can evict their state in a single batched store call.</summary>
     public List<TKey> DrainClosed()
     {
+        // Nothing has closed on the overwhelming majority of steps, and this runs once per
+        // evicting operator per worker per step — so the list is allocated only once a key
+        // actually passes its deadline. Callers read the result and never mutate it.
         var watermark = policy.Clock.FrozenTicks;
-        var closed = new List<TKey>();
+        List<TKey>? closed = null;
         while (_deadlines.TryPeek(out var key, out var deadline) && deadline <= watermark)
         {
             _deadlines.Dequeue();
             _tracked.Remove(key);
-            closed.Add(key);
+            (closed ??= []).Add(key);
         }
-        return closed;
+        return closed ?? Empty;
     }
+
+    private static readonly List<TKey> Empty = [];
 }

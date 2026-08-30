@@ -38,6 +38,27 @@ public sealed class OperatorContext
 internal interface IStepOperator
 {
     object Step(object?[] inputs);
+
+    /// <summary>
+    /// The delta to publish when every input delta this step is empty, letting the scheduler
+    /// skip <see cref="Step"/> altogether — for a keyed operator downstream of an exchange
+    /// that is the common case, since a small delta touches one worker's shard and leaves the
+    /// others with nothing to do.
+    /// <para>
+    /// Null (the default) means "run me anyway", which is the safe answer and the required one
+    /// for any operator that does work a delta cannot account for: reading the staged input
+    /// batch, reacting to a watermark, evicting closed keys, or carrying loop state between
+    /// iterations. Only return a value when <c>Step</c> over empty inputs provably changes no
+    /// state and produces nothing.
+    /// </para>
+    /// <para>
+    /// The instance is reused across steps and shared with every downstream operator that
+    /// receives it, so it must stay empty. That is safe because operators treat their inputs
+    /// as read-only — the same property that already lets pass-through operators return their
+    /// input unchanged.
+    /// </para>
+    /// </summary>
+    object? EmptyStepResult => null;
 }
 
 /// <summary>
@@ -80,7 +101,13 @@ internal sealed class InputOperator<T> : IStepOperator where T : notnull
     public object Step(object?[] inputs)
     {
         var batch = _pending;
-        _pending = new ZSet<T>();
+        // Only mint a replacement once this one has been filled: an idle input would
+        // otherwise allocate a fresh empty Z-set every step, on every worker. Handing the
+        // same empty batch out repeatedly is safe — downstream reads it and PublishAsync
+        // copies before anything reaches a consumer — and Enqueue only writes to it between
+        // steps, once the step that saw it has finished.
+        if (!batch.IsEmpty)
+            _pending = new ZSet<T>();
         return batch;
     }
 }
@@ -89,6 +116,10 @@ internal sealed class MapOperator<TIn, TOut>(Func<TIn, TOut> selector) : IStepOp
     where TIn : notnull
     where TOut : notnull
 {
+    private readonly ZSet<TOut> _empty = new();
+
+    public object? EmptyStepResult => _empty;
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<TIn>)inputs[0]!;
@@ -101,6 +132,10 @@ internal sealed class MapOperator<TIn, TOut>(Func<TIn, TOut> selector) : IStepOp
 
 internal sealed class FilterOperator<T>(Func<T, bool> predicate) : IStepOperator where T : notnull
 {
+    private readonly ZSet<T> _empty = new();
+
+    public object? EmptyStepResult => _empty;
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<T>)inputs[0]!;
@@ -116,6 +151,10 @@ internal sealed class FlatMapOperator<TIn, TOut>(Func<TIn, IEnumerable<TOut>> se
     where TIn : notnull
     where TOut : notnull
 {
+    private readonly ZSet<TOut> _empty = new();
+
+    public object? EmptyStepResult => _empty;
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<TIn>)inputs[0]!;
@@ -129,12 +168,20 @@ internal sealed class FlatMapOperator<TIn, TOut>(Func<TIn, IEnumerable<TOut>> se
 
 internal sealed class NegateOperator<T> : IStepOperator where T : notnull
 {
+    private readonly ZSet<T> _empty = new();
+
+    public object? EmptyStepResult => _empty;
+
     public object Step(object?[] inputs) => ((ZSet<T>)inputs[0]!).Negated();
 }
 
 /// <summary>Z-set addition (bag union) of any number of input streams.</summary>
 internal sealed class PlusOperator<T> : IStepOperator where T : notnull
 {
+    private readonly ZSet<T> _empty = new();
+
+    public object? EmptyStepResult => _empty;
+
     public object Step(object?[] inputs)
     {
         var output = new ZSet<T>();
@@ -185,13 +232,21 @@ internal sealed class ExchangeOperator<T>(Func<T, uint> routingHash) : IExchange
         return fragments;
     }
 
+    /// <summary>Merged output for a worker that was sent nothing. Distinct from
+    /// <see cref="EmptyShard"/>: this one does travel downstream as the node's delta, so
+    /// keeping the two apart means neither role can be broken by a stray write to the other.</summary>
+    private readonly ZSet<T> _emptyMerge = new();
+
     public object Merge(object?[] parts)
     {
-        var merged = new ZSet<T>();
+        // An exchange cannot be skipped the way a plain operator can — its barrier keeps the
+        // workers aligned — but the worker no key routed to this step still need not allocate
+        // a Z-set to say so.
+        ZSet<T>? merged = null;
         foreach (var part in parts)
             if (part is ZSet<T> { IsEmpty: false } fragment)
-                merged.AddAll(fragment);
-        return merged;
+                (merged ??= new ZSet<T>()).AddAll(fragment);
+        return merged ?? _emptyMerge;
     }
 
     // Wire encoding reuses the storage serializer (JSON with fields included, so tuple keys

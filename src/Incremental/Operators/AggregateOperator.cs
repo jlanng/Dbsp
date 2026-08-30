@@ -30,6 +30,13 @@ internal sealed class AggregateOperator<TKey, TValue, TResult> : IStepOperator
         _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
     }
 
+    private readonly ZSet<KeyedValue<TKey, TResult>> _empty = new();
+
+    // Every state change below is driven by a delta row, so an all-empty step is a
+    // no-op — unless a KeyEviction is attached, whose DrainClosed fires off the
+    // watermark instead and must run whether or not data arrived.
+    public object? EmptyStepResult => _eviction is null ? _empty : null;
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;

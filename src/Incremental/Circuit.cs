@@ -850,6 +850,7 @@ public sealed class Circuit : IAsyncDisposable
             var exchange = (IExchangeStepOperator)op;
             _mailboxes[n][worker.Id] = exchange.Partition(slots[node.Inputs[0]], _cluster?.GlobalWorkers ?? _workers.Length);
 
+
             _barrier.SignalAndWait();
 
             if (_cluster is { } cluster)
@@ -886,10 +887,22 @@ public sealed class Circuit : IAsyncDisposable
         }
         else
         {
+            // An operator whose every input is empty this step can usually be skipped
+            // outright (see IStepOperator.EmptyStepResult). Worth the check: a single-row
+            // change reaches one shard, so every other worker runs the whole downstream
+            // circuit on nothing. Exchanges are never skipped — their barrier keeps the
+            // workers aligned whether or not there is data to shuffle.
             var inputs = worker.NodeInputs[n];
+            var allEmpty = node.Inputs.Length > 0;
             for (var i = 0; i < node.Inputs.Length; i++)
-                inputs[i] = slots[node.Inputs[i]];
-            slots[n] = op.Step(inputs);
+            {
+                var value = slots[node.Inputs[i]];
+                inputs[i] = value;
+                allEmpty &= value is IZSet { IsEmpty: true };
+            }
+            slots[n] = allEmpty && op.EmptyStepResult is { } unchanged
+                ? unchanged
+                : op.Step(inputs);
         }
     }
 

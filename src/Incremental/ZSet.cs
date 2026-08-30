@@ -10,6 +10,14 @@ public readonly record struct KeyedValue<TKey, TValue>(TKey Key, TValue Value)
     where TKey : notnull
     where TValue : notnull;
 
+/// <summary>Type-erased view of a <see cref="ZSet{T}"/>, so the runtime — which moves deltas
+/// around as <see cref="object"/> — can ask whether one is empty without knowing its element
+/// type. Deliberately minimal: emptiness is the only property the scheduler needs.</summary>
+internal interface IZSet
+{
+    bool IsEmpty { get; }
+}
+
 /// <summary>
 /// A Z-set: a finite map from values to signed 64-bit weights, the core collection type of
 /// DBSP-style processing. A weight of +1 represents one insertion, -1 one deletion
@@ -17,7 +25,7 @@ public readonly record struct KeyedValue<TKey, TValue>(TKey Key, TValue Value)
 /// dropped. Streams in a circuit carry Z-set <em>deltas</em>, and integrating (summing) the
 /// deltas of a stream yields the current state of the collection it describes.
 /// </summary>
-public sealed class ZSet<T> : IEnumerable<WeightedValue<T>> where T : notnull
+public sealed class ZSet<T> : IZSet, IEnumerable<WeightedValue<T>> where T : notnull
 {
     private readonly Dictionary<T, long> _weights;
 
