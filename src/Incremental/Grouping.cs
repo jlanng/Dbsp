@@ -290,8 +290,8 @@ public sealed class GroupedEventTimeStream<TKey, TValue> : GroupedZStream<TKey, 
         var node = Builder.AddNode(
             "window",
             [NodeId],
-            _ => new FlatMapOperator<KeyedValue<TKey, TValue>, KeyedValue<WindowKey<TKey>, TValue>>(
-                kv => AssignWindows(kv, eventTime(kv.Value).UtcTicks, sizeTicks, hopTicks)));
+            _ => new WindowAssignOperator<TKey, TValue>(
+                value => eventTime(value).UtcTicks, sizeTicks, hopTicks));
         return new WindowedGroupedZStream<TKey, TValue>(Builder, node, WindowEviction());
     }
 
@@ -330,17 +330,4 @@ public sealed class GroupedEventTimeStream<TKey, TValue> : GroupedZStream<TKey, 
     /// margin is already inside the watermark itself.</summary>
     private KeyEviction<WindowKey<TKey>> WindowEviction() =>
         new(Builder.WatermarkClock!, static wk => wk.WindowEnd);
-
-    private static IEnumerable<KeyedValue<WindowKey<TKey>, TValue>> AssignWindows(
-        KeyedValue<TKey, TValue> record, long eventTicks, long sizeTicks, long hopTicks)
-    {
-        var latestStart = eventTicks / hopTicks * hopTicks;
-        for (var start = latestStart; start > eventTicks - sizeTicks; start -= hopTicks)
-            yield return new KeyedValue<WindowKey<TKey>, TValue>(
-                new WindowKey<TKey>(
-                    new DateTimeOffset(start, TimeSpan.Zero),
-                    new DateTimeOffset(start + sizeTicks, TimeSpan.Zero),
-                    record.Key),
-                record.Value);
-    }
 }
