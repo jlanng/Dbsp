@@ -17,6 +17,11 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
 - Benchmarks: `dotnet run -c Release --project benchmarks/Incremental.Benchmarks -- --filter '*'`
   (BenchmarkDotNet); `-- --assert` runs the CI performance contracts — scaling-ratio
   assertions (delta cost vs state size), which is what `.github/workflows/ci.yml` gates on
+- Throughput rig: `dotnet run -c Release --project benchmarks/Incremental.Torture -- --workers 4`
+  runs the showcase pipeline flat out over a sliding order population and reports records/s,
+  the process CPU split (workers vs GC), and allocation per record (`--alloc-types` for a
+  histogram by type; `--processes N` for the cluster wire path). Its README carries the
+  current numbers and the GC settings that matter
 
 ## Architecture invariants
 - Streams carry `ZSet<T>` **deltas** (value → signed weight); operators must be fully
@@ -32,6 +37,17 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
 - Exchange routing must be process-stable: route by `StableHash` (or a user-supplied
   stable hash), never `GetHashCode` — .NET randomizes string hashes per process, which
   silently breaks cluster routing and multi-worker checkpoint restore.
+- Per-step allocation is the dominant cost at throughput, because the GC's share of process
+  CPU scales with it while a circuit's live set stays large and mostly static. Operators size
+  their output Z-sets from the delta they derive them from, keep their flatten/probe/put
+  scratch as cleared-per-step fields rather than rebuilding it, and use the stores' `ApplyAll`
+  / `GetGroupsInto` (batched update with no result array; batched group read into caller-owned
+  buffers) rather than the allocating variants. A new operator that allocates per delta row —
+  or worse, per touched key — is a regression even when its asymptotics are right.
+- The cross-process exchange wire format is the dense codec in `Cluster/ShardCodec.cs`
+  (compiled per type from the same structural rules as `StableHash`), with a JSON fallback for
+  types it cannot round-trip and a format byte on every frame. Redis state serialization is
+  still JSON and must stay so — it is a persisted format.
 - Checkpointed state identity is covered by the state manifest (committed with every
   checkpoint, validated at `Start()`); store names are positional unless pinned with
   `.Named()` — changing store naming or the manifest format needs a format-version bump.
