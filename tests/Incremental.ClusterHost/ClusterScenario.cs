@@ -52,18 +52,27 @@ public static class ClusterScenario
     /// <summary>How many orders the checkpoint-restart scenario feeds before exiting.</summary>
     public const int LoadPhaseOrders = 8;
 
-    /// <summary>orders ⋈ customers (int key) → IndexBy(Region) (string key) → Sum(Amount):
-    /// two exchange hops, the second on the hash-seed-sensitive string key.</summary>
-    public static CircuitBuilder RevenuePipeline(CircuitOptions options)
+    /// <summary>The revenue pipeline's builder plus the definitions each host process
+    /// redeems against its own built circuit (<c>circuit.Handle(...)</c>).</summary>
+    public sealed record RevenueCircuit(
+        CircuitBuilder Builder,
+        InputStream<(int Id, int CustomerId, decimal Amount)> Orders,
+        InputStream<(int Id, string Region)> Customers,
+        Output<KeyedValue<string, decimal>> Revenue);
+
+    /// <summary>orders ⋈ customers (int key) → GroupBy(Region) (string key) → Sum(Amount):
+    /// two exchange hops, the second on the hash-seed-sensitive string key. The output opts
+    /// out of bootstrap: hosts assert on the raw per-shard deltas, not a resync snapshot.</summary>
+    public static RevenueCircuit RevenuePipeline(CircuitOptions options)
     {
         var builder = new CircuitBuilder(options);
         var orders = builder.Input<(int Id, int CustomerId, decimal Amount)>("orders");
         var customers = builder.Input<(int Id, string Region)>("customers");
-        orders.IndexBy(o => o.CustomerId)
-            .Join(customers.IndexBy(c => c.Id), (_, o, c) => (c.Region, o.Amount))
-            .IndexBy(x => x.Region)
+        var revenue = orders.GroupBy(o => o.CustomerId)
+            .Join(customers.GroupBy(c => c.Id), (_, o, c) => (c.Region, o.Amount))
+            .GroupBy(x => x.Region)
             .Sum(x => x.Amount)
-            .Output("revenue");
-        return builder;
+            .ToOutput(bootstrap: false);
+        return new RevenueCircuit(builder, orders, customers, revenue);
     }
 }

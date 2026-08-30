@@ -11,17 +11,18 @@ public class WindowCloseTests
     public async Task Close_fires_once_the_watermark_passes_the_deadline_and_never_again()
     {
         var builder = ManualBuilder();
-        builder.Input<(string Page, DateTimeOffset At)>("views")
-            .WithWatermark(v => v.At, allowedLateness: TimeSpan.Zero)
-            .TumblingWindow(TimeSpan.FromSeconds(5), v => v.At)
-            .IndexBy(w => w.WindowStart)
+        var views = builder.Input<(string Page, DateTimeOffset At)>("views");
+        var closesDef = views
+            .WithEventTime(v => v.At, lateness: TimeSpan.Zero)
+            .Tumble(TimeSpan.FromSeconds(5), v => v.At)
+            .GroupBy(w => w.WindowStart)
             .WindowCloses(windowStart => windowStart.AddSeconds(5))
-            .Output("closes");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string Page, DateTimeOffset At)>("views");
-        var output = circuit.Output<KeyedValue<DateTimeOffset, DateTimeOffset>>("closes");
+        var input = circuit.Handle(views);
+        var output = circuit.Handle(closesDef);
 
         // Step 1 populates window T0; no watermark is frozen yet, so nothing closes.
         await input.InsertAsync(("home", T0.AddSeconds(1)));
@@ -57,17 +58,18 @@ public class WindowCloseTests
     public async Task Allowed_lateness_delays_the_close()
     {
         var builder = ManualBuilder();
-        builder.Input<(string Page, DateTimeOffset At)>("views")
-            .WithWatermark(v => v.At, allowedLateness: TimeSpan.FromSeconds(5))
-            .TumblingWindow(TimeSpan.FromSeconds(5), v => v.At)
-            .IndexBy(w => w.WindowStart)
+        var views = builder.Input<(string Page, DateTimeOffset At)>("views");
+        var closesDef = views
+            .WithEventTime(v => v.At, lateness: TimeSpan.FromSeconds(5))
+            .Tumble(TimeSpan.FromSeconds(5), v => v.At)
+            .GroupBy(w => w.WindowStart)
             .WindowCloses(windowStart => windowStart.AddSeconds(5))
-            .Output("closes");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string Page, DateTimeOffset At)>("views");
-        var output = circuit.Output<KeyedValue<DateTimeOffset, DateTimeOffset>>("closes");
+        var input = circuit.Handle(views);
+        var output = circuit.Handle(closesDef);
 
         // The watermark lags max event time by 5s, so window T0 (deadline T0+5s) only
         // closes once an event at T0+10s or later has been seen — and then one step later,
@@ -99,20 +101,23 @@ public class WindowCloseTests
     public async Task Joining_closes_with_the_aggregate_publishes_finalized_results()
     {
         var builder = ManualBuilder();
-        var windowed = builder.Input<(string User, DateTimeOffset At)>("views")
-            .WithWatermark(v => v.At, allowedLateness: TimeSpan.FromSeconds(5))
-            .TumblingWindow(TimeSpan.FromSeconds(5), v => v.At)
-            .IndexBy(w => w.WindowStart)
-            .WithEviction(windowStart => windowStart.AddSeconds(5));
+        var views = builder.Input<(string User, DateTimeOffset At)>("views");
+        var windowed = views
+            .WithEventTime(v => v.At, lateness: TimeSpan.FromSeconds(5))
+            .Tumble(TimeSpan.FromSeconds(5), v => v.At)
+            .GroupBy(w => w.WindowStart)
+            .EvictWhen(windowStart => windowStart.AddSeconds(5));
         var counts = windowed.Count();
-        windowed.WindowCloses() // parameterless: closes at the eviction policy's deadline
-            .Join(counts, (window, closedAt, count) => (window, count))
-            .Output("finalCounts");
+        var finalsDef = windowed
+            .WindowCloses() // parameterless: closes at the eviction policy's deadline
+            .Grouped()
+            .Join(counts.Grouped(), (window, closedAt, count) => (window, count))
+            .ToOutput();
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string User, DateTimeOffset At)>("views");
-        var output = circuit.Output<(DateTimeOffset Window, long Count)>("finalCounts");
+        var input = circuit.Handle(views);
+        var output = circuit.Handle(finalsDef);
 
         // Two events in window T0, then a late correction: the running count goes 2 -> 3,
         // but nothing is published — only the finalized value will be.
@@ -144,20 +149,63 @@ public class WindowCloseTests
     }
 
     [Fact]
-    public async Task Fully_retracted_window_still_closes_and_is_never_retracted()
+    public async Task OnClose_emits_each_windowed_row_once_and_final()
     {
         var builder = ManualBuilder();
-        builder.Input<(string Page, DateTimeOffset At)>("views")
-            .WithWatermark(v => v.At, allowedLateness: TimeSpan.Zero)
-            .TumblingWindow(TimeSpan.FromSeconds(5), v => v.At)
-            .IndexBy(w => w.WindowStart)
-            .WindowCloses(windowStart => windowStart.AddSeconds(5))
-            .Output("closes");
+        var views = builder.Input<(string Page, DateTimeOffset At)>("views");
+        var finalsDef = views
+            .WithEventTime(v => v.At, lateness: TimeSpan.Zero)
+            .GroupBy(v => v.Page)
+            .TumblingWindow(TimeSpan.FromSeconds(5))
+            .Count()
+            .OnClose()
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string Page, DateTimeOffset At)>("views");
-        var output = circuit.Output<KeyedValue<DateTimeOffset, DateTimeOffset>>("closes");
+        var input = circuit.Handle(views);
+        var output = circuit.Handle(finalsDef);
+
+        // Window T0 flaps 1 -> 2 for "home" while open: nothing is published.
+        await input.InsertAsync(("home", T0.AddSeconds(1)));
+        await circuit.StepAsync(); // freezes T0+1s
+        await input.InsertAsync(("home", T0.AddSeconds(2)));
+        await input.InsertAsync(("docs", T0.AddSeconds(3)));
+        await circuit.StepAsync(); // freezes T0+3s
+        Assert.False(output.Reader.TryRead(out _));
+
+        // Advance the watermark past T0+5s: both pages' final counts emit exactly once.
+        await input.InsertAsync(("home", T0.AddSeconds(7)));
+        await circuit.StepAsync(); // freezes T0+7s
+        await input.InsertAsync(("home", T0.AddSeconds(8)));
+        await circuit.StepAsync(); // watermark T0+7s >= T0+5s: window T0 closes
+        var delta = await output.Reader.ReadAsync();
+        Assert.Equal(1, delta.WeightOf(new WindowedValue<string, long>(T0, T0.AddSeconds(5), "home", 2)));
+        Assert.Equal(1, delta.WeightOf(new WindowedValue<string, long>(T0, T0.AddSeconds(5), "docs", 1)));
+        Assert.Equal(2, delta.DistinctCount);
+
+        // The closed window never re-emits.
+        await input.InsertAsync(("home", T0.AddSeconds(9)));
+        await circuit.StepAsync();
+        Assert.False(output.Reader.TryRead(out _));
+    }
+
+    [Fact]
+    public async Task Fully_retracted_window_still_closes_and_is_never_retracted()
+    {
+        var builder = ManualBuilder();
+        var views = builder.Input<(string Page, DateTimeOffset At)>("views");
+        var closesDef = views
+            .WithEventTime(v => v.At, lateness: TimeSpan.Zero)
+            .Tumble(TimeSpan.FromSeconds(5), v => v.At)
+            .GroupBy(w => w.WindowStart)
+            .WindowCloses(windowStart => windowStart.AddSeconds(5))
+            .ToOutput(bootstrap: false);
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var input = circuit.Handle(views);
+        var output = circuit.Handle(closesDef);
 
         // Window T0's only event is inserted, then deleted: it closes by time, not contents.
         await input.InsertAsync(("home", T0.AddSeconds(1)));
@@ -184,17 +232,18 @@ public class WindowCloseTests
     public async Task Pending_closes_are_flushed_when_inputs_complete()
     {
         var builder = new CircuitBuilder(); // auto-stepping
-        builder.Input<DateTimeOffset>("events")
-            .WithWatermark(t => t, allowedLateness: TimeSpan.Zero)
-            .TumblingWindow(TimeSpan.FromSeconds(5), t => t)
-            .IndexBy(w => w.WindowStart)
+        var events = builder.Input<DateTimeOffset>("events");
+        var closesDef = events
+            .WithEventTime(t => t, lateness: TimeSpan.Zero)
+            .Tumble(TimeSpan.FromSeconds(5), t => t)
+            .GroupBy(w => w.WindowStart)
             .WindowCloses(windowStart => windowStart.AddSeconds(5))
-            .Output("closes");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<DateTimeOffset>("events");
-        var output = circuit.Output<KeyedValue<DateTimeOffset, DateTimeOffset>>("closes");
+        var input = circuit.Handle(events);
+        var output = circuit.Handle(closesDef);
 
         // The last event advances the watermark past window T0's deadline, but that freeze
         // happens after the final data step — the shutdown flush step must still deliver it.
@@ -203,7 +252,7 @@ public class WindowCloseTests
         input.Complete();
 
         var integrated = new ZSet<KeyedValue<DateTimeOffset, DateTimeOffset>>();
-        await foreach (var delta in output.ReadAllAsync())
+        await foreach (var delta in output.Changes())
             integrated.AddAll(delta);
         Assert.Equal(1, integrated.WeightOf(new KeyedValue<DateTimeOffset, DateTimeOffset>(T0, T0.AddSeconds(5))));
         Assert.Equal(1, integrated.DistinctCount); // window [T0+10s, T0+15s) is still open
@@ -214,17 +263,18 @@ public class WindowCloseTests
     {
         const int windows = 150;
         var builder = new CircuitBuilder(new CircuitOptions { Workers = 4 });
-        builder.Input<DateTimeOffset>("events")
-            .WithWatermark(t => t, allowedLateness: TimeSpan.Zero)
-            .TumblingWindow(TimeSpan.FromSeconds(5), t => t)
-            .IndexBy(w => w.WindowStart)
+        var events = builder.Input<DateTimeOffset>("events");
+        var closesDef = events
+            .WithEventTime(t => t, lateness: TimeSpan.Zero)
+            .Tumble(TimeSpan.FromSeconds(5), t => t)
+            .GroupBy(w => w.WindowStart)
             .WindowCloses(windowStart => windowStart.AddSeconds(5))
-            .Output("closes");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<DateTimeOffset>("events");
-        var output = circuit.Output<KeyedValue<DateTimeOffset, DateTimeOffset>>("closes");
+        var input = circuit.Handle(events);
+        var output = circuit.Handle(closesDef);
 
         // In-order events, three per window, so every window is populated on some worker.
         for (var i = 0; i < windows; i++)
@@ -233,7 +283,7 @@ public class WindowCloseTests
         input.Complete();
 
         var integrated = new ZSet<KeyedValue<DateTimeOffset, DateTimeOffset>>();
-        await foreach (var delta in output.ReadAllAsync())
+        await foreach (var delta in output.Changes())
             integrated.AddAll(delta);
 
         // The final watermark passes every deadline but the last window's. Each closed
@@ -251,7 +301,7 @@ public class WindowCloseTests
     public void WindowCloses_requires_a_watermark()
     {
         var builder = new CircuitBuilder();
-        var keyed = builder.Input<(string Key, DateTimeOffset At)>("in").IndexBy(v => v.Key);
+        var keyed = builder.Input<(string Key, DateTimeOffset At)>("in").GroupBy(v => v.Key);
         Assert.Throws<InvalidOperationException>(() => keyed.WindowCloses(_ => DateTimeOffset.MaxValue));
     }
 
@@ -260,8 +310,8 @@ public class WindowCloseTests
     {
         var builder = new CircuitBuilder();
         var keyed = builder.Input<(string Key, DateTimeOffset At)>("in")
-            .WithWatermark(v => v.At, allowedLateness: TimeSpan.Zero)
-            .IndexBy(v => v.Key);
+            .WithEventTime(v => v.At, lateness: TimeSpan.Zero)
+            .GroupBy(v => v.Key);
         Assert.Throws<InvalidOperationException>(() => keyed.WindowCloses());
     }
 }

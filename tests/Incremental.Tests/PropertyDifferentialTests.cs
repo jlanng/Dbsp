@@ -67,11 +67,12 @@ public class PropertyDifferentialTests
             foreach (var workers in WorkerCounts)
             {
                 var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Workers = workers });
-                query(builder.Input<TIn>("in")).Output("out");
+                var inputDef = builder.Input<TIn>("in");
+                var outputDef = query(inputDef).ToOutput();
                 await using var circuit = builder.Build();
                 circuit.Start();
-                var input = circuit.Input<TIn>("in");
-                var output = circuit.Output<TOut>("out");
+                var input = circuit.Handle(inputDef);
+                var output = circuit.Handle(outputDef);
 
                 var integratedIn = new ZSet<TIn>();
                 var integratedOut = new ZSet<TOut>();
@@ -106,12 +107,14 @@ public class PropertyDifferentialTests
             foreach (var workers in WorkerCounts)
             {
                 var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Workers = workers });
-                query(builder.Input<TIn>("left"), builder.Input<TIn>("right")).Output("out");
+                var leftDef = builder.Input<TIn>("left");
+                var rightDef = builder.Input<TIn>("right");
+                var outputDef = query(leftDef, rightDef).ToOutput();
                 await using var circuit = builder.Build();
                 circuit.Start();
-                var left = circuit.Input<TIn>("left");
-                var right = circuit.Input<TIn>("right");
-                var output = circuit.Output<TOut>("out");
+                var left = circuit.Handle(leftDef);
+                var right = circuit.Handle(rightDef);
+                var output = circuit.Handle(outputDef);
 
                 var integratedL = new ZSet<TIn>();
                 var integratedR = new ZSet<TIn>();
@@ -178,7 +181,7 @@ public class PropertyDifferentialTests
             var batches = ToBatches(ops, (k, v) => (Key: k, Val: v));
             AssertDifferential(
                 batches,
-                s => s.IndexBy(x => x.Key).Count(),
+                s => s.GroupBy(x => x.Key).Count(),
                 input => Groups(input).Where(g => g.Value.Sum(r => r.Weight) > 0)
                     .Select(g => new WeightedValue<KeyedValue<int, long>>(
                         new KeyedValue<int, long>(g.Key, g.Value.Sum(r => r.Weight)), 1)));
@@ -192,7 +195,7 @@ public class PropertyDifferentialTests
             AssertDifferential(
                 batches,
                 // Val - 2 makes group sums hit zero while rows remain — the interesting case.
-                s => s.IndexBy(x => x.Key).Sum(x => (decimal)(x.Val - 2)),
+                s => s.GroupBy(x => x.Key).Sum(x => (decimal)(x.Val - 2)),
                 input => Groups(input).Where(g => g.Value.Sum(r => r.Weight) > 0)
                     .Select(g => new WeightedValue<KeyedValue<int, decimal>>(
                         new KeyedValue<int, decimal>(g.Key, g.Value.Sum(r => (r.Val - 2) * r.Weight)), 1)));
@@ -205,7 +208,7 @@ public class PropertyDifferentialTests
             var batches = ToBatches(ops, (k, v) => (Key: k, Val: v));
             AssertDifferential(
                 batches,
-                s => s.IndexBy(x => x.Key).Aggregate(new SortedConcat()),
+                s => s.GroupBy(x => x.Key).Aggregate(new SortedConcat()),
                 input => Groups(input).Where(g => g.Value.Any(r => r.Weight > 0))
                     .Select(g => new WeightedValue<KeyedValue<int, string>>(
                         new KeyedValue<int, string>(g.Key, SortedConcat.Compute(
@@ -237,11 +240,11 @@ public class PropertyDifferentialTests
                 batches,
                 s =>
                 {
-                    var keyed = s.IndexBy(x => x.Key);
+                    var keyed = s.GroupBy(x => x.Key);
                     // Tag min 0 / max 1 and merge, so one circuit exercises both trees —
                     // including deleting the current extremum, the tournament tree's hot spot.
                     return keyed.Min(x => x.Val).MapValues(v => (Tag: 0, V: v))
-                        .Plus(keyed.Max(x => x.Val).MapValues(v => (Tag: 1, V: v)));
+                        .Concat(keyed.Max(x => x.Val).MapValues(v => (Tag: 1, V: v)));
                 },
                 input => Groups(input)
                     .Select(g => (g.Key, Vals: g.Value.Where(r => r.Weight > 0).Select(r => r.Val).ToList()))
@@ -264,7 +267,7 @@ public class PropertyDifferentialTests
                 batches,
                 // Ranked by the value itself: ties are identical rows, so multiplicities —
                 // which count toward K — make the top-2 recompute exact.
-                s => s.IndexBy(x => x.Key).TopK(2, x => x.Val),
+                s => s.GroupBy(x => x.Key).TopK(2, x => x.Val),
                 input => Groups(input).SelectMany(g => g.Value
                     .GroupBy(r => r.Val, r => r.Weight)
                     .Select(v => (Val: v.Key, Count: v.Sum()))
@@ -304,8 +307,8 @@ public class PropertyDifferentialTests
         {
             AssertDifferential2(
                 ToBatches2(ops),
-                (l, r) => l.IndexBy(x => x.Key)
-                    .Join(r.IndexBy(x => x.Key), (k, lv, rv) => (k, lv.Val, rv.Val)),
+                (l, r) => l.GroupBy(x => x.Key)
+                    .Join(r.GroupBy(x => x.Key), (k, lv, rv) => (k, lv.Val, rv.Val)),
                 (left, right) => JoinOracle(left, right));
         }, iter: 25);
 
@@ -325,7 +328,7 @@ public class PropertyDifferentialTests
         {
             AssertDifferential2(
                 ToBatches2(ops),
-                (l, r) => l.IndexBy(x => x.Key).AntiJoin(r.IndexBy(x => x.Key)),
+                (l, r) => l.GroupBy(x => x.Key).AntiJoin(r.GroupBy(x => x.Key)),
                 (left, right) =>
                 {
                     var matchedKeys = right.Where(e => e.Weight > 0).Select(e => e.Value.Key).ToHashSet();
@@ -341,8 +344,8 @@ public class PropertyDifferentialTests
         {
             AssertDifferential2(
                 ToBatches2(ops),
-                (l, r) => l.IndexBy(x => x.Key).LeftJoin(
-                    r.IndexBy(x => x.Key),
+                (l, r) => l.GroupBy(x => x.Key).LeftJoin(
+                    r.GroupBy(x => x.Key),
                     (k, lv, rv) => (k, lv.Val, rv.Val),
                     (k, lv) => (k, lv.Val, -1)),
                 (left, right) =>
@@ -362,14 +365,20 @@ public class PropertyDifferentialTests
             var batches = ToBatches(ops, (k, t) => (Key: k, T: t));
             AssertDifferential(
                 batches,
-                s => s.SessionWindow(gap, e => Time(e.T), e => e.Key),
+                // Generous lateness so nothing is dropped: this property is about
+                // sessionization, not the watermark.
+                s => s.WithEventTime(e => Time(e.T), lateness: TimeSpan.FromDays(1))
+                    .GroupBy(e => e.Key)
+                    .SessionWindow(gap)
+                    .Count(),
                 input =>
                 {
                     var rows = input.Where(e => e.Weight > 0).ToList();
                     return rows.GroupBy(e => e.Value.Key).SelectMany(g =>
                     {
                         // Recompute sessionization from scratch: sorted distinct times,
-                        // split where the inactivity gap is reached (>= gap per the docs).
+                        // split where the inactivity gap is reached (>= gap per the docs),
+                        // then one count row per session over the events it contains.
                         var times = g.Select(e => e.Value.T).Distinct().OrderBy(t => t).ToList();
                         var bounds = new Dictionary<int, (DateTimeOffset Start, DateTimeOffset End)>();
                         for (var i = 0; i < times.Count;)
@@ -382,12 +391,11 @@ public class PropertyDifferentialTests
                                 bounds[times[t]] = span;
                             i = j + 1;
                         }
-                        return g.Select(e => new WeightedValue<KeyedValue<int, Windowed<(int Key, int T)>>>(
-                            new KeyedValue<int, Windowed<(int Key, int T)>>(
-                                e.Value.Key,
-                                new Windowed<(int Key, int T)>(
-                                    bounds[e.Value.T].Start, bounds[e.Value.T].End, e.Value)),
-                            e.Weight));
+                        return g.GroupBy(e => bounds[e.Value.T])
+                            .Select(session => new WeightedValue<WindowedValue<int, long>>(
+                                new WindowedValue<int, long>(
+                                    session.Key.Start, session.Key.End, g.Key, session.Sum(e => e.Weight)),
+                                1));
                     });
                 });
         }, iter: 20);
@@ -404,8 +412,8 @@ public class PropertyDifferentialTests
             AssertDifferential(
                 batches,
                 edges => edges.Recurse(paths => paths
-                    .IndexBy(p => p.To)
-                    .Join(edges.IndexBy(e => e.From), (_, p, e) => (p.From, e.To))),
+                    .GroupBy(p => p.To)
+                    .Join(edges.GroupBy(e => e.From), (_, p, e) => (p.From, e.To))),
                 input =>
                 {
                     var present = input.Where(e => e.Weight > 0).Select(e => e.Value).ToHashSet();

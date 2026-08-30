@@ -16,16 +16,17 @@ public class PipelineBenchmarks
     public void Setup()
     {
         var builder = new CircuitBuilder(Rig.Options());
-        builder.Input<int>("numbers")
-            .Filter(n => (n & 1) == 0)
-            .Map(n => n * 3)
-            .Output("result");
+        var numbers = builder.Input<int>("numbers");
+        var result = numbers
+            .Where(n => (n & 1) == 0)
+            .Select(n => n * 3)
+            .ToOutput();
 
         var circuit = builder.Build();
         circuit.Start();
         _rig = new Rig(circuit);
-        _rig.Watch<int>("result");
-        _input = circuit.Input<int>("numbers");
+        _rig.Watch(result);
+        _input = circuit.Handle(numbers);
         _batch = Enumerable.Range(0, BatchSize).Select(i => new WeightedValue<int>(i, 1)).ToArray();
     }
 

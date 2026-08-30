@@ -6,12 +6,13 @@ public class KeyedInputTests
     public async Task Upsert_retracts_the_previous_row_and_delete_retracts_the_current_one()
     {
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false });
-        builder.KeyedInput<int, (int Id, string Name)>("rows", r => r.Id).Output("out");
+        var rows = builder.KeyedInput<int, (int Id, string Name)>("rows", r => r.Id);
+        var outDef = rows.ToOutput();
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.KeyedInput<int, (int Id, string Name)>("rows");
-        var output = circuit.Output<(int Id, string Name)>("out");
+        var input = circuit.Handle(rows);
+        var output = circuit.Handle(outDef);
 
         await input.UpsertAsync((1, "a"));
         await circuit.StepAsync();
@@ -48,17 +49,17 @@ public class KeyedInputTests
         var orders = builder.Input<(int Id, int Cust)>("orders");
         var customers = builder.KeyedInput<int, (int Id, string Region)>("customers", c => c.Id);
 
-        orders.IndexBy(o => o.Cust)
-            .Join(customers.IndexBy(c => c.Id), (_, o, c) => (o.Id, c.Region))
-            .IndexBy(x => x.Region)
+        var byRegionDef = orders.GroupBy(o => o.Cust)
+            .Join(customers.GroupBy(c => c.Id), (_, o, c) => (o.Id, c.Region))
+            .GroupBy(x => x.Region)
             .Count()
-            .Output("by-region");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var ordersIn = circuit.Input<(int Id, int Cust)>("orders");
-        var customersIn = circuit.KeyedInput<int, (int Id, string Region)>("customers");
-        var output = circuit.Output<KeyedValue<string, long>>("by-region");
+        var ordersIn = circuit.Handle(orders);
+        var customersIn = circuit.Handle(customers);
+        var output = circuit.Handle(byRegionDef);
 
         await customersIn.UpsertAsync((7, "emea"));
         await ordersIn.InsertAsync((1, 7));

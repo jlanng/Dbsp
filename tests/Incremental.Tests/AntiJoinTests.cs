@@ -12,15 +12,15 @@ public class AntiJoinTests
         var orders = builder.Input<(int Id, int Cust)>("orders");
         var customers = builder.Input<int>("customers");
 
-        orders.IndexBy(o => o.Cust)
-            .AntiJoin(customers.IndexBy(c => c))
-            .Output("orphans");
+        var orphansDef = orders.GroupBy(o => o.Cust)
+            .AntiJoin(customers.GroupBy(c => c))
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var ordersIn = circuit.Input<(int Id, int Cust)>("orders");
-        var customersIn = circuit.Input<int>("customers");
-        var output = circuit.Output<KeyedValue<int, (int Id, int Cust)>>("orphans");
+        var ordersIn = circuit.Handle(orders);
+        var customersIn = circuit.Handle(customers);
+        var output = circuit.Handle(orphansDef);
 
         static KeyedValue<int, (int, int)> Row(int id) => new(7, (id, 7));
 
@@ -55,18 +55,18 @@ public class AntiJoinTests
         var orders = builder.Input<(int Id, int Cust)>("orders");
         var customers = builder.Input<(int Id, string Name)>("customers");
 
-        orders.IndexBy(o => o.Cust)
+        var joinedDef = orders.GroupBy(o => o.Cust)
             .LeftJoin(
-                customers.IndexBy(c => c.Id),
+                customers.GroupBy(c => c.Id),
                 matched: (_, order, customer) => (order.Id, customer.Name),
                 unmatched: (_, order) => (order.Id, "<none>"))
-            .Output("joined");
+            .ToOutput();
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var ordersIn = circuit.Input<(int Id, int Cust)>("orders");
-        var customersIn = circuit.Input<(int Id, string Name)>("customers");
-        var output = circuit.Output<(int Id, string Name)>("joined");
+        var ordersIn = circuit.Handle(orders);
+        var customersIn = circuit.Handle(customers);
+        var output = circuit.Handle(joinedDef);
 
         await ordersIn.InsertAsync((1, 7));
         await circuit.StepAsync();
@@ -88,19 +88,19 @@ public class AntiJoinTests
         var left = builder.Input<(int Key, string Val)>("left");
         var right = builder.Input<(int Key, string Val)>("right");
 
-        left.IndexBy(l => l.Key)
+        var joinedDef = left.GroupBy(l => l.Key)
             .FullJoin(
-                right.IndexBy(r => r.Key),
+                right.GroupBy(r => r.Key),
                 matched: (key, l, r) => $"{key}:{l.Val}+{r.Val}",
                 leftOnly: (key, l) => $"{key}:{l.Val}+?",
                 rightOnly: (key, r) => $"{key}:?+{r.Val}")
-            .Output("joined");
+            .ToOutput();
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var leftIn = circuit.Input<(int Key, string Val)>("left");
-        var rightIn = circuit.Input<(int Key, string Val)>("right");
-        var output = circuit.Output<string>("joined");
+        var leftIn = circuit.Handle(left);
+        var rightIn = circuit.Handle(right);
+        var output = circuit.Handle(joinedDef);
 
         await leftIn.InsertAsync((1, "a"));
         await rightIn.InsertAsync((2, "b"));

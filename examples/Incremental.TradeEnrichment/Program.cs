@@ -147,18 +147,25 @@ AnsiConsole.WriteLine();
 var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Workers = 1 });
 
 var tradeStream = builder.KeyedInput<long, Trade>("trades", t => t.Id);
-var enriched = tradeStream.Map(t => new EnrichedTrade(
+var enriched = tradeStream.Select(t => new EnrichedTrade(
     t.Id, t.Side, t.InstrumentId, t.TraderId, t.CounterpartyId, t.Quantity, t.Price, t.Quantity * t.Price,
     "—", "—", "—", "—", "—", "—", "—", "—"));
+
+// Input definitions are redeemed with circuit.Handle(...) after Build(), so the ones the
+// column selections bring into the circuit are kept in variables here.
+KeyedInputStream<int, Instrument>? instrumentInput = null;
+KeyedInputStream<int, TraderRow>? traderInput = null;
+KeyedInputStream<int, Desk>? deskInput = null;
+KeyedInputStream<int, Counterparty>? cptyInput = null;
 
 if (useInstrument)
 {
     var wantSymbol = cols.Contains(ColSymbol);
     var wantAssetClass = cols.Contains(ColAssetClass);
     var wantCurrency = cols.Contains(ColCurrency);
-    var table = builder.KeyedInput<int, Instrument>("instruments", i => i.Id);
-    enriched = enriched.IndexBy(e => e.InstrumentId)
-        .Join(table.IndexBy(i => i.Id), (_, e, i) => e with
+    instrumentInput = builder.KeyedInput<int, Instrument>("instruments", i => i.Id);
+    enriched = enriched.GroupBy(e => e.InstrumentId)
+        .Join(instrumentInput.GroupBy(i => i.Id), (_, e, i) => e with
         {
             Symbol = wantSymbol ? i.Symbol : e.Symbol,
             AssetClass = wantAssetClass ? i.AssetClass : e.AssetClass,
@@ -170,12 +177,12 @@ if (useDesk)
     var wantTrader = cols.Contains(ColTrader);
     var wantDesk = cols.Contains(ColDesk);
     var wantRegion = cols.Contains(ColRegion);
-    var traderTable = builder.KeyedInput<int, TraderRow>("traders", t => t.Id);
-    var deskTable = builder.KeyedInput<int, Desk>("desks", d => d.Id);
-    enriched = enriched.IndexBy(e => e.TraderId)
-        .Join(traderTable.IndexBy(t => t.Id), (_, e, t) => (Trade: e, t.DeskId, t.Name))
-        .IndexBy(x => x.DeskId)
-        .Join(deskTable.IndexBy(d => d.Id), (_, x, d) => x.Trade with
+    traderInput = builder.KeyedInput<int, TraderRow>("traders", t => t.Id);
+    deskInput = builder.KeyedInput<int, Desk>("desks", d => d.Id);
+    enriched = enriched.GroupBy(e => e.TraderId)
+        .Join(traderInput.GroupBy(t => t.Id), (_, e, t) => (Trade: e, t.DeskId, t.Name))
+        .GroupBy(x => x.DeskId)
+        .Join(deskInput.GroupBy(d => d.Id), (_, x, d) => x.Trade with
         {
             Trader = wantTrader ? x.Name : x.Trade.Trader,
             Desk = wantDesk ? d.Name : x.Trade.Desk,
@@ -186,9 +193,9 @@ if (useCpty)
 {
     var wantName = cols.Contains(ColCptyName);
     var wantRating = cols.Contains(ColRating);
-    var table = builder.KeyedInput<int, Counterparty>("counterparties", c => c.Id);
-    enriched = enriched.IndexBy(e => e.CounterpartyId)
-        .Join(table.IndexBy(c => c.Id), (_, e, c) => e with
+    cptyInput = builder.KeyedInput<int, Counterparty>("counterparties", c => c.Id);
+    enriched = enriched.GroupBy(e => e.CounterpartyId)
+        .Join(cptyInput.GroupBy(c => c.Id), (_, e, c) => e with
         {
             Counterparty = wantName ? c.Name : e.Counterparty,
             Rating = wantRating ? c.Rating : e.Rating,
@@ -196,62 +203,82 @@ if (useCpty)
 }
 
 const char KeySep = ''; // unit separator: cannot occur in any dimension value
+// A global ranking needs all rows in one group, so both shapes funnel through a unit key.
+// bootstrap: false — the step loop below drains and integrates the raw changefeed itself
+// and counts each step's delta rows, so no resync batch (or snapshot state) is wanted.
+Output<KeyedValue<int, EnrichedTrade>>? blotterDef = null;
+Output<KeyedValue<int, KeyedValue<string, (long Trades, double Notional)>>>? groupsDef = null;
 if (blotterMode)
 {
-    enriched.IndexBy(_ => 0).TopK(MaxBlotterRows, e => e.Notional).Output("blotter");
+    blotterDef = enriched.GroupBy(_ => 0).TopK(MaxBlotterRows, e => e.Notional).ToOutput(bootstrap: false);
 }
 else
 {
     var selectors = dims.Select(d => d.Select).ToArray();
-    enriched
-        .IndexBy(e => string.Join(KeySep, selectors.Select(s => s(e))))
+    groupsDef = enriched
+        .GroupBy(e => string.Join(KeySep, selectors.Select(s => s(e))))
         .AggregateLinear(new TradeStatsAggregate())
-        .IndexBy(_ => 0)
+        .GroupBy(_ => 0)
         .TopK(MaxGroupRows, s => s.Value.Notional)
-        .Output("groups");
+        .ToOutput(bootstrap: false);
 }
 
 await using var circuit = builder.Build();
 circuit.Start();
 
-var tradeInput = circuit.KeyedInput<long, Trade>("trades");
-if (useInstrument)
+var tradeInput = circuit.Handle(tradeStream);
+KeyedInputHandle<int, TraderRow>? traderHandle = null;
+KeyedInputHandle<int, Counterparty>? cptyHandle = null;
+if (instrumentInput is not null)
 {
-    var handle = circuit.KeyedInput<int, Instrument>("instruments");
+    var handle = circuit.Handle(instrumentInput);
     foreach (var row in instruments)
         await handle.UpsertAsync(row);
 }
-if (useDesk)
+if (traderInput is not null && deskInput is not null)
 {
-    var traderHandle = circuit.KeyedInput<int, TraderRow>("traders");
+    traderHandle = circuit.Handle(traderInput);
     foreach (var row in traders)
         await traderHandle.UpsertAsync(row);
-    var deskHandle = circuit.KeyedInput<int, Desk>("desks");
+    var deskHandle = circuit.Handle(deskInput);
     foreach (var row in desks)
         await deskHandle.UpsertAsync(row);
 }
-if (useCpty)
+if (cptyInput is not null)
 {
-    var handle = circuit.KeyedInput<int, Counterparty>("counterparties");
+    cptyHandle = circuit.Handle(cptyInput);
     foreach (var row in counterparties)
-        await handle.UpsertAsync(row);
+        await cptyHandle.UpsertAsync(row);
 }
 await circuit.StepAsync();
 
-var blotterOut = blotterMode ? circuit.Output<KeyedValue<int, EnrichedTrade>>("blotter") : null;
-var groupsOut = blotterMode ? null : circuit.Output<KeyedValue<int, KeyedValue<string, (long Trades, double Notional)>>>("groups");
+// Step-level output consumption: publishing happens inside StepAsync, so draining the
+// raw Reader right after a step deterministically yields exactly that step's batch —
+// integrated into the live view, with the delta-row count each step reports.
 var blotterView = new ZSet<KeyedValue<int, EnrichedTrade>>();
 var groupsView = new ZSet<KeyedValue<int, KeyedValue<string, (long Trades, double Notional)>>>();
+var blotterHandle = blotterMode ? circuit.Handle(blotterDef!) : null;
+var groupsHandle = blotterMode ? null : circuit.Handle(groupsDef!);
 
 long DrainOutputs()
 {
-    long rows = 0;
-    if (blotterOut is not null)
-        while (blotterOut.Reader.TryRead(out var d)) { blotterView.AddAll(d); rows += d.DistinctCount; }
-    if (groupsOut is not null)
-        while (groupsOut.Reader.TryRead(out var d)) { groupsView.AddAll(d); rows += d.DistinctCount; }
-    return rows;
+    long deltaRows = 0;
+    if (blotterHandle is not null)
+        while (blotterHandle.Reader.TryRead(out var batch))
+        {
+            blotterView.AddAll(batch);
+            deltaRows += batch.DistinctCount;
+        }
+    if (groupsHandle is not null)
+        while (groupsHandle.Reader.TryRead(out var batch))
+        {
+            groupsView.AddAll(batch);
+            deltaRows += batch.DistinctCount;
+        }
+    return deltaRows;
 }
+
+DrainOutputs(); // absorb the reference-data preload step's batch before the timed loop
 
 // ── run: trades churn until keypress, master data shifts underneath ─────────────
 
@@ -285,7 +312,7 @@ async Task<(double Micros, long DeltaRows)> StepTimedAsync()
     var timer = Stopwatch.StartNew();
     await circuit.StepAsync();
     timer.Stop();
-    var deltaRows = DrainOutputs();
+    var deltaRows = DrainOutputs(); // outside the timed section
     stepCount++;
     stepTicks += timer.Elapsed.Ticks;
     lastStepMicros = timer.Elapsed.TotalMicroseconds;
@@ -363,7 +390,7 @@ await AnsiConsole.Live(BuildLiveView()).AutoClear(false).StartAsync(async ctx =>
                     var oldDesk = desks.First(d => d.Id == trader.DeskId).Name;
                     var moved = trader with { DeskId = newDesk.Id };
                     traders[traders.IndexOf(trader)] = moved;
-                    await circuit.KeyedInput<int, TraderRow>("traders").UpsertAsync(moved);
+                    await traderHandle!.UpsertAsync(moved);
                     var (micros, deltaRows) = await StepTimedAsync();
                     var affected = tradesByTrader.GetValueOrDefault(trader.Id);
                     Notice($"[yellow]master data:[/] {trader.Name} moved {oldDesk} → {newDesk.Name} — one upsert " +
@@ -379,7 +406,7 @@ await AnsiConsole.Live(BuildLiveView()).AutoClear(false).StartAsync(async ctx =>
                 {
                     var changed = cpty with { Rating = newRating };
                     counterparties[counterparties.IndexOf(cpty)] = changed;
-                    await circuit.KeyedInput<int, Counterparty>("counterparties").UpsertAsync(changed);
+                    await cptyHandle!.UpsertAsync(changed);
                     var (micros, deltaRows) = await StepTimedAsync();
                     var affected = tradesByCpty.GetValueOrDefault(cpty.Id);
                     Notice($"[yellow]master data:[/] {cpty.Name} re-rated {cpty.Rating} → {newRating} — one upsert " +
@@ -395,6 +422,7 @@ await AnsiConsole.Live(BuildLiveView()).AutoClear(false).StartAsync(async ctx =>
 });
 
 await circuit.DisposeAsync();
+DrainOutputs(); // any batches the final flush steps published
 AnsiConsole.MarkupLine(
     $"[grey]processed[/] {tradesInserted:N0} trades ({tradesAmended:N0} amended, {tradesCancelled:N0} cancelled) " +
     $"in {stepCount:N0} steps, avg [bold]{TimeSpan.FromTicks(stepTicks / Math.Max(1, stepCount)).TotalMicroseconds:N0} µs[/] per step");
@@ -427,7 +455,8 @@ IRenderable BuildGroupTable()
     table.AddColumn(new TableColumn("notional").RightAligned().Width(10));
     table.AddColumn(new TableColumn("avg size").RightAligned().Width(10));
 
-    foreach (var entry in groupsView.OrderByDescending(e => e.Value.Value.Value.Notional).Take(MaxGroupRows))
+    var rows = groupsView.OrderByDescending(e => e.Value.Value.Value.Notional).Take(MaxGroupRows).ToList();
+    foreach (var entry in rows)
     {
         var (trades, notional) = entry.Value.Value.Value;
         var parts = entry.Value.Value.Key.Split(KeySep);
@@ -455,7 +484,8 @@ IRenderable BuildBlotterTable()
     if (cols.Contains(ColCptyName)) table.AddColumn(new TableColumn("counterparty").Width(17));
     if (cols.Contains(ColRating)) table.AddColumn(new TableColumn("rating").Width(6));
 
-    foreach (var entry in blotterView.OrderByDescending(e => e.Value.Value.Notional).Take(MaxBlotterRows))
+    var rows = blotterView.OrderByDescending(e => e.Value.Value.Notional).Take(MaxBlotterRows).ToList();
+    foreach (var entry in rows)
     {
         var t = entry.Value.Value;
         var cells = new List<string> { $"{t.Id:N0}", t.Side };

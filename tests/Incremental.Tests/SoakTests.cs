@@ -27,19 +27,19 @@ public class SoakTests
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Workers = 4 });
         var views = builder.Input<(int Page, DateTimeOffset At)>("views");
         var windowed = views
-            .WithWatermark(v => v.At, allowedLateness: TimeSpan.FromSeconds(2))
-            .TumblingWindow(windowSize, v => v.At)
-            .IndexBy(w => w.WindowStart)
-            .WithEviction(window => window + windowSize);
+            .WithEventTime(v => v.At, lateness: TimeSpan.FromSeconds(2))
+            .Tumble(windowSize, v => v.At)
+            .GroupBy(w => w.WindowStart)
+            .EvictWhen(window => window + windowSize);
         var counts = windowed.Count();
-        windowed.WindowCloses()
-            .Join(counts, (window, _, count) => (Window: window, Count: count))
-            .Output("final");
+        var finalDef = windowed.WindowCloses().Grouped()
+            .Join(counts.Grouped(), (window, _, count) => (Window: window, Count: count))
+            .ToOutput();
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(int Page, DateTimeOffset At)>("views");
-        var final = circuit.Output<(DateTimeOffset Window, long Count)>("final");
+        var input = circuit.Handle(views);
+        var final = circuit.Handle(finalDef);
 
         var rng = new Random(12345);
         var at = DateTimeOffset.UnixEpoch;

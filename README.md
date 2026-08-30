@@ -11,30 +11,33 @@ var builder = new CircuitBuilder(new CircuitOptions { Workers = 4 });
 var orders    = builder.Input<Order>("orders");
 var customers = builder.Input<Customer>("customers");
 
-orders.Filter(o => o.Amount > 0)
-      .IndexBy(o => o.CustomerId)
-      .Join(customers.IndexBy(c => c.Id),
-            (_, order, customer) => new RegionAmount(customer.Region, order.Amount))
-      .IndexBy(x => x.Region)
-      .Sum(x => x.Amount)
-      .Output("revenue");
+var revenueDef = orders
+    .Where(o => o.Amount > 0)
+    .GroupBy(o => o.CustomerId)
+    .Join(customers.GroupBy(c => c.Id),
+          (_, order, customer) => new RegionAmount(customer.Region, order.Amount))
+    .GroupBy(x => x.Region)
+    .Sum(x => x.Amount)
+    .ToOutput();
 
 await using var circuit = builder.Build();
 circuit.Start();
 
-var ordersIn = circuit.Input<Order>("orders");
-var revenue  = circuit.Output<KeyedValue<string, decimal>>("revenue");
+var ordersIn = circuit.Handle(orders);      // definitions redeem for typed handles —
+var revenue  = circuit.Handle(revenueDef);  // no string lookups, no restating types
 
 await ordersIn.InsertAsync(new Order(101, custId: 1, amount: 60m));
 await ordersIn.RemoveAsync(new Order(101, custId: 1, amount: 60m)); // cancelled — retracts downstream
 
-await foreach (var delta in revenue.ReadAllAsync())
-    Console.WriteLine(delta); // e.g. {(emea, 40) => +1, (emea, 100) => -1}
+await foreach (var batch in revenue.Changes())
+    Console.WriteLine(batch); // e.g. {(emea, 40) => +1, (emea, 100) => -1}
 ```
 
-The API is a plain fluent builder over delegates — deliberately **not** LINQ: no expression
-trees, no `IEnumerable`/`IQueryable` contract, nothing that constrains what operators can
-exist or how they execute.
+The API is a plain fluent builder over delegates. It borrows LINQ's names where the
+semantics genuinely match (`Select`, `Where`, `GroupBy`, `Distinct`) but is deliberately
+**not** LINQ: no expression trees, no `IEnumerable`/`IQueryable` contract, nothing that
+constrains what operators can exist or how they execute. See `docs/intro.md` for the full
+introduction.
 
 ## Concepts
 
@@ -52,7 +55,7 @@ deltas. Integrating an output's deltas reproduces the current state of that view
 
 | Operator | Incrementalization |
 | --- | --- |
-| `Map` / `Filter` / `FlatMap` / `Plus` / `Minus` / `Negate` | Linear — applied to the delta directly, stateless |
+| `Select` / `Where` / `SelectMany` / `Concat` / `Minus` / `Negate` | Linear — applied to the delta directly, stateless |
 | `Join` | Bilinear: Δ(L ⋈ R) = ΔL ⋈ R + (L + ΔL) ⋈ ΔR, probing integrated per-side state |
 | `Count` / `Sum` (`AggregateLinear`) | Linear aggregates: folded straight from the delta, state is one (row count, accumulator) pair per key — no group contents stored, update cost independent of group size |
 | `Min` / `Max` | Tournament tree per key: values are hash-partitioned into leaf buckets, each level above holds its children's extrema, the root's extremum is the result. Updates — deleting the current minimum included — touch a fixed number of ≤16-entry buckets and propagate up only while a bucket's extremum changes, so cost is independent of group size |
@@ -61,63 +64,65 @@ deltas. Integrating an output's deltas reproduces the current state of that view
 | `TopK` | Integrated group per key; emits only membership changes (displaced rows retracted). A threshold short-circuit skips the re-rank whenever a key's delta rows all fall strictly below the current K-th entry, so steady-state cost is O(delta) even for huge groups. Multiplicities count toward K |
 | `AntiJoin` | Integrated left side plus per-key right-side row counts; a key whose match-presence flips retracts or re-asserts its left rows |
 | `LeftJoin` / `FullJoin` | Pure composition: inner join ⊕ mapped anti-join(s) — the Z-set algebra makes the union incremental for free |
-| `TumblingWindow` / `HoppingWindow` | Pure data transformation (flat-map): records join every window covering their event time; keying by `(window, …)` turns any aggregate into a windowed one. Late and deleted events correct their windows via ordinary deltas |
+| `TumblingWindow` / `HoppingWindow` | Pure data transformation (flat-map) on a grouping: records join every window covering their event time, and the window composes into the group's identity automatically — aggregates over the windowed grouping are windowed aggregates, with eviction derived from the window. Late and deleted events correct their windows via ordinary deltas |
 | `SessionWindow` | Stateful, unlike the fixed windows: integrated events per session key, re-sessionized per touched key (never a full rescan). Rows whose session bounds change are retracted and re-asserted, so a bridging or late event merges sessions and a deletion shrinks or splits one — downstream aggregates correct themselves via the ordinary deltas |
 | `Recurse` | Fixed-point subcircuit (DBSP recursion), iterated to convergence within each step; the loop's `Join`/`Distinct` state is profiled by inner iteration (incremental in both time dimensions), so the emitted delta is exactly the change between successive fixed points — retractions included, cyclic derivations unwound in well-founded order |
 
 **Watermarks and eviction.** Correctness never depends on watermarks here — late events
 just produce correcting deltas. Watermarks serve one purpose: bounding state.
-`WithWatermark(v => v.At, allowedLateness)` declares an event-time source; the circuit's
-watermark advances to (max event time seen − lateness), min across sources, frozen between
-steps so all workers agree, and events below it are dropped. Downstream,
-`.WithEviction(key => closesAt)` on a keyed stream lets aggregations and TopK delete a
-key's state once the watermark passes its deadline — already-emitted results stay final,
-and a windowed pipeline runs forever in constant memory:
+`WithEventTime(v => v.At, lateness)` declares an event-time source (and carries the
+timestamp in the type: windows only exist on groupings of an event-timed stream, enforced
+at compile time); the circuit's watermark advances to (max event time seen − lateness),
+min across sources, frozen between steps so all workers agree, and events below it are
+dropped. Windowed groupings derive eviction from the window automatically — state for a
+window is deleted once the watermark closes it, already-emitted results stay final, and a
+windowed pipeline runs forever in constant memory:
 
 ```csharp
-views.WithWatermark(v => v.At, allowedLateness: TimeSpan.FromSeconds(2))
-     .TumblingWindow(windowSize, v => v.At)
-     .IndexBy(w => (Window: w.WindowStart, Page: w.Value.Page))
-     .WithEviction(key => key.Window + windowSize)
-     .Count();
+views.WithEventTime(v => v.At, lateness: TimeSpan.FromSeconds(2))
+     .GroupBy(v => v.Page)
+     .TumblingWindow(windowSize)
+     .Count()                 // rows (WindowStart, WindowEnd, Page, Count); eviction automatic
+     .TopK(3, r => r.Value);  // top pages within each window
 ```
 
-**Session windows.** `.SessionWindow(gap, v => v.At, v => v.UserId)` groups each key's
+For keyed state whose lifecycle isn't window-derived, the escape hatch is
+`.EvictWhen(key => closesAt)` on any grouping.
+
+**Session windows.** `.GroupBy(c => c.UserId).SessionWindow(gap)` groups each key's
 events into sessions separated by at least `gap` of event-time inactivity; a session spans
 [first event, last event + gap), and an event exactly at a session's end starts a new one.
-Session assignment can't be a flat-map — which events share a session depends on which other
-events exist — so the operator sits downstream of an exchange on the session key (inserted
-automatically, like `IndexBy`) and re-sessionizes a key's integrated events whenever a step
-touches it, retracting the rows whose bounds changed. Keying the result by
-`(key, start, end)` turns any aggregate into a per-session one, and with a watermark a key's
-event state is dropped once the watermark passes its last event + gap:
+Session assignment can't be a flat-map — which events share a session depends on which
+other events exist — so the operator runs on the worker owning each key and re-sessionizes
+a key's integrated events whenever a step touches it, retracting the rows whose bounds
+changed. The session bounds compose into the group's identity like any window, so
+aggregates are per-session automatically and a key's event state is dropped once the
+watermark passes its last event + gap:
 
 ```csharp
-clicks.WithWatermark(c => c.At, lateness)
-      .SessionWindow(TimeSpan.FromMinutes(30), c => c.At, c => c.UserId)
-      .IndexBy(s => (User: s.Key, Start: s.Value.WindowStart, End: s.Value.WindowEnd))
-      .WithEviction(s => s.End)
+clicks.WithEventTime(c => c.At, lateness)
+      .GroupBy(c => c.UserId)
+      .SessionWindow(TimeSpan.FromMinutes(30))
       .Count(); // clicks per session, corrected as sessions extend, merge, or split
 ```
 
-**Window-close notifications.** `.WindowCloses()` on a keyed stream is a first-class stream
-that announces each key exactly once — with weight +1, never retracted — when the watermark
-passes its deadline (the attached eviction policy's, or an explicit
-`.WindowCloses(key => closesAt)`). Closed means what it means for eviction: no further
-events for the key can be admitted, so its results are final. The notifications stay
-partitioned by key (the worker owning a key announces it), so joining them with the
-window's aggregate publishes finalized results in the same step the state is evicted:
+**Emit-on-close.** Live windowed results flap by design — each update retracts the stale
+row and asserts the new one. `.OnClose()` on a windowed result emits each row exactly once,
+final, when the watermark closes its window, in the same step the window's state is
+evicted:
 
 ```csharp
-var windowed = views.WithWatermark(v => v.At, lateness)
-                    .TumblingWindow(windowSize, v => v.At)
-                    .IndexBy(w => w.WindowStart)
-                    .WithEviction(window => window + windowSize);
-var counts = windowed.Count();
-windowed.WindowCloses()
-        .Join(counts, (window, closedAt, count) => (window, count))
-        .Output("finalCounts"); // one (window, count) row per window, once it is final
+views.WithEventTime(v => v.At, lateness)
+     .GroupBy(v => v.Page)
+     .TumblingWindow(windowSize)
+     .Count()
+     .OnClose()   // one final (window, page, count) row per group, no flapping
+     .ToOutput();
 ```
+
+Underneath sits `.WindowCloses()` on a grouping — a first-class stream announcing each key
+exactly once (weight +1, never retracted) when the watermark passes its deadline — which
+remains available for close-driven pipelines the paved road doesn't cover.
 
 **Recursion (fixed points).** `.Recurse(body)` closes a stream over itself and computes the
 least fixed point `X = Distinct(seed ∪ body(X))` — the DBSP recursive circuit, with the
@@ -126,8 +131,8 @@ closure is the classic shape:
 
 ```csharp
 var closure = edges.Recurse(paths =>
-    paths.IndexBy(p => p.To)
-         .Join(edges.IndexBy(e => e.From), (_, p, e) => (p.From, e.To)));
+    paths.GroupBy(p => p.To)
+         .Join(edges.GroupBy(e => e.From), (_, p, e) => (p.From, e.To)));
 ```
 
 Within every outer step the subcircuit iterates to convergence — a feedback edge (z⁻¹ over
@@ -142,11 +147,11 @@ paths "support themselves" around a cycle. Workers iterate in lockstep (the conv
 decision is a global all-workers reduction on the exchange barrier), so the body's joins
 shuffle correctly mid-loop, and a `maxIterations` guard (default 10 000) faults the circuit
 if a non-monotone body never converges. Bodies may use the linear operators plus
-`IndexBy`/`Join`/`Distinct`; aggregations and the like are rejected at definition time.
+`GroupBy`/`Join`/`Distinct`; aggregations and the like are rejected at definition time.
 
 **Exchange (multi-threading).** `CircuitOptions.Workers = N` runs N worker threads, each
 owning its own instance of every operator and its own shard of all operator state.
-`IndexBy` inserts an *exchange* operator — the DBSP/timely-dataflow shuffle — which
+`GroupBy` inserts an *exchange* operator — the DBSP/timely-dataflow shuffle — which
 hash-partitions each delta by key and redistributes it across workers mid-step (barrier
 synchronized), so joins and grouped aggregations are correct and scale with the worker
 count. `Distinct` shuffles by value automatically. There is no locking on operator state:
@@ -165,13 +170,13 @@ join's state across a cluster or orphaning it across a checkpoint restart. A key
 `StableHash` cannot derive a hash for (interfaces, delegates, unordered collections,
 types with no public readable members) is rejected at definition time; a type whose
 equality diverges from its public structure (say, a case-insensitive key) takes the
-`IndexBy(keySelector, stableHash)` / `Distinct(stableHash)` overloads — the supplied
+`GroupBy(keySelector, stableHash)` / `Distinct(stableHash)` overloads — the supplied
 `Func<TKey, uint>` must return the same value for equal keys in every process, on every
 machine.
 
 **Cross-process exchange (clustering).** The same shuffle spans machines, behind the same
 operator API: the circuit definition is built unchanged on every process — user code
-(`IndexBy`/`Join`/aggregations) never learns the cluster exists — and only
+(`GroupBy`/`Join`/aggregations) never learns the cluster exists — and only
 `CircuitOptions.Cluster` declares the process's place in a static topology. Each of the N
 processes hosts a contiguous slice of the global worker set (process p owns global workers
 [p·Workers, (p+1)·Workers)), every exchange hash-partitions by key across all Workers × N
@@ -252,7 +257,7 @@ propagates cooperatively instead of poisoning the circuit: the faulting worker p
 exchange barrier, so peers blocked mid-shuffle — recursion-loop iterations included — bail
 out of the step rather than deadlock, and the circuit moves to a terminal faulted state
 within that step. The faulting `StepAsync` throws the original exception (an
-`AggregateException` when several workers fault in the same step), consumers' `ReadAllAsync`
+`AggregateException` when several workers fault in the same step), consumers’ `Changes()`
 observes it after the pre-fault deltas, producers blocked in `InsertAsync` are released with
 a `CircuitFaultedException` (original fault as its inner) instead of hanging, and
 `Circuit.Fault` exposes it; `DisposeAsync` of a faulted circuit completes quietly. A failed
@@ -291,7 +296,9 @@ upsert/delete-by-key semantics: the handle tracks the current row per key, so
 `UpsertAsync(row)` emits the retraction of the previous version automatically and
 `DeleteAsync(key)` retracts the current one. This is the natural way to feed reference /
 master data (and any stream whose rows are amended in place) — one upsert to a reference
-row re-attributes everything joined against it.
+row re-attributes everything joined against it. Caveat (design in progress): the upsert
+map lives on the producer side and is not checkpointed, and keyed inputs carry no source
+offsets — treat a keyed input as a full-replay source after a restart.
 
 **What your types must satisfy.** Values are Z-set members and dictionary keys, so every
 type flowing through a stream needs value equality — records are the natural fit. A
@@ -360,16 +367,20 @@ around it and a rebuild still finds its state. Pure additions — new operators,
 starts empty — are always allowed. A name pins identity, not meaning: state is resumed
 as-is, so rename the operator when its computation changes.
 
-Output deltas are transient and not checkpointed — consumers re-derive views by
-integrating. A consumer that cannot replay every delta since the beginning bootstraps from
-a **snapshot output**: `.Output("revenue", snapshot: true)` also maintains the view's
-integrated state (behind the storage provider, so it checkpoints and recovers with
-everything else), and `OutputHandle.ReadSnapshotAsync()` returns the current view as of
-the last completed step — take the snapshot first, then integrate the deltas read
-afterwards on top of it. Deltas published between the last commit and a crash are never
-replayed; a restarted consumer re-bootstraps from the snapshot rather than expecting the
-gap to be filled. (In a cluster the snapshot covers the local process's workers, like the
-delta stream itself.)
+Output batches are transient and not checkpointed — consumers re-derive views by
+integrating. Batches published between the last commit and a crash are never replayed, so
+**table-shaped outputs resync automatically**: a keyed or windowed result's `ToOutput()`
+maintains the view's integrated state behind the storage provider (checkpointed and
+recovered with everything else), and the handle's `Changes()` begins with one batch
+asserting the current integrated state — treat it as a reset. That makes consumers correct
+across restarts and mid-run subscription with no opt-in to remember;
+`ToOutput(bootstrap: false)` opts a stateless consumer out of the state cost.
+`MaterializeInMemory()` builds on the same resync: a live in-memory view with consistent
+`Current()` snapshots on demand — its cost is in its name (O(live rows) heap). Outputs are
+single-consumer (a second `Changes()` throws rather than silently splitting the feed), and
+plain stream outputs are pure changefeeds: at-most-once across a crash, exactly-once being
+the downstream consumer's offset/idempotency concern. (In a cluster an output covers the
+local process's workers, like the delta stream itself.)
 
 **Stepping modes.** By default a pump task steps the circuit whenever input is available.
 With `AutoStep = false` the circuit advances only on explicit `StepAsync()` calls — exact,
@@ -504,16 +515,24 @@ disclosed trade-offs (below), not missing semantics:
 - Cluster checkpoints commit per process with no distributed commit protocol: a crash can
   leave processes one checkpoint apart — compare `Circuit.CommittedStep` across processes
   before feeding data.
-- Exactly-once ends at the output edge: deltas published after the last commit are not
-  replayed after a crash; consumers recover by re-bootstrapping from a snapshot output.
+- Exactly-once ends at the output edge: batches published after the last commit are not
+  replayed after a crash; table-shaped outputs resync consumers automatically (batch zero
+  of the changefeed), stream-shaped outputs are at-most-once across a crash by design.
 - Floating-point sums drift under retraction — prefer `decimal`/`long` accumulators.
 - Changing a persisted value type's shape (renaming/retyping members) invalidates its
   serialized state; there is no schema migration — change the key prefix and rebuild from
   source, or keep state types stable.
 
+- [x] 0.2 consumer API (`docs/intro.md`): LINQ-dialect names, group-then-window typed
+      ladder (windows only on event-timed groupings, eviction derived, per-window `TopK`,
+      `OnClose`), definitions redeemed for typed handles (`circuit.Handle(def)` — outputs
+      unnamed), changefeed-first outputs with automatic table-shaped resync and
+      `MaterializeInMemory` views
+
 ### Headroom
 
 - [ ] All-singing, all-dancing demo showing every feature together
+- [ ] Keyed-input restart story (checkpoint the upsert map, or derive retractions from
+      operator state)
 - [ ] Investigate off-heap in-process storage to reduce GC (RocksDB, SQLite candidates)
-- [ ] Investigate higher-order APIs with more user-friendly or domain-specific applications
 - [ ] Cluster transport TLS/authentication

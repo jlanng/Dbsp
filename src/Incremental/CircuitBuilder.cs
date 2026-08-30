@@ -78,8 +78,11 @@ public sealed class CircuitBuilder
 
     internal WatermarkClock GetOrCreateWatermarkClock() => WatermarkClock ??= new WatermarkClock(Options.Workers);
 
-    /// <summary>Declares a named input. Feed it after <see cref="Build"/> via <see cref="Circuit.Input{T}"/>.</summary>
-    public ZStream<T> Input<T>(string name) where T : notnull
+    /// <summary>Declares a named input. Redeem the returned definition after
+    /// <see cref="Build"/> via <see cref="Circuit.Handle{T}(InputStream{T})"/>. The name is
+    /// the durable identity of the external feed — checkpointed source offsets are keyed by
+    /// it, so it must stay stable across restarts and topology edits.</summary>
+    public InputStream<T> Input<T>(string name) where T : notnull
     {
         ThrowIfBuilt();
         RequireOutsideRecursion("Input");
@@ -88,13 +91,16 @@ public sealed class CircuitBuilder
 
         var nodeId = AddNode($"input[{name}]", [], _ => new InputOperator<T>());
         _inputs.Add(new InputRegistration<T> { Name = name, NodeId = nodeId });
-        return new ZStream<T>(this, nodeId);
+        return new InputStream<T>(this, nodeId, name);
     }
 
-    /// <summary>Declares a named input with upsert/delete-by-key semantics: after
-    /// <see cref="Build"/>, <see cref="Circuit.KeyedInput{TKey,TValue}"/> returns a handle
-    /// whose <c>UpsertAsync</c> retracts the previous row for the key automatically.</summary>
-    public ZStream<TValue> KeyedInput<TKey, TValue>(string name, Func<TValue, TKey> keySelector)
+    /// <summary>Declares a named input with upsert/delete-by-key semantics: redeem it after
+    /// <see cref="Build"/> via <see cref="Circuit.Handle{TKey,TValue}(KeyedInputStream{TKey,TValue})"/>
+    /// for a handle whose <c>UpsertAsync</c> retracts the previous row for the key
+    /// automatically. Caveat (design in progress): the upsert map lives on the producer side
+    /// and is not checkpointed, and keyed inputs carry no source offsets — treat a keyed
+    /// input as a full-replay source after a restart.</summary>
+    public KeyedInputStream<TKey, TValue> KeyedInput<TKey, TValue>(string name, Func<TValue, TKey> keySelector)
         where TKey : notnull
         where TValue : notnull
     {
@@ -105,7 +111,7 @@ public sealed class CircuitBuilder
 
         var nodeId = AddNode($"input[{name}]", [], _ => new InputOperator<TValue>());
         _inputs.Add(new KeyedInputRegistration<TKey, TValue> { Name = name, NodeId = nodeId, KeySelector = keySelector });
-        return new ZStream<TValue>(this, nodeId);
+        return new KeyedInputStream<TKey, TValue>(this, nodeId, name);
     }
 
     internal int AddNode(string kind, int[] inputs, Func<OperatorContext, IStepOperator> factory, bool isExchange = false)
@@ -153,14 +159,17 @@ public sealed class CircuitBuilder
         node.StateId = name;
     }
 
-    internal void AddOutput<T>(string name, int nodeId, bool snapshot = false) where T : notnull
+    /// <summary>Registers an output. Outputs are unnamed in the API — the definition
+    /// reference is the identity — so the registration name here is auto-assigned, used only
+    /// for diagnostics and handle lookup.</summary>
+    internal string AddOutput<T>(int nodeId, bool snapshot) where T : notnull
     {
         ThrowIfBuilt();
-        RequireOutsideRecursion("Output");
+        RequireOutsideRecursion("ToOutput");
         RequireVisible(nodeId);
-        if (_outputs.Any(o => o.Name == name))
-            throw new ArgumentException($"An output named '{name}' already exists.", nameof(name));
+        var name = $"out{_outputs.Count}";
         _outputs.Add(new OutputRegistration<T> { Name = name, NodeId = nodeId, Snapshot = snapshot });
+        return name;
     }
 
     /// <summary>Streams defined inside a Recurse body carry per-iteration deltas that are
@@ -178,8 +187,8 @@ public sealed class CircuitBuilder
     {
         if (_scope is not null)
             throw new NotSupportedException(
-                $"{operation} is not supported inside a Recurse body. A loop body may use Map, Filter, FlatMap, " +
-                "Plus, Minus, Negate, IndexBy, MapValues, Values, Join, and Distinct.");
+                $"{operation} is not supported inside a Recurse body. A loop body may use Select, Where, SelectMany, " +
+                "Concat, Minus, Negate, GroupBy, MapValues, Values, Join, and Distinct.");
     }
 
     internal RecursionScope OpenRecursionScope()
@@ -233,7 +242,7 @@ public sealed class CircuitBuilder
             throw new InvalidOperationException(
                 $"Operator names must be unique within a circuit — they key checkpointed state. Duplicated: {string.Join(", ", duplicateNames)}.");
         _built = true;
-        return new Circuit([.. _nodes], [.. _loopRegions], _inputs, _outputs, Options, WatermarkClock);
+        return new Circuit(this, [.. _nodes], [.. _loopRegions], _inputs, _outputs, Options, WatermarkClock);
     }
 
     private void ThrowIfBuilt()

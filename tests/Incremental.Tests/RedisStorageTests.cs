@@ -34,14 +34,14 @@ public class RedisStorageTests
 
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Storage = storage });
         var orders = builder.Input<(int Id, string Region, int Amount)>("orders");
-        orders.IndexBy(o => o.Region)
+        var countsDef = orders.GroupBy(o => o.Region)
             .Count()
-            .Output("counts");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(int Id, string Region, int Amount)>("orders");
-        var output = circuit.Output<KeyedValue<string, long>>("counts");
+        var input = circuit.Handle(orders);
+        var output = circuit.Handle(countsDef);
 
         await input.InsertAsync((1, "emea", 10));
         await input.InsertAsync((2, "emea", 20));
@@ -67,15 +67,16 @@ public class RedisStorageTests
         });
 
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Storage = storage });
-        builder.Input<(string Grp, string Name, int Score)>("scores")
-            .IndexBy(s => s.Grp)
+        var scores = builder.Input<(string Grp, string Name, int Score)>("scores");
+        var topDef = scores
+            .GroupBy(s => s.Grp)
             .TopK(1, s => s.Score)
-            .Output("top");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string Grp, string Name, int Score)>("scores");
-        var output = circuit.Output<KeyedValue<string, (string Grp, string Name, int Score)>>("top");
+        var input = circuit.Handle(scores);
+        var output = circuit.Handle(topDef);
 
         await input.InsertAsync(("g", "a", 1));
         await circuit.StepAsync();
@@ -99,15 +100,16 @@ public class RedisStorageTests
         });
 
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Storage = storage });
-        builder.Input<(string Key, int Value)>("readings")
-            .IndexBy(r => r.Key)
+        var readings = builder.Input<(string Key, int Value)>("readings");
+        var minimumsDef = readings
+            .GroupBy(r => r.Key)
             .Min(r => r.Value)
-            .Output("minimums");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string Key, int Value)>("readings");
-        var output = circuit.Output<KeyedValue<string, int>>("minimums");
+        var input = circuit.Handle(readings);
+        var output = circuit.Handle(minimumsDef);
 
         await input.InsertAsync(("k", 5));
         await input.InsertAsync(("k", 3));
@@ -178,15 +180,15 @@ public class RedisStorageTests
 
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Storage = FreshProvider(redis) });
         var edges = builder.Input<(string From, string To)>("edges");
-        edges.Recurse(paths => paths
-                .IndexBy(p => p.To)
-                .Join(edges.IndexBy(e => e.From), (_, p, e) => (p.From, e.To)))
-            .Output("closure");
+        var closureDef = edges.Recurse(paths => paths
+                .GroupBy(p => p.To)
+                .Join(edges.GroupBy(e => e.From), (_, p, e) => (p.From, e.To)))
+            .ToOutput();
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string From, string To)>("edges");
-        var output = circuit.Output<(string From, string To)>("closure");
+        var input = circuit.Handle(edges);
+        var output = circuit.Handle(closureDef);
 
         await input.InsertAsync(("a", "b"));
         await input.InsertAsync(("b", "c"));

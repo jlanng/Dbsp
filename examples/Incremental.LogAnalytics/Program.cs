@@ -35,24 +35,19 @@ var builder = new CircuitBuilder(new CircuitOptions { Workers = 2, Storage = sto
 var windowSize = TimeSpan.FromSeconds(5);
 var views = builder.Input<PageView>("views");
 
-var viewsPerPage = views
-    .WithWatermark(v => v.At, allowedLateness: TimeSpan.FromSeconds(2))
-    .TumblingWindow(windowSize, v => v.At)
-    .IndexBy(w => (Window: w.WindowStart, Page: w.Value.Page))
-    .WithEviction(key => key.Window + windowSize)
-    .Count();
-
-viewsPerPage
-    .IndexBy(count => count.Key.Window)
-    .WithEviction(window => window + windowSize)
-    .TopK(3, count => count.Value)
-    .Output("top-pages");
+var topPages = views
+    .WithEventTime(v => v.At, lateness: TimeSpan.FromSeconds(2))
+    .GroupBy(v => v.Page)
+    .TumblingWindow(windowSize)
+    .Count()                    // live count per (window, page); closed windows evicted
+    .TopK(3, r => r.Value)      // top 3 pages within each window
+    .ToOutput();
 
 await using var circuit = builder.Build();
 circuit.Start();
 
-var input = circuit.Input<PageView>("views");
-var topPages = circuit.Output<KeyedValue<DateTimeOffset, KeyedValue<(DateTimeOffset Window, string Page), long>>>("top-pages");
+var input = circuit.Handle(views);
+var topPagesOut = circuit.Handle(topPages);
 
 AnsiConsole.Write(new Panel(new Rows(
         new Markup("A simulated clickstream flows through an incremental (DBSP-style) circuit:"),
@@ -60,7 +55,7 @@ AnsiConsole.Write(new Panel(new Rows(
         new Text(""),
         new Markup("[green]▪[/] Nothing below is ever recomputed. Each update is a [bold]delta[/]: when a count changes, the stale total is retracted and the new one asserted, and the TopK stage re-ranks each window's leaderboard from those deltas alone."),
         new Markup("[green]▪[/] The top (newest) window's bars grow live; older windows freeze once the [bold]watermark[/] (max event time seen − 2s allowed lateness, shown in the header) passes their end. Their operator state is then evicted — the pipeline could run forever in constant memory."),
-        new Markup("[green]▪[/] Two worker threads process the stream in parallel; the [bold]IndexBy[/] stages hash-shard records by key (DBSP's exchange operator), so each worker owns its slice of state.")))
+        new Markup("[green]▪[/] Two worker threads process the stream in parallel; the [bold]GroupBy[/] stages hash-shard records by key (DBSP's exchange operator), so each worker owns its slice of state.")))
     .Header("[bold] what you're watching [/]")
     .Padding(1, 0)
     .BorderColor(Color.Grey));
@@ -72,13 +67,13 @@ long eventsSent = 0;
 // Renderer: integrate the output deltas and redraw the dashboard in place.
 var renderer = Task.Run(async () =>
 {
-    var integrated = new ZSet<KeyedValue<DateTimeOffset, KeyedValue<(DateTimeOffset Window, string Page), long>>>();
+    var integrated = new ZSet<WindowedValue<string, long>>();
     await AnsiConsole.Live(new Markup("[grey]waiting for data…[/]"))
         .AutoClear(false)
         .StartAsync(async ctx =>
         {
             var lastRefresh = 0L;
-            await foreach (var delta in topPages.ReadAllAsync())
+            await foreach (var delta in topPagesOut.Changes())
             {
                 integrated.AddAll(delta);
                 if (stopwatch.ElapsedMilliseconds - lastRefresh < 100)
@@ -106,7 +101,7 @@ await renderer;
 await circuit.DisposeAsync();
 redis?.Dispose();
 
-IRenderable BuildDashboard(ZSet<KeyedValue<DateTimeOffset, KeyedValue<(DateTimeOffset Window, string Page), long>>> integrated)
+IRenderable BuildDashboard(ZSet<WindowedValue<string, long>> integrated)
 {
     var renderables = new List<IRenderable>
     {
@@ -119,7 +114,7 @@ IRenderable BuildDashboard(ZSet<KeyedValue<DateTimeOffset, KeyedValue<(DateTimeO
 
     var colors = new[] { Color.Green, Color.Yellow, Color.Orange1 };
     var windows = integrated
-        .GroupBy(entry => entry.Value.Key)
+        .GroupBy(entry => entry.Value.WindowStart)
         .OrderByDescending(group => group.Key)
         .Take(3);
 
@@ -130,8 +125,8 @@ IRenderable BuildDashboard(ZSet<KeyedValue<DateTimeOffset, KeyedValue<(DateTimeO
             .Label($"[bold]{group.Key:HH:mm:ss} – {group.Key + windowSize:HH:mm:ss}[/]")
             .LeftAlignLabel();
         var rank = 0;
-        foreach (var entry in group.OrderByDescending(e => e.Value.Value.Value))
-            chart.AddItem(entry.Value.Value.Key.Page, entry.Value.Value.Value, colors[Math.Min(rank++, colors.Length - 1)]);
+        foreach (var entry in group.OrderByDescending(e => e.Value.Value))
+            chart.AddItem(entry.Value.Key, entry.Value.Value, colors[Math.Min(rank++, colors.Length - 1)]);
         renderables.Add(new Padder(chart, new Padding(0, 1, 0, 0)));
     }
 

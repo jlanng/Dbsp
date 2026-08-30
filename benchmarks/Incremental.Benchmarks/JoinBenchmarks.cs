@@ -27,17 +27,17 @@ public class JoinBenchmarks
         var orders = builder.Input<(int OrderId, int CustomerId)>("orders");
         var customers = builder.Input<(int CustomerId, string Name)>("customers");
 
-        orders.IndexBy(o => o.CustomerId)
-            .Join(customers.IndexBy(c => c.CustomerId), (_, order, customer) => (order.OrderId, customer.Name))
-            .Output("joined");
+        var joined = orders.GroupBy(o => o.CustomerId)
+            .Join(customers.GroupBy(c => c.CustomerId), (_, order, customer) => (order.OrderId, customer.Name))
+            .ToOutput();
 
         var circuit = builder.Build();
         circuit.Start();
         _rig = new Rig(circuit);
-        _rig.Watch<(int OrderId, string Name)>("joined");
-        _orders = circuit.Input<(int OrderId, int CustomerId)>("orders");
+        _rig.Watch(joined);
+        _orders = circuit.Handle(orders);
 
-        var customersIn = circuit.Input<(int CustomerId, string Name)>("customers");
+        var customersIn = circuit.Handle(customers);
         await _rig.FeedAsync(customersIn, Enumerable.Range(0, StateSize)
             .Select(i => new WeightedValue<(int, string)>((i, "customer"), 1)));
         await _rig.FeedAsync(_orders, Enumerable.Range(0, StateSize)

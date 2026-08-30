@@ -5,7 +5,7 @@ namespace Incremental.Operators;
 /// <summary>
 /// Backs a snapshot output (<c>Output(name, snapshot: true)</c>): passes its input delta
 /// through unchanged while integrating it into a store, so the current state of the view
-/// can be read back via <see cref="OutputHandle{T}.ReadSnapshotAsync"/>. The store is an
+/// can be read back via the bootstrap read of <see cref="OutputHandle{T}.Changes"/>. The store is an
 /// indexed store with a single group rather than a weight store because reading a snapshot
 /// needs enumeration, which only <see cref="IIndexedWeightStore{TKey,TValue}.GetGroup"/>
 /// offers. Integration happens inside the step — before the checkpoint commit — so with a

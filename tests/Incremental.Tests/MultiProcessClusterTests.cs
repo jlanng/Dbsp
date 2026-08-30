@@ -143,10 +143,11 @@ public class MultiProcessClusterTests
     /// shared pipeline definition.</summary>
     private static async Task<ZSet<KeyedValue<string, decimal>>> ReferenceRevenue()
     {
-        await using var single = ClusterScenario.RevenuePipeline(new CircuitOptions { AutoStep = false }).Build();
+        var pipeline = ClusterScenario.RevenuePipeline(new CircuitOptions { AutoStep = false });
+        await using var single = pipeline.Builder.Build();
         single.Start();
-        var orders = single.Input<(int Id, int CustomerId, decimal Amount)>("orders");
-        var customers = single.Input<(int Id, string Region)>("customers");
+        var orders = single.Handle(pipeline.Orders);
+        var customers = single.Handle(pipeline.Customers);
         foreach (var customer in ClusterScenario.Customers)
             await customers.InsertAsync(customer);
         foreach (var (order, weight) in ClusterScenario.Orders)
@@ -154,7 +155,7 @@ public class MultiProcessClusterTests
         await single.StepAsync().WaitAsync(HostTimeout);
 
         var integrated = new ZSet<KeyedValue<string, decimal>>();
-        var output = single.Output<KeyedValue<string, decimal>>("revenue");
+        var output = single.Handle(pipeline.Revenue);
         while (output.Reader.TryRead(out var delta))
             integrated.AddAll(delta);
         return integrated;

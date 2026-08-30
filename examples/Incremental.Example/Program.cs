@@ -11,25 +11,27 @@ var orders = builder.KeyedInput<int, Order>("orders", o => o.OrderId);
 var customers = builder.KeyedInput<int, Customer>("customers", c => c.Id);
 
 var enriched = orders
-    .Filter(o => o.Amount > 0)
-    .IndexBy(o => o.CustomerId)
-    .Join(customers.IndexBy(c => c.Id), (_, order, customer) => new RegionAmount(customer.Region, order.Amount));
+    .Where(o => o.Amount > 0)
+    .GroupBy(o => o.CustomerId)
+    .Join(customers.GroupBy(c => c.Id), (_, order, customer) => new RegionAmount(customer.Region, order.Amount));
 
-var byRegion = enriched.IndexBy(x => x.Region);
-byRegion.Sum(x => x.Amount).Output("revenue");
-byRegion.Max(x => x.Amount).Output("largest-order");
+var byRegion = enriched.GroupBy(x => x.Region);
+// bootstrap: false — these consumers print raw deltas rather than maintaining state, so
+// they want the pure changefeed, not a resync batch first.
+var revenue = byRegion.Sum(x => x.Amount).ToOutput(bootstrap: false);
+var largest = byRegion.Max(x => x.Amount).ToOutput(bootstrap: false);
 
 await using var circuit = builder.Build();
 circuit.Start();
 
-var ordersIn = circuit.KeyedInput<int, Order>("orders");
-var customersIn = circuit.KeyedInput<int, Customer>("customers");
-var revenue = circuit.Output<KeyedValue<string, decimal>>("revenue");
-var largest = circuit.Output<KeyedValue<string, decimal>>("largest-order");
+var ordersIn = circuit.Handle(orders);
+var customersIn = circuit.Handle(customers);
+var revenueOut = circuit.Handle(revenue);
+var largestOut = circuit.Handle(largest);
 
 var printers = Task.WhenAll(
-    PrintDeltasAsync("revenue", revenue),
-    PrintDeltasAsync("largest-order", largest));
+    PrintDeltasAsync("revenue", revenueOut),
+    PrintDeltasAsync("largest-order", largestOut));
 
 await customersIn.UpsertAsync(new Customer(1, "emea"));
 await customersIn.UpsertAsync(new Customer(2, "apac"));
@@ -58,7 +60,7 @@ await circuit.DisposeAsync();
 
 static async Task PrintDeltasAsync<T>(string name, OutputHandle<T> output) where T : notnull
 {
-    await foreach (var delta in output.ReadAllAsync())
+    await foreach (var delta in output.Changes())
         foreach (var (value, weight) in delta)
             Console.WriteLine($"[{name}] {value} {weight:+#;-#;0}");
 }

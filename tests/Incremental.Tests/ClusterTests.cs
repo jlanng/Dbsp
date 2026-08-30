@@ -41,17 +41,23 @@ public class ClusterTests
             Assert.Equal(weight, actual.WeightOf(value));
     }
 
-    private static CircuitBuilder RevenuePipeline(CircuitOptions options)
+    private sealed record RevenueCircuit(
+        CircuitBuilder Builder,
+        InputStream<(int Id, int CustomerId, decimal Amount)> Orders,
+        InputStream<(int Id, string Region)> Customers,
+        Output<KeyedValue<string, decimal>> Revenue);
+
+    private static RevenueCircuit RevenuePipeline(CircuitOptions options)
     {
         var builder = new CircuitBuilder(options);
         var orders = builder.Input<(int Id, int CustomerId, decimal Amount)>("orders");
         var customers = builder.Input<(int Id, string Region)>("customers");
-        orders.IndexBy(o => o.CustomerId)
-            .Join(customers.IndexBy(c => c.Id), (_, o, c) => (c.Region, o.Amount))
-            .IndexBy(x => x.Region)
+        var revenue = orders.GroupBy(o => o.CustomerId)
+            .Join(customers.GroupBy(c => c.Id), (_, o, c) => (c.Region, o.Amount))
+            .GroupBy(x => x.Region)
             .Sum(x => x.Amount)
-            .Output("revenue");
-        return builder;
+            .ToOutput(bootstrap: false);
+        return new RevenueCircuit(builder, orders, customers, revenue);
     }
 
     private static readonly ((int, int, decimal) Order, bool OnProcess0, long Weight)[] OrderChurn =
@@ -61,41 +67,45 @@ public class ClusterTests
         ((105, 2, 5m), true, 1), ((106, 3, 7m), false, 1),   // inputs can be fed on any process
     ];
 
-    private static async Task RunRevenueChurn(Circuit process0, Circuit process1)
+    private static async Task RunRevenueChurn(
+        (Circuit Circuit, RevenueCircuit Defs) process0,
+        (Circuit Circuit, RevenueCircuit Defs) process1)
     {
-        process0.Start();
-        process1.Start();
-        var customersIn = process1.Input<(int Id, string Region)>("customers"); // reference data on process 1
+        process0.Circuit.Start();
+        process1.Circuit.Start();
+        var customersIn = process1.Circuit.Handle(process1.Defs.Customers); // reference data on process 1
         foreach (var customer in new[] { (1, "emea"), (2, "apac"), (3, "amer") })
             await customersIn.InsertAsync(customer);
 
         // Multi-step incremental churn, orders fed on either process, one step at a time.
         foreach (var (order, onProcess0, weight) in OrderChurn)
         {
-            var ordersIn = (onProcess0 ? process0 : process1).Input<(int Id, int CustomerId, decimal Amount)>("orders");
+            var feeder = onProcess0 ? process0 : process1;
+            var ordersIn = feeder.Circuit.Handle(feeder.Defs.Orders);
             await ordersIn.SendAsync(order, weight);
-            await StepAll(process0, process1);
+            await StepAll(process0.Circuit, process1.Circuit);
         }
 
         // Mid-stream reference-data amendment: apac's customer moves to emea.
         await customersIn.RemoveAsync((2, "apac"));
         await customersIn.InsertAsync((2, "emea"));
-        await StepAll(process0, process1);
+        await StepAll(process0.Circuit, process1.Circuit);
     }
 
     private static async Task<ZSet<KeyedValue<string, decimal>>> RevenueReference()
     {
-        await using var single = RevenuePipeline(new CircuitOptions { AutoStep = false }).Build();
+        var defs = RevenuePipeline(new CircuitOptions { AutoStep = false });
+        await using var single = defs.Builder.Build();
         single.Start();
-        var orders = single.Input<(int Id, int CustomerId, decimal Amount)>("orders");
-        var customers = single.Input<(int Id, string Region)>("customers");
+        var orders = single.Handle(defs.Orders);
+        var customers = single.Handle(defs.Customers);
         foreach (var customer in new[] { (1, "emea"), (2, "emea"), (3, "amer") }) // post-amendment state
             await customers.InsertAsync(customer);
         foreach (var (order, _, weight) in OrderChurn)
             await orders.SendAsync(order, weight);
         await single.StepAsync().WaitAsync(Timeout);
         var integrated = new ZSet<KeyedValue<string, decimal>>();
-        Drain(integrated, single.Output<KeyedValue<string, decimal>>("revenue"));
+        Drain(integrated, single.Handle(defs.Revenue));
         return integrated;
     }
 
@@ -103,14 +113,16 @@ public class ClusterTests
     public async Task Join_and_aggregate_across_two_processes_match_single_process()
     {
         var mesh = InMemoryExchangeTransport.CreateMesh(2);
-        await using var process0 = RevenuePipeline(Clustered(mesh[0], workers: 2)).Build();
-        await using var process1 = RevenuePipeline(Clustered(mesh[1], workers: 2)).Build();
-        await RunRevenueChurn(process0, process1);
+        var defs0 = RevenuePipeline(Clustered(mesh[0], workers: 2));
+        var defs1 = RevenuePipeline(Clustered(mesh[1], workers: 2));
+        await using var process0 = defs0.Builder.Build();
+        await using var process1 = defs1.Builder.Build();
+        await RunRevenueChurn((process0, defs0), (process1, defs1));
 
         var integrated = new ZSet<KeyedValue<string, decimal>>();
         Drain(integrated,
-            process0.Output<KeyedValue<string, decimal>>("revenue"),
-            process1.Output<KeyedValue<string, decimal>>("revenue"));
+            process0.Handle(defs0.Revenue),
+            process1.Handle(defs1.Revenue));
 
         AssertSameZSet(await RevenueReference(), integrated);
     }
@@ -120,14 +132,16 @@ public class ClusterTests
     {
         var ports = FreePorts(2);
         string[] endpoints = [$"127.0.0.1:{ports[0]}", $"127.0.0.1:{ports[1]}"];
-        await using var process0 = RevenuePipeline(Clustered(new TcpExchangeTransport(0, endpoints), workers: 2)).Build();
-        await using var process1 = RevenuePipeline(Clustered(new TcpExchangeTransport(1, endpoints), workers: 2)).Build();
-        await RunRevenueChurn(process0, process1);
+        var defs0 = RevenuePipeline(Clustered(new TcpExchangeTransport(0, endpoints), workers: 2));
+        var defs1 = RevenuePipeline(Clustered(new TcpExchangeTransport(1, endpoints), workers: 2));
+        await using var process0 = defs0.Builder.Build();
+        await using var process1 = defs1.Builder.Build();
+        await RunRevenueChurn((process0, defs0), (process1, defs1));
 
         var integrated = new ZSet<KeyedValue<string, decimal>>();
         Drain(integrated,
-            process0.Output<KeyedValue<string, decimal>>("revenue"),
-            process1.Output<KeyedValue<string, decimal>>("revenue"));
+            process0.Handle(defs0.Revenue),
+            process1.Handle(defs1.Revenue));
 
         AssertSameZSet(await RevenueReference(), integrated);
     }
@@ -135,21 +149,24 @@ public class ClusterTests
     [Fact]
     public async Task Distinct_retractions_cross_the_wire()
     {
-        static CircuitBuilder Pipeline(CircuitOptions options)
+        static (CircuitBuilder Builder, InputStream<int> Values, Output<int> Distinct) Pipeline(CircuitOptions options)
         {
             var builder = new CircuitBuilder(options);
-            builder.Input<int>("values").Distinct().Output("distinct");
-            return builder;
+            var values = builder.Input<int>("values");
+            var distinct = values.Distinct().ToOutput();
+            return (builder, values, distinct);
         }
 
         var mesh = InMemoryExchangeTransport.CreateMesh(2);
-        await using var process0 = Pipeline(Clustered(mesh[0], workers: 2)).Build();
-        await using var process1 = Pipeline(Clustered(mesh[1], workers: 2)).Build();
+        var defs0 = Pipeline(Clustered(mesh[0], workers: 2));
+        var defs1 = Pipeline(Clustered(mesh[1], workers: 2));
+        await using var process0 = defs0.Builder.Build();
+        await using var process1 = defs1.Builder.Build();
         process0.Start();
         process1.Start();
-        var in0 = process0.Input<int>("values");
-        var in1 = process1.Input<int>("values");
-        var outputs = new[] { process0.Output<int>("distinct"), process1.Output<int>("distinct") };
+        var in0 = process0.Handle(defs0.Values);
+        var in1 = process1.Handle(defs1.Values);
+        var outputs = new[] { process0.Handle(defs0.Distinct), process1.Handle(defs1.Distinct) };
         var integrated = new ZSet<int>();
 
         // Three copies of every value, split across processes: Distinct's shuffle-by-value
@@ -183,30 +200,35 @@ public class ClusterTests
     public async Task Watermark_is_globally_min_reduced_and_eviction_stays_consistent()
     {
         var start = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
-        static CircuitBuilder Pipeline(CircuitOptions options)
+        static (CircuitBuilder Builder,
+            InputStream<(DateTimeOffset At, string Page)> Views,
+            Output<KeyedValue<DateTimeOffset, long>> Counts) Pipeline(CircuitOptions options)
         {
             var builder = new CircuitBuilder(options);
-            builder.Input<(DateTimeOffset At, string Page)>("views")
-                .WithWatermark(v => v.At, allowedLateness: TimeSpan.Zero)
-                .IndexBy(v => v.At)
-                .WithEviction(key => key) // a bucket closes the moment the watermark passes it
+            var views = builder.Input<(DateTimeOffset At, string Page)>("views");
+            var counts = views
+                .WithEventTime(v => v.At, lateness: TimeSpan.Zero)
+                .GroupBy(v => v.At)
+                .EvictWhen(key => key) // a bucket closes the moment the watermark passes it
                 .Count()
-                .Output("counts");
-            return builder;
+                .ToOutput(bootstrap: false);
+            return (builder, views, counts);
         }
 
         // Workers = 1 per process also covers the inline (no worker thread) engine.
         var mesh = InMemoryExchangeTransport.CreateMesh(2);
-        await using var process0 = Pipeline(Clustered(mesh[0], workers: 1)).Build();
-        await using var process1 = Pipeline(Clustered(mesh[1], workers: 1)).Build();
+        var defs0 = Pipeline(Clustered(mesh[0], workers: 1));
+        var defs1 = Pipeline(Clustered(mesh[1], workers: 1));
+        await using var process0 = defs0.Builder.Build();
+        await using var process1 = defs1.Builder.Build();
         process0.Start();
         process1.Start();
-        var in0 = process0.Input<(DateTimeOffset At, string Page)>("views");
-        var in1 = process1.Input<(DateTimeOffset At, string Page)>("views");
+        var in0 = process0.Handle(defs0.Views);
+        var in1 = process1.Handle(defs1.Views);
         var outputs = new[]
         {
-            process0.Output<KeyedValue<DateTimeOffset, long>>("counts"),
-            process1.Output<KeyedValue<DateTimeOffset, long>>("counts"),
+            process0.Handle(defs0.Counts),
+            process1.Handle(defs1.Counts),
         };
         var integrated = new ZSet<KeyedValue<DateTimeOffset, long>>();
 
@@ -239,16 +261,20 @@ public class ClusterTests
     [Fact]
     public async Task Empty_steps_align_without_hanging()
     {
-        static CircuitBuilder Pipeline(CircuitOptions options)
+        static (CircuitBuilder Builder, InputStream<string> Words, Output<KeyedValue<string, long>> Counts)
+            Pipeline(CircuitOptions options)
         {
             var builder = new CircuitBuilder(options);
-            builder.Input<string>("words").IndexBy(w => w).Count().Output("counts");
-            return builder;
+            var words = builder.Input<string>("words");
+            var counts = words.GroupBy(w => w).Count().ToOutput(bootstrap: false);
+            return (builder, words, counts);
         }
 
         var mesh = InMemoryExchangeTransport.CreateMesh(2);
-        await using var a = Pipeline(Clustered(mesh[0], workers: 2)).Build();
-        await using var b = Pipeline(Clustered(mesh[1], workers: 2)).Build();
+        var defsA = Pipeline(Clustered(mesh[0], workers: 2));
+        var defsB = Pipeline(Clustered(mesh[1], workers: 2));
+        await using var a = defsA.Builder.Build();
+        await using var b = defsB.Builder.Build();
         a.Start();
         b.Start();
 
@@ -256,35 +282,38 @@ public class ClusterTests
         for (var i = 0; i < 5; i++)
             await StepAll(a, b);
 
-        await a.Input<string>("words").InsertAsync("hello");
+        await a.Handle(defsA.Words).InsertAsync("hello");
         await StepAll(a, b);
         var integrated = new ZSet<KeyedValue<string, long>>();
-        Drain(integrated, a.Output<KeyedValue<string, long>>("counts"), b.Output<KeyedValue<string, long>>("counts"));
+        Drain(integrated, a.Handle(defsA.Counts), b.Handle(defsB.Counts));
         Assert.Equal(1, integrated.WeightOf(new KeyedValue<string, long>("hello", 1)));
     }
 
     [Fact]
     public async Task Fault_on_one_process_faults_the_peer_instead_of_hanging_it()
     {
-        static CircuitBuilder Pipeline(CircuitOptions options)
+        static (CircuitBuilder Builder, InputStream<int> Numbers) Pipeline(CircuitOptions options)
         {
             var builder = new CircuitBuilder(options);
-            builder.Input<int>("numbers")
-                .Map(n => n == 13 ? throw new InvalidOperationException("boom 13") : n)
-                .IndexBy(n => n % 4)
+            var numbers = builder.Input<int>("numbers");
+            numbers
+                .Select(n => n == 13 ? throw new InvalidOperationException("boom 13") : n)
+                .GroupBy(n => n % 4)
                 .Count()
-                .Output("counts");
-            return builder;
+                .ToOutput(bootstrap: false);
+            return (builder, numbers);
         }
 
         var mesh = InMemoryExchangeTransport.CreateMesh(2);
-        await using var process0 = Pipeline(Clustered(mesh[0], workers: 2)).Build();
-        await using var process1 = Pipeline(Clustered(mesh[1], workers: 2)).Build();
+        var defs0 = Pipeline(Clustered(mesh[0], workers: 2));
+        var defs1 = Pipeline(Clustered(mesh[1], workers: 2));
+        await using var process0 = defs0.Builder.Build();
+        await using var process1 = defs1.Builder.Build();
         process0.Start();
         process1.Start();
 
         for (var n = 0; n < 16; n++)
-            await process0.Input<int>("numbers").InsertAsync(n);
+            await process0.Handle(defs0.Numbers).InsertAsync(n);
 
         // Process 0 throws in user code before its exchange; process 1 sits waiting for
         // process 0's shards and must be faulted by the poison, not left blocked.
@@ -312,9 +341,9 @@ public class ClusterTests
         var builder = new CircuitBuilder(Clustered(mesh[0], workers: 1));
         var edges = builder.Input<(string From, string To)>("edges");
         edges.Recurse(paths => paths
-                .IndexBy(p => p.To)
-                .Join(edges.IndexBy(e => e.From), (_, p, e) => (p.From, e.To)))
-            .Output("closure");
+                .GroupBy(p => p.To)
+                .Join(edges.GroupBy(e => e.From), (_, p, e) => (p.From, e.To)))
+            .ToOutput();
 
         var ex = Assert.Throws<NotSupportedException>(() => builder.Build());
         Assert.Contains("Recurse", ex.Message);

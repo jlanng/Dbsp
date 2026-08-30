@@ -215,47 +215,87 @@ public sealed class KeyedInputHandle<TKey, TValue>
 }
 
 /// <summary>
-/// Consumer-side handle to a circuit output: a stream of Z-set deltas, one per step that
-/// produced changes. Integrate the deltas (e.g. with <see cref="ZSet{T}.AddAll"/>) to
-/// materialize the current state of the output collection.
+/// Consumer-side handle to a circuit output: a changefeed of Z-set batches, one per step
+/// that produced changes. An output is a single bounded channel with exactly one consumer —
+/// <see cref="Changes"/> (or <see cref="MaterializeInMemory"/>, which is that consumer) can
+/// be claimed once; a second subscription throws instead of silently splitting the feed.
+/// A slow consumer stalls the whole circuit via backpressure, deliberately — always run and
+/// await your consumer.
 /// </summary>
 public sealed class OutputHandle<T> where T : notnull
 {
-    private readonly string _name;
+    private readonly ChannelReader<ZSet<T>> _reader;
+    private int _claimed;
 
     internal OutputHandle(string name, ChannelReader<ZSet<T>> reader)
     {
-        _name = name;
-        Reader = reader;
+        Name = name;
+        _reader = reader;
     }
 
-    /// <summary>Set by the circuit for outputs declared with <c>snapshot: true</c>.</summary>
+    internal string Name { get; }
+
+    /// <summary>Set by the circuit for bootstrap-enabled (table-shaped) outputs.</summary>
     internal Func<CancellationToken, Task<ZSet<T>>>? SnapshotReader { get; set; }
 
-    public ChannelReader<ZSet<T>> Reader { get; }
-
-    public IAsyncEnumerable<ZSet<T>> ReadAllAsync(CancellationToken cancellationToken = default) =>
-        Reader.ReadAllAsync(cancellationToken);
+    /// <summary>Advanced: the output's raw channel, for step-level consumption (one batch
+    /// per completed step) and non-blocking emptiness checks. Bypasses the bootstrap batch
+    /// and the consumer claim — do not mix with <see cref="Changes"/> or
+    /// <see cref="MaterializeInMemory"/>, which read the same channel.</summary>
+    public ChannelReader<ZSet<T>> Reader => _reader;
 
     /// <summary>
-    /// The current integrated state of the view, as of the last completed step — the
-    /// bootstrap point for a consumer that cannot replay every delta since the beginning.
-    /// Only valid on an output declared with <c>Output(name, snapshot: true)</c>.
-    ///
-    /// Bootstrap contract: take the snapshot first, then integrate the deltas read
-    /// <em>afterwards</em> on top of it. Deltas still buffered when the snapshot is taken
-    /// are already contained in it, so this call discards them — do not read deltas
-    /// concurrently with it. After a circuit restart against a checkpointing storage
-    /// provider the snapshot reflects the committed checkpoint; deltas published between
-    /// the last commit and a crash are never replayed, so a consumer recovers by
-    /// re-bootstrapping from here rather than expecting the gap to be filled. In a
-    /// clustered circuit the snapshot covers this process's workers only, like the delta
-    /// stream itself. The read waits for any in-flight step to finish, so it never observes
-    /// a half-applied step.
+    /// The output's changefeed: each batch holds every row the step touched, weighted +/−.
+    /// On a bootstrap-enabled output (a keyed or windowed result's <c>ToOutput()</c>, by
+    /// default) the first batch asserts the current integrated state — empty on a fresh
+    /// start — so a consumer that maintains state treats it as a reset; this is what makes
+    /// consumers correct across restarts and mid-run subscription, since batches emitted
+    /// between the last checkpoint and a crash are never replayed. A plain stream output
+    /// starts straight into live batches (at-most-once across a crash). The enumeration
+    /// completes when the circuit disposes and throws <see cref="CircuitFaultedException"/>
+    /// if the circuit faults. One consumer only: a second call throws.
     /// </summary>
-    public Task<ZSet<T>> ReadSnapshotAsync(CancellationToken cancellationToken = default) =>
-        SnapshotReader is { } read
-            ? read(cancellationToken)
-            : throw new InvalidOperationException(
-                $"Output '{_name}' does not maintain a snapshot; declare it with .Output(\"{_name}\", snapshot: true) to read one.");
+    public IAsyncEnumerable<ZSet<T>> Changes(CancellationToken cancellationToken = default)
+    {
+        Claim();
+        return ChangesCore(cancellationToken);
+    }
+
+    private async IAsyncEnumerable<ZSet<T>> ChangesCore(
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        // The snapshot read discards batches buffered before it — they are contained in it.
+        if (SnapshotReader is { } bootstrap)
+            yield return await bootstrap(cancellationToken).ConfigureAwait(false);
+
+        await foreach (var batch in _reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            yield return batch;
+    }
+
+    /// <summary>
+    /// Maintains the output's integrated result in memory and becomes the output's single
+    /// consumer. Requires a bootstrap-enabled output (a keyed or windowed result's
+    /// <c>ToOutput()</c>) — the automatic resync is what makes the view correct across
+    /// restarts and mid-run attachment. The cost is in the name: the view holds the full
+    /// live result set on the heap — fine for windowed/evicted results and small
+    /// dimensions, a deliberate decision for anything with an unbounded keyspace.
+    /// </summary>
+    public InMemoryView<T> MaterializeInMemory()
+    {
+        if (SnapshotReader is null)
+            throw new InvalidOperationException(
+                $"Output '{Name}' is a plain changefeed with no current state to materialize. " +
+                "MaterializeInMemory needs a table-shaped output: call ToOutput() on a keyed or windowed " +
+                "result (with its default bootstrap), not on a plain stream.");
+        Claim();
+        return new InMemoryView<T>(ChangesCore);
+    }
+
+    private void Claim()
+    {
+        if (Interlocked.Exchange(ref _claimed, 1) != 0)
+            throw new InvalidOperationException(
+                $"Output '{Name}' already has a consumer. An output is a single channel — a second subscription " +
+                "would silently split the feed. Declare a second output on the same stream to consume it twice.");
+    }
 }

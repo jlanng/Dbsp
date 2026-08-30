@@ -16,15 +16,16 @@ public class ExtremumTests
     public async Task Max_updates_and_recovers_after_deleting_the_maximum()
     {
         var builder = ManualBuilder();
-        builder.Input<(string Key, int Value)>("readings")
-            .IndexBy(r => r.Key)
+        var readings = builder.Input<(string Key, int Value)>("readings");
+        var maximumsDef = readings
+            .GroupBy(r => r.Key)
             .Max(r => r.Value)
-            .Output("maximums");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string Key, int Value)>("readings");
-        var output = circuit.Output<KeyedValue<string, int>>("maximums");
+        var input = circuit.Handle(readings);
+        var output = circuit.Handle(maximumsDef);
 
         await input.InsertAsync(("k", 5));
         await input.InsertAsync(("k", 3));
@@ -51,15 +52,16 @@ public class ExtremumTests
     public async Task Duplicate_minimum_survives_removing_one_instance()
     {
         var builder = ManualBuilder();
-        builder.Input<(string Key, int Value)>("readings")
-            .IndexBy(r => r.Key)
+        var readings = builder.Input<(string Key, int Value)>("readings");
+        var minimumsDef = readings
+            .GroupBy(r => r.Key)
             .Min(r => r.Value)
-            .Output("minimums");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string Key, int Value)>("readings");
-        var output = circuit.Output<KeyedValue<string, int>>("minimums");
+        var input = circuit.Handle(readings);
+        var output = circuit.Handle(minimumsDef);
 
         await input.InsertAsync(("k", 3));
         await input.InsertAsync(("k", 3));
@@ -85,15 +87,16 @@ public class ExtremumTests
     public async Task Vanished_group_retracts_without_asserting()
     {
         var builder = ManualBuilder();
-        builder.Input<(string Key, int Value)>("readings")
-            .IndexBy(r => r.Key)
+        var readings = builder.Input<(string Key, int Value)>("readings");
+        var minimumsDef = readings
+            .GroupBy(r => r.Key)
             .Min(r => r.Value)
-            .Output("minimums");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string Key, int Value)>("readings");
-        var output = circuit.Output<KeyedValue<string, int>>("minimums");
+        var input = circuit.Handle(readings);
+        var output = circuit.Handle(minimumsDef);
 
         await input.InsertAsync(("k", 4));
         await circuit.StepAsync();
@@ -111,15 +114,16 @@ public class ExtremumTests
     public async Task Insert_and_remove_in_one_step_nets_to_no_output()
     {
         var builder = ManualBuilder();
-        builder.Input<(string Key, int Value)>("readings")
-            .IndexBy(r => r.Key)
+        var readings = builder.Input<(string Key, int Value)>("readings");
+        var minimumsDef = readings
+            .GroupBy(r => r.Key)
             .Min(r => r.Value)
-            .Output("minimums");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string Key, int Value)>("readings");
-        var output = circuit.Output<KeyedValue<string, int>>("minimums");
+        var input = circuit.Handle(readings);
+        var output = circuit.Handle(minimumsDef);
 
         await input.InsertAsync(("k", 8));
         await circuit.StepAsync();
@@ -136,15 +140,16 @@ public class ExtremumTests
     public async Task Min_over_large_churning_group_matches_oracle()
     {
         var builder = ManualBuilder();
-        builder.Input<(string Key, int Value)>("readings")
-            .IndexBy(r => r.Key)
+        var readings = builder.Input<(string Key, int Value)>("readings");
+        var minimumsDef = readings
+            .GroupBy(r => r.Key)
             .Min(r => r.Value)
-            .Output("minimums");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string Key, int Value)>("readings");
-        var output = circuit.Output<KeyedValue<string, int>>("minimums");
+        var input = circuit.Handle(readings);
+        var output = circuit.Handle(minimumsDef);
 
         var oracle = new SortedDictionary<int, int>(); // value -> multiplicity
         var integrated = new ZSet<KeyedValue<string, int>>();
@@ -221,15 +226,16 @@ public class ExtremumTests
     public async Task Min_is_consistent_across_workers()
     {
         var builder = new CircuitBuilder(new CircuitOptions { Workers = 4 });
-        builder.Input<(int Key, int Value)>("readings")
-            .IndexBy(r => r.Key)
+        var readings = builder.Input<(int Key, int Value)>("readings");
+        var minimumsDef = readings
+            .GroupBy(r => r.Key)
             .Min(r => r.Value)
-            .Output("minimums");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(int Key, int Value)>("readings");
-        var output = circuit.Output<KeyedValue<int, int>>("minimums");
+        var input = circuit.Handle(readings);
+        var output = circuit.Handle(minimumsDef);
 
         var expected = new Dictionary<int, int>();
         var random = new Random(7);
@@ -243,7 +249,7 @@ public class ExtremumTests
         input.Complete();
 
         var integrated = new ZSet<KeyedValue<int, int>>();
-        await foreach (var delta in output.ReadAllAsync())
+        await foreach (var delta in output.Changes())
             integrated.AddAll(delta);
 
         Assert.Equal(expected.Count, integrated.DistinctCount);
@@ -257,18 +263,19 @@ public class ExtremumTests
         var T0 = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
         var storage = new GroupRemovalRecordingStorage();
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Storage = storage });
-        builder.Input<(int Value, DateTimeOffset At)>("readings")
-            .WithWatermark(v => v.At, allowedLateness: TimeSpan.Zero)
-            .TumblingWindow(TimeSpan.FromSeconds(5), v => v.At)
-            .IndexBy(w => w.WindowStart)
-            .WithEviction(windowStart => windowStart.AddSeconds(5))
+        var readings = builder.Input<(int Value, DateTimeOffset At)>("readings");
+        var minimumsDef = readings
+            .WithEventTime(v => v.At, lateness: TimeSpan.Zero)
+            .Tumble(TimeSpan.FromSeconds(5), v => v.At)
+            .GroupBy(w => w.WindowStart)
+            .EvictWhen(windowStart => windowStart.AddSeconds(5))
             .Min(w => w.Value.Value)
-            .Output("minimums");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(int Value, DateTimeOffset At)>("readings");
-        var output = circuit.Output<KeyedValue<DateTimeOffset, int>>("minimums");
+        var input = circuit.Handle(readings);
+        var output = circuit.Handle(minimumsDef);
 
         // Step 1 populates window T0; the watermark freezes at T0+2s afterwards.
         await input.InsertAsync((10, T0.AddSeconds(1)));

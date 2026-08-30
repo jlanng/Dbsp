@@ -44,21 +44,22 @@ public class FaultPropagationTests
     public async Task Fault_between_exchanges_releases_peers_within_the_step()
     {
         // Distinct shuffles by value, so exactly one of the four workers owns the poison
-        // value and throws in the Map — while its peers sit on the next exchange barrier
-        // (IndexBy), waiting for a participant that will never arrive. The poisoned barrier
+        // value and throws in the Select — while its peers sit on the next exchange barrier
+        // (GroupBy), waiting for a participant that will never arrive. The poisoned barrier
         // must release them; the timeout is the deadlock detector.
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Workers = 4 });
-        builder.Input<int>("numbers")
+        var numbers = builder.Input<int>("numbers");
+        var countsDef = numbers
             .Distinct()
-            .Map(n => n == 13 ? throw new InvalidOperationException("boom 13") : n)
-            .IndexBy(n => n % 3)
+            .Select(n => n == 13 ? throw new InvalidOperationException("boom 13") : n)
+            .GroupBy(n => n % 3)
             .Count()
-            .Output("counts");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<int>("numbers");
-        var output = circuit.Output<KeyedValue<int, long>>("counts");
+        var input = circuit.Handle(numbers);
+        var output = circuit.Handle(countsDef);
 
         for (var n = 0; n < 32; n++)
             await input.InsertAsync(n);
@@ -77,7 +78,7 @@ public class FaultPropagationTests
 
         var consumerEx = await Assert.ThrowsAnyAsync<Exception>(async () =>
         {
-            await foreach (var _ in output.ReadAllAsync()) { }
+            await foreach (var _ in output.Changes()) { }
         }).WaitAsync(StepTimeout);
         AssertContainsOriginal(consumerEx, "boom 13");
 
@@ -90,19 +91,20 @@ public class FaultPropagationTests
     }
 
     [Fact]
-    public async Task Fault_in_a_keyed_operator_downstream_of_IndexBy_faults_the_step()
+    public async Task Fault_in_a_keyed_operator_downstream_of_GroupBy_faults_the_step()
     {
         // The throw happens after the exchange, in the aggregate of the worker that owns
         // the poisoned key, while its peers run their own shards of the same step.
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Workers = 4 });
-        builder.Input<(int Key, int Amount)>("orders")
-            .IndexBy(o => o.Key)
+        var orders = builder.Input<(int Key, int Amount)>("orders");
+        orders
+            .GroupBy(o => o.Key)
             .Sum(o => o.Amount < 0 ? throw new InvalidOperationException("negative amount") : o.Amount)
-            .Output("sums");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(int Key, int Amount)>("orders");
+        var input = circuit.Handle(orders);
 
         for (var k = 0; k < 16; k++)
             await input.InsertAsync((k, k == 7 ? -1 : k));
@@ -120,15 +122,16 @@ public class FaultPropagationTests
         // a producer still inserting must be released with the fault — not left suspended
         // forever on a channel no step will ever drain again.
         var builder = new CircuitBuilder(new CircuitOptions { Workers = 4, InputChannelCapacity = 4 });
-        builder.Input<int>("numbers")
+        var numbers = builder.Input<int>("numbers");
+        var distinctDef = numbers
             .Distinct()
-            .Map(n => n < 0 ? throw new InvalidOperationException("boom pump") : n)
-            .Output("distinct");
+            .Select(n => n < 0 ? throw new InvalidOperationException("boom pump") : n)
+            .ToOutput();
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<int>("numbers");
-        var output = circuit.Output<int>("distinct");
+        var input = circuit.Handle(numbers);
+        var output = circuit.Handle(distinctDef);
 
         await input.InsertAsync(-1);
         var producerEx = await Assert.ThrowsAsync<CircuitFaultedException>(async () =>
@@ -141,7 +144,7 @@ public class FaultPropagationTests
 
         var consumerEx = await Assert.ThrowsAnyAsync<Exception>(async () =>
         {
-            await foreach (var _ in output.ReadAllAsync()) { }
+            await foreach (var _ in output.Changes()) { }
         }).WaitAsync(StepTimeout);
         AssertContainsOriginal(consumerEx, "boom pump");
         AssertContainsOriginal(circuit.Fault!, "boom pump");
@@ -156,14 +159,14 @@ public class FaultPropagationTests
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Workers = 4 });
         var edges = builder.Input<(string From, string To)>("edges");
         edges.Recurse(paths => paths
-                .IndexBy(p => p.To)
-                .Join(edges.IndexBy(e => e.From), (_, p, e) => (p.From, e.To))
-                .Map(p => p == ("a", "c") ? throw new InvalidOperationException("boom loop") : p))
-            .Output("closure");
+                .GroupBy(p => p.To)
+                .Join(edges.GroupBy(e => e.From), (_, p, e) => (p.From, e.To))
+                .Select(p => p == ("a", "c") ? throw new InvalidOperationException("boom loop") : p))
+            .ToOutput();
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string From, string To)>("edges");
+        var input = circuit.Handle(edges);
 
         await input.InsertAsync(("a", "b"));
         await input.InsertAsync(("b", "c"));
@@ -186,14 +189,14 @@ public class FaultPropagationTests
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Workers = 4 });
         var edges = builder.Input<(string From, string To)>("edges");
         edges.Recurse(paths => paths
-                .IndexBy(p => p.To)
-                .Join(edges.IndexBy(e => e.From), (_, p, e) => (p.From, e.To)),
+                .GroupBy(p => p.To)
+                .Join(edges.GroupBy(e => e.From), (_, p, e) => (p.From, e.To)),
                 maxIterations: 3)
-            .Output("closure");
+            .ToOutput();
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string From, string To)>("edges");
+        var input = circuit.Handle(edges);
         for (var i = 0; i < 7; i++)
             await input.InsertAsync(($"n{i}", $"n{i + 1}"));
 
@@ -209,7 +212,8 @@ public class FaultPropagationTests
     public async Task Committed_checkpoint_reflects_only_pre_fault_steps()
     {
         var storage = new InMemoryCheckpointStorageProvider();
-        static CircuitBuilder Pipeline(IStorageProvider storage)
+        static (CircuitBuilder Builder, InputStream<(int Id, string Region)> Orders, Output<KeyedValue<string, long>> Counts)
+            Pipeline(IStorageProvider storage)
         {
             var builder = new CircuitBuilder(new CircuitOptions
             {
@@ -217,21 +221,23 @@ public class FaultPropagationTests
                 Workers = 4,
                 Storage = storage,
             });
-            builder.Input<(int Id, string Region)>("orders")
-                .Map(o => o.Id < 0 ? throw new InvalidOperationException("poison record") : o)
-                .IndexBy(o => o.Region)
+            var orders = builder.Input<(int Id, string Region)>("orders");
+            var counts = orders
+                .Select(o => o.Id < 0 ? throw new InvalidOperationException("poison record") : o)
+                .GroupBy(o => o.Region)
                 .Count()
-                .Output("counts");
-            return builder;
+                .ToOutput(bootstrap: false);
+            return (builder, orders, counts);
         }
         static (int Id, string Region) Record(int i) => (i, $"r{i % 3}");
 
         var integrated = new ZSet<KeyedValue<string, long>>();
         {
-            await using var crashed = Pipeline(storage).Build();
+            var pipeline = Pipeline(storage);
+            await using var crashed = pipeline.Builder.Build();
             crashed.Start();
-            var input = crashed.Input<(int Id, string Region)>("orders");
-            var output = crashed.Output<KeyedValue<string, long>>("counts");
+            var input = crashed.Handle(pipeline.Orders);
+            var output = crashed.Handle(pipeline.Counts);
 
             for (var i = 0; i < 20; i++)
                 await input.SendAsync(Record(i), 1, offset: i);
@@ -253,12 +259,13 @@ public class FaultPropagationTests
         // Rebuild against the same provider: recovery rolls the staged step back, the
         // producer resumes past the checkpoint (with the poison fixed), and the deltas of
         // both runs integrate to exactly the records committed once each.
-        await using var resumed = Pipeline(storage).Build();
+        var resumedPipeline = Pipeline(storage);
+        await using var resumed = resumedPipeline.Builder.Build();
         resumed.Start();
         Assert.Equal(19L, resumed.CommittedOffset("orders"));
 
-        var replay = resumed.Input<(int Id, string Region)>("orders");
-        var counts = resumed.Output<KeyedValue<string, long>>("counts");
+        var replay = resumed.Handle(resumedPipeline.Orders);
+        var counts = resumed.Handle(resumedPipeline.Counts);
         for (var i = 20; i < 30; i++)
             await replay.SendAsync(Record(i), 1, offset: i);
         await resumed.StepAsync().WaitAsync(StepTimeout);
@@ -277,12 +284,13 @@ public class FaultPropagationTests
     public async Task Clean_dispose_while_idle_is_not_a_fault()
     {
         var builder = new CircuitBuilder(new CircuitOptions { Workers = 4 });
-        builder.Input<int>("numbers").Map(n => n * 2).Output("doubled");
+        var numbers = builder.Input<int>("numbers");
+        var doubledDef = numbers.Select(n => n * 2).ToOutput();
 
         var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<int>("numbers");
-        var output = circuit.Output<int>("doubled");
+        var input = circuit.Handle(numbers);
+        var output = circuit.Handle(doubledDef);
 
         await input.InsertAsync(21);
         var delta = await output.Reader.ReadAsync().AsTask().WaitAsync(StepTimeout);
@@ -290,27 +298,28 @@ public class FaultPropagationTests
 
         await circuit.DisposeAsync().AsTask().WaitAsync(StepTimeout); // idle: workers parked between steps
         Assert.Null(circuit.Fault);
-        await foreach (var _ in output.ReadAllAsync()) { } // completes cleanly, no error
+        await foreach (var _ in output.Changes()) { } // completes cleanly, no error
     }
 
     [Fact]
     public async Task Clean_dispose_under_load_is_not_a_fault()
     {
         var builder = new CircuitBuilder(new CircuitOptions { Workers = 4 });
-        builder.Input<int>("numbers")
-            .IndexBy(n => n % 97)
+        var numbers = builder.Input<int>("numbers");
+        var countsDef = numbers
+            .GroupBy(n => n % 97)
             .Count()
-            .Output("counts");
+            .ToOutput(bootstrap: false);
 
         var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<int>("numbers");
-        var output = circuit.Output<KeyedValue<int, long>>("counts");
+        var input = circuit.Handle(numbers);
+        var output = circuit.Handle(countsDef);
 
         var integrated = new ZSet<KeyedValue<int, long>>();
         var consumer = Task.Run(async () =>
         {
-            await foreach (var delta in output.ReadAllAsync())
+            await foreach (var delta in output.Changes())
                 integrated.AddAll(delta);
         });
 

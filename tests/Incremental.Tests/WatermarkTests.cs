@@ -2,6 +2,13 @@ using Incremental.Storage;
 
 namespace Incremental.Tests;
 
+/// <summary>
+/// Watermark and eviction mechanics exercised through the manual window-as-data escape
+/// hatch (<c>SelectMany</c> into <see cref="Windowed{T}"/> + <c>GroupBy</c> +
+/// <c>EvictWhen</c>): these tests assert on the generic keyed eviction path, and the
+/// escape hatch deserves coverage of its own. The paved windowed-grouping road is covered
+/// in <see cref="WindowingAndTopKTests"/> and <see cref="WindowCloseTests"/>.
+/// </summary>
 public class WatermarkTests
 {
     private static readonly DateTimeOffset T0 = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
@@ -10,17 +17,17 @@ public class WatermarkTests
     public async Task Events_older_than_the_watermark_are_dropped()
     {
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false });
-        builder.Input<(string Page, DateTimeOffset At)>("views")
-            .WithWatermark(v => v.At, allowedLateness: TimeSpan.FromSeconds(5))
-            .TumblingWindow(TimeSpan.FromSeconds(5), v => v.At)
-            .IndexBy(w => w.WindowStart)
+        var views = builder.Input<(string Page, DateTimeOffset At)>("views");
+        var countsDef = views.WithEventTime(v => v.At, lateness: TimeSpan.FromSeconds(5))
+                .Tumble(TimeSpan.FromSeconds(5), v => v.At)
+            .GroupBy(w => w.WindowStart)
             .Count()
-            .Output("counts");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string Page, DateTimeOffset At)>("views");
-        var output = circuit.Output<KeyedValue<DateTimeOffset, long>>("counts");
+        var input = circuit.Handle(views);
+        var output = circuit.Handle(countsDef);
 
         // First step advances the watermark to T0+20s − 5s lateness = T0+15s.
         await input.InsertAsync(("home", T0.AddSeconds(20)));
@@ -42,18 +49,18 @@ public class WatermarkTests
     {
         var storage = new EvictionRecordingStorage();
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Storage = storage });
-        builder.Input<(string Page, DateTimeOffset At)>("views")
-            .WithWatermark(v => v.At, allowedLateness: TimeSpan.Zero)
-            .TumblingWindow(TimeSpan.FromSeconds(5), v => v.At)
-            .IndexBy(w => w.WindowStart)
-            .WithEviction(windowStart => windowStart.AddSeconds(5))
+        var views = builder.Input<(string Page, DateTimeOffset At)>("views");
+        var countsDef = views.WithEventTime(v => v.At, lateness: TimeSpan.Zero)
+                .Tumble(TimeSpan.FromSeconds(5), v => v.At)
+            .GroupBy(w => w.WindowStart)
+            .EvictWhen(windowStart => windowStart.AddSeconds(5))
             .Count()
-            .Output("counts");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string Page, DateTimeOffset At)>("views");
-        var output = circuit.Output<KeyedValue<DateTimeOffset, long>>("counts");
+        var input = circuit.Handle(views);
+        var output = circuit.Handle(countsDef);
 
         // Step 1 populates window T0; the watermark freezes at T0+1s afterwards.
         await input.InsertAsync(("home", T0.AddSeconds(1)));
@@ -82,23 +89,24 @@ public class WatermarkTests
     {
         var storage = new EvictionRecordingStorage();
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Storage = storage });
-        var users = builder.Input<(string User, DateTimeOffset At)>("users")
-            .WithWatermark(v => v.At, allowedLateness: TimeSpan.Zero)
-            .TumblingWindow(TimeSpan.FromSeconds(5), v => v.At)
-            .IndexBy(w => w.WindowStart)
-            .WithEviction(windowStart => windowStart.AddSeconds(5));
-        var pages = builder.Input<(string Page, DateTimeOffset At)>("pages")
-            .WithWatermark(v => v.At, allowedLateness: TimeSpan.Zero)
-            .TumblingWindow(TimeSpan.FromSeconds(5), v => v.At)
-            .IndexBy(w => w.WindowStart);
-        users.Join(pages, (window, user, page) => (window, user.Value.User, page.Value.Page))
-            .Output("joined");
+        var users = builder.Input<(string User, DateTimeOffset At)>("users");
+        var pages = builder.Input<(string Page, DateTimeOffset At)>("pages");
+        var usersByWindow = users.WithEventTime(v => v.At, lateness: TimeSpan.Zero)
+                .Tumble(TimeSpan.FromSeconds(5), v => v.At)
+            .GroupBy(w => w.WindowStart)
+            .EvictWhen(windowStart => windowStart.AddSeconds(5));
+        var pagesByWindow = pages.WithEventTime(v => v.At, lateness: TimeSpan.Zero)
+                .Tumble(TimeSpan.FromSeconds(5), v => v.At)
+            .GroupBy(w => w.WindowStart);
+        var joinedDef = usersByWindow
+            .Join(pagesByWindow, (window, user, page) => (window, user.Value.User, page.Value.Page))
+            .ToOutput();
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var userInput = circuit.Input<(string User, DateTimeOffset At)>("users");
-        var pageInput = circuit.Input<(string Page, DateTimeOffset At)>("pages");
-        var output = circuit.Output<(DateTimeOffset Window, string User, string Page)>("joined");
+        var userInput = circuit.Handle(users);
+        var pageInput = circuit.Handle(pages);
+        var output = circuit.Handle(joinedDef);
 
         // Step 1 joins within window T0; no watermark is frozen yet, nothing evicts.
         await userInput.InsertAsync(("alice", T0.AddSeconds(1)));
@@ -132,24 +140,25 @@ public class WatermarkTests
     {
         var storage = new EvictionRecordingStorage();
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Storage = storage });
-        var users = builder.Input<(string User, DateTimeOffset At)>("users")
-            .WithWatermark(v => v.At, allowedLateness: TimeSpan.Zero)
-            .TumblingWindow(TimeSpan.FromSeconds(5), v => v.At)
-            .IndexBy(w => w.WindowStart)
-            .WithEviction(windowStart => windowStart.AddSeconds(5));
-        var blocks = builder.Input<(string Block, DateTimeOffset At)>("blocks")
-            .WithWatermark(v => v.At, allowedLateness: TimeSpan.Zero)
-            .TumblingWindow(TimeSpan.FromSeconds(5), v => v.At)
-            .IndexBy(w => w.WindowStart);
-        users.AntiJoin(blocks)
+        var users = builder.Input<(string User, DateTimeOffset At)>("users");
+        var blocks = builder.Input<(string Block, DateTimeOffset At)>("blocks");
+        var usersByWindow = users.WithEventTime(v => v.At, lateness: TimeSpan.Zero)
+                .Tumble(TimeSpan.FromSeconds(5), v => v.At)
+            .GroupBy(w => w.WindowStart)
+            .EvictWhen(windowStart => windowStart.AddSeconds(5));
+        var blocksByWindow = blocks.WithEventTime(v => v.At, lateness: TimeSpan.Zero)
+                .Tumble(TimeSpan.FromSeconds(5), v => v.At)
+            .GroupBy(w => w.WindowStart);
+        var unmatchedDef = usersByWindow
+            .AntiJoin(blocksByWindow)
             .MapValues(w => w.Value.User)
-            .Output("unmatched");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var userInput = circuit.Input<(string User, DateTimeOffset At)>("users");
-        var blockInput = circuit.Input<(string Block, DateTimeOffset At)>("blocks");
-        var output = circuit.Output<KeyedValue<DateTimeOffset, string>>("unmatched");
+        var userInput = circuit.Handle(users);
+        var blockInput = circuit.Handle(blocks);
+        var output = circuit.Handle(unmatchedDef);
 
         // Step 1: window T0 has no right rows, so alice is emitted as unmatched.
         await userInput.InsertAsync(("alice", T0.AddSeconds(1)));
@@ -183,19 +192,20 @@ public class WatermarkTests
     {
         var storage = new EvictionRecordingStorage();
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Storage = storage });
-        builder.Input<(string User, DateTimeOffset At)>("views")
-            .WithWatermark(v => v.At, allowedLateness: TimeSpan.Zero)
-            .TumblingWindow(TimeSpan.FromSeconds(5), v => v.At)
-            .IndexBy(w => w.WindowStart)
-            .WithEviction(windowStart => windowStart.AddSeconds(5))
-            .MapValues(w => w.Value.User)
+        var views = builder.Input<(string User, DateTimeOffset At)>("views");
+        var distinctDef = views.WithEventTime(v => v.At, lateness: TimeSpan.Zero)
+                .Tumble(TimeSpan.FromSeconds(5), v => v.At)
+            .Select(w => (Window: w.WindowStart, User: w.Value.User))
+            .GroupBy(x => x.Window)
+            .EvictWhen(windowStart => windowStart.AddSeconds(5))
             .Distinct()
-            .Output("distinctUsers");
+            .MapValues(x => x.User)
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string User, DateTimeOffset At)>("views");
-        var output = circuit.Output<KeyedValue<DateTimeOffset, string>>("distinctUsers");
+        var input = circuit.Handle(views);
+        var output = circuit.Handle(distinctDef);
 
         // Step 1: alice appears twice in window T0 but is emitted once.
         await input.InsertAsync(("alice", T0.AddSeconds(1)));
