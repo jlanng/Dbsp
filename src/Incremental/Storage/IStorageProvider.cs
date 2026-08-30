@@ -38,15 +38,32 @@ public interface IStorageProvider
 public interface ICheckpointStorageProvider : IStorageProvider
 {
     /// <summary>Discards any staged (uncommitted) writes and returns the input offsets of
-    /// the last committed checkpoint: input name → offset of the last record whose effects
-    /// are in durable state. Empty when no checkpoint exists. The circuit calls this once,
-    /// on <see cref="Circuit.Start"/>, before any step runs.</summary>
+    /// the last committed checkpoint: one entry per consumed position — an unstamped
+    /// input's running count under its plain name, a stamped input's per-partition
+    /// positions under one <c>{name}#p{partition}</c> entry each. The provider treats the
+    /// keys as opaque strings; the circuit does the encoding. Empty when no checkpoint
+    /// exists. The circuit calls this once, on <see cref="Circuit.Start"/>, before any
+    /// step runs.</summary>
     IReadOnlyDictionary<string, long> Recover();
 
     /// <summary>Atomically persists all staged state changes together with
     /// <paramref name="inputOffsets"/>: either the new checkpoint lands in full, or the
     /// previous one remains intact.</summary>
     void Commit(IReadOnlyDictionary<string, long> inputOffsets);
+
+    /// <summary>The state manifest committed with the last checkpoint under
+    /// <paramref name="scope"/> (one scope per process sharing the physical store), or null
+    /// when none has been committed. The circuit compares it against its own state layout on
+    /// <see cref="Circuit.Start"/> and refuses to run on a mismatch, so a rebuilt circuit
+    /// whose operators would read the wrong state faults loudly instead of corrupting
+    /// silently.</summary>
+    string? CommittedManifest(string scope);
+
+    /// <summary>Stages <paramref name="manifest"/> for <paramref name="scope"/>: it is
+    /// persisted atomically with the next <see cref="Commit"/>, never on its own — a
+    /// committed manifest always describes committed state. <see cref="Recover"/> discards
+    /// staged manifests along with staged writes.</summary>
+    void StageManifest(string scope, string manifest);
 }
 
 public interface IWeightStore<T> where T : notnull

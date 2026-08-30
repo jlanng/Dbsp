@@ -41,6 +41,7 @@ internal sealed class ExtremumOperator<TKey, TValue, TProjected> : IStepOperator
 
     private readonly IIndexedWeightStore<ExtremumSlot<TKey>, TProjected> _tree;
     private readonly Func<TValue, TProjected> _selector;
+    private readonly Func<TProjected, ulong> _slotHash;
     private readonly int _sign; // -1: MIN, +1: MAX (a candidate wins when Compare has this sign)
     private readonly EvictionTracker<TKey>? _eviction;
 
@@ -50,6 +51,18 @@ internal sealed class ExtremumOperator<TKey, TValue, TProjected> : IStepOperator
         _selector = selector;
         _sign = sign;
         _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
+        try
+        {
+            // Tree slots are derived from the hash and may live in persistent storage a
+            // later process reattaches, so the hash must be process-stable.
+            _slotHash = StableHash.HasherFor<TProjected>();
+        }
+        catch (NotSupportedException e)
+        {
+            throw new InvalidOperationException(
+                $"Min/Max derives its persistent tournament-tree slots from a process-stable hash of the projected " +
+                $"type '{typeof(TProjected)}', which could not be derived. {e.Message}", e);
+        }
     }
 
     public object Step(object?[] inputs)
@@ -65,7 +78,7 @@ internal sealed class ExtremumOperator<TKey, TValue, TProjected> : IStepOperator
         foreach (var ((key, value), weight) in delta)
         {
             var projected = _selector(value);
-            var slot = (uint)StableHash.Of(projected) & LeafMask;
+            var slot = (uint)_slotHash(projected) & LeafMask;
             if (!changes.TryGetValue((key, slot), out var rows))
                 changes[(key, slot)] = rows = [];
             rows.Add(new WeightedValue<TProjected>(projected, weight));
@@ -196,7 +209,7 @@ internal sealed class ExtremumOperator<TKey, TValue, TProjected> : IStepOperator
             {
                 foreach (var (value, _) in entriesPerBucket[i])
                 {
-                    var leafSlot = (uint)StableHash.Of(value) & LeafMask;
+                    var leafSlot = (uint)_slotHash(value) & LeafMask;
                     children.Add(new ExtremumSlot<TKey>(buckets[i].Key, (byte)(level - 1), leafSlot >> (BitsPerLevel * (level - 1))));
                 }
             }
@@ -204,39 +217,5 @@ internal sealed class ExtremumOperator<TKey, TValue, TProjected> : IStepOperator
         }
 
         _tree.RemoveGroups(buckets);
-    }
-}
-
-/// <summary>
-/// A 64-bit hash whose value must not change between processes, because tournament-tree
-/// slots are derived from it and the tree may live in a persistent storage provider that a
-/// later process reattaches. Strings hash their contents (their built-in hash is randomized
-/// per process); other types rely on their own GetHashCode, which is deterministic for the
-/// numeric, temporal, and Guid types extrema are typically computed over. Composite types
-/// containing strings hash per-process only, which is fine for in-memory storage.
-/// </summary>
-internal static class StableHash
-{
-    public static ulong Of<T>(T value) where T : notnull =>
-        Mix(value is string s ? Fnv1a(s) : (uint)EqualityComparer<T>.Default.GetHashCode(value));
-
-    private static ulong Fnv1a(string s)
-    {
-        var hash = 14695981039346656037ul;
-        foreach (var c in s)
-            hash = (hash ^ c) * 1099511628211ul;
-        return hash;
-    }
-
-    /// <summary>splitmix64 finalizer: spreads clustered inputs (sequential ints, timestamps)
-    /// over the low bits that slot selection uses.</summary>
-    private static ulong Mix(ulong x)
-    {
-        x ^= x >> 30;
-        x *= 0xBF58476D1CE4E5B9ul;
-        x ^= x >> 27;
-        x *= 0x94D049BB133111EBul;
-        x ^= x >> 31;
-        return x;
     }
 }

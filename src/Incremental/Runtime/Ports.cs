@@ -26,6 +26,30 @@ internal sealed class KeyedInputRegistration<TKey, TValue> : InputRegistration
             writer => new KeyedInputHandle<TKey, TValue>(new InputHandle<TValue>(writer), KeySelector));
 }
 
+/// <summary>Encodes the checkpoint entry keys the committed-offsets marker uses: an
+/// unstamped input's running count commits under its plain name, a stamped input's
+/// per-partition positions commit under one <c>{name}#p{partition}</c> entry each — so the
+/// marker stays a flat string → long map for every checkpoint provider. Input names
+/// therefore must not contain <c>'#'</c> (enforced at build time).</summary>
+internal static class OffsetKeys
+{
+    private const string Separator = "#p";
+
+    public static string Encode(string inputName, int partition) => $"{inputName}{Separator}{partition}";
+
+    public static bool TryDecode(string key, out string inputName, out int partition)
+    {
+        var separator = key.LastIndexOf(Separator, StringComparison.Ordinal);
+        if (separator > 0 && int.TryParse(key.AsSpan(separator + Separator.Length), out partition) && partition >= 0)
+        {
+            inputName = key[..separator];
+            return true;
+        }
+        (inputName, partition) = ("", 0);
+        return false;
+    }
+}
+
 internal interface IInputPort
 {
     string Name { get; }
@@ -33,19 +57,28 @@ internal interface IInputPort
     bool HasPending { get; }
     bool IsCompleted { get; }
 
-    /// <summary>The offset of the last record consumed into a step: the producer's source
-    /// offset when records are stamped, a running record count otherwise. -1 when nothing
-    /// has been consumed (and no checkpoint was recovered).</summary>
-    long ConsumedOffset { get; }
+    /// <summary>Records currently buffered in the bounded channel (for the queue-depth gauge).</summary>
+    int BufferedCount { get; }
 
     Task<bool> WaitToReadAsync(CancellationToken cancellationToken);
 
-    /// <summary>Seeds the input's position from a recovered checkpoint, before any step runs:
-    /// replayed records stamped at or below it are dropped, and unstamped records continue
-    /// the numbering from it.</summary>
-    void SeedOffset(long offset);
+    /// <summary>Seeds an unstamped input's position from a recovered checkpoint, before any
+    /// step runs: numbering continues from it. Locks the input to unstamped records.</summary>
+    void SeedUnstamped(long offset);
 
-    void DrainInto(Worker[] workers, int maxItems);
+    /// <summary>Seeds one partition's position from a recovered checkpoint, before any step
+    /// runs: replayed records stamped at or below it are dropped. Locks the input to
+    /// stamped records.</summary>
+    void SeedPartition(int partition, long offset);
+
+    /// <summary>Adds this input's consumed positions to a checkpoint's offsets marker, under
+    /// the keys <see cref="OffsetKeys"/> describes. Adds nothing when nothing has been
+    /// consumed (and no checkpoint was recovered).</summary>
+    void AppendConsumedOffsets(Dictionary<string, long> into);
+
+    /// <summary>Returns the number of records drained (replay-dropped ones included — they
+    /// were consumed from the channel), which feeds the records metric.</summary>
+    int DrainInto(Worker[] workers, int maxItems);
     void CompleteWriter();
 
     /// <summary>Completes the input's channel with <paramref name="error"/> (the fault path):
@@ -58,11 +91,22 @@ internal sealed class InputPort<T> : IInputPort where T : notnull
 {
     private readonly Channel<InputEntry<T>> _channel;
     private readonly int _nodeId;
-    private long _offset = -1;
+
+    // Stamping mode mirrors the handle's lock, but from the consuming side — which is the
+    // side that survives a restart: a recovered checkpoint seeds the mode, so a producer
+    // that switches kinds across a restart (committed positions of the other kind) faults
+    // the step instead of deduplicating against a meaningless position.
+    private byte _mode; // 0 = nothing consumed or seeded, 1 = unstamped, 2 = stamped
+    private long _unstamped = -1;                // running count (unstamped mode)
+    private Dictionary<int, long>? _partitions;  // partition → highest consumed offset (stamped mode)
 
     public InputPort(string name, int nodeId, CircuitOptions options,
         Func<ChannelWriter<InputEntry<T>>, object>? handleFactory = null)
     {
+        if (name.Contains('#'))
+            throw new ArgumentException(
+                $"Input name '{name}' contains '#', which is reserved for the checkpoint offset keys ({nameof(OffsetKeys)}).",
+                nameof(name));
         Name = name;
         _nodeId = nodeId;
         _channel = Channel.CreateBounded<InputEntry<T>>(new BoundedChannelOptions(options.InputChannelCapacity)
@@ -77,17 +121,36 @@ internal sealed class InputPort<T> : IInputPort where T : notnull
     public object Handle { get; }
     public bool HasPending => _channel.Reader.TryPeek(out _);
     public bool IsCompleted => _channel.Reader.Completion.IsCompleted;
-    public long ConsumedOffset => _offset;
+    public int BufferedCount => _channel.Reader.Count;
 
     public Task<bool> WaitToReadAsync(CancellationToken cancellationToken) =>
         _channel.Reader.WaitToReadAsync(cancellationToken).AsTask();
 
-    public void SeedOffset(long offset) => _offset = offset;
+    public void SeedUnstamped(long offset)
+    {
+        _mode = 1;
+        _unstamped = offset;
+    }
+
+    public void SeedPartition(int partition, long offset)
+    {
+        _mode = 2;
+        (_partitions ??= new Dictionary<int, long>())[partition] = offset;
+    }
+
+    public void AppendConsumedOffsets(Dictionary<string, long> into)
+    {
+        if (_mode == 1 && _unstamped >= 0)
+            into[Name] = _unstamped;
+        else if (_mode == 2)
+            foreach (var (partition, offset) in _partitions!)
+                into[OffsetKeys.Encode(Name, partition)] = offset;
+    }
 
     /// <summary>Moves up to <paramref name="maxItems"/> buffered records into the workers'
     /// input operators for the next step, round-robin. Keyed operators re-shard via exchange
     /// anyway, so initial placement only needs to spread load.</summary>
-    public void DrainInto(Worker[] workers, int maxItems)
+    public int DrainInto(Worker[] workers, int maxItems)
     {
         ZSet<T>?[]? buffers = null;
         var target = 0;
@@ -97,16 +160,24 @@ internal sealed class InputPort<T> : IInputPort where T : notnull
             drained++;
             if (entry.Offset >= 0)
             {
-                // Stamped records must advance the position: one at or below it — in
-                // particular one replayed after a restart, when the position starts at the
-                // committed checkpoint — is a duplicate and is dropped.
-                if (entry.Offset <= _offset)
+                if (_mode == 1)
+                    throw MixedStamping(stamped: true);
+                _mode = 2;
+
+                // Stamped records must advance their partition's position: one at or below
+                // it — in particular one replayed after a restart, when the position starts
+                // at the committed checkpoint — is a duplicate and is dropped.
+                _partitions ??= new Dictionary<int, long>();
+                if (_partitions.TryGetValue(entry.Partition, out var position) && entry.Offset <= position)
                     continue;
-                _offset = entry.Offset;
+                _partitions[entry.Partition] = entry.Offset;
             }
             else
             {
-                _offset++; // unstamped records are numbered as they are consumed
+                if (_mode == 2)
+                    throw MixedStamping(stamped: false);
+                _mode = 1;
+                _unstamped++; // unstamped records are numbered as they are consumed
             }
 
             buffers ??= new ZSet<T>?[workers.Length];
@@ -114,17 +185,25 @@ internal sealed class InputPort<T> : IInputPort where T : notnull
             target = (target + 1) % workers.Length;
         }
 
-        if (buffers is null)
-            return;
-
-        for (var i = 0; i < workers.Length; i++)
-            if (buffers[i] is { } batch)
-                ((InputOperator<T>)workers[i].Operators[_nodeId]).Enqueue(batch);
+        if (buffers is not null)
+            for (var i = 0; i < workers.Length; i++)
+                if (buffers[i] is { } batch)
+                    ((InputOperator<T>)workers[i].Operators[_nodeId]).Enqueue(batch);
+        return drained;
     }
 
     public void CompleteWriter() => _channel.Writer.TryComplete();
 
     public void Fail(Exception error) => _channel.Writer.TryComplete(error);
+
+    /// <summary>The handle already refuses mixing within one run, so reaching this means the
+    /// producer switched kinds across a restart: the recovered checkpoint committed positions
+    /// of the other kind, and deduplicating against them would be meaningless.</summary>
+    private InvalidOperationException MixedStamping(bool stamped) => new(
+        $"Input '{Name}' has consumed (or recovered a committed checkpoint of) " +
+        $"{(stamped ? "unstamped" : "offset-stamped")} records, but received {(stamped ? "an offset-stamped" : "an unstamped")} " +
+        "one. Mixing the two would corrupt the input's replay position (exactly-once dedup); stamp every record of an " +
+        "input with source offsets, or none of them — across restarts too.");
 }
 
 internal abstract class OutputRegistration
@@ -136,36 +215,63 @@ internal abstract class OutputRegistration
 
 internal sealed class OutputRegistration<T> : OutputRegistration where T : notnull
 {
-    public override IOutputPort CreatePort(CircuitOptions options) => new OutputPort<T>(Name, NodeId, options);
+    public bool Snapshot { get; init; }
+
+    public override IOutputPort CreatePort(CircuitOptions options) => new OutputPort<T>(Name, NodeId, options, Snapshot);
 }
 
 internal interface IOutputPort
 {
     string Name { get; }
     object Handle { get; }
+
+    /// <summary>Deltas currently buffered in the bounded channel (for the queue-depth gauge).</summary>
+    int BufferedCount { get; }
     ValueTask PublishAsync(Worker[] workers, CancellationToken cancellationToken);
     void Complete(Exception? error);
+
+    /// <summary>Wires the handle's snapshot read to the circuit (no-op for plain outputs).
+    /// Called once, after the circuit's workers and ports exist.</summary>
+    void BindSnapshot(Circuit circuit);
 }
 
 internal sealed class OutputPort<T> : IOutputPort where T : notnull
 {
     private readonly Channel<ZSet<T>> _channel;
     private readonly int _nodeId;
+    private readonly bool _snapshot;
 
-    public OutputPort(string name, int nodeId, CircuitOptions options)
+    public OutputPort(string name, int nodeId, CircuitOptions options, bool snapshot)
     {
         Name = name;
         _nodeId = nodeId;
+        _snapshot = snapshot;
         _channel = Channel.CreateBounded<ZSet<T>>(new BoundedChannelOptions(options.OutputChannelCapacity)
         {
             SingleWriter = true,
             FullMode = BoundedChannelFullMode.Wait,
         });
-        Handle = new OutputHandle<T>(_channel.Reader);
+        Handle = new OutputHandle<T>(name, _channel.Reader);
+    }
+
+    public void BindSnapshot(Circuit circuit)
+    {
+        if (_snapshot)
+            ((OutputHandle<T>)Handle).SnapshotReader =
+                cancellationToken => circuit.ReadOutputSnapshotAsync<T>(_nodeId, DiscardPending, cancellationToken);
+    }
+
+    /// <summary>Drops every delta currently buffered in the channel. Only the snapshot read
+    /// uses this: everything published before a snapshot is taken is subsumed by it, so a
+    /// bootstrapping consumer must not integrate those deltas a second time.</summary>
+    private void DiscardPending()
+    {
+        while (_channel.Reader.TryRead(out _)) { }
     }
 
     public string Name { get; }
     public object Handle { get; }
+    public int BufferedCount => _channel.Reader.Count;
 
     /// <summary>Merges the per-worker deltas of this output's node for the step just run and,
     /// if non-empty, publishes them. Awaiting the bounded write is what propagates a slow
