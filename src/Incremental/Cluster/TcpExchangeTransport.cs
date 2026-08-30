@@ -19,9 +19,10 @@ namespace Incremental.Cluster;
 /// transport's pending reads and writes, which faults the circuit instead of hanging it.
 ///
 /// <para><b>Security: this transport is unauthenticated cleartext.</b> The handshake is a
-/// bare peer index and frames are plain JSON on the socket — anything that can reach the
+/// bare peer index and frames are unencrypted on the socket — anything that can reach the
 /// port can join the mesh and inject data, and every exchanged record crosses the wire
-/// readable. Run it only on a trusted, isolated network segment (or over an encrypted
+/// readable (the dense encoding is a compression, not a cipher). Run it only on a trusted,
+/// isolated network segment (or over an encrypted
 /// tunnel the deployment provides); the <c>maxFrameBytes</c> cap bounds what a single
 /// frame can make the receiver allocate, but it is a robustness cap, not an
 /// authentication mechanism.</para>

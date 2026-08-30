@@ -37,6 +37,10 @@ internal sealed record Options
     /// <summary>Print a byte-weighted allocation histogram by type for the measured window.</summary>
     public bool AllocationTypes { get; init; }
 
+    /// <summary>When &gt; 1, run the cluster-mode graph across this many co-hosted processes
+    /// stepped in lockstep, which is what puts the exchange wire format on the measured path.</summary>
+    public int Processes { get; init; } = 1;
+
     public static Options Parse(string[] args)
     {
         var options = new Options();
@@ -70,6 +74,7 @@ internal sealed record Options
                 "seed" => options with { Seed = Int() },
                 "batch" => options with { StepBatch = Int() },
                 "input-capacity" => options with { InputCapacity = Int() },
+                "processes" => options with { Processes = Int() },
                 _ => throw new ArgumentException($"Unknown option '{arg}'."),
             };
         }
