@@ -72,6 +72,56 @@ internal sealed class ExtremumOperator<TKey, TValue, TProjected> : IStepOperator
     // watermark instead and must run whether or not data arrived.
     public object? EmptyStepResult => _eviction is null ? _empty : null;
 
+    /// <summary>
+    /// One level's pending bucket changes, held as index chains over flat buffers rather than
+    /// a list per bucket. A delta row walks all seven levels, so anything allocated per bucket
+    /// per level is allocated several times per record — which is what this shape avoids: the
+    /// buffers are cleared and refilled, and two of them ping-pong (this level's buckets are
+    /// read while the parent's are written).
+    /// </summary>
+    private sealed class Level
+    {
+        public readonly List<TKey> Keys = [];
+        public readonly List<uint> Slots = [];
+        public readonly List<int> Head = [];    // index into Rows of this bucket's first row, or -1
+        public readonly List<(TProjected Value, long Weight, int Next)> Rows = [];
+        private readonly Dictionary<(TKey Key, uint Slot), int> _index = [];
+
+        public int Count => Keys.Count;
+
+        public void Clear()
+        {
+            Keys.Clear();
+            Slots.Clear();
+            Head.Clear();
+            Rows.Clear();
+            _index.Clear();
+        }
+
+        public void Add(TKey key, uint slot, TProjected value, long weight)
+        {
+            ref var bucket = ref System.Runtime.InteropServices.CollectionsMarshal
+                .GetValueRefOrAddDefault(_index, (key, slot), out var known);
+            if (!known)
+            {
+                bucket = Keys.Count;
+                Keys.Add(key);
+                Slots.Add(slot);
+                Head.Add(-1);
+            }
+            Rows.Add((value, weight, Head[bucket]));
+            Head[bucket] = Rows.Count - 1;
+        }
+    }
+
+    private readonly Level _levelA = new();
+    private readonly Level _levelB = new();
+    private readonly List<ExtremumSlot<TKey>> _slots = [];
+    private readonly List<WeightedValue<TProjected>> _before = [];
+    private readonly List<int> _bounds = [];
+    private readonly List<WeightedValue<TProjected>> _merged = [];
+    private readonly List<(ExtremumSlot<TKey>, TProjected, long)> _updates = [];
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
@@ -79,53 +129,51 @@ internal sealed class ExtremumOperator<TKey, TValue, TProjected> : IStepOperator
 
         // Level-major walk (all keys advance together) so each level is one batched read
         // and one batched write against the store, regardless of how many keys the delta
-        // touches: changes holds the pending entries per (key, slot) bucket at the
-        // current level.
-        var changes = new Dictionary<(TKey Key, uint Slot), List<WeightedValue<TProjected>>>();
+        // touches: `current` holds the pending entries per (key, slot) bucket at the
+        // current level, `next` collects what propagates to the parents.
+        var current = _levelA;
+        var next = _levelB;
+        current.Clear();
         foreach (var ((key, value), weight) in delta)
         {
             var projected = _selector(value);
-            var slot = (uint)_slotHash(projected) & LeafMask;
-            if (!changes.TryGetValue((key, slot), out var rows))
-                changes[(key, slot)] = rows = [];
-            rows.Add(new WeightedValue<TProjected>(projected, weight));
+            current.Add(key, (uint)_slotHash(projected) & LeafMask, projected, weight);
             _eviction?.Track(key);
         }
 
         var comparer = Comparer<TProjected>.Default;
-        for (byte level = 0; level <= RootLevel && changes.Count > 0; level++)
+        for (byte level = 0; level <= RootLevel && current.Count > 0; level++)
         {
-            var buckets = new List<ExtremumSlot<TKey>>(changes.Count);
-            var bucketEntries = new List<List<WeightedValue<TProjected>>>(changes.Count);
-            foreach (var ((key, slot), entries) in changes)
+            _slots.Clear();
+            for (var i = 0; i < current.Count; i++)
+                _slots.Add(new ExtremumSlot<TKey>(current.Keys[i], level, current.Slots[i]));
+
+            _before.Clear();
+            _bounds.Clear();
+            _tree.GetGroupsInto(_slots, _before, _bounds);
+
+            _updates.Clear();
+            next.Clear();
+
+            for (var i = 0; i < _slots.Count; i++)
             {
-                buckets.Add(new ExtremumSlot<TKey>(key, level, slot));
-                bucketEntries.Add(entries);
-            }
+                var start = i == 0 ? 0 : _bounds[i - 1];
+                var end = _bounds[i];
+                var hadOld = TryExtremum(_before, start, end, comparer, out var oldBest);
 
-            var befores = _tree.GetGroups(buckets);
-            var updates = new List<(ExtremumSlot<TKey>, TProjected, long)>();
-            var parentChanges = new Dictionary<(TKey Key, uint Slot), List<WeightedValue<TProjected>>>();
-
-            for (var i = 0; i < buckets.Count; i++)
-            {
-                var bucket = buckets[i];
-                var before = befores[i];
-                var hadOld = TryExtremum(before, comparer, out var oldBest);
-
-                var merged = new Dictionary<TProjected, long>(before.Count + bucketEntries[i].Count);
-                foreach (var (v, w) in before)
-                    merged[v] = w;
-                foreach (var (v, w) in bucketEntries[i])
+                // The bucket after this step's rows are folded in. A bucket holds at most
+                // one entry per child (fanout 16), and leaf buckets are 1-in-16M, so this
+                // stays a handful of entries and a linear merge beats a hash table on it.
+                _merged.Clear();
+                for (var b = start; b < end; b++)
+                    _merged.Add(_before[b]);
+                for (var row = current.Head[i]; row >= 0; row = current.Rows[row].Next)
                 {
-                    updates.Add((bucket, v, w));
-                    var updated = merged.GetValueOrDefault(v) + w;
-                    if (updated == 0)
-                        merged.Remove(v);
-                    else
-                        merged[v] = updated;
+                    var (value, weight, _) = current.Rows[row];
+                    _updates.Add((_slots[i], value, weight));
+                    Fold(_merged, value, weight);
                 }
-                var hasNew = TryExtremum(merged, comparer, out var newBest);
+                var hasNew = TryExtremum(_merged, 0, _merged.Count, comparer, out var newBest);
 
                 if (hadOld == hasNew && (!hadOld || EqualityComparer<TProjected>.Default.Equals(oldBest!, newBest!)))
                     continue; // extremum unchanged: nothing propagates past this bucket
@@ -135,26 +183,24 @@ internal sealed class ExtremumOperator<TKey, TValue, TProjected> : IStepOperator
                     // The root's extremum is the emitted result, so its old value is
                     // exactly what was published last — no separate result store needed.
                     if (hadOld)
-                        output.Add(new KeyedValue<TKey, TProjected>(bucket.Key, oldBest!), -1);
+                        output.Add(new KeyedValue<TKey, TProjected>(current.Keys[i], oldBest!), -1);
                     if (hasNew)
-                        output.Add(new KeyedValue<TKey, TProjected>(bucket.Key, newBest!), 1);
+                        output.Add(new KeyedValue<TKey, TProjected>(current.Keys[i], newBest!), 1);
                 }
                 else
                 {
-                    var parent = (bucket.Key, bucket.Slot >> BitsPerLevel);
-                    if (!parentChanges.TryGetValue(parent, out var list))
-                        parentChanges[parent] = list = [];
+                    var parentSlot = current.Slots[i] >> BitsPerLevel;
                     if (hadOld)
-                        list.Add(new WeightedValue<TProjected>(oldBest!, -1));
+                        next.Add(current.Keys[i], parentSlot, oldBest!, -1);
                     if (hasNew)
-                        list.Add(new WeightedValue<TProjected>(newBest!, 1));
+                        next.Add(current.Keys[i], parentSlot, newBest!, 1);
                 }
             }
 
             // Buckets at one level are disjoint from the next level's reads, so the
             // whole level's updates flush as one wave after its reads.
-            _tree.UpdateAll(updates);
-            changes = parentChanges;
+            _tree.ApplyAll(_updates);
+            (current, next) = (next, current);
         }
 
         if (_eviction?.DrainClosed() is { Count: > 0 } closed)
@@ -163,29 +209,32 @@ internal sealed class ExtremumOperator<TKey, TValue, TProjected> : IStepOperator
         return output;
     }
 
-    private bool TryExtremum(IReadOnlyList<WeightedValue<TProjected>> entries, Comparer<TProjected> comparer, out TProjected best)
+    /// <summary>Adds <paramref name="weight"/> to <paramref name="value"/>'s entry in a
+    /// bucket-sized multiset, dropping it if the sum reaches zero.</summary>
+    private static void Fold(List<WeightedValue<TProjected>> bucket, TProjected value, long weight)
     {
-        var found = false;
-        best = default!;
-        foreach (var (value, weight) in entries)
+        for (var i = 0; i < bucket.Count; i++)
         {
-            if (weight <= 0)
+            if (!EqualityComparer<TProjected>.Default.Equals(bucket[i].Value, value))
                 continue;
-            if (!found || Math.Sign(comparer.Compare(value, best)) == _sign)
-            {
-                best = value;
-                found = true;
-            }
+            var updated = bucket[i].Weight + weight;
+            if (updated == 0)
+                bucket.RemoveAt(i);
+            else
+                bucket[i] = new WeightedValue<TProjected>(value, updated);
+            return;
         }
-        return found;
+        bucket.Add(new WeightedValue<TProjected>(value, weight));
     }
 
-    private bool TryExtremum(Dictionary<TProjected, long> entries, Comparer<TProjected> comparer, out TProjected best)
+    private bool TryExtremum(
+        List<WeightedValue<TProjected>> entries, int start, int end, Comparer<TProjected> comparer, out TProjected best)
     {
         var found = false;
         best = default!;
-        foreach (var (value, weight) in entries)
+        for (var i = start; i < end; i++)
         {
+            var (value, weight) = entries[i];
             if (weight <= 0)
                 continue;
             if (!found || Math.Sign(comparer.Compare(value, best)) == _sign)
