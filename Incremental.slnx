@@ -13,6 +13,7 @@
     <Project Path="src/Incremental/Incremental.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/Incremental.ClusterHost/Incremental.ClusterHost.csproj" />
     <Project Path="tests/Incremental.Tests/Incremental.Tests.csproj" />
   </Folder>
 </Solution>
