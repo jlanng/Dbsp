@@ -143,6 +143,45 @@ public class CircuitTests
     }
 
     [Fact]
+    public async Task Sum_overflow_faults_the_step_instead_of_wrapping()
+    {
+        var builder = ManualBuilder();
+        builder.Input<(string Key, int Amount)>("orders")
+            .IndexBy(o => o.Key)
+            .Sum(o => o.Amount)
+            .Output("sums");
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var input = circuit.Input<(string Key, int Amount)>("orders");
+
+        await input.InsertAsync(("a", int.MaxValue));
+        await input.InsertAsync(("a", 1));
+        await Assert.ThrowsAsync<OverflowException>(() => circuit.StepAsync());
+        Assert.NotNull(circuit.Fault);
+    }
+
+    [Fact]
+    public async Task Long_sum_overflow_faults_the_step_instead_of_wrapping()
+    {
+        var builder = ManualBuilder();
+        builder.Input<(string Key, long Amount)>("orders")
+            .IndexBy(o => o.Key)
+            .Sum(o => o.Amount)
+            .Output("sums");
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var input = circuit.Input<(string Key, long Amount)>("orders");
+
+        await input.InsertAsync(("a", long.MaxValue));
+        await circuit.StepAsync();
+        await input.InsertAsync(("a", 1L));
+        await Assert.ThrowsAsync<OverflowException>(() => circuit.StepAsync());
+        Assert.NotNull(circuit.Fault);
+    }
+
+    [Fact]
     public async Task Min_recovers_after_deleting_the_minimum()
     {
         var builder = ManualBuilder();

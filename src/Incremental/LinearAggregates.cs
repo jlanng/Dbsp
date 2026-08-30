@@ -26,6 +26,14 @@ public static class LinearAggregates
     public static ILinearAggregate<TValue, long> Count<TValue>() where TValue : notnull =>
         new CountAggregate<TValue>();
 
+    /// <summary>
+    /// SUM of <paramref name="selector"/> over the group. Integer accumulation is checked:
+    /// an overflow throws <see cref="OverflowException"/> (faulting the circuit) instead of
+    /// silently wrapping. Prefer <see cref="decimal"/> or <see cref="long"/> accumulators —
+    /// <see cref="float"/>/<see cref="double"/> sums are not exact under retraction: adding
+    /// x and later adding -x does not restore the previous accumulator (rounding), so a
+    /// long-lived floating-point sum drifts permanently as rows are amended or deleted.
+    /// </summary>
     public static ILinearAggregate<TValue, TNumber> Sum<TValue, TNumber>(Func<TValue, TNumber> selector)
         where TValue : notnull
         where TNumber : INumber<TNumber> =>
@@ -44,7 +52,11 @@ public static class LinearAggregates
         where TNumber : INumber<TNumber>
     {
         public TNumber Zero => TNumber.Zero;
-        public TNumber Map(TValue value, long weight) => selector(value) * TNumber.CreateChecked(weight);
-        public TNumber Combine(TNumber left, TNumber right) => left + right;
+
+        // checked binds the generic-math checked operators (op_CheckedMultiply/Add), so
+        // integer accumulators overflow loudly like the Z-set weight arithmetic does;
+        // float/double/decimal keep their own semantics (their checked ops are the same).
+        public TNumber Map(TValue value, long weight) => checked(selector(value) * TNumber.CreateChecked(weight));
+        public TNumber Combine(TNumber left, TNumber right) => checked(left + right);
     }
 }
