@@ -166,6 +166,47 @@ internal sealed class FlatMapOperator<TIn, TOut>(Func<TIn, IEnumerable<TOut>> se
     }
 }
 
+/// <summary>
+/// Hopping/tumbling window assignment: each record joins every window of <c>size</c> whose
+/// start is a multiple of <c>hop</c> and which covers its event time. This is a flat map with
+/// a known, constant fan-out — <c>ceil(size/hop)</c> windows per record — which is exactly what
+/// the general <see cref="FlatMapOperator{TIn,TOut}"/> cannot exploit: it would size its output
+/// for one row per input and then grow through it, and pay an iterator allocation per record
+/// for the assignment sequence. A 30-second window hopping every 5 seconds sextuples its
+/// input, so on a busy stream that is the largest Z-set the graph builds.
+/// </summary>
+internal sealed class WindowAssignOperator<TKey, TValue>(
+    Func<TValue, long> eventTicks, long sizeTicks, long hopTicks) : IStepOperator
+    where TKey : notnull
+    where TValue : notnull
+{
+    private readonly ZSet<KeyedValue<WindowKey<TKey>, TValue>> _empty = new();
+    private readonly int _windowsPerRecord = (int)((sizeTicks + hopTicks - 1) / hopTicks);
+
+    public object? EmptyStepResult => _empty;
+
+    public object Step(object?[] inputs)
+    {
+        var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
+        var output = new ZSet<KeyedValue<WindowKey<TKey>, TValue>>(delta.DistinctCount * _windowsPerRecord);
+        foreach (var ((key, value), weight) in delta)
+        {
+            var ticks = eventTicks(value);
+            var latestStart = ticks / hopTicks * hopTicks;
+            for (var start = latestStart; start > ticks - sizeTicks; start -= hopTicks)
+                output.Add(
+                    new KeyedValue<WindowKey<TKey>, TValue>(
+                        new WindowKey<TKey>(
+                            new DateTimeOffset(start, TimeSpan.Zero),
+                            new DateTimeOffset(start + sizeTicks, TimeSpan.Zero),
+                            key),
+                        value),
+                    weight);
+        }
+        return output;
+    }
+}
+
 internal sealed class NegateOperator<T> : IStepOperator where T : notnull
 {
     private readonly ZSet<T> _empty = new();

@@ -54,19 +54,33 @@ public sealed class InMemoryStorageProvider : IStorageProvider
     {
         private readonly Dictionary<TKey, Dictionary<TValue, long>> _groups = new();
 
+        // Groups appear and vanish constantly in a sliding workload — a key whose last row is
+        // retracted takes its dictionary with it, and the next insert on that key allocates
+        // another. Emptied dictionaries are parked here instead (bounded, and empty, so this
+        // holds nothing but their capacity) and handed back out on the next create.
+        private readonly Stack<Dictionary<TValue, long>> _spare = new();
+        private const int MaxSpare = 32;
+
         public long Update(TKey key, TValue value, long delta)
         {
-            ref var group = ref CollectionsMarshal.GetValueRefOrAddDefault(_groups, key, out var hadGroup);
+            ref var entry = ref CollectionsMarshal.GetValueRefOrAddDefault(_groups, key, out var hadGroup);
             if (!hadGroup)
-                group = new Dictionary<TValue, long>();
+                entry = _spare.Count > 0 ? _spare.Pop() : new Dictionary<TValue, long>();
+            // Held as a local, not through the ref: removing the key below clears the slot
+            // the ref points at, and the group is still needed after that.
+            var group = entry!;
 
-            ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(group!, value, out _);
+            ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(group, value, out _);
             var updated = slot + delta;
             if (updated == 0)
             {
-                group!.Remove(value);
+                group.Remove(value);
                 if (group.Count == 0)
+                {
                     _groups.Remove(key);
+                    if (_spare.Count < MaxSpare)
+                        _spare.Push(group);
+                }
             }
             else
             {
