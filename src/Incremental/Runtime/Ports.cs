@@ -147,6 +147,12 @@ internal sealed class InputPort<T> : IInputPort where T : notnull
                 into[OffsetKeys.Encode(Name, partition)] = offset;
     }
 
+    // Reused across drains (the coordinator drains one input at a time, between steps), plus
+    // a running estimate of how many records a worker gets per step: a batch Z-set built from
+    // empty otherwise walks the dictionary's doubling ladder on every step of every input.
+    private ZSet<T>?[]? _buffers;
+    private int _perWorkerHint;
+
     /// <summary>Moves up to <paramref name="maxItems"/> buffered records into the workers'
     /// input operators for the next step, round-robin. Keyed operators re-shard via exchange
     /// anyway, so initial placement only needs to spread load.</summary>
@@ -180,15 +186,23 @@ internal sealed class InputPort<T> : IInputPort where T : notnull
                 _unstamped++; // unstamped records are numbered as they are consumed
             }
 
-            buffers ??= new ZSet<T>?[workers.Length];
-            (buffers[target] ??= new ZSet<T>()).Add(entry.Value, entry.Weight);
+            buffers ??= _buffers is { } cached && cached.Length == workers.Length
+                ? cached
+                : _buffers = new ZSet<T>?[workers.Length];
+            (buffers[target] ??= new ZSet<T>(_perWorkerHint)).Add(entry.Value, entry.Weight);
             target = (target + 1) % workers.Length;
         }
 
         if (buffers is not null)
+        {
             for (var i = 0; i < workers.Length; i++)
+            {
                 if (buffers[i] is { } batch)
                     ((InputOperator<T>)workers[i].Operators[_nodeId]).Enqueue(batch);
+                buffers[i] = null;  // the batch belongs to the worker now
+            }
+            _perWorkerHint = drained / workers.Length;
+        }
         return drained;
     }
 

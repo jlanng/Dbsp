@@ -12,11 +12,12 @@ internal static class ThreadCpu
 {
     private static readonly double TicksPerSecond = 100.0;   // USER_HZ, fixed at 100 on Linux
 
-    internal readonly record struct Snapshot(double WorkerSeconds, double ProcessSeconds, int WorkerThreads);
+    internal readonly record struct Snapshot(
+        double WorkerSeconds, double GcSeconds, double ProducerSeconds, double ProcessSeconds, int WorkerThreads);
 
     public static Snapshot Take()
     {
-        double workers = 0, total = 0;
+        double workers = 0, gc = 0, producer = 0, total = 0;
         var workerThreads = 0;
         foreach (var task in Directory.EnumerateDirectories("/proc/self/task"))
         {
@@ -51,7 +52,15 @@ internal static class ThreadCpu
                 workers += seconds;
                 workerThreads++;
             }
+            else if (comm.StartsWith(".NET Server GC") || comm.StartsWith(".NET BGC"))
+            {
+                gc += seconds;
+            }
+            else if (comm.StartsWith("torture-producer"))
+            {
+                producer += seconds;
+            }
         }
-        return new Snapshot(workers, total, workerThreads);
+        return new Snapshot(workers, gc, producer, total, workerThreads);
     }
 }

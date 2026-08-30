@@ -45,44 +45,78 @@ internal sealed class SessionWindowOperator<TKey, TValue> : IStepOperator
         _clock = clock;
     }
 
+    // Per-step scratch, reused across steps and — for the per-key working lists — across the
+    // keys of a step. A sliding stream touches a great many keys per step (one per event on a
+    // wide keyspace), so a collection allocated per touched key is allocated per record.
+    private readonly List<(TKey, TValue, long)> _entries = [];
+    private readonly List<TKey> _touched = [];
+    private readonly Dictionary<TKey, int> _bucketOf = [];
+    private readonly List<(TValue Value, long Weight, int Next)> _deltaRows = [];
+    private readonly List<int> _deltaHead = [];
+    private readonly List<WeightedValue<TValue>> _oldRows = [];
+    private readonly List<int> _oldBounds = [];
+    private readonly List<(long Ticks, TValue Value, long Weight)> _oldItems = [];
+    private readonly List<(long Ticks, TValue Value, long Weight)> _newItems = [];
+    private readonly Dictionary<TValue, long> _merged = [];
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
-        var output = new ZSet<KeyedValue<TKey, Windowed<TValue>>>();
+        var output = new ZSet<KeyedValue<TKey, Windowed<TValue>>>(delta.DistinctCount * 2);
 
-        var entries = new List<(TKey, TValue, long)>(delta.DistinctCount);
-        var touched = new List<TKey>();
-        var deltasByKey = new Dictionary<TKey, List<(TValue Value, long Weight)>>();
+        var entries = _entries;
+        var touched = _touched;
+        entries.Clear();
+        touched.Clear();
+        _bucketOf.Clear();
+        _deltaRows.Clear();
+        _deltaHead.Clear();
+        entries.EnsureCapacity(delta.DistinctCount);
         foreach (var ((key, value), weight) in delta)
         {
             entries.Add((key, value, weight));
-            if (!deltasByKey.TryGetValue(key, out var forKey))
+            // A key's delta rows are an index chain through _deltaRows rather than a list
+            // of their own (see TopK, which does the same for the same reason).
+            ref var bucket = ref System.Runtime.InteropServices.CollectionsMarshal
+                .GetValueRefOrAddDefault(_bucketOf, key, out var known);
+            if (!known)
             {
-                deltasByKey[key] = forKey = [];
+                bucket = touched.Count;
                 touched.Add(key);
+                _deltaHead.Add(-1);
             }
-            forKey.Add((value, weight));
+            _deltaRows.Add((value, weight, _deltaHead[bucket]));
+            _deltaHead[bucket] = _deltaRows.Count - 1;
         }
 
         // The retractions must reflect the state as it stood before this delta, so the
         // touched groups are read first, then the delta is persisted in one batched call.
-        var oldGroups = _events.GetGroups(touched);
-        _events.UpdateAll(entries);
+        _oldRows.Clear();
+        _oldBounds.Clear();
+        _events.GetGroupsInto(touched, _oldRows, _oldBounds);
+        _events.ApplyAll(entries);
 
+        var oldItems = _oldItems;
+        var newItems = _newItems;
+        var merged = _merged;
         for (var i = 0; i < touched.Count; i++)
         {
             var key = touched[i];
-            var oldGroup = oldGroups[i];
+            var groupStart = i == 0 ? 0 : _oldBounds[i - 1];
+            var groupEnd = _oldBounds[i];
 
-            var oldItems = new List<(long Ticks, TValue Value, long Weight)>(oldGroup.Count);
-            foreach (var (value, weight) in oldGroup)
-                oldItems.Add((_eventTime(value).UtcTicks, value, weight));
-
-            var merged = new Dictionary<TValue, long>(oldGroup.Count);
-            foreach (var (value, weight) in oldGroup)
-                merged[value] = weight;
-            foreach (var (value, weight) in deltasByKey[key])
+            oldItems.Clear();
+            merged.Clear();
+            for (var g = groupStart; g < groupEnd; g++)
             {
+                var (value, weight) = _oldRows[g];
+                oldItems.Add((_eventTime(value).UtcTicks, value, weight));
+                merged[value] = weight;
+            }
+
+            for (var row = _deltaHead[i]; row >= 0; row = _deltaRows[row].Next)
+            {
+                var (value, weight, _) = _deltaRows[row];
                 var updated = merged.GetValueOrDefault(value) + weight;
                 if (updated == 0)
                     merged.Remove(value);
@@ -90,7 +124,7 @@ internal sealed class SessionWindowOperator<TKey, TValue> : IStepOperator
                     merged[value] = updated;
             }
 
-            var newItems = new List<(long Ticks, TValue Value, long Weight)>(merged.Count);
+            newItems.Clear();
             foreach (var (value, weight) in merged)
                 newItems.Add((_eventTime(value).UtcTicks, value, weight));
 
