@@ -33,19 +33,34 @@ internal sealed class LinearAggregateOperator<TKey, TValue, TResult> : IStepOper
     // watermark instead and must run whether or not data arrived.
     public object? EmptyStepResult => _eviction is null ? _empty : null;
 
+    // Per-step scratch, reused across steps (single-threaded per worker; the store's batched
+    // calls read these within the call).
+    private readonly Dictionary<TKey, (long Rows, TResult Acc)> _perKey = [];
+    private readonly List<TKey> _keys = [];
+    private readonly List<(TKey, (long, TResult))> _puts = [];
+    private readonly List<TKey> _removes = [];
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
-        var output = new ZSet<KeyedValue<TKey, TResult>>();
 
-        var perKey = new Dictionary<TKey, (long Rows, TResult Acc)>();
+        var perKey = _perKey;
+        perKey.Clear();
         foreach (var ((key, value), weight) in delta)
         {
-            var entry = perKey.TryGetValue(key, out var current) ? current : (Rows: 0L, Acc: _aggregate.Zero);
-            perKey[key] = (entry.Rows + weight, _aggregate.Combine(entry.Acc, _aggregate.Map(value, weight)));
+            ref var entry = ref System.Runtime.InteropServices.CollectionsMarshal
+                .GetValueRefOrAddDefault(perKey, key, out var seen);
+            if (!seen)
+                entry = (0L, _aggregate.Zero);
+            entry = (entry.Rows + weight, _aggregate.Combine(entry.Acc, _aggregate.Map(value, weight)));
         }
 
-        var keys = new List<TKey>(perKey.Count);
+        // At most one retraction and one assertion per touched key.
+        var output = new ZSet<KeyedValue<TKey, TResult>>(perKey.Count * 2);
+
+        var keys = _keys;
+        keys.Clear();
+        keys.EnsureCapacity(perKey.Count);
         foreach (var (key, _) in perKey)
         {
             keys.Add(key);
@@ -53,8 +68,10 @@ internal sealed class LinearAggregateOperator<TKey, TValue, TResult> : IStepOper
         }
 
         var states = _state.TryGetAll(keys);
-        var puts = new List<(TKey, (long, TResult))>();
-        var removes = new List<TKey>();
+        var puts = _puts;
+        var removes = _removes;
+        puts.Clear();
+        removes.Clear();
 
         for (var i = 0; i < keys.Count; i++)
         {

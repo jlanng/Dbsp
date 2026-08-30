@@ -1,4 +1,5 @@
 using System.Diagnostics.CodeAnalysis;
+using System.Runtime.InteropServices;
 
 namespace Incremental.Storage;
 
@@ -25,12 +26,21 @@ public sealed class InMemoryStorageProvider : IStorageProvider
 
         public long Update(T value, long delta)
         {
-            var updated = _weights.GetValueOrDefault(value) + delta;
+            // One probe locates the slot and writes it; only the (rare) fall-to-zero case
+            // pays a second lookup to remove the entry.
+            ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(_weights, value, out _);
+            var updated = slot + delta;
             if (updated == 0)
                 _weights.Remove(value);
             else
-                _weights[value] = updated;
+                slot = updated;
             return updated;
+        }
+
+        public void ApplyAll(IReadOnlyList<(T Value, long Delta)> entries)
+        {
+            for (var i = 0; i < entries.Count; i++)
+                Update(entries[i].Value, entries[i].Delta);
         }
 
         public long WeightOf(T value) => _weights.GetValueOrDefault(value);
@@ -46,21 +56,32 @@ public sealed class InMemoryStorageProvider : IStorageProvider
 
         public long Update(TKey key, TValue value, long delta)
         {
-            if (!_groups.TryGetValue(key, out var group))
-                _groups[key] = group = new Dictionary<TValue, long>();
+            ref var group = ref CollectionsMarshal.GetValueRefOrAddDefault(_groups, key, out var hadGroup);
+            if (!hadGroup)
+                group = new Dictionary<TValue, long>();
 
-            var updated = group.GetValueOrDefault(value) + delta;
+            ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(group!, value, out _);
+            var updated = slot + delta;
             if (updated == 0)
             {
-                group.Remove(value);
+                group!.Remove(value);
                 if (group.Count == 0)
                     _groups.Remove(key);
             }
             else
             {
-                group[value] = updated;
+                slot = updated;
             }
             return updated;
+        }
+
+        public void ApplyAll(IReadOnlyList<(TKey Key, TValue Value, long Delta)> entries)
+        {
+            for (var i = 0; i < entries.Count; i++)
+            {
+                var (key, value, delta) = entries[i];
+                Update(key, value, delta);
+            }
         }
 
         public IReadOnlyList<WeightedValue<TValue>> GetGroup(TKey key)
@@ -73,6 +94,24 @@ public sealed class InMemoryStorageProvider : IStorageProvider
             foreach (var kv in group)
                 result[i++] = new WeightedValue<TValue>(kv.Key, kv.Value);
             return result;
+        }
+
+        /// <summary>Reads whole groups without materializing one array per group: the entries
+        /// go straight from the live dictionaries into the caller's buffer, which the hot
+        /// operators reuse across steps. Safe precisely because the contract is a copy —
+        /// callers get values, not a view onto state that the next update would move.</summary>
+        public void GetGroupsInto(IReadOnlyList<TKey> keys, List<WeightedValue<TValue>> into, List<int> bounds)
+        {
+            for (var i = 0; i < keys.Count; i++)
+            {
+                if (_groups.TryGetValue(keys[i], out var group))
+                {
+                    into.EnsureCapacity(into.Count + group.Count);
+                    foreach (var kv in group)
+                        into.Add(new WeightedValue<TValue>(kv.Key, kv.Value));
+                }
+                bounds.Add(into.Count);
+            }
         }
 
         public void RemoveGroup(TKey key) => _groups.Remove(key);

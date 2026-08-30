@@ -32,17 +32,31 @@ internal sealed class AntiJoinOperator<TKey, TLeft, TRight> : IStepOperator
     // watermark instead and must run whether or not data arrived.
     public object? EmptyStepResult => _eviction is null ? _empty : null;
 
+    // Per-step scratch, reused across steps (single-threaded per worker).
+    private readonly Dictionary<TKey, long> _rightKeyDeltas = [];
+    private readonly List<(TKey, long)> _countEntries = [];
+    private readonly List<TKey> _flipped = [];
+    private readonly List<long> _flipSigns = [];
+    private readonly List<WeightedValue<TLeft>> _flippedRows = [];
+    private readonly List<int> _flippedBounds = [];
+    private readonly List<(TKey, TLeft, long)> _leftEntries = [];
+    private readonly List<TKey> _leftKeys = [];
+    private readonly Dictionary<TKey, int> _matchIndex = [];
+
     public object Step(object?[] inputs)
     {
         var deltaLeft = (ZSet<KeyedValue<TKey, TLeft>>)inputs[0]!;
         var deltaRight = (ZSet<KeyedValue<TKey, TRight>>)inputs[1]!;
-        var output = new ZSet<KeyedValue<TKey, TLeft>>();
+        var output = new ZSet<KeyedValue<TKey, TLeft>>(deltaLeft.DistinctCount);
 
-        var rightKeyDeltas = new Dictionary<TKey, long>();
+        var rightKeyDeltas = _rightKeyDeltas;
+        rightKeyDeltas.Clear();
         foreach (var ((key, _), weight) in deltaRight)
             rightKeyDeltas[key] = rightKeyDeltas.GetValueOrDefault(key) + weight;
 
-        var countEntries = new List<(TKey, long)>(rightKeyDeltas.Count);
+        var countEntries = _countEntries;
+        countEntries.Clear();
+        countEntries.EnsureCapacity(rightKeyDeltas.Count);
         foreach (var (key, keyDelta) in rightKeyDeltas)
         {
             countEntries.Add((key, keyDelta));
@@ -50,8 +64,10 @@ internal sealed class AntiJoinOperator<TKey, TLeft, TRight> : IStepOperator
         }
 
         var after = _rightRowCount.UpdateAll(countEntries);
-        var flipped = new List<TKey>();
-        var flipSigns = new List<long>();
+        var flipped = _flipped;
+        var flipSigns = _flipSigns;
+        flipped.Clear();
+        flipSigns.Clear();
         for (var i = 0; i < countEntries.Count; i++)
         {
             var (key, keyDelta) = countEntries[i];
@@ -65,26 +81,37 @@ internal sealed class AntiJoinOperator<TKey, TLeft, TRight> : IStepOperator
         }
 
         // Presence flipped: every integrated left row for these keys changes sides.
-        var flippedGroups = _left.GetGroups(flipped);
-        for (var i = 0; i < flipped.Count; i++)
-            foreach (var (leftValue, leftWeight) in flippedGroups[i])
-                output.Add(new KeyedValue<TKey, TLeft>(flipped[i], leftValue), flipSigns[i] * leftWeight);
+        if (flipped.Count > 0)
+        {
+            _flippedRows.Clear();
+            _flippedBounds.Clear();
+            _left.GetGroupsInto(flipped, _flippedRows, _flippedBounds);
+            for (var i = 0; i < flipped.Count; i++)
+                for (var r = i == 0 ? 0 : _flippedBounds[i - 1]; r < _flippedBounds[i]; r++)
+                {
+                    var (leftValue, leftWeight) = _flippedRows[r];
+                    output.Add(new KeyedValue<TKey, TLeft>(flipped[i], leftValue), flipSigns[i] * leftWeight);
+                }
+        }
 
-        var leftEntries = new List<(TKey, TLeft, long)>(deltaLeft.DistinctCount);
-        var leftKeys = new List<TKey>();
-        var matchIndex = new Dictionary<TKey, int>();
+        var leftEntries = _leftEntries;
+        var leftKeys = _leftKeys;
+        leftEntries.Clear();
+        leftKeys.Clear();
+        _matchIndex.Clear();
+        leftEntries.EnsureCapacity(deltaLeft.DistinctCount);
         foreach (var ((key, leftValue), weight) in deltaLeft)
         {
             leftEntries.Add((key, leftValue, weight));
             _eviction?.Track(key);
-            if (matchIndex.TryAdd(key, leftKeys.Count))
+            if (_matchIndex.TryAdd(key, leftKeys.Count))
                 leftKeys.Add(key);
         }
 
-        _left.UpdateAll(leftEntries);
+        _left.ApplyAll(leftEntries);
         var rightCounts = _rightRowCount.WeightOfAll(leftKeys);
         foreach (var (key, leftValue, weight) in leftEntries)
-            if (rightCounts[matchIndex[key]] <= 0)
+            if (rightCounts[_matchIndex[key]] <= 0)
                 output.Add(new KeyedValue<TKey, TLeft>(key, leftValue), weight);
 
         // Closed keys can never flip again (the watermark drops their events), so both the

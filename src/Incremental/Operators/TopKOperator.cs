@@ -36,6 +36,9 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
         _count = count;
         _direction = descending ? -1 : 1;
         _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
+        var comparer = Comparer<TOrder>.Default;
+        var direction = _direction;
+        _rankComparison = (a, b) => direction * comparer.Compare(a.Order, b.Order);
     }
 
     private readonly ZSet<KeyedValue<TKey, TValue>> _empty = new();
@@ -45,66 +48,113 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
     // watermark instead and must run whether or not data arrived.
     public object? EmptyStepResult => _eviction is null ? _empty : null;
 
+    // Per-step scratch, reused across steps (single-threaded per worker). The delta rows of a
+    // touched key are held as a chain through _nextRow — index-linked lists over one flat
+    // buffer — so a step that touches many keys allocates no per-key list.
+    private readonly List<(TKey, TValue, long)> _entries = [];
+    private readonly List<TKey> _touchedKeys = [];
+    private readonly Dictionary<TKey, int> _firstRow = [];
+    private readonly List<WeightedValue<TValue>> _rows = [];
+    private readonly List<int> _nextRow = [];
+    private readonly List<int> _chainHead = [];
+    private readonly List<TKey> _rerankKeys = [];
+    private readonly List<WeightedValue<TValue>[]?> _rerankPrevious = [];
+    private readonly List<(TOrder Order, WeightedValue<TValue> Entry)> _ranked = [];
+    private readonly List<WeightedValue<TValue>> _top = [];
+    private readonly List<(TKey, WeightedValue<TValue>[])> _puts = [];
+    private readonly List<TKey> _removes = [];
+    private readonly List<WeightedValue<TValue>> _groupRows = [];
+    private readonly List<int> _groupBounds = [];
+
+    /// <summary>Held rather than built per sort: a lambda closing over the comparer allocates
+    /// a delegate (and a display class) on every re-rank otherwise.</summary>
+    private readonly Comparison<(TOrder Order, WeightedValue<TValue> Entry)> _rankComparison;
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
 
-        var entries = new List<(TKey, TValue, long)>(delta.DistinctCount);
-        var touchedKeys = new List<TKey>();
-        var touched = new Dictionary<TKey, List<WeightedValue<TValue>>>();
+        var entries = _entries;
+        var touchedKeys = _touchedKeys;
+        entries.Clear();
+        touchedKeys.Clear();
+        _firstRow.Clear();
+        _rows.Clear();
+        _nextRow.Clear();
+        _chainHead.Clear();
+        entries.EnsureCapacity(delta.DistinctCount);
         foreach (var ((key, value), weight) in delta)
         {
             entries.Add((key, value, weight));
-            if (!touched.TryGetValue(key, out var rows))
+            ref var head = ref System.Runtime.InteropServices.CollectionsMarshal
+                .GetValueRefOrAddDefault(_firstRow, key, out var known);
+            if (!known)
             {
-                touched[key] = rows = [];
+                head = touchedKeys.Count;
                 touchedKeys.Add(key);
+                _chainHead.Add(-1);
             }
-            rows.Add(new WeightedValue<TValue>(value, weight));
+            var slot = head;
+            _rows.Add(new WeightedValue<TValue>(value, weight));
+            _nextRow.Add(_chainHead[slot]);
+            _chainHead[slot] = _rows.Count - 1;
             _eviction?.Track(key);
         }
-        _groups.UpdateAll(entries);
+        _groups.ApplyAll(entries);
 
         var comparer = Comparer<TOrder>.Default;
         var lastResults = _lastEmitted.TryGetAll(touchedKeys);
 
-        // Allocated only once a key actually needs re-ranking. The threshold short-circuit
+        // Filled only with the keys that actually need re-ranking. The threshold short-circuit
         // means the usual outcome is that none does — a delta below the cutoff cannot move
         // the top — and that path should cost nothing beyond the state update above.
-        List<TKey>? rerankKeys = null;
-        List<WeightedValue<TValue>[]?>? rerankPrevious = null;
+        var rerankKeys = _rerankKeys;
+        var rerankPrevious = _rerankPrevious;
+        rerankKeys.Clear();
+        rerankPrevious.Clear();
         for (var i = 0; i < touchedKeys.Count; i++)
         {
             var (hadPrevious, emitted) = lastResults[i];
-            if (hadPrevious && TopUnaffected(emitted!, touched[touchedKeys[i]], comparer))
+            if (hadPrevious && TopUnaffected(emitted!, i, comparer))
                 continue;
-            (rerankKeys ??= []).Add(touchedKeys[i]);
-            (rerankPrevious ??= []).Add(hadPrevious ? emitted : null);
+            rerankKeys.Add(touchedKeys[i]);
+            rerankPrevious.Add(hadPrevious ? emitted : null);
         }
 
-        if (rerankKeys is null)
+        if (rerankKeys.Count == 0)
         {
             EvictClosed();
             return _empty;
         }
 
-        var output = new ZSet<KeyedValue<TKey, TValue>>();
-        var groups = _groups.GetGroups(rerankKeys);
-        var puts = new List<(TKey, WeightedValue<TValue>[])>();
-        var removes = new List<TKey>();
+        var output = new ZSet<KeyedValue<TKey, TValue>>(rerankKeys.Count * _count * 2);
+        // A re-rank reads the whole group, which is the largest read this operator makes;
+        // GetGroupsInto keeps it in one reused buffer rather than an array per key.
+        _groupRows.Clear();
+        _groupBounds.Clear();
+        _groups.GetGroupsInto(rerankKeys, _groupRows, _groupBounds);
+        var puts = _puts;
+        var removes = _removes;
+        puts.Clear();
+        removes.Clear();
 
+        var ranked = _ranked;
+        var top = _top;
         for (var i = 0; i < rerankKeys.Count; i++)
         {
             var key = rerankKeys[i];
-            var previous = rerankPrevious![i]; // non-null whenever rerankKeys is
+            var previous = rerankPrevious[i];
 
-            var ranked = new List<(TOrder Order, WeightedValue<TValue> Entry)>();
-            foreach (var entry in groups[i])
+            ranked.Clear();
+            for (var g = i == 0 ? 0 : _groupBounds[i - 1]; g < _groupBounds[i]; g++)
+            {
+                var entry = _groupRows[g];
                 if (entry.Weight > 0)
                     ranked.Add((_orderBy(entry.Value), entry));
-            ranked.Sort((a, b) => _direction * comparer.Compare(a.Order, b.Order));
+            }
+            ranked.Sort(_rankComparison);
 
-            var top = new List<WeightedValue<TValue>>();
+            top.Clear();
             long remaining = _count;
             foreach (var (_, entry) in ranked)
             {
@@ -126,7 +176,7 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
                 if (previous is not null)
                     removes.Add(key);
             }
-            else if (previous is null || !top.SequenceEqual(previous))
+            else if (previous is null || !SameTop(top, previous))
             {
                 puts.Add((key, [.. top]));
             }
@@ -155,10 +205,19 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
     /// <summary>True when this step's delta rows provably cannot change the emitted top:
     /// it is full (K rows counting multiplicity) and every delta row ranks strictly worse
     /// than the K-th entry. Ties with the cutoff conservatively force a re-rank.</summary>
-    private bool TopUnaffected(
-        WeightedValue<TValue>[] emitted,
-        List<WeightedValue<TValue>> deltaRows,
-        Comparer<TOrder> comparer)
+    /// <summary>Element-wise comparison of the freshly ranked top against the stored one,
+    /// without the enumerator pair a LINQ SequenceEqual would allocate on every re-rank.</summary>
+    private static bool SameTop(List<WeightedValue<TValue>> top, WeightedValue<TValue>[] previous)
+    {
+        if (top.Count != previous.Length)
+            return false;
+        for (var i = 0; i < previous.Length; i++)
+            if (!top[i].Equals(previous[i]))
+                return false;
+        return true;
+    }
+
+    private bool TopUnaffected(WeightedValue<TValue>[] emitted, int keyIndex, Comparer<TOrder> comparer)
     {
         long emittedWeight = 0;
         foreach (var (_, weight) in emitted)
@@ -168,8 +227,8 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
 
         // Emitted rows are stored in rank order; the last one is the K-th (worst) entry.
         var cutoff = _orderBy(emitted[^1].Value);
-        foreach (var (value, _) in deltaRows)
-            if (_direction * comparer.Compare(_orderBy(value), cutoff) <= 0)
+        for (var row = _chainHead[keyIndex]; row >= 0; row = _nextRow[row])
+            if (_direction * comparer.Compare(_orderBy(_rows[row].Value), cutoff) <= 0)
                 return false; // ranks at or above the cutoff: could enter or leave the top
         return true;
     }
