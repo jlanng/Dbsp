@@ -145,14 +145,26 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
             var key = rerankKeys[i];
             var previous = rerankPrevious[i];
 
+            // Select the best K entries rather than sorting the whole group: a re-rank reads
+            // a group that can hold thousands of rows to publish three of them, and every
+            // entry carries at least one rank, so K entries always suffice. The bounded
+            // insert is O(K) and only runs for a row that beats the current K-th.
             ranked.Clear();
             for (var g = i == 0 ? 0 : _groupBounds[i - 1]; g < _groupBounds[i]; g++)
             {
                 var entry = _groupRows[g];
-                if (entry.Weight > 0)
-                    ranked.Add((_orderBy(entry.Value), entry));
+                if (entry.Weight <= 0)
+                    continue;
+                var order = _orderBy(entry.Value);
+                if (ranked.Count == _count && _rankComparison((order, entry), ranked[^1]) >= 0)
+                    continue;
+                var at = ranked.Count;
+                while (at > 0 && _rankComparison((order, entry), ranked[at - 1]) < 0)
+                    at--;
+                if (ranked.Count == _count)
+                    ranked.RemoveAt(ranked.Count - 1);
+                ranked.Insert(at, (order, entry));
             }
-            ranked.Sort(_rankComparison);
 
             top.Clear();
             long remaining = _count;
