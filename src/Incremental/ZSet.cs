@@ -10,6 +10,14 @@ public readonly record struct KeyedValue<TKey, TValue>(TKey Key, TValue Value)
     where TKey : notnull
     where TValue : notnull;
 
+/// <summary>Type-erased view of a <see cref="ZSet{T}"/>, so the runtime — which moves deltas
+/// around as <see cref="object"/> — can ask whether one is empty without knowing its element
+/// type. Deliberately minimal: emptiness is the only property the scheduler needs.</summary>
+internal interface IZSet
+{
+    bool IsEmpty { get; }
+}
+
 /// <summary>
 /// A Z-set: a finite map from values to signed 64-bit weights, the core collection type of
 /// DBSP-style processing. A weight of +1 represents one insertion, -1 one deletion
@@ -17,7 +25,7 @@ public readonly record struct KeyedValue<TKey, TValue>(TKey Key, TValue Value)
 /// dropped. Streams in a circuit carry Z-set <em>deltas</em>, and integrating (summing) the
 /// deltas of a stream yields the current state of the collection it describes.
 /// </summary>
-public sealed class ZSet<T> : IEnumerable<WeightedValue<T>> where T : notnull
+public sealed class ZSet<T> : IZSet, IEnumerable<WeightedValue<T>> where T : notnull
 {
     private readonly Dictionary<T, long> _weights;
 
@@ -76,13 +84,42 @@ public sealed class ZSet<T> : IEnumerable<WeightedValue<T>> where T : notnull
         return result;
     }
 
-    public IEnumerator<WeightedValue<T>> GetEnumerator()
+    /// <summary>Allocation-free enumeration. <c>foreach</c> binds to this by pattern rather
+    /// than through <see cref="IEnumerable{T}"/>, so iterating a Z-set — which every operator
+    /// does several times per step, most often over an empty shard — costs nothing. The
+    /// interface implementations below still allocate an iterator; they exist for LINQ and
+    /// other <c>IEnumerable</c> consumers, which are never on the step path.</summary>
+    public Enumerator GetEnumerator() => new(_weights);
+
+    IEnumerator<WeightedValue<T>> IEnumerable<WeightedValue<T>>.GetEnumerator() => Enumerate();
+
+    IEnumerator IEnumerable.GetEnumerator() => Enumerate();
+
+    private IEnumerator<WeightedValue<T>> Enumerate()
     {
         foreach (var kv in _weights)
             yield return new WeightedValue<T>(kv.Key, kv.Value);
     }
 
-    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+    /// <summary>A by-value cursor over the Z-set's entries, wrapping the underlying
+    /// dictionary's own struct enumerator.</summary>
+    public struct Enumerator
+    {
+        private Dictionary<T, long>.Enumerator _inner;
+
+        internal Enumerator(Dictionary<T, long> weights) => _inner = weights.GetEnumerator();
+
+        public WeightedValue<T> Current { get; private set; }
+
+        public bool MoveNext()
+        {
+            if (!_inner.MoveNext())
+                return false;
+            var (value, weight) = _inner.Current;
+            Current = new WeightedValue<T>(value, weight);
+            return true;
+        }
+    }
 
     public override string ToString() =>
         "{" + string.Join(", ", _weights.Select(kv => $"{kv.Key} => {kv.Value:+#;-#;0}")) + "}";

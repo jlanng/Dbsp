@@ -22,6 +22,12 @@ internal sealed class SnapshotOperator<T> : IStepOperator where T : notnull
     public SnapshotOperator(OperatorContext context) =>
         _integrated = context.Storage.CreateIndexedWeightStore<int, T>(context.StateName("integrated"));
 
+    private readonly ZSet<T> _empty = new();
+
+    // Step already skips the integrated-state update for an empty delta and passes it
+    // straight through, so standing in a shared empty changes nothing downstream.
+    public object? EmptyStepResult => _empty;
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<T>)inputs[0]!;
