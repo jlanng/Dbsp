@@ -8,13 +8,13 @@ namespace Incremental.Tests;
 /// integrated input — after every step, under arbitrary insert/retract interleavings.
 /// Inputs are generated over deliberately small domains so values collide, pass through
 /// zero, and retract often, and every property runs the same batches at Workers = 1 and
-/// Workers = 4 (the sharded exchange path). CsCheck shrinks failures and prints the seed to
-/// reproduce them; the op-list → batch folding below is deterministic, so a seed replays the
-/// exact circuit run.
+/// Workers = 4 — the sharded exchange path, in both synchronization modes (barrier and
+/// point-to-point). CsCheck shrinks failures and prints the seed to reproduce them; the
+/// op-list → batch folding below is deterministic, so a seed replays the exact circuit run.
 /// </summary>
 public class PropertyDifferentialTests
 {
-    private static readonly int[] WorkerCounts = [1, 4];
+    private static readonly (int Workers, bool P2p)[] Engines = [(1, false), (4, false), (4, true)];
 
     // ---------------------------------------------------------------- generators
 
@@ -64,9 +64,12 @@ public class PropertyDifferentialTests
 
         async Task RunAsync()
         {
-            foreach (var workers in WorkerCounts)
+            foreach (var (workers, p2p) in Engines)
             {
-                var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Workers = workers });
+                var builder = new CircuitBuilder(new CircuitOptions
+                {
+                    AutoStep = false, Workers = workers, PointToPointExchange = p2p,
+                });
                 var inputDef = builder.Input<TIn>("in");
                 var outputDef = query(inputDef).ToOutput();
                 await using var circuit = builder.Build();
@@ -85,7 +88,7 @@ public class PropertyDifferentialTests
                         integratedOut.AddAll(delta);
                     foreach (var (v, w) in batches[step])
                         integratedIn.Add(v, w);
-                    AssertZSetsEqual(oracle(integratedIn), integratedOut, workers, step);
+                    AssertZSetsEqual(oracle(integratedIn), integratedOut, workers, p2p, step);
                 }
             }
         }
@@ -104,9 +107,12 @@ public class PropertyDifferentialTests
 
         async Task RunAsync()
         {
-            foreach (var workers in WorkerCounts)
+            foreach (var (workers, p2p) in Engines)
             {
-                var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Workers = workers });
+                var builder = new CircuitBuilder(new CircuitOptions
+                {
+                    AutoStep = false, Workers = workers, PointToPointExchange = p2p,
+                });
                 var leftDef = builder.Input<TIn>("left");
                 var rightDef = builder.Input<TIn>("right");
                 var outputDef = query(leftDef, rightDef).ToOutput();
@@ -128,14 +134,14 @@ public class PropertyDifferentialTests
                         integratedOut.AddAll(delta);
                     foreach (var (isLeft, entry) in batches[step])
                         (isLeft ? integratedL : integratedR).Add(entry.Value, entry.Weight);
-                    AssertZSetsEqual(oracle(integratedL, integratedR), integratedOut, workers, step);
+                    AssertZSetsEqual(oracle(integratedL, integratedR), integratedOut, workers, p2p, step);
                 }
             }
         }
     }
 
     private static void AssertZSetsEqual<T>(
-        IEnumerable<WeightedValue<T>> expectedEntries, ZSet<T> actual, int workers, int step)
+        IEnumerable<WeightedValue<T>> expectedEntries, ZSet<T> actual, int workers, bool p2p, int step)
         where T : notnull
     {
         var expected = new ZSet<T>(expectedEntries);
@@ -143,7 +149,7 @@ public class PropertyDifferentialTests
             && expected.All(e => actual.WeightOf(e.Value) == e.Weight);
         if (!equal)
             throw new Exception(
-                $"differential mismatch (workers={workers}, after step {step}): " +
+                $"differential mismatch (workers={workers}, {(p2p ? "point-to-point" : "barrier")}, after step {step}): " +
                 $"expected {expected} but integrated deltas give {actual}");
     }
 

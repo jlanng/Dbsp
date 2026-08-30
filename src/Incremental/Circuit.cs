@@ -46,6 +46,16 @@ public sealed class Circuit : IAsyncDisposable
     // node this step. The exchange barrier makes writes visible before anyone reads.
     private readonly object[][][] _mailboxes;
 
+    // Point-to-point exchange mode (CircuitOptions.PointToPointExchange, local only):
+    // one published-sequence slot per (node, sender), strided a cache line apart so each
+    // producer owns its line. A producer stores its fragments into _mailboxes[n][sender]
+    // and release-publishes its execution count for the node; a consumer acquire-reads
+    // each sender's slot until it reaches its own count, replacing the barrier rendezvous
+    // (and its fences) with per-cell release/acquire. Null in barrier mode.
+    private readonly long[]? _exchangeSeqs;
+    private bool _exchangePoisoned;
+    private const int SeqStride = 8; // longs per slot: one 64-byte cache line each
+
     // Cross-process exchange (null when not clustered): the runtime shipping remote-bound
     // shards, plus scratch space _remoteShards[node][peerProcess] holding the shards each
     // peer sent this step (indexed by local worker), filled by the designated worker
@@ -56,6 +66,13 @@ public sealed class Circuit : IAsyncDisposable
     private long _stepNumber;
     private long _committedStepMarker = -1;
 
+    // PHASE-STATS (temporary probe instrumentation — revert before committing). Env-gated
+    // per-phase step attribution, printed to stderr at dispose.
+    private static readonly bool PhaseStats =
+        Environment.GetEnvironmentVariable("INCREMENTAL_PHASE_STATS") == "1";
+    private long _psDrain, _psWorkerPhase, _psLaunch, _psLand, _psCheckpoint, _psPublish,
+        _psTotal, _psSteps;
+
     private readonly CancellationTokenSource _shutdown = new();
 
     // Serializes steps against snapshot reads: a snapshot must never observe a half-applied
@@ -64,6 +81,18 @@ public sealed class Circuit : IAsyncDisposable
     private readonly SemaphoreSlim _stepGate = new(1, 1);
     private TaskCompletionSource _stepDone = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _workersRemaining;
+
+    // Auto-stepping circuits overlap the previous step's output publish with the current
+    // step's execution (depth exactly one: a step stages its outputs only after the previous
+    // flush finished, preserving per-output step order and keeping at most one step's deltas
+    // outside the bounded channels — a slow consumer still stalls the circuit, one step
+    // later). Manual stepping keeps the synchronous publish: StepAsync's contract is that
+    // the step's deltas are published when it returns, and clustered circuits step in
+    // lockstep. The flush task never faults; it parks its failure here for the coordinator
+    // to surface inside the step fault domain (see AwaitOutputFlushAsync).
+    private bool StagesPublishes => _options.AutoStep;
+    private Task _outputFlush = Task.CompletedTask;
+    private Exception? _flushFault;
     private bool _stopping;
     private bool _started;
     private bool _disposed;
@@ -125,6 +154,9 @@ public sealed class Circuit : IAsyncDisposable
         _log = _diag.CircuitLogger;
 
         _barrier = new SpinBarrier(options.Workers);
+        _exchangeSeqs = options.PointToPointExchange && options.Workers > 1
+            ? new long[nodes.Length * options.Workers * SeqStride]
+            : null;
         _cluster = options.Cluster is { } cluster
             ? new ClusterRuntime(cluster.Transport, options.Workers, _barrier, options.ExchangeTimeout, _diag)
             : null;
@@ -162,6 +194,8 @@ public sealed class Circuit : IAsyncDisposable
                     : [];
             }
             _workers[w] = new Worker(w, operators, new object?[nodes.Length], nodeInputs, exchangeIncoming);
+            if (_exchangeSeqs is not null)
+                _workers[w].ExchangeSeq = new long[nodes.Length];
         }
         if (manifestStores is not null)
             _stateManifest = BuildStateManifest(manifestStores);
@@ -183,7 +217,7 @@ public sealed class Circuit : IAsyncDisposable
         foreach (var output in _outputs)
             output.BindSnapshot(this);
 
-        _diag.RegisterGauges(_inputs, _outputs, () => CurrentWatermark, options.Cluster?.Transport);
+        _diag.RegisterGauges(_inputs, _outputs, _workers, () => CurrentWatermark, options.Cluster?.Transport);
         _log.LogInformation(
             "Circuit {Circuit} built: {Workers} workers, {Nodes} nodes, {Inputs} inputs, {Outputs} outputs, " +
             "cluster process {ProcessIndex} of {ProcessCount}, checkpointing {Checkpointing}",
@@ -369,6 +403,8 @@ public sealed class Circuit : IAsyncDisposable
                 drained += input.DrainInto(_workers, _options.MaxStepItemsPerInput);
             _diag.RecordsDrained(drained);
 
+            var psDrained = Stopwatch.GetTimestamp(); // PHASE-STATS
+
             if (RunsInline)
             {
                 // Clustered inline steps block on remote frames mid-step; that must never
@@ -382,12 +418,40 @@ public sealed class Circuit : IAsyncDisposable
             }
             else
             {
-                _stepDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                // Auto-stepping: synchronous continuations, so the last worker to finish
+                // runs the coordinator's land work (freeze, commit, publish staging, next
+                // launch) inline instead of paying a thread-pool wake — the pump owns the
+                // whole await chain, so nothing foreign runs on the worker thread. Manual
+                // stepping keeps the asynchronous hop: StepAsync's caller continuation must
+                // not run (or block) on a worker thread.
+                _stepDone = new TaskCompletionSource(StagesPublishes
+                    ? TaskCreationOptions.None
+                    : TaskCreationOptions.RunContinuationsAsynchronously);
                 Volatile.Write(ref _workersRemaining, _workers.Length);
                 foreach (var worker in _workers)
                     worker.Go.Release();
 
                 await _stepDone.Task.ConfigureAwait(false);
+            }
+
+            // PHASE-STATS: attribute the worker-phase block; launch = release-to-earliest
+            // worker start, land = latest worker end to coordinator resumption.
+            var psWorkersDone = Stopwatch.GetTimestamp();
+            if (PhaseStats)
+            {
+                _psDrain += psDrained - stepStarted;
+                _psWorkerPhase += psWorkersDone - psDrained;
+                if (!RunsInline)
+                {
+                    long first = long.MaxValue, last = 0;
+                    foreach (var w in _workers)
+                    {
+                        first = Math.Min(first, w.StepStartTs);
+                        last = Math.Max(last, w.StepEndTs);
+                    }
+                    _psLaunch += Math.Max(0, first - psDrained);
+                    _psLand += Math.Max(0, psWorkersDone - last);
+                }
             }
 
             // End-of-step alignment across processes: every process finishes this step, and
@@ -402,16 +466,42 @@ public sealed class Circuit : IAsyncDisposable
             // Output deltas are transient (consumers integrate them) and not checkpointed.
             // A commit failure is a fault like any other: the provider's atomicity keeps the
             // previous checkpoint intact, and the circuit must not run on unsure durability.
+            var psPreCommit = Stopwatch.GetTimestamp(); // PHASE-STATS
             if (_checkpoint is not null && ++_stepsSinceCommit >= _options.CheckpointInterval)
                 CommitCheckpoint();
+            var psCommitted = Stopwatch.GetTimestamp(); // PHASE-STATS
 
             // Publishing belongs to the step's fault domain: state has already advanced, so
             // a failed or cancelled publish would silently lose this step's deltas and
             // permanently desynchronize every consumer's integrated view. Fault instead —
             // the committed checkpoint (taken above, before publishing) stays the intact
-            // resume point.
-            foreach (var output in _outputs)
-                await output.PublishAsync(_workers, cancellationToken).ConfigureAwait(false);
+            // resume point. Auto-stepping circuits stage the deltas here and flush them
+            // overlapped with the next step (see StagesPublishes); the previous step's
+            // flush — and its failure — lands first, so outputs stay in step order and a
+            // flush fault surfaces at most one step late.
+            if (StagesPublishes)
+            {
+                await AwaitOutputFlushAsync().ConfigureAwait(false);
+                var staged = false;
+                foreach (var output in _outputs)
+                    staged |= output.Stage(_workers);
+                if (staged)
+                    _outputFlush = Task.Run(() => FlushOutputsAsync(cancellationToken));
+            }
+            else
+            {
+                foreach (var output in _outputs)
+                    await output.PublishAsync(_workers, cancellationToken).ConfigureAwait(false);
+            }
+
+            if (PhaseStats) // PHASE-STATS
+            {
+                var now = Stopwatch.GetTimestamp();
+                _psCheckpoint += psCommitted - psPreCommit;
+                _psPublish += now - psCommitted;
+                _psTotal += now - stepStarted;
+                _psSteps++;
+            }
 
             _diag.StepCompleted(Stopwatch.GetElapsedTime(stepStarted).TotalSeconds);
             if (_watermarkClock is not null && _log.IsEnabled(LogLevel.Trace))
@@ -422,6 +512,42 @@ public sealed class Circuit : IAsyncDisposable
         {
             FaultCircuit(ex);
             throw;
+        }
+    }
+
+    /// <summary>Writes every staged output delta to its bounded channel, in output order.
+    /// Runs off the coordinator path (overlapped with the next step) and never faults: a
+    /// failure is parked in <see cref="_flushFault"/> for <see cref="AwaitOutputFlushAsync"/>
+    /// to surface inside a step's fault domain — an unawaited faulted task here would
+    /// otherwise go unobserved when the step that would await it faults first.</summary>
+    private async Task FlushOutputsAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            foreach (var output in _outputs)
+                await output.FlushStagedAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // The circuit faulting mid-flush completes the channels with the fault; this
+            // ChannelClosedException is that fault surfacing here, not a new failure.
+            if (ex is System.Threading.Channels.ChannelClosedException && Volatile.Read(ref _fault) is not null)
+                return;
+            _flushFault = ex;
+        }
+    }
+
+    /// <summary>Awaits the in-flight output flush and rethrows its failure, if any, into the
+    /// caller's fault domain (with its original stack). Callers: the next step before it
+    /// stages, the pump before completing the outputs, and the snapshot read before it
+    /// discards subsumed deltas.</summary>
+    private async Task AwaitOutputFlushAsync()
+    {
+        await _outputFlush.ConfigureAwait(false);
+        if (_flushFault is { } fault)
+        {
+            _flushFault = null;
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(fault).Throw();
         }
     }
 
@@ -450,6 +576,19 @@ public sealed class Circuit : IAsyncDisposable
         {
             if (Volatile.Read(ref _fault) is { } fault)
                 throw new CircuitFaultedException(fault);
+
+            // A staged flush may still be delivering the previous step's deltas: let it
+            // land before the discard, or deltas the snapshot subsumes could arrive after
+            // it and be integrated twice by the bootstrapping consumer.
+            try
+            {
+                await AwaitOutputFlushAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                FaultCircuit(ex);
+                throw;
+            }
             discardPending();
 
             var merged = new ZSet<T>();
@@ -754,6 +893,18 @@ public sealed class Circuit : IAsyncDisposable
             if (_watermarkClock is not null && !cancellationToken.IsCancellationRequested)
                 await RunStepAsync(cancellationToken).ConfigureAwait(false);
 
+            // The last step's staged flush must land before the outputs complete; its
+            // failure is a lost delta — a circuit fault, exactly as on a step.
+            try
+            {
+                await AwaitOutputFlushAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                FaultCircuit(ex);
+                throw;
+            }
+
             foreach (var output in _outputs)
                 output.Complete(null);
         }
@@ -764,13 +915,35 @@ public sealed class Circuit : IAsyncDisposable
         }
     }
 
+    // SpinOnce iterations a worker between steps spends polling its Go semaphore before
+    // parking on it: the coordinator gap between steps is usually short (drain, freeze,
+    // publish staging — the every-Nth-step commit is the long pole), and the semaphore's
+    // kernel wake is a measurable slice of a sparse step. Same shape as SpinBarrier's
+    // budget: a short burst of spins, then yields, then a real park — a quiet circuit
+    // costs nothing.
+    private const int LaunchSpinBudget = 128;
+
     private void WorkerLoop(Worker worker)
     {
         while (true)
         {
-            worker.Go.Wait();
+            if (!worker.Go.Wait(0))
+            {
+                var spinner = new SpinWait();
+                while (!worker.Go.Wait(0))
+                {
+                    if (spinner.Count >= LaunchSpinBudget)
+                    {
+                        worker.Go.Wait();
+                        break;
+                    }
+                    spinner.SpinOnce(sleep1Threshold: -1);
+                }
+            }
             if (Volatile.Read(ref _stopping))
                 return;
+
+            worker.StepStartTs = Stopwatch.GetTimestamp(); // PHASE-STATS
 
             try
             {
@@ -790,11 +963,18 @@ public sealed class Circuit : IAsyncDisposable
                 // the coordinator's fault transition.
                 lock (_stepFaults)
                     _stepFaults.Add(ex);
+                // Point-to-point waiters poll this flag: peers spinning on a publication
+                // this worker will never make unwind instead of spinning forever.
+                Volatile.Write(ref _exchangePoisoned, true);
                 _barrier.Poison();
                 // Remote peers must not wait on shards this worker will never ship, and the
                 // designated worker may be blocked on inbound cluster traffic.
                 _cluster?.Poison(ex);
             }
+
+            // PHASE-STATS
+            worker.StepEndTs = Stopwatch.GetTimestamp();
+            worker.SpanTicks += worker.StepEndTs - worker.StepStartTs;
 
             // Every worker — clean, faulted, or bailed — leaves the step through this
             // decrement, so the last one out sees every fault recorded this step and can
@@ -837,6 +1017,61 @@ public sealed class Circuit : IAsyncDisposable
         }
     }
 
+    /// <summary>Waits on the exchange barrier, attributing the wait to the worker: the
+    /// accumulated ticks feed the barrier-wait gauge, which is what separates
+    /// synchronization cost from compute in a step. Accumulates even on the poison unwind
+    /// so a faulting step does not under-report.</summary>
+    private void BarrierWait(Worker worker)
+    {
+        var started = Stopwatch.GetTimestamp();
+        try
+        {
+            _barrier.SignalAndWait();
+        }
+        finally
+        {
+            worker.BarrierWaitTicks += Stopwatch.GetTimestamp() - started;
+        }
+    }
+
+    /// <summary>Point-to-point exchange wait: acquire-spins until one sender's published
+    /// sequence reaches <paramref name="expected"/>, attributing time to the same
+    /// barrier-wait counter as barrier mode so the gauge means "synchronization wait" in
+    /// both. The already-published fast path costs one volatile read and no timestamps.
+    /// Waiters poll the poison flag so a faulted peer's never-coming publication unwinds
+    /// the step (mirroring <see cref="SpinBarrier.Poison"/>) instead of hanging it.
+    /// Returns the published value, whose low bit carries the sender's "I shuffled data"
+    /// flag — exactly this execution's, never a later one, because a sender's next
+    /// publication is ordered behind this worker's completion of the current execution
+    /// (the same handoff argument that makes mailbox reuse safe).</summary>
+    private long AwaitPublication(Worker worker, long[] seqs, int slot, long expected)
+    {
+        var observed = Volatile.Read(ref seqs[slot]);
+        if (observed >= expected)
+            return observed;
+        worker.SlowWaits++; // PHASE-STATS
+        var started = Stopwatch.GetTimestamp();
+        try
+        {
+            var spinner = new SpinWait();
+            while ((observed = Volatile.Read(ref seqs[slot])) < expected)
+            {
+                if (Volatile.Read(ref _exchangePoisoned))
+                    throw new BarrierPoisonedException();
+                // Prototype-grade escalation: pure spins, then yields — never Sleep(1),
+                // whose ≥1 ms oversleep would dwarf the waits it replaces. A production
+                // version would park on a per-producer event past a budget, as
+                // SpinBarrier does, instead of yield-polling a badly stalled peer.
+                spinner.SpinOnce(sleep1Threshold: -1);
+            }
+            return observed;
+        }
+        finally
+        {
+            worker.BarrierWaitTicks += Stopwatch.GetTimestamp() - started;
+        }
+    }
+
     private void RunNode(Worker worker, int n)
     {
         var slots = worker.Slots;
@@ -848,10 +1083,55 @@ public sealed class Circuit : IAsyncDisposable
             // Partition across the GLOBAL worker set (equal to the local one when not
             // clustered); the barrier makes every local worker's fragments visible.
             var exchange = (IExchangeStepOperator)op;
-            _mailboxes[n][worker.Id] = exchange.Partition(slots[node.Inputs[0]], _cluster?.GlobalWorkers ?? _workers.Length);
+            var input = slots[node.Inputs[0]];
+            var psT0 = PhaseStats ? Stopwatch.GetTimestamp() : 0; // PHASE-STATS
+            _mailboxes[n][worker.Id] = exchange.Partition(input, _cluster?.GlobalWorkers ?? _workers.Length);
+            if (PhaseStats) // PHASE-STATS
+            {
+                worker.PartitionTicks += Stopwatch.GetTimestamp() - psT0;
+                worker.ExchangeExecutions++;
+            }
 
+            if (_exchangeSeqs is { } seqs)
+            {
+                // Point-to-point: release-publish this worker's fragments under its
+                // execution count for the node, then wait for each peer's publication of
+                // the same count — never for peers to arrive anywhere. A worker's own
+                // count doubles as the expected sequence because every worker executes
+                // every node the same number of times (loop iteration counts are a global
+                // decision), and mailbox reuse is safe because a node's next execution is
+                // always ordered behind every peer's consumption of the current one (the
+                // step handoff between steps, the loop reduction barriers between
+                // iterations).
+                //
+                // The published value is the count shifted up one, with the low bit set
+                // when this worker actually shuffled data. In the sparse regime most
+                // exchanges move nothing for anyone: when every sender's bit is clear the
+                // whole shuffle — reading peers' mailbox lines, the merge — is skipped and
+                // the node yields its canonical empty delta, which the ordinary
+                // empty-input skip then propagates through the downstream segment.
+                var count = ++worker.ExchangeSeq[n];
+                var expected = count << 1;
+                var shuffled = input is not IZSet { IsEmpty: true };
+                Volatile.Write(ref seqs[(n * _workers.Length + worker.Id) * SeqStride],
+                    shuffled ? expected | 1 : expected);
+                for (var sender = 0; sender < _workers.Length; sender++)
+                    if (sender != worker.Id)
+                        shuffled |= (AwaitPublication(worker, seqs,
+                            (n * _workers.Length + sender) * SeqStride, expected) & 1) != 0;
 
-            _barrier.SignalAndWait();
+                if (!shuffled && op.EmptyStepResult is { } nothing)
+                {
+                    if (PhaseStats) // PHASE-STATS
+                        worker.EmptyExchangeSkips++;
+                    slots[n] = nothing;
+                    return;
+                }
+            }
+            else
+            {
+                BarrierWait(worker);
+            }
 
             if (_cluster is { } cluster)
             {
@@ -871,9 +1151,10 @@ public sealed class Circuit : IAsyncDisposable
                         if (p != cluster.ProcessIndex)
                             _remoteShards[n][p] = exchange.DeserializeShards(cluster.ReceiveShards(step, n, p));
                 }
-                _barrier.SignalAndWait();
+                BarrierWait(worker);
             }
 
+            var psT1 = PhaseStats ? Stopwatch.GetTimestamp() : 0; // PHASE-STATS
             var myShard = (_cluster?.FirstGlobalWorker ?? 0) + worker.Id;
             var incoming = worker.ExchangeIncoming[n];
             var i = 0;
@@ -884,6 +1165,8 @@ public sealed class Circuit : IAsyncDisposable
                     if (p != c.ProcessIndex)
                         incoming[i++] = _remoteShards[n][p][worker.Id];
             slots[n] = exchange.Merge(incoming);
+            if (PhaseStats) // PHASE-STATS
+                worker.MergeTicks += Stopwatch.GetTimestamp() - psT1;
         }
         else
         {
@@ -940,11 +1223,11 @@ public sealed class Circuit : IAsyncDisposable
             if (_workers.Length > 1)
             {
                 flags[worker.Id] = more;
-                _barrier.SignalAndWait(); // own flag written before anyone reads
+                BarrierWait(worker); // own flag written before anyone reads
                 more = false;
                 for (var w = 0; w < flags.Length; w++)
                     more |= flags[w];
-                _barrier.SignalAndWait(); // all flags read before anyone writes the next iteration's
+                BarrierWait(worker); // all flags read before anyone writes the next iteration's
             }
 
             if (!more)
@@ -1037,6 +1320,25 @@ public sealed class Circuit : IAsyncDisposable
 
         if (_cluster is not null)
             await _cluster.DisposeAsync().ConfigureAwait(false);
+
+        if (PhaseStats && _psSteps > 0) // PHASE-STATS
+        {
+            double Us(long ticks) => ticks * 1e6 / Stopwatch.Frequency / _psSteps;
+            var exchanges = _nodes.Count(n => n.IsExchange);
+            Console.Error.WriteLine(
+                $"[phase-stats] {Name}: steps {_psSteps}, nodes {_nodes.Length}, exchanges {exchanges}, workers {_workers.Length}");
+            Console.Error.WriteLine(
+                $"[phase-stats]   coord us/step: drain {Us(_psDrain):F1} workerPhase {Us(_psWorkerPhase):F1} " +
+                $"(launch {Us(_psLaunch):F1} land {Us(_psLand):F1}) checkpoint {Us(_psCheckpoint):F1} " +
+                $"publish {Us(_psPublish):F1} total {Us(_psTotal):F1}");
+            foreach (var w in _workers)
+                Console.Error.WriteLine(
+                    $"[phase-stats]   w{w.Id} us/step: span {Us(w.SpanTicks):F1} wait {Us(w.BarrierWaitTicks):F1} " +
+                    $"partition {Us(w.PartitionTicks):F1} merge {Us(w.MergeTicks):F1} " +
+                    $"compute {Us(w.SpanTicks - w.BarrierWaitTicks - w.PartitionTicks - w.MergeTicks):F1} " +
+                    $"slowWaits/step {(double)w.SlowWaits / _psSteps:F1} of {(double)w.ExchangeExecutions * Math.Max(0, _workers.Length - 1) / _psSteps:F1} " +
+                    $"emptySkips/step {(double)w.EmptyExchangeSkips / _psSteps:F1} of {(double)w.ExchangeExecutions / _psSteps:F1}");
+        }
 
         _shutdown.Cancel();
         _shutdown.Dispose();

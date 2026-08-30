@@ -62,18 +62,24 @@ public sealed class ShowcaseCircuit
     public int LastRingDelta;
 
     public readonly int Workers;
+    public readonly bool PointToPoint;
 
-    public ShowcaseCircuit(string name, IStorageProvider storage, ILoggerFactory loggerFactory, int workers = 2)
+    public ShowcaseCircuit(string name, IStorageProvider storage, ILoggerFactory loggerFactory, int workers = 2,
+        bool pointToPoint = false, bool autoStep = false)
     {
         Workers = workers;
+        PointToPoint = pointToPoint;
         var builder = new CircuitBuilder(new CircuitOptions
         {
             Name = name,
             Workers = workers,           // >1: exchanges really shuffle, state is sharded per worker
-            AutoStep = false,            // explicit steps: exact boundaries for timing and beats
+            // The app steps explicitly: exact boundaries for timing and beats. autoStep is
+            // for pump-driven measurement harnesses — StepTimedAsync must not be called then.
+            AutoStep = autoStep,
             Storage = storage,
             CheckpointInterval = 4,      // a crash loses up to 3 steps — replay covers the gap
             LoggerFactory = loggerFactory,
+            PointToPointExchange = pointToPoint, // --p2p: exchanges sync point-to-point, not on the barrier
         });
         Defs = ShowcasePipeline.Declare(builder);
         Circuit = builder.Build();

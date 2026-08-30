@@ -228,6 +228,45 @@ public class WindowCloseTests
         Assert.Equal(1, integrated.DistinctCount); // no close for windows that never saw data
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Window_closes_on_a_step_where_every_exchange_is_empty(bool pointToPoint)
+    {
+        var builder = new CircuitBuilder(new CircuitOptions
+        {
+            AutoStep = false, Workers = 4, PointToPointExchange = pointToPoint,
+        });
+        var views = builder.Input<(string Page, DateTimeOffset At)>("views");
+        var closesDef = views
+            .WithEventTime(v => v.At, lateness: TimeSpan.Zero)
+            .Tumble(TimeSpan.FromSeconds(5), v => v.At)
+            .GroupBy(w => w.WindowStart)
+            .WindowCloses(windowStart => windowStart.AddSeconds(5))
+            .ToOutput(bootstrap: false);
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var input = circuit.Handle(views);
+        var output = circuit.Handle(closesDef);
+
+        // Populate window T0, then freeze a watermark past its deadline.
+        await input.InsertAsync(("home", T0.AddSeconds(1)));
+        await circuit.StepAsync();
+        await input.InsertAsync(("home", T0.AddSeconds(7)));
+        await circuit.StepAsync(); // sees watermark T0+1s (window still open); freezes T0+7s
+        Assert.False(output.Reader.TryRead(out _));
+
+        // The closing step carries no data at all: every exchange in the circuit is
+        // globally empty, so an exchange fast path that skipped too much — the shuffle is
+        // skippable, its watermark-driven downstream (EmptyStepResult == null) is not —
+        // would swallow this close.
+        await circuit.StepAsync();
+        var delta = await output.Reader.ReadAsync();
+        Assert.Equal(1, delta.WeightOf(new KeyedValue<DateTimeOffset, DateTimeOffset>(T0, T0.AddSeconds(5))));
+        Assert.Equal(1, delta.DistinctCount);
+    }
+
     [Fact]
     public async Task Pending_closes_are_flushed_when_inputs_complete()
     {

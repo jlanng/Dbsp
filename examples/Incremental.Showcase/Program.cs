@@ -23,6 +23,15 @@ var port = Arg("--port") is { } p ? int.Parse(p) : 5170;
 // >1 by default so every other tab really exercises the exchange path. Tab 5 measures what
 // that costs and can relaunch the showcase at another count.
 var workers = Arg("--workers") is { } w ? Math.Clamp(int.Parse(w), 1, 32) : 2;
+// Experimental: exchanges synchronize point-to-point (seq-mailbox) instead of on the
+// global barrier. Tab 5 measures both modes side by side regardless of this flag; this
+// switches the LIVE pipeline (and disables --cluster, which stays barrier-based).
+var p2p = args.Contains("--p2p");
+if (p2p && withCluster)
+{
+    Console.Error.WriteLine("--p2p and --cluster are mutually exclusive (the cluster shuffle is barrier-based).");
+    return 2;
+}
 
 var notices = new NoticeLog(40);
 using var metrics = new IncrementalMetrics();
@@ -44,7 +53,7 @@ else
     storageLabel = "in-memory checkpoints";
 }
 
-var show = new Show(storage, storageLabel, withCluster, notices, metrics, loggerFactory, workers);
+var show = new Show(storage, storageLabel, withCluster, notices, metrics, loggerFactory, workers, p2p);
 var json = new JsonSerializerOptions
 {
     PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -140,6 +149,7 @@ app.MapPost("/api/relaunch", (int? workers, bool? cluster, IHostApplicationLifet
     };
     if (useRedis) next.Add("--redis");
     if (cluster ?? withCluster) next.Add("--cluster");
+    else if (p2p) next.Add("--p2p");
     relaunchArgs = [.. next];
     notices.Push(NoticeLevel.Info, $"relaunching: {string.Join(' ', next)}");
     lifetime.StopApplication();
@@ -173,7 +183,7 @@ var driver = Task.Run(async () =>
 
 var url = $"http://localhost:{port}";
 Console.WriteLine($"Incremental showcase — a marketplace payments desk");
-Console.WriteLine($"  {url}   ({storageLabel}, {workers} worker{(workers == 1 ? "" : "s")}{(withCluster ? ", cluster armed" : "")})");
+Console.WriteLine($"  {url}   ({storageLabel}, {workers} worker{(workers == 1 ? "" : "s")}{(p2p ? ", point-to-point exchanges" : "")}{(withCluster ? ", cluster armed" : "")})");
 Console.WriteLine("  Ctrl-C to stop.");
 if (!args.Contains("--no-open")) OpenBrowser(url);
 

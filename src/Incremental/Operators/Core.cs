@@ -211,17 +211,28 @@ internal sealed class ExchangeOperator<T>(Func<T, uint> routingHash) : IExchange
     // boundary — and, for an exchange inside a Recurse region, the loop's own flag barriers.
     private ZSet<T>[]? _fragments;
 
+    // The publication for a step this worker routed nothing: every shard is EmptyShard, and
+    // the array is never written after creation, so one instance serves every empty execution
+    // instead of re-filling (or reallocating) a fragment array to say "nothing for anyone".
+    private ZSet<T>[]? _emptyFragments;
+
     // Single-worker fast path: no shuffle, pass the delta through untouched.
     public object Step(object?[] inputs) => inputs[0]!;
 
     public object[] Partition(object? input, int parts)
     {
+        var delta = (ZSet<T>)input!;
+        if (delta.IsEmpty)
+            return _emptyFragments is { } empties && empties.Length == parts
+                ? empties
+                : CreateEmptyFragments(parts);
+
         var fragments = _fragments is { } cached && cached.Length == parts
             ? cached
             : _fragments = new ZSet<T>[parts];
         Array.Fill(fragments, EmptyShard);
 
-        foreach (var (value, weight) in (ZSet<T>)input!)
+        foreach (var (value, weight) in delta)
         {
             var target = (int)(routingHash(value) % (uint)parts);
             var fragment = fragments[target];
@@ -232,10 +243,23 @@ internal sealed class ExchangeOperator<T>(Func<T, uint> routingHash) : IExchange
         return fragments;
     }
 
+    private ZSet<T>[] CreateEmptyFragments(int parts)
+    {
+        var empties = new ZSet<T>[parts];
+        Array.Fill(empties, EmptyShard);
+        return _emptyFragments = empties;
+    }
+
     /// <summary>Merged output for a worker that was sent nothing. Distinct from
     /// <see cref="EmptyShard"/>: this one does travel downstream as the node's delta, so
     /// keeping the two apart means neither role can be broken by a stray write to the other.</summary>
     private readonly ZSet<T> _emptyMerge = new();
+
+    /// <summary>An exchange over all-empty inputs shuffles nothing and changes no state, so
+    /// the scheduler may skip it wholesale — single-worker via the ordinary empty-input skip,
+    /// point-to-point via the empty bit each producer publishes with its sequence — as long
+    /// as it still publishes/consumes sequences where peers expect them.</summary>
+    public object? EmptyStepResult => _emptyMerge;
 
     public object Merge(object?[] parts)
     {

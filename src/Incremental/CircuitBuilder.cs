@@ -68,6 +68,10 @@ public sealed class CircuitBuilder
                 throw new NotSupportedException(
                     "Clustered circuits require AutoStep = false: processes run their steps in lockstep, so step " +
                     "initiation is explicit — call StepAsync on every process for every step.");
+            if (Options.PointToPointExchange)
+                throw new NotSupportedException(
+                    "PointToPointExchange applies to local workers only; the cluster shuffle is barrier-based. " +
+                    "Unset one of the two.");
         }
     }
 

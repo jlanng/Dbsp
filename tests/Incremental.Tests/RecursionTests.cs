@@ -10,8 +10,8 @@ namespace Incremental.Tests;
 /// </summary>
 public class RecursionTests
 {
-    private static CircuitBuilder ManualBuilder(int workers = 1) =>
-        new(new CircuitOptions { AutoStep = false, Workers = workers });
+    private static CircuitBuilder ManualBuilder(int workers = 1, bool pointToPoint = false) =>
+        new(new CircuitOptions { AutoStep = false, Workers = workers, PointToPointExchange = pointToPoint });
 
     /// <summary>closure = fix X. Distinct(edges ∪ {(p.From, e.To) | p ∈ X, e ∈ edges, p.To = e.From})</summary>
     private static (InputStream<(string From, string To)> Edges, Output<(string From, string To)> Closure)
@@ -233,14 +233,15 @@ public class RecursionTests
     }
 
     [Theory]
-    [InlineData(1)]
-    [InlineData(4)]
-    public async Task Random_churn_matches_a_from_scratch_reference(int workers)
+    [InlineData(1, false)]
+    [InlineData(4, false)]
+    [InlineData(4, true)] // exchanges inside the loop, synchronized point-to-point
+    public async Task Random_churn_matches_a_from_scratch_reference(int workers, bool pointToPoint)
     {
         // Property-style: apply a random insert/delete churn (duplicates, cycles, and
         // self-loops all arise) and after every step compare the integrated closure against
         // reachability recomputed from scratch on the current edge multiset.
-        var builder = ManualBuilder(workers);
+        var builder = ManualBuilder(workers, pointToPoint);
         var (edgesDef, closureDef) = DefineClosure(builder);
 
         await using var circuit = builder.Build();
