@@ -3,9 +3,10 @@ using System.Numerics;
 namespace Incremental;
 
 /// <summary>
-/// An aggregate over one group of an indexed Z-set. <paramref name="group"/> is the full
-/// integrated contents of the group (never empty; weights are positive when the input
-/// describes a well-formed multiset). Implementations must be pure.
+/// An aggregate over one group of an indexed Z-set. The group passed to
+/// <see cref="Aggregate"/> is the full integrated contents of the group (never empty;
+/// weights are positive when the input describes a well-formed multiset). Implementations
+/// must be pure.
 /// </summary>
 public interface IAggregateFunction<TValue, out TResult> where TValue : notnull
 {

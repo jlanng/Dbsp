@@ -14,17 +14,31 @@ internal sealed class WindowCloseOperator<TKey, TValue>(KeyEviction<TKey> policy
     where TKey : notnull
     where TValue : notnull
 {
-    private readonly EvictionTracker<TKey> _deadlines = new(policy);
+    // Own deadline queue rather than an EvictionTracker: the notification carries the
+    // deadline, so ClosesAt runs once per key and its result is reused at close.
+    private readonly PriorityQueue<(TKey Key, DateTimeOffset ClosesAt), long> _deadlines = new();
+    private readonly HashSet<TKey> _tracked = [];
 
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
         foreach (var ((key, _), _) in delta)
-            _deadlines.Track(key);
+        {
+            if (_tracked.Add(key))
+            {
+                var closesAt = policy.ClosesAt(key);
+                _deadlines.Enqueue((key, closesAt), closesAt.UtcTicks);
+            }
+        }
 
+        var watermark = policy.Clock.FrozenTicks;
         var output = new ZSet<KeyedValue<TKey, DateTimeOffset>>();
-        foreach (var key in _deadlines.DrainClosed())
-            output.Add(new KeyedValue<TKey, DateTimeOffset>(key, policy.ClosesAt(key)), 1);
+        while (_deadlines.TryPeek(out var entry, out var deadline) && deadline <= watermark)
+        {
+            _deadlines.Dequeue();
+            _tracked.Remove(entry.Key);
+            output.Add(new KeyedValue<TKey, DateTimeOffset>(entry.Key, entry.ClosesAt), 1);
+        }
         return output;
     }
 }
