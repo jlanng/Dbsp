@@ -89,12 +89,51 @@ public sealed class InMemoryStorageProvider : IStorageProvider
             return updated;
         }
 
+        /// <summary>Batched update that remembers the group it last touched. Callers arrive
+        /// with entries grouped by key far more often than not — a snapshot output writes
+        /// every row of a step under one group, and the Min/Max tree emits its updates
+        /// bucket by bucket — and for a key like a tournament-tree slot or a category string
+        /// the group lookup is the expensive half of the update.</summary>
         public void ApplyAll(IReadOnlyList<(TKey Key, TValue Value, long Delta)> entries)
         {
+            var comparer = EqualityComparer<TKey>.Default;
+            var lastKey = default(TKey);
+            Dictionary<TValue, long>? lastGroup = null;
+
             for (var i = 0; i < entries.Count; i++)
             {
                 var (key, value, delta) = entries[i];
-                Update(key, value, delta);
+                Dictionary<TValue, long> group;
+                if (lastGroup is not null && comparer.Equals(key, lastKey!))
+                {
+                    group = lastGroup;
+                }
+                else
+                {
+                    ref var entry = ref CollectionsMarshal.GetValueRefOrAddDefault(_groups, key, out var hadGroup);
+                    if (!hadGroup)
+                        entry = _spare.Count > 0 ? _spare.Pop() : new Dictionary<TValue, long>();
+                    group = entry!;
+                    (lastKey, lastGroup) = (key, group);
+                }
+
+                ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(group, value, out _);
+                var updated = slot + delta;
+                if (updated == 0)
+                {
+                    group.Remove(value);
+                    if (group.Count == 0)
+                    {
+                        _groups.Remove(key);
+                        if (_spare.Count < MaxSpare)
+                            _spare.Push(group);
+                        lastGroup = null;  // no longer reachable through the map
+                    }
+                }
+                else
+                {
+                    slot = updated;
+                }
             }
         }
 
