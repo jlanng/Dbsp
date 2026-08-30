@@ -457,6 +457,7 @@ examples/Incremental.TaxiAnalytics genuine big data: ~13M real NYC yellow-taxi t
 ```sh
 dotnet run -c Release --project benchmarks/Incremental.Benchmarks -- --filter '*'   # full BenchmarkDotNet suite
 dotnet run -c Release --project benchmarks/Incremental.Benchmarks -- --assert      # CI performance contracts
+dotnet run -c Release --project benchmarks/Incremental.Torture -- --workers 4      # sustained throughput
 ```
 
 The `--assert` mode is what CI gates on. Shared runners are too noisy for absolute timing
@@ -466,6 +467,18 @@ exceeds a generous bound (1.5× allocations, 5× time). A regression from O(delt
 shows up as a ~64× ratio, so the check is high-signal without being flaky. The full suite
 runs on demand via the *Benchmarks* GitHub workflow (`workflow_dispatch`), which uploads
 the BenchmarkDotNet artifacts.
+
+`Incremental.Torture` answers the other question — what a whole graph costs per record when
+it is running flat out, rather than what one operator costs per delta row. It runs the
+showcase pipeline over a sliding population of orders (inserting order *N* retracts order
+*N−live*, so state settles at a fixed size and retractions are on every step), reports the
+process CPU split between workers and the GC, and has an in-process allocation profiler by
+type (`--alloc-types`). `--processes N` runs the cluster graph across co-hosted processes,
+which is what puts the exchange wire format on the measured path. See its README for current
+numbers and for the two runtime GC settings that matter more than any single code change:
+**size the server GC's heap count to `CircuitOptions.Workers` rather than to the core count,
+and turn DATAS off** — a circuit's live set is large and mostly static, which is the shape
+DATAS handles worst.
 
 ## Packaging
 

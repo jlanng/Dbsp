@@ -6,13 +6,16 @@ tumbling/hopping/session windows and a recursive transitive closure). It exists 
 different question from `Incremental.Benchmarks`: not "what does one operator cost per delta
 row" but "what does a real graph cost per record when it is running flat out".
 
-```
+```sh
 dotnet run -c Release --project benchmarks/Incremental.Torture -- --workers 4 --seconds 20 --warmup 8
 ```
 
-Add `--alloc-types` for a byte-weighted allocation histogram by type (an in-process
-`GCAllocationTick` listener — no external tooling), `--rate N` to pace at N orders/second
-instead of running unpaced, `--json` for a machine-readable summary line.
+| flag | |
+|---|---|
+| `--alloc-types` | byte-weighted allocation histogram by type (an in-process `GCAllocationTick` listener — no external tooling) |
+| `--rate N` | pace at N orders/second instead of running unpaced |
+| `--processes N` | cluster mode: N co-hosted processes stepped in lockstep, which puts the exchange wire format on the measured path |
+| `--batch`, `--live-orders`, `--workers`, `--customers`, `--merchants`, `--json` | see `Options.cs` |
 
 ## What it does
 
@@ -25,23 +28,55 @@ negative-weight paths on every step, which a pure-insert benchmark never touches
 Each order carries an insert, a retraction, and up to two payment rows, so the record rate
 through the inputs is roughly 3.8x the order rate.
 
-Worker saturation comes from `/proc/self/task`: the circuit names its threads
-`circuit-worker-N`, so utime+stime of exactly those threads over wall time over the worker
-count answers "are the workers busy?" without instrumenting the step path.
+Worker saturation and the CPU split come from `/proc/self/task`: the circuit names its
+threads `circuit-worker-N`, so utime+stime of exactly those threads — against the GC threads
+and everything else — answers "where is the machine going?" without instrumenting the step
+path.
 
-## Baseline
+## Results
 
-Measured on a 13th-gen i7-13700H, 4 workers, default dataset (150k live orders, 50k
-customers, 2k merchants), unpaced:
+13th-gen i7-13700H, 4 workers, default dataset (150k live orders, 50k customers, 2k
+merchants), unpaced, default GC:
 
-| | |
-|---|---|
-| throughput | 160k records/s |
-| CPU per record | 41.2 us (process), 14.6 us (workers only) |
-| worker saturation | 58% |
-| allocated | 11.3 KB/record — 1.7 GB/s |
-| working set | 2.4 GB |
+| | before | after |
+|---|---|---|
+| throughput | 160k records/s | **290k records/s** |
+| CPU per record | 41.2 us | **16.6 us** |
+| — of which workers | 14.6 us | 9.4 us |
+| — of which GC | 25.9 us | 7.1 us |
+| allocated per record | 11.3 KB | **2.5 KB** |
+| worker saturation | 58% | 68% |
 
-The process burns 6.6 cores to keep 4 workers 58% busy: at 1.7 GB/s of allocation the
-server GC's own threads are the majority of the machine's work. Allocation, not the step
-path, is the thing to attack.
+Cluster mode (2 processes x 2 workers), where the exchange wire format is on the path:
+
+| | before (JSON) | after (dense) |
+|---|---|---|
+| throughput | 194k records/s | **404k records/s** |
+| CPU per record | 24.2 us | **10.7 us** |
+| bytes per record on the wire | 353 B | **121 B** |
+
+## Runtime tuning (not code)
+
+Two GC settings are worth more than any single code change here, and neither is something
+the library can set for you — they are startup configuration:
+
+```xml
+<ServerGarbageCollection>true</ServerGarbageCollection>
+<ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+<GarbageCollectionAdaptationMode>0</GarbageCollectionAdaptationMode>   <!-- DATAS off -->
+```
+```sh
+DOTNET_GCHeapCount=4      # match CircuitOptions.Workers, not the core count
+```
+
+The server GC defaults to one heap per logical core, so a 4-worker circuit on a 20-thread
+machine collects 20 heaps with 20 threads — most of them for memory the workers never touch.
+DATAS (on by default for server GC since .NET 9) then keeps trimming the heap, which on a
+large, mostly-static live set means near-continuous gen2 work. Setting the heap count to the
+worker count and turning DATAS off takes this workload from **16.6 us to 11.6 us of CPU per
+record** at the cost of a larger working set (2.2 GB to 2.6 GB).
+
+Step batch size trades the same way in miniature: bigger batches amortize per-step cost
+across more records (worker CPU falls) but keep more step-scoped garbage alive across a
+collection (GC CPU rises). On this workload `MaxStepItemsPerInput` around 4096 is the
+minimum of the two.
