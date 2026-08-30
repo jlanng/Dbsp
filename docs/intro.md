@@ -439,4 +439,7 @@ Implementation notes (not consumer-facing):
   (aggregate-of-aggregates — window-sticky `GroupBy` to a unit key works but is ugly;
   `TopK` doesn't need it, it ranks per window natively); the keyed-input restart mechanism
   (checkpoint the upsert map vs. derive retractions from operator state); watermark
-  idleness handling.
+  idleness handling; whether required input names can go too — today they are the durable
+  key for checkpointed source offsets (a reference dies with the process, positional
+  identity would re-bind offsets across topology edits), but a derived-with-optional-pin
+  scheme like store naming may be possible.
