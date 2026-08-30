@@ -37,27 +37,43 @@ internal sealed class AggregateOperator<TKey, TValue, TResult> : IStepOperator
     // watermark instead and must run whether or not data arrived.
     public object? EmptyStepResult => _eviction is null ? _empty : null;
 
+    // Per-step scratch, reused across steps (single-threaded per worker).
+    private readonly List<(TKey, TValue, long)> _entries = [];
+    private readonly List<TKey> _touched = [];
+    private readonly HashSet<TKey> _seen = [];
+    private readonly List<(TKey, TResult)> _puts = [];
+    private readonly List<TKey> _removes = [];
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
-        var output = new ZSet<KeyedValue<TKey, TResult>>();
 
-        var entries = new List<(TKey, TValue, long)>(delta.DistinctCount);
-        var touched = new List<TKey>();
-        var seen = new HashSet<TKey>();
+        var entries = _entries;
+        var touched = _touched;
+        entries.Clear();
+        touched.Clear();
+        _seen.Clear();
+        entries.EnsureCapacity(delta.DistinctCount);
         foreach (var ((key, value), weight) in delta)
         {
             entries.Add((key, value, weight));
-            if (seen.Add(key))
+            if (_seen.Add(key))
                 touched.Add(key);
             _eviction?.Track(key);
         }
-        _groups.UpdateAll(entries);
+        _groups.ApplyAll(entries);
 
+        // At most one retraction and one assertion per touched key.
+        var output = new ZSet<KeyedValue<TKey, TResult>>(touched.Count * 2);
+
+        // The group here is handed to a user aggregate, so it stays a plain materialized
+        // list rather than a reused window over shared scratch.
         var groups = _groups.GetGroups(touched);
         var lastResults = _lastEmitted.TryGetAll(touched);
-        var puts = new List<(TKey, TResult)>();
-        var removes = new List<TKey>();
+        var puts = _puts;
+        var removes = _removes;
+        puts.Clear();
+        removes.Clear();
 
         for (var i = 0; i < touched.Count; i++)
         {

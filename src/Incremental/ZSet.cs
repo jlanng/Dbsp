@@ -1,4 +1,5 @@
 using System.Collections;
+using System.Runtime.InteropServices;
 
 namespace Incremental;
 
@@ -48,32 +49,52 @@ public sealed class ZSet<T> : IZSet, IEnumerable<WeightedValue<T>> where T : not
     public long WeightOf(T value) => _weights.GetValueOrDefault(value);
 
     /// <summary>Adds <paramref name="weight"/> to the weight of <paramref name="value"/>,
-    /// removing the entry if the sum reaches zero.</summary>
+    /// removing the entry if the sum reaches zero. One hash lookup in the common case: this
+    /// is the innermost loop of every operator in the library, so the probe that finds the
+    /// slot is also the probe that writes it.</summary>
     public void Add(T value, long weight = 1)
     {
         if (weight == 0)
             return;
 
-        if (_weights.TryGetValue(value, out var existing))
+        ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(_weights, value, out var existed);
+        if (!existed)
         {
-            var updated = checked(existing + weight);
-            if (updated == 0)
-                _weights.Remove(value);
-            else
-                _weights[value] = updated;
+            slot = weight;
+            return;
         }
+
+        var updated = checked(slot + weight);
+        if (updated == 0)
+            _weights.Remove(value);  // `slot` is dead past this point
         else
-        {
-            _weights[value] = weight;
-        }
+            slot = updated;
     }
 
     /// <summary>Adds every entry of <paramref name="other"/> into this Z-set (Z-set addition, in place).</summary>
     public void AddAll(ZSet<T> other)
     {
+        if (other._weights.Count == 0)
+            return;
+        _weights.EnsureCapacity(_weights.Count + other._weights.Count);
         foreach (var (value, weight) in other)
             Add(value, weight);
     }
+
+    /// <summary>Reserves room for <paramref name="count"/> entries, so filling a Z-set whose
+    /// size is known (or bounded) up front does not walk the dictionary's doubling ladder —
+    /// which allocates, and then abandons, every intermediate size on the way up.</summary>
+    public void EnsureCapacity(int count)
+    {
+        if (count > _weights.Count)
+            _weights.EnsureCapacity(count);
+    }
+
+    /// <summary>Empties the Z-set while keeping its capacity, so a buffer that is refilled
+    /// every step stops re-growing after the first few. Only for Z-sets whose owner knows no
+    /// one else still holds them — operators treat their inputs as read-only, which is what
+    /// makes reuse safe where it is used (see <c>ExchangeOperator.Partition</c>).</summary>
+    public void Clear() => _weights.Clear();
 
     /// <summary>Returns a new Z-set with every weight negated (turns insertions into retractions).</summary>
     public ZSet<T> Negated()

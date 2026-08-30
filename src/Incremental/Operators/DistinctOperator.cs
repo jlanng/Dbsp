@@ -19,12 +19,16 @@ internal sealed class DistinctOperator<T> : IStepOperator where T : notnull
     public DistinctOperator(OperatorContext context) =>
         _integrated = context.Storage.CreateWeightStore<T>(context.StateName("integrated"));
 
+    private readonly List<(T, long)> _entries = [];
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<T>)inputs[0]!;
-        var output = new ZSet<T>();
+        var output = new ZSet<T>(delta.DistinctCount);
 
-        var entries = new List<(T, long)>(delta.DistinctCount);
+        var entries = _entries;
+        entries.Clear();
+        entries.EnsureCapacity(delta.DistinctCount);
         foreach (var (value, weight) in delta)
             entries.Add((value, weight));
 
@@ -67,12 +71,16 @@ internal sealed class KeyedDistinctOperator<TKey, TValue> : IStepOperator
     // attached KeyEviction still has to drain against the watermark every step.
     public object? EmptyStepResult => _eviction is null ? _empty : null;
 
+    private readonly List<(TKey, TValue, long)> _entries = [];
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
-        var output = new ZSet<KeyedValue<TKey, TValue>>();
+        var output = new ZSet<KeyedValue<TKey, TValue>>(delta.DistinctCount);
 
-        var entries = new List<(TKey, TValue, long)>(delta.DistinctCount);
+        var entries = _entries;
+        entries.Clear();
+        entries.EnsureCapacity(delta.DistinctCount);
         foreach (var ((key, value), weight) in delta)
         {
             entries.Add((key, value, weight));

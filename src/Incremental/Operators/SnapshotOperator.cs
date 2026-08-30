@@ -28,15 +28,22 @@ internal sealed class SnapshotOperator<T> : IStepOperator where T : notnull
     // straight through, so standing in a shared empty changes nothing downstream.
     public object? EmptyStepResult => _empty;
 
+    /// <summary>Flattening buffer for the batched store write, reused across steps: the store
+    /// reads it within the call and never retains it, and this operator is single-threaded
+    /// per worker. Every table-shaped output has one of these on the step path, so the
+    /// per-step allocation it would otherwise make is paid once per output per step.</summary>
+    private readonly List<(int, T, long)> _updates = [];
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<T>)inputs[0]!;
         if (!delta.IsEmpty)
         {
-            var updates = new List<(int, T, long)>(delta.DistinctCount);
+            _updates.Clear();
+            _updates.EnsureCapacity(delta.DistinctCount);
             foreach (var (value, weight) in delta)
-                updates.Add((Group, value, weight));
-            _integrated.UpdateAll(updates);
+                _updates.Add((Group, value, weight));
+            _integrated.ApplyAll(_updates);
         }
         return delta;
     }

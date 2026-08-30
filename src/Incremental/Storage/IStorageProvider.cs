@@ -89,6 +89,12 @@ public interface IWeightStore<T> where T : notnull
         return results;
     }
 
+    /// <summary>Batched <see cref="Update"/> for callers that discard the resulting weights —
+    /// the common case, and the one worth not allocating a result array for. Defaults to
+    /// <see cref="UpdateAll"/> so a provider whose batching does real work (prefetching a
+    /// round trip, say) keeps it without overriding anything.</summary>
+    void ApplyAll(IReadOnlyList<(T Value, long Delta)> entries) => UpdateAll(entries);
+
     /// <summary>Batched <see cref="WeightOf"/>, aligned with the input.</summary>
     long[] WeightOfAll(IReadOnlyList<T> values)
     {
@@ -131,6 +137,12 @@ public interface IIndexedWeightStore<TKey, TValue>
         return results;
     }
 
+    /// <summary>Batched <see cref="Update"/> for callers that discard the resulting weights —
+    /// the common case, and the one worth not allocating a result array for. Defaults to
+    /// <see cref="UpdateAll"/> so a provider whose batching does real work (prefetching a
+    /// round trip, say) keeps it without overriding anything.</summary>
+    void ApplyAll(IReadOnlyList<(TKey Key, TValue Value, long Delta)> entries) => UpdateAll(entries);
+
     /// <summary>Batched <see cref="GetGroup"/>, aligned with the input.</summary>
     IReadOnlyList<WeightedValue<TValue>>[] GetGroups(IReadOnlyList<TKey> keys)
     {
@@ -138,6 +150,23 @@ public interface IIndexedWeightStore<TKey, TValue>
         for (var i = 0; i < keys.Count; i++)
             results[i] = GetGroup(keys[i]);
         return results;
+    }
+
+    /// <summary>Batched <see cref="GetGroup"/> that appends into caller-owned buffers instead
+    /// of returning a list per group: <paramref name="into"/> receives every requested group's
+    /// entries end to end, and <paramref name="bounds"/> receives one entry per key — the
+    /// exclusive end offset of that key's run, so group <c>i</c> occupies
+    /// <c>[i == 0 ? 0 : bounds[i-1], bounds[i])</c>. Both buffers are appended to, never
+    /// cleared. This is the shape the hot operators want (they scan each group once and keep
+    /// the buffers across steps); providers that must materialize anyway inherit the default.</summary>
+    void GetGroupsInto(IReadOnlyList<TKey> keys, List<WeightedValue<TValue>> into, List<int> bounds)
+    {
+        foreach (var group in GetGroups(keys))
+        {
+            for (var i = 0; i < group.Count; i++)
+                into.Add(group[i]);
+            bounds.Add(into.Count);
+        }
     }
 
     /// <summary>Batched <see cref="RemoveGroup"/>.</summary>

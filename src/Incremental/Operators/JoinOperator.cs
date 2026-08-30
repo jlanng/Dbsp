@@ -35,34 +35,62 @@ internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IStepOperator
     // watermark instead and must run whether or not data arrived.
     public object? EmptyStepResult => _eviction is null ? _empty : null;
 
+    // Per-step scratch, reused across steps: this operator is single-threaded per worker and
+    // the store's batched calls read these within the call. A join sits on the busiest edge
+    // of most graphs, so what it allocates per step it allocates per record.
+    private readonly List<(TKey Key, TLeft Value, long Delta)> _leftEntries = [];
+    private readonly List<(TKey Key, TRight Value, long Delta)> _rightEntries = [];
+    private readonly List<TKey> _probeKeys = [];
+    private readonly Dictionary<TKey, int> _probeIndex = [];
+    private readonly List<int> _groupOfEntry = [];
+    private readonly List<int> _bounds = [];
+    private readonly List<WeightedValue<TLeft>> _leftRows = [];
+    private readonly List<WeightedValue<TRight>> _rightRows = [];
+
     public object Step(object?[] inputs)
     {
         var deltaLeft = (ZSet<KeyedValue<TKey, TLeft>>)inputs[0]!;
         var deltaRight = (ZSet<KeyedValue<TKey, TRight>>)inputs[1]!;
-        var output = new ZSet<TOut>();
+        var output = new ZSet<TOut>(deltaLeft.DistinctCount + deltaRight.DistinctCount);
 
         // ΔL ⋈ R (right state not yet updated with ΔR)
-        var rightGroups = FetchGroups(_right, deltaLeft, out var leftEntries);
-        foreach (var ((key, left), leftWeight) in deltaLeft)
+        Flatten(deltaLeft, _leftEntries);
+        _rightRows.Clear();
+        _bounds.Clear();
+        _right.GetGroupsInto(_probeKeys, _rightRows, _bounds);
+        for (var i = 0; i < _leftEntries.Count; i++)
         {
-            foreach (var (right, rightWeight) in rightGroups[key])
+            var (key, left, leftWeight) = _leftEntries[i];
+            var group = _groupOfEntry[i];
+            for (var r = group == 0 ? 0 : _bounds[group - 1]; r < _bounds[group]; r++)
+            {
+                var (right, rightWeight) = _rightRows[r];
                 output.Add(_resultSelector(key, left, right), checked(leftWeight * rightWeight));
+            }
             _eviction?.Track(key);
         }
 
         // Integrate ΔL, so the pass below also covers the ΔL ⋈ ΔR cross term.
-        _left.UpdateAll(leftEntries);
+        _left.ApplyAll(_leftEntries);
 
         // (L + ΔL) ⋈ ΔR
-        var leftGroups = FetchGroups(_left, deltaRight, out var rightEntries);
-        foreach (var ((key, right), rightWeight) in deltaRight)
+        Flatten(deltaRight, _rightEntries);
+        _leftRows.Clear();
+        _bounds.Clear();
+        _left.GetGroupsInto(_probeKeys, _leftRows, _bounds);
+        for (var i = 0; i < _rightEntries.Count; i++)
         {
-            foreach (var (left, leftWeight) in leftGroups[key])
+            var (key, right, rightWeight) = _rightEntries[i];
+            var group = _groupOfEntry[i];
+            for (var l = group == 0 ? 0 : _bounds[group - 1]; l < _bounds[group]; l++)
+            {
+                var (left, leftWeight) = _leftRows[l];
                 output.Add(_resultSelector(key, left, right), checked(leftWeight * rightWeight));
+            }
             _eviction?.Track(key);
         }
 
-        _right.UpdateAll(rightEntries);
+        _right.ApplyAll(_rightEntries);
 
         // Closed keys can never be probed again (the watermark drops their events), so
         // both sides' state for them is deleted; results already emitted remain final.
@@ -75,28 +103,30 @@ internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IStepOperator
         return output;
     }
 
-    /// <summary>One batched read of the groups a delta will probe, plus that delta flattened
-    /// into the entry list its own side integrates.</summary>
-    private static Dictionary<TKey, IReadOnlyList<WeightedValue<TValue>>> FetchGroups<TValue, TOther>(
-        IIndexedWeightStore<TKey, TValue> store,
-        ZSet<KeyedValue<TKey, TOther>> delta,
-        out List<(TKey Key, TOther Value, long Delta)> entries)
+    /// <summary>Flattens a delta into <paramref name="entries"/> (the list its own side
+    /// integrates) while building the distinct probe-key list and, for each entry, the index
+    /// of its key's group — so the probe loop reads the fetched groups by offset instead of
+    /// hashing the key a second time.</summary>
+    private void Flatten<TValue>(ZSet<KeyedValue<TKey, TValue>> delta, List<(TKey, TValue, long)> entries)
         where TValue : notnull
-        where TOther : notnull
     {
-        entries = new List<(TKey, TOther, long)>(delta.DistinctCount);
-        var keys = new List<TKey>();
-        var groups = new Dictionary<TKey, IReadOnlyList<WeightedValue<TValue>>>();
+        entries.Clear();
+        _probeKeys.Clear();
+        _probeIndex.Clear();
+        _groupOfEntry.Clear();
+        entries.EnsureCapacity(delta.DistinctCount);
+        _groupOfEntry.EnsureCapacity(delta.DistinctCount);
         foreach (var ((key, value), weight) in delta)
         {
             entries.Add((key, value, weight));
-            if (groups.TryAdd(key, []))
-                keys.Add(key);
+            ref var group = ref System.Runtime.InteropServices.CollectionsMarshal
+                .GetValueRefOrAddDefault(_probeIndex, key, out var known);
+            if (!known)
+            {
+                group = _probeKeys.Count;
+                _probeKeys.Add(key);
+            }
+            _groupOfEntry.Add(group);
         }
-
-        var fetched = store.GetGroups(keys);
-        for (var i = 0; i < keys.Count; i++)
-            groups[keys[i]] = fetched[i];
-        return groups;
     }
 }

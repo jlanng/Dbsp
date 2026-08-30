@@ -139,7 +139,7 @@ internal sealed class FilterOperator<T>(Func<T, bool> predicate) : IStepOperator
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<T>)inputs[0]!;
-        var output = new ZSet<T>();
+        var output = new ZSet<T>(delta.DistinctCount);
         foreach (var (value, weight) in delta)
             if (predicate(value))
                 output.Add(value, weight);
@@ -158,7 +158,7 @@ internal sealed class FlatMapOperator<TIn, TOut>(Func<TIn, IEnumerable<TOut>> se
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<TIn>)inputs[0]!;
-        var output = new ZSet<TOut>();
+        var output = new ZSet<TOut>(delta.DistinctCount);
         foreach (var (value, weight) in delta)
             foreach (var expanded in selector(value))
                 output.Add(expanded, weight);
@@ -184,7 +184,10 @@ internal sealed class PlusOperator<T> : IStepOperator where T : notnull
 
     public object Step(object?[] inputs)
     {
-        var output = new ZSet<T>();
+        var total = 0;
+        foreach (var input in inputs)
+            total += ((ZSet<T>)input!).DistinctCount;
+        var output = new ZSet<T>(total);
         foreach (var input in inputs)
             output.AddAll((ZSet<T>)input!);
         return output;
@@ -196,63 +199,50 @@ internal sealed class PlusOperator<T> : IStepOperator where T : notnull
 /// state must route every key to the worker whose shard holds it.</summary>
 internal sealed class ExchangeOperator<T>(Func<T, uint> routingHash) : IExchangeStepOperator where T : notnull
 {
-    /// <summary>Stand-in for a shard this step routed nothing to. Fragments are read-only
-    /// once <see cref="Partition"/> returns — peers only merge them, and the cluster path only
-    /// serializes them — so every empty shard shares this one instance instead of allocating a
-    /// Z-set to hold nothing. Never hand it downstream: it must not reach an operator slot,
-    /// where an operator could take it for its own delta.</summary>
-    private static readonly ZSet<T> EmptyShard = new();
-
-    // Reused across steps rather than reallocated: the fragment array is fixed-size (the
-    // global worker count cannot change mid-run), and the previous step's fragments are dead
-    // by the time this worker repartitions. Every worker runs every node in the same order,
-    // so between one step's Merge (which reads peers' arrays, after the exchange barrier) and
-    // the next Partition on this node there is always at least that barrier plus the step
-    // boundary — and, for an exchange inside a Recurse region, the loop's own flag barriers.
+    // Both the fragment array and the Z-sets in it are reused across steps rather than
+    // reallocated. The array is fixed-size (the global worker count cannot change mid-run),
+    // and the previous step's fragments are dead by the time this worker repartitions: every
+    // worker runs every node in the same order, so between one step's Merge (which reads
+    // peers' arrays, after the exchange barrier) and the next Partition on this node there is
+    // always at least that barrier plus the step boundary — and, for an exchange inside a
+    // Recurse region, the loop's own flag barriers. Reusing the Z-sets matters more than
+    // reusing the array: a shuffle refills the same shards every step, so after a few steps
+    // they are the right size and stop re-walking the dictionary's doubling ladder. Merge
+    // therefore copies rather than adopting a fragment — the fragment is about to be cleared.
     private ZSet<T>[]? _fragments;
-
-    // The publication for a step this worker routed nothing: every shard is EmptyShard, and
-    // the array is never written after creation, so one instance serves every empty execution
-    // instead of re-filling (or reallocating) a fragment array to say "nothing for anyone".
-    private ZSet<T>[]? _emptyFragments;
 
     // Single-worker fast path: no shuffle, pass the delta through untouched.
     public object Step(object?[] inputs) => inputs[0]!;
 
     public object[] Partition(object? input, int parts)
     {
+        var fragments = _fragments;
+        if (fragments is null || fragments.Length != parts)
+        {
+            fragments = _fragments = new ZSet<T>[parts];
+            for (var i = 0; i < parts; i++)
+                fragments[i] = new ZSet<T>();
+        }
+        else
+        {
+            // Clearing an already-empty dictionary is free, so the sparse case — most shards
+            // empty, most executions routing nothing — costs a handful of length checks.
+            foreach (var fragment in fragments)
+                fragment.Clear();
+        }
+
         var delta = (ZSet<T>)input!;
         if (delta.IsEmpty)
-            return _emptyFragments is { } empties && empties.Length == parts
-                ? empties
-                : CreateEmptyFragments(parts);
-
-        var fragments = _fragments is { } cached && cached.Length == parts
-            ? cached
-            : _fragments = new ZSet<T>[parts];
-        Array.Fill(fragments, EmptyShard);
+            return fragments;
 
         foreach (var (value, weight) in delta)
-        {
-            var target = (int)(routingHash(value) % (uint)parts);
-            var fragment = fragments[target];
-            if (ReferenceEquals(fragment, EmptyShard))
-                fragments[target] = fragment = new ZSet<T>();
-            fragment.Add(value, weight);
-        }
+            fragments[(int)(routingHash(value) % (uint)parts)].Add(value, weight);
         return fragments;
     }
 
-    private ZSet<T>[] CreateEmptyFragments(int parts)
-    {
-        var empties = new ZSet<T>[parts];
-        Array.Fill(empties, EmptyShard);
-        return _emptyFragments = empties;
-    }
-
-    /// <summary>Merged output for a worker that was sent nothing. Distinct from
-    /// <see cref="EmptyShard"/>: this one does travel downstream as the node's delta, so
-    /// keeping the two apart means neither role can be broken by a stray write to the other.</summary>
+    /// <summary>Merged output for a worker that was sent nothing. Kept apart from the reused
+    /// fragments: this one does travel downstream as the node's delta and must stay empty
+    /// forever, whereas the fragments are cleared and refilled every step.</summary>
     private readonly ZSet<T> _emptyMerge = new();
 
     /// <summary>An exchange over all-empty inputs shuffles nothing and changes no state, so
@@ -265,12 +255,21 @@ internal sealed class ExchangeOperator<T>(Func<T, uint> routingHash) : IExchange
     {
         // An exchange cannot be skipped the way a plain operator can — its barrier keeps the
         // workers aligned — but the worker no key routed to this step still need not allocate
-        // a Z-set to say so.
-        ZSet<T>? merged = null;
+        // a Z-set to say so. Sizing the merge up front is the point of the counting pass:
+        // the shards are disjoint by key, so their entry counts sum to the merged size
+        // exactly, and the result is allocated once at its final size.
+        var total = 0;
+        foreach (var part in parts)
+            if (part is ZSet<T> fragment)
+                total += fragment.DistinctCount;
+        if (total == 0)
+            return _emptyMerge;
+
+        var merged = new ZSet<T>(total);
         foreach (var part in parts)
             if (part is ZSet<T> { IsEmpty: false } fragment)
-                (merged ??= new ZSet<T>()).AddAll(fragment);
-        return merged ?? _emptyMerge;
+                merged.AddAll(fragment);
+        return merged;
     }
 
     // Wire encoding reuses the storage serializer (JSON with fields included, so tuple keys
