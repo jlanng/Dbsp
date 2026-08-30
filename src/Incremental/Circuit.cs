@@ -150,7 +150,18 @@ public sealed class Circuit : IAsyncDisposable
                 };
                 operators[n] = nodes[n].Factory(context);
             }
-            _workers[w] = new Worker(w, operators, new object?[nodes.Length]);
+            // Per-node scratch, allocated once per worker rather than once per node per step.
+            var peerCount = _cluster is null ? 0 : _cluster.ProcessCount - 1;
+            var nodeInputs = new object?[nodes.Length][];
+            var exchangeIncoming = new object?[nodes.Length][];
+            for (var n = 0; n < nodes.Length; n++)
+            {
+                nodeInputs[n] = new object?[nodes[n].Inputs.Length];
+                exchangeIncoming[n] = nodes[n].IsExchange
+                    ? new object?[options.Workers + peerCount]
+                    : [];
+            }
+            _workers[w] = new Worker(w, operators, new object?[nodes.Length], nodeInputs, exchangeIncoming);
         }
         if (manifestStores is not null)
             _stateManifest = BuildStateManifest(manifestStores);
@@ -839,6 +850,7 @@ public sealed class Circuit : IAsyncDisposable
             var exchange = (IExchangeStepOperator)op;
             _mailboxes[n][worker.Id] = exchange.Partition(slots[node.Inputs[0]], _cluster?.GlobalWorkers ?? _workers.Length);
 
+
             _barrier.SignalAndWait();
 
             if (_cluster is { } cluster)
@@ -863,8 +875,7 @@ public sealed class Circuit : IAsyncDisposable
             }
 
             var myShard = (_cluster?.FirstGlobalWorker ?? 0) + worker.Id;
-            var peerCount = _cluster is null ? 0 : _cluster.ProcessCount - 1;
-            var incoming = new object?[_workers.Length + peerCount];
+            var incoming = worker.ExchangeIncoming[n];
             var i = 0;
             for (var sender = 0; sender < _workers.Length; sender++)
                 incoming[i++] = _mailboxes[n][sender][myShard];
@@ -876,10 +887,22 @@ public sealed class Circuit : IAsyncDisposable
         }
         else
         {
-            var inputs = new object?[node.Inputs.Length];
+            // An operator whose every input is empty this step can usually be skipped
+            // outright (see IStepOperator.EmptyStepResult). Worth the check: a single-row
+            // change reaches one shard, so every other worker runs the whole downstream
+            // circuit on nothing. Exchanges are never skipped — their barrier keeps the
+            // workers aligned whether or not there is data to shuffle.
+            var inputs = worker.NodeInputs[n];
+            var allEmpty = node.Inputs.Length > 0;
             for (var i = 0; i < node.Inputs.Length; i++)
-                inputs[i] = slots[node.Inputs[i]];
-            slots[n] = op.Step(inputs);
+            {
+                var value = slots[node.Inputs[i]];
+                inputs[i] = value;
+                allEmpty &= value is IZSet { IsEmpty: true };
+            }
+            slots[n] = allEmpty && op.EmptyStepResult is { } unchanged
+                ? unchanged
+                : op.Step(inputs);
         }
     }
 

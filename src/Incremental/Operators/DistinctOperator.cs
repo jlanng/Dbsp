@@ -10,6 +10,10 @@ namespace Incremental.Operators;
 /// </summary>
 internal sealed class DistinctOperator<T> : IStepOperator where T : notnull
 {
+    private readonly ZSet<T> _empty = new();
+
+    public object? EmptyStepResult => _empty;
+
     private readonly IWeightStore<T> _integrated;
 
     public DistinctOperator(OperatorContext context) =>
@@ -56,6 +60,12 @@ internal sealed class KeyedDistinctOperator<TKey, TValue> : IStepOperator
         _integrated = context.Storage.CreateIndexedWeightStore<TKey, TValue>(context.StateName("integrated"));
         _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
     }
+
+    private readonly ZSet<KeyedValue<TKey, TValue>> _empty = new();
+
+    // Same gate as the other keyed operators: no delta, no state change — but an
+    // attached KeyEviction still has to drain against the watermark every step.
+    public object? EmptyStepResult => _eviction is null ? _empty : null;
 
     public object Step(object?[] inputs)
     {

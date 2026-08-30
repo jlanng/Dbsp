@@ -38,10 +38,16 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
         _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
     }
 
+    private readonly ZSet<KeyedValue<TKey, TValue>> _empty = new();
+
+    // Every state change below is driven by a delta row, so an all-empty step is a
+    // no-op — unless a KeyEviction is attached, whose DrainClosed fires off the
+    // watermark instead and must run whether or not data arrived.
+    public object? EmptyStepResult => _eviction is null ? _empty : null;
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
-        var output = new ZSet<KeyedValue<TKey, TValue>>();
 
         var entries = new List<(TKey, TValue, long)>(delta.DistinctCount);
         var touchedKeys = new List<TKey>();
@@ -62,17 +68,27 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
         var comparer = Comparer<TOrder>.Default;
         var lastResults = _lastEmitted.TryGetAll(touchedKeys);
 
-        var rerankKeys = new List<TKey>();
-        var rerankPrevious = new List<WeightedValue<TValue>[]?>();
+        // Allocated only once a key actually needs re-ranking. The threshold short-circuit
+        // means the usual outcome is that none does — a delta below the cutoff cannot move
+        // the top — and that path should cost nothing beyond the state update above.
+        List<TKey>? rerankKeys = null;
+        List<WeightedValue<TValue>[]?>? rerankPrevious = null;
         for (var i = 0; i < touchedKeys.Count; i++)
         {
             var (hadPrevious, emitted) = lastResults[i];
             if (hadPrevious && TopUnaffected(emitted!, touched[touchedKeys[i]], comparer))
                 continue;
-            rerankKeys.Add(touchedKeys[i]);
-            rerankPrevious.Add(hadPrevious ? emitted : null);
+            (rerankKeys ??= []).Add(touchedKeys[i]);
+            (rerankPrevious ??= []).Add(hadPrevious ? emitted : null);
         }
 
+        if (rerankKeys is null)
+        {
+            EvictClosed();
+            return _empty;
+        }
+
+        var output = new ZSet<KeyedValue<TKey, TValue>>();
         var groups = _groups.GetGroups(rerankKeys);
         var puts = new List<(TKey, WeightedValue<TValue>[])>();
         var removes = new List<TKey>();
@@ -80,7 +96,7 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
         for (var i = 0; i < rerankKeys.Count; i++)
         {
             var key = rerankKeys[i];
-            var previous = rerankPrevious[i];
+            var previous = rerankPrevious![i]; // non-null whenever rerankKeys is
 
             var ranked = new List<(TOrder Order, WeightedValue<TValue> Entry)>();
             foreach (var entry in groups[i])
@@ -119,13 +135,21 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
         _lastEmitted.PutAll(puts);
         _lastEmitted.RemoveAll(removes);
 
+        EvictClosed();
+
+        return output;
+    }
+
+    /// <summary>Drops the state of every key the watermark has closed. Runs on both exits from
+    /// <see cref="Step"/>, including the short-circuit — eviction is driven by the watermark,
+    /// not by whether this step's delta happened to move a top.</summary>
+    private void EvictClosed()
+    {
         if (_eviction?.DrainClosed() is { Count: > 0 } closed)
         {
             _groups.RemoveGroups(closed);
             _lastEmitted.RemoveAll(closed);
         }
-
-        return output;
     }
 
     /// <summary>True when this step's delta rows provably cannot change the emitted top:
