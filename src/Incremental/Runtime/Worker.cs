@@ -28,6 +28,26 @@ internal sealed class Worker(
     /// nodes that are not exchanges.</summary>
     public object?[][] ExchangeIncoming { get; } = exchangeIncoming;
 
+    /// <summary>Cumulative <see cref="System.Diagnostics.Stopwatch"/> ticks this worker has
+    /// spent blocked in <see cref="SpinBarrier.SignalAndWait"/> (exchange shuffles and loop
+    /// fixed-point reductions). Written only by the owning worker thread, mid-step, with no
+    /// synchronization — the diagnostics gauge reads it racily, which is fine for a
+    /// monotonically growing time counter.</summary>
+    public long BarrierWaitTicks;
+
+    /// <summary>Point-to-point exchange mode only: how many times this worker has executed
+    /// each exchange node, indexed by node — the sequence number it publishes fragments
+    /// under. Every worker executes every node the same number of times (loop iteration
+    /// counts are a global decision), so a worker's own count is also the sequence it
+    /// expects from every peer. Empty when the circuit synchronizes on the barrier.</summary>
+    public long[] ExchangeSeq { get; set; } = [];
+
+    // PHASE-STATS (temporary probe instrumentation — revert before committing). Cumulative
+    // ticks per phase of the exchange path, plus per-step span timestamps for launch/land
+    // attribution. Written only by the owning worker thread; read racily at dispose.
+    public long PartitionTicks, MergeTicks, SpanTicks, SlowWaits, ExchangeExecutions, EmptyExchangeSkips;
+    public long StepStartTs, StepEndTs;
+
     /// <summary>Released once by the coordinator for every step this worker should run.</summary>
     public SemaphoreSlim Go { get; } = new(0);
 

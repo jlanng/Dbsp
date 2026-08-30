@@ -61,12 +61,15 @@ internal sealed class CircuitDiagnostics : IDisposable
             ObserveWatermarkLag, "s", "Wall-clock time minus the frozen event-time watermark.");
         Meter.CreateObservableGauge("incremental.cluster.send_queue_depth",
             ObserveSendQueueDepths, "{frame}", "Frames buffered in each peer's bounded send queue.");
+        Meter.CreateObservableGauge("incremental.circuit.barrier_wait",
+            ObserveBarrierWait, "s", "Cumulative time each worker has spent waiting at exchange and loop barriers.");
     }
 
     private readonly KeyValuePair<string, object?> _tag;
     private readonly KeyValuePair<string, object?>[] _peerTags;
     private IInputPort[] _inputs = [];
     private IOutputPort[] _outputs = [];
+    private Worker[] _workers = [];
     private Func<DateTimeOffset?>? _watermark;
     private ITransportDiagnostics? _transport;
 
@@ -88,11 +91,12 @@ internal sealed class CircuitDiagnostics : IDisposable
     /// <summary>Hooks up the state the observable gauges read; called once the circuit's
     /// ports exist. Gauge reads race steps harmlessly — a queue depth is a point-in-time
     /// approximation by nature.</summary>
-    public void RegisterGauges(IInputPort[] inputs, IOutputPort[] outputs,
+    public void RegisterGauges(IInputPort[] inputs, IOutputPort[] outputs, Worker[] workers,
         Func<DateTimeOffset?> watermark, object? transport)
     {
         _inputs = inputs;
         _outputs = outputs;
+        _workers = workers;
         _watermark = watermark;
         _transport = transport as ITransportDiagnostics;
         Registry.TryAdd(this, 0);
@@ -154,6 +158,15 @@ internal sealed class CircuitDiagnostics : IDisposable
             if (circuit._watermark?.Invoke() is { } watermark)
                 yield return new Measurement<double>(
                     (DateTimeOffset.UtcNow - watermark).TotalSeconds, circuit._tag);
+    }
+
+    private static IEnumerable<Measurement<double>> ObserveBarrierWait()
+    {
+        foreach (var circuit in Registry.Keys)
+            foreach (var worker in circuit._workers)
+                yield return new Measurement<double>(
+                    (double)Volatile.Read(ref worker.BarrierWaitTicks) / System.Diagnostics.Stopwatch.Frequency,
+                    circuit._tag, new KeyValuePair<string, object?>("worker", worker.Id));
     }
 
     private static IEnumerable<Measurement<long>> ObserveSendQueueDepths()

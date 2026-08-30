@@ -332,9 +332,14 @@ const render = {
           { label: "p50 latency", num: 1, get: (r) => r.latencyP50.toFixed(1) + " µs" },
           { label: "p99 latency", num: 1, get: (r) => r.latencyP99.toFixed(1) + " µs" },
           { label: "bulk throughput", num: 1, get: (r) => n0(r.bulkRowsPerSec) + " rows/s" },
+          { label: "sync wait live · bulk", num: 1, get: (r) => r.barrierPctLive.toFixed(0) + "% · " + r.barrierPctBulk.toFixed(0) + "%" },
         ], sc.samples, (r) => r.label)
         + boxed(`<div style="color:var(--faint)">Measured on this machine (${sc.cores} logical cores): latency from ${
             n0(sc.liveBatch)}-row steps, throughput from ${n0(sc.bulkBatch)}-row steps, same declaration throughout.
+            Sync wait is the share of worker time spent blocked at exchanges, not computing —
+            measured over the live-batch section and the bulk section separately, because it amortizes with batch size.
+            Barrier rows rendezvous every worker at every exchange; point-to-point rows (experimental) wait only for
+            the data they are about to read, so skew stops convoying the whole worker set.
             Lowest latency at ${sc.samples.reduce((a, b) => (a.latencyP50 <= b.latencyP50 ? a : b)).workers} worker(s);
             highest throughput at ${sc.samples.reduce((a, b) => (a.bulkRowsPerSec >= b.bulkRowsPerSec ? a : b)).workers}.
             The web host is serving this page while it measures, which costs the p99 a little.</div>`

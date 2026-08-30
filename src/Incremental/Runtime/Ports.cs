@@ -228,6 +228,20 @@ internal interface IOutputPort
     /// <summary>Deltas currently buffered in the bounded channel (for the queue-depth gauge).</summary>
     int BufferedCount { get; }
     ValueTask PublishAsync(Worker[] workers, CancellationToken cancellationToken);
+
+    /// <summary>Captures the just-run step's merged delta synchronously, without touching the
+    /// channel — the auto-stepping circuit stages here and writes via
+    /// <see cref="FlushStagedAsync"/> overlapped with the next step. The capture copies (as
+    /// <see cref="PublishAsync"/> does), so the flush never depends on worker slots the next
+    /// step is about to overwrite. At most one step may be staged at a time: the circuit
+    /// awaits the previous flush before staging again. Returns whether anything was staged,
+    /// so an all-empty step skips the flush task entirely.</summary>
+    bool Stage(Worker[] workers);
+
+    /// <summary>Publishes the staged delta, if any. Awaiting the bounded write is what turns
+    /// a slow consumer into backpressure — one step later than the synchronous path, which
+    /// is the entire slack the staging introduces.</summary>
+    ValueTask FlushStagedAsync(CancellationToken cancellationToken);
     void Complete(Exception? error);
 
     /// <summary>Wires the handle's snapshot read to the circuit (no-op for plain outputs).
@@ -278,6 +292,25 @@ internal sealed class OutputPort<T> : IOutputPort where T : notnull
     /// consumer back into the circuit as backpressure.</summary>
     public async ValueTask PublishAsync(Worker[] workers, CancellationToken cancellationToken)
     {
+        if (Merge(workers) is { } merged)
+            await _channel.Writer.WriteAsync(merged, cancellationToken).ConfigureAwait(false);
+    }
+
+    public bool Stage(Worker[] workers) => (_staged = Merge(workers)) is not null;
+
+    public async ValueTask FlushStagedAsync(CancellationToken cancellationToken)
+    {
+        if (_staged is { } staged)
+        {
+            _staged = null;
+            await _channel.Writer.WriteAsync(staged, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private ZSet<T>? _staged;
+
+    private ZSet<T>? Merge(Worker[] workers)
+    {
         ZSet<T>? merged = null;
         foreach (var worker in workers)
         {
@@ -287,9 +320,7 @@ internal sealed class OutputPort<T> : IOutputPort where T : notnull
                 merged.AddAll(delta);
             }
         }
-
-        if (merged is { IsEmpty: false })
-            await _channel.Writer.WriteAsync(merged, cancellationToken).ConfigureAwait(false);
+        return merged is { IsEmpty: false } ? merged : null;
     }
 
     public void Complete(Exception? error) => _channel.Writer.TryComplete(error);

@@ -68,6 +68,7 @@ public sealed class Show : IAsyncDisposable
     readonly Dictionary<string, Beat> beats = [];
     readonly Director director = new(DateTimeOffset.UtcNow);
     ShowcaseCircuit live;
+    readonly bool pointToPoint;
     int globalTick;
     int generation = 1;
     bool keyedInputsArmed = true;        // a crash-rebuild disarms keyed upserts (disclosed limitation)
@@ -76,15 +77,17 @@ public sealed class Show : IAsyncDisposable
     ClusterView? cluster;
 
     public Show(IStorageProvider storage, string storageLabel, bool withCluster,
-        NoticeLog notices, IncrementalMetrics metrics, ILoggerFactory loggerFactory, int workers)
+        NoticeLog notices, IncrementalMetrics metrics, ILoggerFactory loggerFactory, int workers,
+        bool pointToPoint = false)
     {
         this.storage = storage;
         this.loggerFactory = loggerFactory;
         this.withCluster = withCluster;
+        this.pointToPoint = pointToPoint;
         StorageLabel = storageLabel;
         Notices = notices;
         Metrics = metrics;
-        live = new ShowcaseCircuit("showcase", storage, loggerFactory, workers);
+        live = new ShowcaseCircuit("showcase", storage, loggerFactory, workers, pointToPoint);
         Tabs = BuildTabs();
     }
 
@@ -294,7 +297,7 @@ public sealed class Show : IAsyncDisposable
         // The crash itself: every reference dropped, nothing disposed, nothing flushed.
         Notices.Push(NoticeLevel.Bad, "💥 crash: circuit abandoned without dispose — views and consumers died with it; rebuilding from the last committed checkpoint");
         generation++;
-        live = new ShowcaseCircuit($"showcase-g{generation}", storage, loggerFactory);
+        live = new ShowcaseCircuit($"showcase-g{generation}", storage, loggerFactory, pointToPoint: pointToPoint);
         var committed = new Dictionary<string, long?>
         {
             ["orders-web"] = live.Circuit.CommittedOffset("orders-web"),
@@ -335,8 +338,8 @@ public sealed class Show : IAsyncDisposable
     async Task MeasureBeat()
     {
         Running = false;         // the measurement must not compete with the live circuit
-        Notices.Push(NoticeLevel.Info, "measuring 1 / 2 / 4 workers on this machine — traffic paused, the view holds for ~20 s");
-        scaling = await ScalingAct.MeasureAllAsync(live.Workers);
+        Notices.Push(NoticeLevel.Info, "measuring 1 / 2 / 4 workers, barrier and point-to-point, on this machine — traffic paused, the view holds for ~30 s");
+        scaling = await ScalingAct.MeasureAllAsync(live.Workers, live.PointToPoint);
         var best = scaling.Samples.MinBy(s => s.LatencyP50)!;
         var fastest = scaling.Samples.MaxBy(s => s.BulkRowsPerSec)!;
         Notices.Push(NoticeLevel.Good,

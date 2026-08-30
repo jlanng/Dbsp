@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using Incremental;
 using Microsoft.Extensions.Logging;
 
@@ -13,10 +14,13 @@ namespace Incremental.Showcase;
 public static class ScalingAct
 {
     /// <summary>Per-step latency at the showcase's live batch size, and bulk throughput,
-    /// for one topology.</summary>
+    /// for one topology. The barrier percentages are the share of aggregate worker time
+    /// spent waiting at exchange barriers rather than computing — measured separately for
+    /// the live-batch and bulk sections, because barrier cost amortizes with batch size.</summary>
     public record Sample(
         string Label, int Workers, int Processes,
-        double LatencyP50, double LatencyP99, double BulkRowsPerSec, bool Highlight);
+        double LatencyP50, double LatencyP99, double BulkRowsPerSec,
+        double BarrierPctLive, double BarrierPctBulk, bool Highlight);
 
     // The showcase's enrichment shape, minus the parts that would dominate the timing:
     // two exchanges (group by merchant to join, group by category to aggregate).
@@ -45,14 +49,22 @@ public static class ScalingAct
     public const int BulkBatch = 8_000;
     public const int BulkSteps = 10;
 
-    /// <summary>Every in-process topology, measured back to back on this machine.</summary>
-    public static async Task<ScalingView> MeasureAllAsync(int currentWorkers)
+    /// <summary>Every in-process topology, measured back to back on this machine — the
+    /// multi-worker ones in both synchronization modes, so the table shows what the barrier
+    /// itself costs against point-to-point publication.</summary>
+    public static async Task<ScalingView> MeasureAllAsync(int currentWorkers, bool currentP2p = false)
     {
-        var samples = new List<Sample>();
-        foreach (var workers in new[] { 1, 2, 4 })
-            samples.Add(await MeasureAsync(
-                workers == 1 ? "1 worker · no exchange" : $"{workers} workers · sharded",
-                workers, workers == currentWorkers));
+        var samples = new List<Sample>
+        {
+            await MeasureAsync("1 worker · no exchange", 1, currentWorkers == 1),
+        };
+        foreach (var workers in new[] { 2, 4 })
+        {
+            samples.Add(await MeasureAsync($"{workers} workers · barrier", workers,
+                workers == currentWorkers && !currentP2p));
+            samples.Add(await MeasureAsync($"{workers} workers · point-to-point", workers,
+                workers == currentWorkers && currentP2p, p2p: true));
+        }
         return new ScalingView([.. samples], Environment.ProcessorCount, LiveBatch, BulkBatch,
             currentWorkers, DebugBuild);
     }
@@ -67,7 +79,7 @@ public static class ScalingAct
         false;
 #endif
 
-    public static async Task<Sample> MeasureAsync(string label, int workers, bool highlight)
+    public static async Task<Sample> MeasureAsync(string label, int workers, bool highlight, bool p2p = false)
     {
         var rng = new Random(11);
         var merchants = Enumerable.Range(0, 24)
@@ -76,7 +88,41 @@ public static class ScalingAct
         Order NextOrder(long id) => new(id, 1 + rng.Next(80), 100 + (int)(rng.NextDouble() * 24),
             "web", 1, Math.Round(5m + (decimal)rng.NextDouble() * 120m, 2), DateTimeOffset.UtcNow);
 
-        var options = new CircuitOptions { Name = $"scaling-w{workers}", Workers = workers, AutoStep = false };
+        var options = new CircuitOptions
+        {
+            Name = $"scaling-w{workers}{(p2p ? "-p2p" : "")}",
+            Workers = workers,
+            AutoStep = false,
+            PointToPointExchange = p2p,
+        };
+
+        // The library reports cumulative per-worker barrier wait through its meter; polling
+        // the gauge before and after a measured section and dividing the delta by
+        // workers × step time gives the share of worker time spent synchronizing.
+        var barrierSeconds = 0.0;
+        using var meters = new MeterListener();
+        meters.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "Incremental" && instrument.Name == "incremental.circuit.barrier_wait")
+                l.EnableMeasurementEvents(instrument);
+        };
+        meters.SetMeasurementEventCallback<double>((_, value, tags, _) =>
+        {
+            foreach (var tag in tags)
+                if (tag.Key == "circuit" && Equals(tag.Value, options.Name))
+                {
+                    barrierSeconds += value;
+                    break;
+                }
+        });
+        meters.Start();
+        double BarrierWait()
+        {
+            barrierSeconds = 0;
+            meters.RecordObservableInstruments();
+            return barrierSeconds;
+        }
+
         var (builder, ordersDef, merchantsDef, statsDef) = Declare(options);
         await using var circuit = builder.Build();
         circuit.Start();
@@ -99,6 +145,7 @@ public static class ScalingAct
         }
 
         var micros = new double[LatencySteps];
+        var barrierBefore = BarrierWait();
         for (var i = 0; i < LatencySteps; i++)
         {
             for (var j = 0; j < LiveBatch; j++) await orders.InsertAsync(NextOrder(id++));
@@ -108,16 +155,25 @@ public static class ScalingAct
             micros[i] = timer.Elapsed.TotalMicroseconds;
             Drain();
         }
+        // Barrier wait accrues only inside steps (idle workers park on their Go semaphore,
+        // not the barrier), so the summed step time is the right denominator.
+        var barrierPctLive = 100 * (BarrierWait() - barrierBefore) / (workers * micros.Sum() / 1e6);
         Array.Sort(micros);
 
+        barrierBefore = BarrierWait();
         var bulkTimer = Stopwatch.StartNew();
+        var bulkStepTimer = new Stopwatch();
         for (var i = 0; i < BulkSteps; i++)
         {
             for (var j = 0; j < BulkBatch; j++) await orders.InsertAsync(NextOrder(id++));
+            bulkStepTimer.Start();
             await circuit.StepAsync();
+            bulkStepTimer.Stop();
             Drain();
         }
         bulkTimer.Stop();
+        var barrierPctBulk = 100 * (BarrierWait() - barrierBefore)
+            / (workers * bulkStepTimer.Elapsed.TotalSeconds);
 
         orders.Complete();
         merchantInput.Complete();
@@ -125,7 +181,8 @@ public static class ScalingAct
 
         return new Sample(label, workers, 1,
             micros[micros.Length / 2], micros[(int)(micros.Length * 0.99)],
-            BulkBatch * BulkSteps / bulkTimer.Elapsed.TotalSeconds, highlight);
+            BulkBatch * BulkSteps / bulkTimer.Elapsed.TotalSeconds,
+            barrierPctLive, barrierPctBulk, highlight);
     }
 
     /// <summary>The full showcase pipeline (136 nodes, 19 outputs, checkpointing on) at one

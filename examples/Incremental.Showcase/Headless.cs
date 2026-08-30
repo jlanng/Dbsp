@@ -158,11 +158,12 @@ public static class Headless
                 if (s.Scaling is { } sc)
                 {
                     Table($"threads · same declaration, {sc.Cores} logical cores{(sc.DebugBuild ? " · DEBUG BUILD, throughput is a lower bound" : "")}",
-                        ["topology", "p50", "p99", "bulk throughput"],
+                        ["topology", "p50", "p99", "bulk throughput", "sync wait live · bulk"],
                         sc.Samples.Select(x => new[]
                         {
                             x.Label + (x.Highlight ? "  ← running" : ""),
                             $"{x.LatencyP50:N1} µs", $"{x.LatencyP99:N1} µs", $"{x.BulkRowsPerSec:N0} rows/s",
+                            $"{x.BarrierPctLive:N0}% · {x.BarrierPctBulk:N0}%",
                         }));
                     var quickest = sc.Samples.MinBy(x => x.LatencyP50)!;
                     var fastest = sc.Samples.MaxBy(x => x.BulkRowsPerSec)!;

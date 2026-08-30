@@ -58,6 +58,16 @@ public sealed class CircuitOptions
     /// exchange operators shuffle across all of them. Null (default) — single process.</summary>
     public ClusterOptions? Cluster { get; init; }
 
+    /// <summary>EXPERIMENTAL. When true, local exchanges synchronize point-to-point instead
+    /// of on a global barrier: each worker release-publishes its fragments under a per-node
+    /// sequence number and waits only for the peers' publications it is about to read. A
+    /// worker never waits for peers to <em>arrive</em> — only for data — so skew at one
+    /// operator no longer convoys every worker at every exchange, which is most of the
+    /// multi-worker step cost on small deltas. Semantics are unchanged: workers still
+    /// drift only within a step, and steps remain atomic. Local processes only — combining
+    /// this with <see cref="Cluster"/> throws (the cluster shuffle stays barrier-based).</summary>
+    public bool PointToPointExchange { get; init; }
+
     /// <summary>Upper bound on any single cross-process wait in a clustered step: receiving
     /// an exchange node's shards from a peer, the end-of-step alignment frames, or space in
     /// a peer's bounded send queue. Null (default) waits forever — a peer that is merely
