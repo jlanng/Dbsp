@@ -155,7 +155,7 @@ internal sealed class LoopDistinctOperator<T> : IStepOperator, ILoopOperator whe
         // store call per outer step. Retractions cancel against the insertions they undo
         // at the same iteration, so fully retracted values leave no state behind.
         if (_stepDeltas.Count > 0)
-            _history.UpdateAll(_stepDeltas);
+            _history.ApplyAll(_stepDeltas);
         Reset();
     }
 
@@ -291,9 +291,9 @@ internal sealed class LoopJoinOperator<TKey, TLeft, TRight, TOut> : IStepOperato
     public void EndOuterStep()
     {
         if (_leftFold.Count > 0)
-            _left.UpdateAll(_leftFold);
+            _left.ApplyAll(_leftFold);
         if (_rightFold.Count > 0)
-            _right.UpdateAll(_rightFold);
+            _right.ApplyAll(_rightFold);
         Reset();
     }
 
