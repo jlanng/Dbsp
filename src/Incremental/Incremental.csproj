@@ -9,4 +9,10 @@
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.3" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The exchange wire codec is an internal detail with a public consequence: a value that
+         does not round-trip is silent cross-process corruption. The tests reach it directly. -->
+    <InternalsVisibleTo Include="Incremental.Tests" />
+  </ItemGroup>
+
 </Project>

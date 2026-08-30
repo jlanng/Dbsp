@@ -17,6 +17,12 @@ using Incremental.Torture;
 
 var options = Options.Parse(args);
 
+if (options.Processes > 1)
+{
+    await ClusterRun.RunAsync(options);
+    return;
+}
+
 // Records drained and steps run come from the library's own meter rather than from the
 // harness's bookkeeping: it is the number the circuit actually processed.
 long recordsDrained = 0, stepsRun = 0;

@@ -1,3 +1,4 @@
+using Incremental.Cluster;
 using Incremental.Storage;
 
 namespace Incremental.Operators;
@@ -313,30 +314,102 @@ internal sealed class ExchangeOperator<T>(Func<T, uint> routingHash) : IExchange
         return merged;
     }
 
-    // Wire encoding reuses the storage serializer (JSON with fields included, so tuple keys
-    // round-trip): a delta batch is just (value, weight) pairs, one array per target worker.
+    // Wire encoding: a frame is one shard per target worker, each a run of (value, weight)
+    // pairs. Values go through the dense codec when T has one — field values in order, no
+    // names, LEB128 integers — and fall back to the storage serializer's JSON otherwise. The
+    // decision is a property of T, so both ends of a mesh (same build, same types) make it
+    // identically; the format byte on the frame catches the case where they somehow do not.
+    //
+    // Scratch is per instance and only the designated worker serializes, so the buffers below
+    // are single-threaded like everything else here.
+    private WireWriter? _wireWriter;
+    private WireReader? _wireReader;
+    private ZSet<T>? _shard;
+
+    private const byte JsonFrame = 0;
 
     public byte[] SerializeShards(object[][] senderFragments, int firstShard, int count)
     {
-        var shards = new WeightedValue<T>[count][];
+        var shard = _shard ??= new ZSet<T>();
+        if (WireCodec<T>.Write is not { } write)
+        {
+            var shards = new WeightedValue<T>[count][];
+            for (var k = 0; k < count; k++)
+            {
+                shard.Clear();
+                MergeShard(senderFragments, firstShard + k, shard);
+                shards[k] = [.. shard];
+            }
+            var json = System.Text.Encoding.UTF8.GetBytes(JsonStateSerializer.Instance.Serialize(shards));
+            var framed = new byte[json.Length + 1];
+            framed[0] = JsonFrame;
+            json.CopyTo(framed, 1);
+            return framed;
+        }
+
+        var writer = _wireWriter ??= new WireWriter();
+        writer.Reset();
+        writer.WriteByte(WireCodec.FormatVersion);
+        writer.WriteUInt32((uint)count);
         for (var k = 0; k < count; k++)
         {
-            var merged = new ZSet<T>();
-            foreach (var fragments in senderFragments)
-                if (fragments[firstShard + k] is ZSet<T> { IsEmpty: false } fragment)
-                    merged.AddAll(fragment);
-            shards[k] = [.. merged];
+            shard.Clear();
+            MergeShard(senderFragments, firstShard + k, shard);
+            writer.WriteUInt32((uint)shard.DistinctCount);
+            foreach (var (value, weight) in shard)
+            {
+                write(writer, value);
+                writer.WriteInt64(weight);
+            }
         }
-        return System.Text.Encoding.UTF8.GetBytes(JsonStateSerializer.Instance.Serialize(shards));
+        return writer.ToArray();
+    }
+
+    private static void MergeShard(object[][] senderFragments, int shard, ZSet<T> into)
+    {
+        foreach (var fragments in senderFragments)
+            if (fragments[shard] is ZSet<T> { IsEmpty: false } fragment)
+                into.AddAll(fragment);
     }
 
     public object[] DeserializeShards(byte[] payload)
     {
-        var shards = JsonStateSerializer.Instance.Deserialize<WeightedValue<T>[][]>(
-            System.Text.Encoding.UTF8.GetString(payload));
-        var result = new object[shards.Length];
-        for (var k = 0; k < shards.Length; k++)
-            result[k] = new ZSet<T>(shards[k]);
+        if (payload.Length == 0)
+            throw new InvalidDataException("Received an empty exchange frame.");
+        if (payload[0] == JsonFrame)
+        {
+            var shards = JsonStateSerializer.Instance.Deserialize<WeightedValue<T>[][]>(
+                System.Text.Encoding.UTF8.GetString(payload, 1, payload.Length - 1));
+            var decoded = new object[shards.Length];
+            for (var k = 0; k < shards.Length; k++)
+                decoded[k] = new ZSet<T>(shards[k]);
+            return decoded;
+        }
+        if (payload[0] != WireCodec.FormatVersion)
+            throw new InvalidDataException(
+                $"Exchange frame carries wire format {payload[0]}, but this process speaks {WireCodec.FormatVersion}. " +
+                "Every process of a cluster must run the same build.");
+
+        var read = WireCodec<T>.Read
+            ?? throw new InvalidDataException(
+                $"Received a dense exchange frame for '{typeof(T)}', which this process has no dense codec for. " +
+                "Every process of a cluster must run the same build.");
+        var reader = _wireReader ??= new WireReader();
+        reader.Reset(payload);
+        reader.ReadByte(); // format, already checked
+        var count = (int)reader.ReadUInt32();
+        var result = new object[count];
+        for (var k = 0; k < count; k++)
+        {
+            var entries = (int)reader.ReadUInt32();
+            var zset = new ZSet<T>(entries);
+            for (var i = 0; i < entries; i++)
+            {
+                var value = read(reader);
+                zset.Add(value, reader.ReadInt64());
+            }
+            result[k] = zset;
+        }
         return result;
     }
 }
