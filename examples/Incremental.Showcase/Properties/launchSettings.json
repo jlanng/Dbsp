@@ -1,0 +1,24 @@
+{
+  "profiles": {
+    "Showcase": {
+      "commandName": "Project",
+      "launchBrowser": false,
+      "dotnetRunMessages": true
+    },
+    "Showcase (Redis)": {
+      "commandName": "Project",
+      "launchBrowser": false,
+      "commandLineArgs": "--redis"
+    },
+    "Showcase (two processes)": {
+      "commandName": "Project",
+      "launchBrowser": false,
+      "commandLineArgs": "--cluster"
+    },
+    "Showcase (headless smoke test)": {
+      "commandName": "Project",
+      "launchBrowser": false,
+      "commandLineArgs": "--headless"
+    }
+  }
+}

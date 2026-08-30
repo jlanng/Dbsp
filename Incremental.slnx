@@ -5,6 +5,7 @@
   <Folder Name="/examples/">
     <Project Path="examples/Incremental.Example/Incremental.Example.csproj" />
     <Project Path="examples/Incremental.LogAnalytics/Incremental.LogAnalytics.csproj" />
+    <Project Path="examples/Incremental.Showcase/Incremental.Showcase.csproj" />
     <Project Path="examples/Incremental.TaxiAnalytics/Incremental.TaxiAnalytics.csproj" />
     <Project Path="examples/Incremental.TradeEnrichment/Incremental.TradeEnrichment.csproj" />
   </Folder>
