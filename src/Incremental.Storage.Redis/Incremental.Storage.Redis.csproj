@@ -1,4 +1,9 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Incremental.Storage.Redis</PackageId>
+    <Description>Redis-backed storage provider for Incremental: operator state in Redis hashes with atomic checkpoints (state + input offsets in one MULTI/EXEC) for exactly-once restart.</Description>
+  </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Incremental\Incremental.csproj" />
@@ -7,11 +12,5 @@
   <ItemGroup>
     <PackageReference Include="StackExchange.Redis" Version="3.1.31" />
   </ItemGroup>
-
-  <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-  </PropertyGroup>
 
 </Project>
