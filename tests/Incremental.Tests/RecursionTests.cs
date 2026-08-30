@@ -14,26 +14,28 @@ public class RecursionTests
         new(new CircuitOptions { AutoStep = false, Workers = workers });
 
     /// <summary>closure = fix X. Distinct(edges ∪ {(p.From, e.To) | p ∈ X, e ∈ edges, p.To = e.From})</summary>
-    private static void DefineClosure(CircuitBuilder builder, int maxIterations = 10_000)
+    private static (InputStream<(string From, string To)> Edges, Output<(string From, string To)> Closure)
+        DefineClosure(CircuitBuilder builder, int maxIterations = 10_000)
     {
         var edges = builder.Input<(string From, string To)>("edges");
-        edges.Recurse(paths => paths
-                .IndexBy(p => p.To)
-                .Join(edges.IndexBy(e => e.From), (_, p, e) => (p.From, e.To)),
+        var closure = edges.Recurse(paths => paths
+                .GroupBy(p => p.To)
+                .Join(edges.GroupBy(e => e.From), (_, p, e) => (p.From, e.To)),
                 maxIterations)
-            .Output("closure");
+            .ToOutput();
+        return (edges, closure);
     }
 
     [Fact]
     public async Task Transitive_closure_grows_incrementally()
     {
         var builder = ManualBuilder();
-        DefineClosure(builder);
+        var (edgesDef, closureDef) = DefineClosure(builder);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var edges = circuit.Input<(string From, string To)>("edges");
-        var closure = circuit.Output<(string From, string To)>("closure");
+        var edges = circuit.Handle(edgesDef);
+        var closure = circuit.Handle(closureDef);
 
         await edges.InsertAsync(("a", "b"));
         await circuit.StepAsync();
@@ -62,12 +64,12 @@ public class RecursionTests
     public async Task Edge_deletion_retracts_exactly_the_lost_paths()
     {
         var builder = ManualBuilder();
-        DefineClosure(builder);
+        var (edgesDef, closureDef) = DefineClosure(builder);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var edges = circuit.Input<(string From, string To)>("edges");
-        var closure = circuit.Output<(string From, string To)>("closure");
+        var edges = circuit.Handle(edgesDef);
+        var closure = circuit.Handle(closureDef);
 
         // Diamond: a→b→d and a→c→d. The path (a, d) has two derivations.
         await edges.InsertAsync(("a", "b"));
@@ -99,12 +101,12 @@ public class RecursionTests
     public async Task Cyclic_graph_converges_and_unwinds()
     {
         var builder = ManualBuilder();
-        DefineClosure(builder);
+        var (edgesDef, closureDef) = DefineClosure(builder);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var edges = circuit.Input<(string From, string To)>("edges");
-        var closure = circuit.Output<(string From, string To)>("closure");
+        var edges = circuit.Handle(edgesDef);
+        var closure = circuit.Handle(closureDef);
 
         // A 3-cycle: every node reaches every node, including itself.
         await edges.InsertAsync(("a", "b"));
@@ -137,12 +139,12 @@ public class RecursionTests
         // ((b, a) ⋈ a→a → (b, a)). Deleting the edge b→a must retract the path even though
         // the cyclic derivation still "supports" it — support that is not well-founded.
         var builder = ManualBuilder();
-        DefineClosure(builder);
+        var (edgesDef, closureDef) = DefineClosure(builder);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var edges = circuit.Input<(string From, string To)>("edges");
-        var closure = circuit.Output<(string From, string To)>("closure");
+        var edges = circuit.Handle(edgesDef);
+        var closure = circuit.Handle(closureDef);
 
         await edges.InsertAsync(("a", "a"));
         await edges.InsertAsync(("b", "a"));
@@ -163,12 +165,12 @@ public class RecursionTests
     public async Task Duplicate_edges_keep_paths_until_the_last_copy_is_removed()
     {
         var builder = ManualBuilder();
-        DefineClosure(builder);
+        var (edgesDef, closureDef) = DefineClosure(builder);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var edges = circuit.Input<(string From, string To)>("edges");
-        var closure = circuit.Output<(string From, string To)>("closure");
+        var edges = circuit.Handle(edgesDef);
+        var closure = circuit.Handle(closureDef);
 
         await edges.InsertAsync(("a", "b"));
         await edges.InsertAsync(("a", "b"));
@@ -198,15 +200,15 @@ public class RecursionTests
         // The same fixed point, phrased as a hierarchy: ancestors = reports ∪ (ancestors ∘ reports).
         var builder = ManualBuilder();
         var reports = builder.Input<(string Person, string Manager)>("reports");
-        reports.Recurse(ancestors => ancestors
-                .IndexBy(a => a.Manager)
-                .Join(reports.IndexBy(r => r.Person), (_, a, r) => (a.Person, r.Manager)))
-            .Output("ancestors");
+        var ancestorsDef = reports.Recurse(ancestors => ancestors
+                .GroupBy(a => a.Manager)
+                .Join(reports.GroupBy(r => r.Person), (_, a, r) => (a.Person, r.Manager)))
+            .ToOutput();
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string Person, string Manager)>("reports");
-        var output = circuit.Output<(string Person, string Manager)>("ancestors");
+        var input = circuit.Handle(reports);
+        var output = circuit.Handle(ancestorsDef);
 
         await input.InsertAsync(("dave", "carol"));
         await input.InsertAsync(("carol", "bob"));
@@ -239,12 +241,12 @@ public class RecursionTests
         // self-loops all arise) and after every step compare the integrated closure against
         // reachability recomputed from scratch on the current edge multiset.
         var builder = ManualBuilder(workers);
-        DefineClosure(builder);
+        var (edgesDef, closureDef) = DefineClosure(builder);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var edgesIn = circuit.Input<(string From, string To)>("edges");
-        var closure = circuit.Output<(string From, string To)>("closure");
+        var edgesIn = circuit.Handle(edgesDef);
+        var closure = circuit.Handle(closureDef);
 
         var nodes = new[] { "a", "b", "c", "d", "e", "f" };
         var random = new Random(20260828);
@@ -301,7 +303,7 @@ public class RecursionTests
     public async Task Multi_worker_deltas_match_single_worker()
     {
         // The same scripted churn through a 1-worker and a 4-worker circuit must integrate
-        // to identical per-step states — exchanges inside the loop (the body's IndexBy and
+        // to identical per-step states — exchanges inside the loop (the body's GroupBy and
         // the stabilizer's shuffle) reshard every iteration, and convergence is global.
         var script = new (string From, string To, bool Insert)[]
         {
@@ -317,11 +319,11 @@ public class RecursionTests
         foreach (var workers in new[] { 1, 4 })
         {
             var builder = ManualBuilder(workers);
-            DefineClosure(builder);
+            var (edgesDef, closureDef) = DefineClosure(builder);
             await using var circuit = builder.Build();
             circuit.Start();
-            var edges = circuit.Input<(string From, string To)>("edges");
-            var closure = circuit.Output<(string From, string To)>("closure");
+            var edges = circuit.Handle(edgesDef);
+            var closure = circuit.Handle(closureDef);
             var integrated = workers == 1 ? single : multi;
 
             foreach (var (from, to, insert) in script)
@@ -347,19 +349,19 @@ public class RecursionTests
         // AutoStep batches the inserts into arbitrary steps, so the loop's cross-step
         // iteration profiles get exercised under nondeterministic step boundaries.
         var builder = new CircuitBuilder(new CircuitOptions { Workers = 4 });
-        DefineClosure(builder);
+        var (edgesDef, closureDef) = DefineClosure(builder);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var edges = circuit.Input<(string From, string To)>("edges");
-        var closure = circuit.Output<(string From, string To)>("closure");
+        var edges = circuit.Handle(edgesDef);
+        var closure = circuit.Handle(closureDef);
 
         for (var i = 0; i < 20; i++)
             await edges.InsertAsync(($"n{i}", $"n{i + 1}"));
         edges.Complete();
 
         var integrated = new ZSet<(string From, string To)>();
-        await foreach (var delta in closure.ReadAllAsync())
+        await foreach (var delta in closure.Changes())
             integrated.AddAll(delta);
 
         // A 21-node chain closes to every ordered pair i < j.
@@ -374,11 +376,11 @@ public class RecursionTests
     {
         // A 7-hop chain needs more than 3 iterations to close; the guard faults the step.
         var builder = ManualBuilder();
-        DefineClosure(builder, maxIterations: 3);
+        var (edgesDef, _) = DefineClosure(builder, maxIterations: 3);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var edges = circuit.Input<(string From, string To)>("edges");
+        var edges = circuit.Handle(edgesDef);
 
         for (var i = 0; i < 7; i++)
             await edges.InsertAsync(($"n{i}", $"n{i + 1}"));
@@ -397,13 +399,13 @@ public class RecursionTests
         edges.Recurse(paths =>
         {
             leaked = paths;
-            return paths.IndexBy(p => p.To)
-                .Join(edges.IndexBy(e => e.From), (_, p, e) => (p.From, e.To));
+            return paths.GroupBy(p => p.To)
+                .Join(edges.GroupBy(e => e.From), (_, p, e) => (p.From, e.To));
         });
 
         // Per-iteration deltas are meaningless outside the loop; only Recurse's result escapes.
-        Assert.Throws<InvalidOperationException>(() => leaked!.Map(p => p.From));
-        Assert.Throws<InvalidOperationException>(() => leaked!.Output("boom"));
+        Assert.Throws<InvalidOperationException>(() => leaked!.Select(p => p.From));
+        Assert.Throws<InvalidOperationException>(() => leaked!.ToOutput());
     }
 
     [Fact]
@@ -413,6 +415,6 @@ public class RecursionTests
         var edges = builder.Input<(string From, string To)>("edges");
 
         Assert.Throws<NotSupportedException>(() =>
-            edges.Recurse(paths => paths.IndexBy(p => p.From).Count().Values().Map(_ => ("", ""))));
+            edges.Recurse(paths => paths.GroupBy(p => p.From).Count().Values().Select(_ => ("", ""))));
     }
 }

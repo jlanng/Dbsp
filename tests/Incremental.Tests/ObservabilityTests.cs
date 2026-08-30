@@ -23,9 +23,10 @@ public class ObservabilityTests
             Name = $"log-test-{Guid.NewGuid():N}",
             LoggerFactory = logs,
         });
-        builder.Input<int>("numbers")
-            .Map(n => n == 13 ? throw new InvalidOperationException("boom") : n)
-            .Output("result");
+        var numbers = builder.Input<int>("numbers");
+        numbers
+            .Select(n => n == 13 ? throw new InvalidOperationException("boom") : n)
+            .ToOutput();
 
         await using var circuit = builder.Build();
         Assert.Contains(logs.Entries, e =>
@@ -35,7 +36,7 @@ public class ObservabilityTests
         Assert.Contains(logs.Entries, e =>
             e is { Category: "Incremental.Circuit", Level: LogLevel.Information } && e.Message.Contains("started"));
 
-        var input = circuit.Input<int>("numbers");
+        var input = circuit.Handle(numbers);
         await input.InsertAsync(13);
         await Assert.ThrowsAsync<InvalidOperationException>(() => circuit.StepAsync());
 
@@ -56,13 +57,14 @@ public class ObservabilityTests
             Name = name,
             Storage = new InMemoryCheckpointStorageProvider(),
         });
-        builder.Input<int>("numbers")
-            .Map(n => n == 13 ? throw new InvalidOperationException("boom") : n)
-            .Output("result");
+        var numbers = builder.Input<int>("numbers");
+        numbers
+            .Select(n => n == 13 ? throw new InvalidOperationException("boom") : n)
+            .ToOutput();
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<int>("numbers");
+        var input = circuit.Handle(numbers);
 
         await input.InsertAsync(1);
         await input.InsertAsync(2);

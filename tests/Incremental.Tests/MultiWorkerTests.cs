@@ -11,15 +11,16 @@ public class MultiWorkerTests
     public async Task Grouped_count_is_correct_across_workers()
     {
         var builder = new CircuitBuilder(new CircuitOptions { Workers = 4 });
-        builder.Input<string>("words")
-            .IndexBy(w => w)
+        var words = builder.Input<string>("words");
+        var countsDef = words
+            .GroupBy(w => w)
             .Count()
-            .Output("counts");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<string>("words");
-        var output = circuit.Output<KeyedValue<string, long>>("counts");
+        var input = circuit.Handle(words);
+        var output = circuit.Handle(countsDef);
 
         var expected = new Dictionary<string, long>();
         for (var i = 0; i < 5000; i++)
@@ -31,7 +32,7 @@ public class MultiWorkerTests
         input.Complete();
 
         var integrated = new ZSet<KeyedValue<string, long>>();
-        await foreach (var delta in output.ReadAllAsync())
+        await foreach (var delta in output.Changes())
             integrated.AddAll(delta);
 
         // After integration exactly one (word, count) row per word remains, with weight +1.
@@ -47,15 +48,15 @@ public class MultiWorkerTests
         var left = builder.Input<(int Key, string Tag)>("left");
         var right = builder.Input<(int Key, int Value)>("right");
 
-        left.IndexBy(l => l.Key)
-            .Join(right.IndexBy(r => r.Key), (key, l, r) => (key, l.Tag, r.Value))
-            .Output("joined");
+        var joinedDef = left.GroupBy(l => l.Key)
+            .Join(right.GroupBy(r => r.Key), (key, l, r) => (key, l.Tag, r.Value))
+            .ToOutput();
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var leftIn = circuit.Input<(int Key, string Tag)>("left");
-        var rightIn = circuit.Input<(int Key, int Value)>("right");
-        var output = circuit.Output<(int Key, string Tag, int Value)>("joined");
+        var leftIn = circuit.Handle(left);
+        var rightIn = circuit.Handle(right);
+        var output = circuit.Handle(joinedDef);
 
         const int keys = 100;
         for (var k = 0; k < keys; k++)
@@ -67,7 +68,7 @@ public class MultiWorkerTests
         rightIn.Complete();
 
         var integrated = new ZSet<(int, string, int)>();
-        await foreach (var delta in output.ReadAllAsync())
+        await foreach (var delta in output.Changes())
             integrated.AddAll(delta);
 
         Assert.Equal(keys, integrated.DistinctCount);
@@ -79,12 +80,13 @@ public class MultiWorkerTests
     public async Task Distinct_state_is_consistent_across_workers()
     {
         var builder = new CircuitBuilder(new CircuitOptions { Workers = 4 });
-        builder.Input<int>("values").Distinct().Output("distinct");
+        var values = builder.Input<int>("values");
+        var distinctDef = values.Distinct().ToOutput();
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<int>("values");
-        var output = circuit.Output<int>("distinct");
+        var input = circuit.Handle(values);
+        var output = circuit.Handle(distinctDef);
 
         // Every value inserted three times; round-robin input placement would split copies
         // across workers if Distinct did not shuffle by value first.
@@ -94,7 +96,7 @@ public class MultiWorkerTests
         input.Complete();
 
         var integrated = new ZSet<int>();
-        await foreach (var delta in output.ReadAllAsync())
+        await foreach (var delta in output.Changes())
             integrated.AddAll(delta);
 
         Assert.Equal(200, integrated.DistinctCount);

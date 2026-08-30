@@ -23,16 +23,17 @@ public class SumBenchmarks
     public async Task Setup()
     {
         var builder = new CircuitBuilder(Rig.Options());
-        builder.Input<(int Key, long Amount)>("rows")
-            .IndexBy(r => r.Key)
+        var rows = builder.Input<(int Key, long Amount)>("rows");
+        var sums = rows
+            .GroupBy(r => r.Key)
             .Sum(r => r.Amount)
-            .Output("sums");
+            .ToOutput(bootstrap: false); // measure the aggregate, not snapshot maintenance
 
         var circuit = builder.Build();
         circuit.Start();
         _rig = new Rig(circuit);
-        _rig.Watch<KeyedValue<int, long>>("sums");
-        _input = circuit.Input<(int Key, long Amount)>("rows");
+        _rig.Watch(sums);
+        _input = circuit.Handle(rows);
 
         await _rig.FeedAsync(_input, Enumerable.Range(0, GroupCount)
             .Select(i => new WeightedValue<(int, long)>((i, i), 1)));
@@ -77,16 +78,17 @@ public class MinBenchmarks
     public async Task Setup()
     {
         var builder = new CircuitBuilder(Rig.Options());
-        builder.Input<(int Key, int Value)>("rows")
-            .IndexBy(r => r.Key)
+        var rows = builder.Input<(int Key, int Value)>("rows");
+        var mins = rows
+            .GroupBy(r => r.Key)
             .Min(r => r.Value)
-            .Output("mins");
+            .ToOutput(bootstrap: false); // measure the aggregate, not snapshot maintenance
 
         var circuit = builder.Build();
         circuit.Start();
         _rig = new Rig(circuit);
-        _rig.Watch<KeyedValue<int, int>>("mins");
-        _input = circuit.Input<(int Key, int Value)>("rows");
+        _rig.Watch(mins);
+        _input = circuit.Handle(rows);
 
         await _rig.FeedAsync(_input,
             from key in Enumerable.Range(0, Groups)
@@ -131,16 +133,17 @@ public class TopKBenchmarks
     public async Task Setup()
     {
         var builder = new CircuitBuilder(Rig.Options());
-        builder.Input<(int Key, int Score)>("rows")
-            .IndexBy(r => r.Key)
+        var rows = builder.Input<(int Key, int Score)>("rows");
+        var top = rows
+            .GroupBy(r => r.Key)
             .TopK(K, r => r.Score)
-            .Output("top");
+            .ToOutput(bootstrap: false); // measure the operator, not snapshot maintenance
 
         var circuit = builder.Build();
         circuit.Start();
         _rig = new Rig(circuit);
-        _rig.Watch<KeyedValue<int, (int Key, int Score)>>("top");
-        _input = circuit.Input<(int Key, int Score)>("rows");
+        _rig.Watch(top);
+        _input = circuit.Handle(rows);
 
         await _rig.FeedAsync(_input,
             from key in Enumerable.Range(0, Groups)

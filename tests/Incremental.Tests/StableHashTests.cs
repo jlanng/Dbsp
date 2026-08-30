@@ -93,38 +93,39 @@ public class StableHashTests
     }
 
     [Fact]
-    public void Sharded_IndexBy_rejects_unhashable_key_types_at_definition_time()
+    public void Sharded_GroupBy_rejects_unhashable_key_types_at_definition_time()
     {
         var builder = new CircuitBuilder(new CircuitOptions { Workers = 2 });
         var e = Assert.Throws<InvalidOperationException>(() =>
-            builder.Input<int>("numbers").IndexBy(v => new NoPublicMembers(v)));
+            builder.Input<int>("numbers").GroupBy(v => new NoPublicMembers(v)));
         Assert.Contains("stableHash", e.Message);
 
         // A single-worker circuit never exchanges, so the same key type is accepted.
         var singleWorker = new CircuitBuilder(new CircuitOptions { Workers = 1 });
-        singleWorker.Input<int>("numbers").IndexBy(v => new NoPublicMembers(v)).Count().Output("counts");
+        singleWorker.Input<int>("numbers").GroupBy(v => new NoPublicMembers(v)).Count().ToOutput(bootstrap: false);
     }
 
     [Fact]
     public async Task Custom_stable_hash_overload_routes_unhashable_keys()
     {
         var builder = new CircuitBuilder(new CircuitOptions { Workers = 4 });
-        builder.Input<int>("numbers")
-            .IndexBy(v => new NoPublicMembers(v % 3), k => (uint)k.Value)
+        var numbers = builder.Input<int>("numbers");
+        var countsDef = numbers
+            .GroupBy(v => new NoPublicMembers(v % 3), k => (uint)k.Value)
             .Count()
-            .Output("counts");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<int>("numbers");
-        var output = circuit.Output<KeyedValue<NoPublicMembers, long>>("counts");
+        var input = circuit.Handle(numbers);
+        var output = circuit.Handle(countsDef);
 
         for (var i = 0; i < 300; i++)
             await input.InsertAsync(i);
         input.Complete();
 
         var integrated = new ZSet<KeyedValue<NoPublicMembers, long>>();
-        await foreach (var delta in output.ReadAllAsync())
+        await foreach (var delta in output.Changes())
             integrated.AddAll(delta);
 
         Assert.Equal(3, integrated.DistinctCount);

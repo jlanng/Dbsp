@@ -13,7 +13,12 @@ namespace Incremental.Tests;
 /// </summary>
 public class StateManifestTests
 {
-    private static CircuitBuilder Pipeline(
+    private sealed record ManifestPipeline(
+        CircuitBuilder Builder,
+        InputStream<(int Id, string Region)> Orders,
+        Output<KeyedValue<string, long>> Counts);
+
+    private static ManifestPipeline Pipeline(
         IStorageProvider storage,
         int workers = 1,
         bool extraFilter = false,
@@ -27,14 +32,14 @@ public class StateManifestTests
             Storage = storage,
         });
         var orders = builder.Input<(int Id, string Region)>("orders");
-        var stream = extraFilter ? orders.Filter(o => o.Id != 0) : orders;
-        var counts = stream.IndexBy(o => o.Region).Count();
+        ZStream<(int Id, string Region)> stream = extraFilter ? orders.Where(o => o.Id != 0) : orders;
+        var counts = stream.GroupBy(o => o.Region).Count();
         if (named)
             counts = counts.Named("region-counts");
-        counts.Output("counts");
+        var countsDef = counts.ToOutput(bootstrap: false);
         if (extraBranch)
-            orders.IndexBy(o => o.Id).Count().Output("byId");
-        return builder;
+            orders.GroupBy(o => o.Id).Count().ToOutput(bootstrap: false);
+        return new ManifestPipeline(builder, orders, countsDef);
     }
 
     private static KeyedValue<string, long> Row(string region, long count) => new(region, count);
@@ -42,13 +47,14 @@ public class StateManifestTests
     private static async Task<InMemoryCheckpointStorageProvider> CommittedRun(bool named = false, int workers = 1)
     {
         var storage = new InMemoryCheckpointStorageProvider();
-        await using var circuit = Pipeline(storage, workers: workers, named: named).Build();
+        var pipeline = Pipeline(storage, workers: workers, named: named);
+        await using var circuit = pipeline.Builder.Build();
         circuit.Start();
-        var input = circuit.Input<(int Id, string Region)>("orders");
+        var input = circuit.Handle(pipeline.Orders);
         await input.SendAsync((1, "emea"), 1, offset: 10);
         await input.SendAsync((2, "emea"), 1, offset: 11);
         await circuit.StepAsync();
-        var delta = await circuit.Output<KeyedValue<string, long>>("counts").Reader.ReadAsync();
+        var delta = await circuit.Handle(pipeline.Counts).Reader.ReadAsync();
         Assert.Equal(1, delta.WeightOf(Row("emea", 2)));
         return storage;
     }
@@ -61,7 +67,7 @@ public class StateManifestTests
         // The extra filter renumbers every node downstream of the input, so the count's
         // positional store name no longer matches the committed one — silent corruption
         // territory, refused loudly at Start instead.
-        await using var evolved = Pipeline(storage, extraFilter: true).Build();
+        await using var evolved = Pipeline(storage, extraFilter: true).Builder.Build();
         var error = Assert.Throws<InvalidOperationException>(evolved.Start);
         Assert.Contains("does not match the checkpoint", error.Message);
         Assert.Contains(".Named", error.Message);
@@ -75,14 +81,15 @@ public class StateManifestTests
 
         // Same evolution, but the count's state is keyed by its name, not its position:
         // the rebuilt circuit resumes it and the new record lands on the recovered 2.
-        await using var evolved = Pipeline(storage, extraFilter: true, named: true).Build();
+        var evolvedPipeline = Pipeline(storage, extraFilter: true, named: true);
+        await using var evolved = evolvedPipeline.Builder.Build();
         evolved.Start();
         Assert.Equal(11L, evolved.CommittedOffset("orders"));
 
-        var input = evolved.Input<(int Id, string Region)>("orders");
+        var input = evolved.Handle(evolvedPipeline.Orders);
         await input.SendAsync((3, "emea"), 1, offset: 12);
         await evolved.StepAsync();
-        var delta = await evolved.Output<KeyedValue<string, long>>("counts").Reader.ReadAsync();
+        var delta = await evolved.Handle(evolvedPipeline.Counts).Reader.ReadAsync();
         Assert.Equal(-1, delta.WeightOf(Row("emea", 2)));
         Assert.Equal(1, delta.WeightOf(Row("emea", 3)));
     }
@@ -92,7 +99,7 @@ public class StateManifestTests
     {
         var storage = await CommittedRun(workers: 2);
 
-        await using var evolved = Pipeline(storage, workers: 1).Build();
+        await using var evolved = Pipeline(storage, workers: 1).Builder.Build();
         var error = Assert.Throws<InvalidOperationException>(evolved.Start);
         Assert.Contains("workers", error.Message);
         Assert.Contains("workers=2", error.Message);
@@ -106,13 +113,14 @@ public class StateManifestTests
 
         // Appending a new branch adds stores (they start empty) without disturbing any
         // existing identity: the restore proceeds and the old state is intact.
-        await using var evolved = Pipeline(storage, extraBranch: true).Build();
+        var evolvedPipeline = Pipeline(storage, extraBranch: true);
+        await using var evolved = evolvedPipeline.Builder.Build();
         evolved.Start();
 
-        var input = evolved.Input<(int Id, string Region)>("orders");
+        var input = evolved.Handle(evolvedPipeline.Orders);
         await input.SendAsync((3, "emea"), 1, offset: 12);
         await evolved.StepAsync();
-        var delta = await evolved.Output<KeyedValue<string, long>>("counts").Reader.ReadAsync();
+        var delta = await evolved.Handle(evolvedPipeline.Counts).Reader.ReadAsync();
         Assert.Equal(-1, delta.WeightOf(Row("emea", 2)));
         Assert.Equal(1, delta.WeightOf(Row("emea", 3)));
     }
@@ -122,8 +130,8 @@ public class StateManifestTests
     {
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false });
         var orders = builder.Input<(int Id, string Region)>("orders");
-        orders.IndexBy(o => o.Region).Count().Named("counts").Output("byRegion");
-        orders.IndexBy(o => o.Id).Count().Named("counts").Output("byId");
+        orders.GroupBy(o => o.Region).Count().Named("counts").ToOutput(bootstrap: false);
+        orders.GroupBy(o => o.Id).Count().Named("counts").ToOutput(bootstrap: false);
         var error = Assert.Throws<InvalidOperationException>(() => builder.Build());
         Assert.Contains("'counts'", error.Message);
     }
@@ -132,7 +140,7 @@ public class StateManifestTests
     public void Invalid_operator_names_are_rejected_immediately()
     {
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false });
-        var counts = builder.Input<(int Id, string Region)>("orders").IndexBy(o => o.Region).Count();
+        var counts = builder.Input<(int Id, string Region)>("orders").GroupBy(o => o.Region).Count();
         Assert.Throws<ArgumentException>(() => counts.Named("has space"));
         Assert.Throws<ArgumentException>(() => counts.Named("dotted.name"));
         Assert.Throws<ArgumentException>(() => counts.Named(""));
@@ -147,27 +155,28 @@ public class StateManifestTests
         var prefix = $"sp-test:{Guid.NewGuid():N}";
 
         var storage = new RedisStorageProvider(redis, new RedisStorageOptions { KeyPrefix = prefix });
-        await using (var circuit = Pipeline(storage).Build())
+        var redisPipeline = Pipeline(storage);
+        await using (var circuit = redisPipeline.Builder.Build())
         {
             circuit.Start();
-            var input = circuit.Input<(int Id, string Region)>("orders");
+            var input = circuit.Handle(redisPipeline.Orders);
             await input.SendAsync((1, "emea"), 1, offset: 10);
             await circuit.StepAsync();
-            var delta = await circuit.Output<KeyedValue<string, long>>("counts").Reader.ReadAsync();
+            var delta = await circuit.Handle(redisPipeline.Counts).Reader.ReadAsync();
             Assert.Equal(1, delta.WeightOf(Row("emea", 1)));
         }
 
         // A fresh provider over the same prefix — the real restart shape. The identical
         // circuit resumes; the evolved one is refused by the committed manifest.
         var resumedStorage = new RedisStorageProvider(redis, new RedisStorageOptions { KeyPrefix = prefix });
-        await using (var resumed = Pipeline(resumedStorage).Build())
+        await using (var resumed = Pipeline(resumedStorage).Builder.Build())
         {
             resumed.Start();
             Assert.Equal(10L, resumed.CommittedOffset("orders"));
         }
 
         var evolvedStorage = new RedisStorageProvider(redis, new RedisStorageOptions { KeyPrefix = prefix });
-        await using var evolved = Pipeline(evolvedStorage, extraFilter: true).Build();
+        await using var evolved = Pipeline(evolvedStorage, extraFilter: true).Builder.Build();
         var error = Assert.Throws<InvalidOperationException>(evolved.Start);
         Assert.Contains("does not match the checkpoint", error.Message);
     }

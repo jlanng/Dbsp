@@ -15,7 +15,12 @@ namespace Incremental.Tests;
 /// </summary>
 public class CheckpointTests
 {
-    private static CircuitBuilder CountByRegion(IStorageProvider storage, int workers = 1, int interval = 1)
+    private sealed record CountPipeline(
+        CircuitBuilder Builder,
+        InputStream<(int Id, string Region)> Orders,
+        Output<KeyedValue<string, long>> Counts);
+
+    private static CountPipeline CountByRegion(IStorageProvider storage, int workers = 1, int interval = 1)
     {
         var builder = new CircuitBuilder(new CircuitOptions
         {
@@ -24,11 +29,10 @@ public class CheckpointTests
             Storage = storage,
             CheckpointInterval = interval,
         });
-        builder.Input<(int Id, string Region)>("orders")
-            .IndexBy(o => o.Region)
-            .Count()
-            .Output("counts");
-        return builder;
+        var orders = builder.Input<(int Id, string Region)>("orders");
+        // bootstrap: false — these tests integrate raw per-step batches themselves.
+        var counts = orders.GroupBy(o => o.Region).Count().ToOutput(bootstrap: false);
+        return new CountPipeline(builder, orders, counts);
     }
 
     private static KeyedValue<string, long> Row(string region, long count) => new(region, count);
@@ -37,9 +41,10 @@ public class CheckpointTests
     public async Task Offsets_advance_as_steps_commit()
     {
         var storage = new InMemoryCheckpointStorageProvider();
-        await using var circuit = CountByRegion(storage).Build();
+        var pipeline = CountByRegion(storage);
+        await using var circuit = pipeline.Builder.Build();
         circuit.Start();
-        var input = circuit.Input<(int Id, string Region)>("orders");
+        var input = circuit.Handle(pipeline.Orders);
 
         Assert.Null(circuit.CommittedOffset("orders"));
         Assert.Throws<KeyNotFoundException>(() => circuit.CommittedOffset("nope"));
@@ -59,11 +64,12 @@ public class CheckpointTests
     {
         var storage = new InMemoryCheckpointStorageProvider();
 
-        await using (var circuit = CountByRegion(storage).Build())
+        var pipeline = CountByRegion(storage);
+        await using (var circuit = pipeline.Builder.Build())
         {
             circuit.Start();
-            var input = circuit.Input<(int Id, string Region)>("orders");
-            var output = circuit.Output<KeyedValue<string, long>>("counts");
+            var input = circuit.Handle(pipeline.Orders);
+            var output = circuit.Handle(pipeline.Counts);
             await input.SendAsync((1, "emea"), 1, offset: 10);
             await input.SendAsync((2, "emea"), 1, offset: 11);
             await circuit.StepAsync();
@@ -73,12 +79,13 @@ public class CheckpointTests
 
         // "Restart": a new circuit over the same provider recovers the committed offsets,
         // and a producer replaying its source is deduplicated up to the checkpoint.
-        await using var resumed = CountByRegion(storage).Build();
+        var resumedPipeline = CountByRegion(storage);
+        await using var resumed = resumedPipeline.Builder.Build();
         resumed.Start();
         Assert.Equal(11L, resumed.CommittedOffset("orders"));
 
-        var replay = resumed.Input<(int Id, string Region)>("orders");
-        var counts = resumed.Output<KeyedValue<string, long>>("counts");
+        var replay = resumed.Handle(resumedPipeline.Orders);
+        var counts = resumed.Handle(resumedPipeline.Counts);
         await replay.SendAsync((1, "emea"), 1, offset: 10); // replayed — dropped
         await replay.SendAsync((2, "emea"), 1, offset: 11); // replayed — dropped
         await replay.SendAsync((3, "emea"), 1, offset: 12); // new
@@ -98,24 +105,26 @@ public class CheckpointTests
 
         // Interval 100: the step runs but commits nothing — then the circuit is abandoned
         // without disposing, the in-process equivalent of a crash between checkpoints.
-        var crashed = CountByRegion(storage, interval: 100).Build();
+        var crashedPipeline = CountByRegion(storage, interval: 100);
+        var crashed = crashedPipeline.Builder.Build();
         crashed.Start();
-        var input = crashed.Input<(int Id, string Region)>("orders");
-        var output = crashed.Output<KeyedValue<string, long>>("counts");
+        var input = crashed.Handle(crashedPipeline.Orders);
+        var output = crashed.Handle(crashedPipeline.Counts);
         await input.SendAsync((1, "emea"), 1, offset: 0);
         await crashed.StepAsync();
         var delta = await output.Reader.ReadAsync();
         Assert.Equal(1, delta.WeightOf(Row("emea", 1))); // staged state is visible in-run
         Assert.Null(crashed.CommittedOffset("orders"));  // but nothing is durable yet
 
-        await using var resumed = CountByRegion(storage).Build();
+        var resumedPipeline = CountByRegion(storage);
+        await using var resumed = resumedPipeline.Builder.Build();
         resumed.Start();
         Assert.Null(resumed.CommittedOffset("orders"));
 
         // Recovery rolled the staged count back, so re-sending offset 0 is not a duplicate
         // and counts from a clean slate — once, not twice.
-        var replay = resumed.Input<(int Id, string Region)>("orders");
-        var counts = resumed.Output<KeyedValue<string, long>>("counts");
+        var replay = resumed.Handle(resumedPipeline.Orders);
+        var counts = resumed.Handle(resumedPipeline.Counts);
         await replay.SendAsync((1, "emea"), 1, offset: 0);
         await resumed.StepAsync();
         var resumedDelta = await counts.Reader.ReadAsync();
@@ -127,10 +136,11 @@ public class CheckpointTests
     public async Task Interval_batches_commits_and_clean_shutdown_commits_the_tail()
     {
         var storage = new InMemoryCheckpointStorageProvider();
-        await using (var circuit = CountByRegion(storage, interval: 2).Build())
+        var pipeline = CountByRegion(storage, interval: 2);
+        await using (var circuit = pipeline.Builder.Build())
         {
             circuit.Start();
-            var input = circuit.Input<(int Id, string Region)>("orders");
+            var input = circuit.Handle(pipeline.Orders);
 
             await input.InsertAsync((1, "emea"));
             await circuit.StepAsync();
@@ -145,7 +155,7 @@ public class CheckpointTests
             Assert.Equal(1L, circuit.CommittedOffset("orders")); // staged again...
         } // ...and committed by the clean shutdown
 
-        await using var resumed = CountByRegion(storage).Build();
+        await using var resumed = CountByRegion(storage).Builder.Build();
         resumed.Start();
         Assert.Equal(2L, resumed.CommittedOffset("orders"));
     }
@@ -154,10 +164,11 @@ public class CheckpointTests
     public async Task Mid_run_redelivery_with_offsets_is_dropped()
     {
         var storage = new InMemoryCheckpointStorageProvider();
-        await using var circuit = CountByRegion(storage).Build();
+        var pipeline = CountByRegion(storage);
+        await using var circuit = pipeline.Builder.Build();
         circuit.Start();
-        var input = circuit.Input<(int Id, string Region)>("orders");
-        var output = circuit.Output<KeyedValue<string, long>>("counts");
+        var input = circuit.Handle(pipeline.Orders);
+        var output = circuit.Handle(pipeline.Counts);
 
         await input.SendAsync((1, "emea"), 1, offset: 5);
         await circuit.StepAsync();
@@ -202,12 +213,13 @@ public class CheckpointTests
 
         // Reference: the same 100 records through a never-crashed run (its own prefix).
         var reference = new ZSet<KeyedValue<string, long>>();
-        await using (var pristine = CountByRegion(
-            new RedisStorageProvider(redis, new RedisStorageOptions { KeyPrefix = $"{prefix}:ref" })).Build())
+        var pristinePipeline = CountByRegion(
+            new RedisStorageProvider(redis, new RedisStorageOptions { KeyPrefix = $"{prefix}:ref" }));
+        await using (var pristine = pristinePipeline.Builder.Build())
         {
             pristine.Start();
-            var input = pristine.Input<(int Id, string Region)>("orders");
-            var output = pristine.Output<KeyedValue<string, long>>("counts");
+            var input = pristine.Handle(pristinePipeline.Orders);
+            var output = pristine.Handle(pristinePipeline.Counts);
             for (var i = 0; i < 100; i++)
                 await input.SendAsync(Record(i), 1, offset: i);
             await pristine.StepAsync();
@@ -219,11 +231,12 @@ public class CheckpointTests
         // abandon the circuit without disposing. Redis holds the last committed step.
         var integrated = new ZSet<KeyedValue<string, long>>();
         {
-            var crashed = CountByRegion(
-                new RedisStorageProvider(redis, new RedisStorageOptions { KeyPrefix = prefix })).Build();
+            var crashedPipeline = CountByRegion(
+                new RedisStorageProvider(redis, new RedisStorageOptions { KeyPrefix = prefix }));
+            var crashed = crashedPipeline.Builder.Build();
             crashed.Start();
-            var input = crashed.Input<(int Id, string Region)>("orders");
-            var output = crashed.Output<KeyedValue<string, long>>("counts");
+            var input = crashed.Handle(crashedPipeline.Orders);
+            var output = crashed.Handle(crashedPipeline.Counts);
             for (var i = 0; i < 20; i++)
                 await input.SendAsync(Record(i), 1, offset: i);
             await crashed.StepAsync();
@@ -237,14 +250,15 @@ public class CheckpointTests
         // Resume: a fresh provider over the same prefix. The circuit reports where the
         // crashed run got to; the producer seeks there — sloppily, replaying a few
         // already-committed records, which must be dropped.
-        await using var resumed = CountByRegion(
-            new RedisStorageProvider(redis, new RedisStorageOptions { KeyPrefix = prefix })).Build();
+        var resumedPipeline = CountByRegion(
+            new RedisStorageProvider(redis, new RedisStorageOptions { KeyPrefix = prefix }));
+        await using var resumed = resumedPipeline.Builder.Build();
         resumed.Start();
         var committed = resumed.CommittedOffset("orders");
         Assert.Equal(39L, committed);
 
-        var replay = resumed.Input<(int Id, string Region)>("orders");
-        var counts = resumed.Output<KeyedValue<string, long>>("counts");
+        var replay = resumed.Handle(resumedPipeline.Orders);
+        var counts = resumed.Handle(resumedPipeline.Counts);
         for (var i = (int)committed!.Value - 5; i < 100; i++)
             await replay.SendAsync(Record(i), 1, offset: i);
         await resumed.StepAsync();
@@ -263,11 +277,12 @@ public class CheckpointTests
         var integrated = new ZSet<KeyedValue<string, long>>();
 
         {
-            var crashed = CountByRegion(
-                new RedisStorageProvider(redis, new RedisStorageOptions { KeyPrefix = prefix }), workers: 4).Build();
+            var crashedPipeline = CountByRegion(
+                new RedisStorageProvider(redis, new RedisStorageOptions { KeyPrefix = prefix }), workers: 4);
+            var crashed = crashedPipeline.Builder.Build();
             crashed.Start();
-            var input = crashed.Input<(int Id, string Region)>("orders");
-            var output = crashed.Output<KeyedValue<string, long>>("counts");
+            var input = crashed.Handle(crashedPipeline.Orders);
+            var output = crashed.Handle(crashedPipeline.Counts);
             for (var i = 0; i < 30; i++)
                 await input.SendAsync(Record(i), 1, offset: i);
             await crashed.StepAsync();
@@ -279,13 +294,14 @@ public class CheckpointTests
             // Abandoned mid-stream: the commit marker covers all four workers' shards.
         }
 
-        await using var resumed = CountByRegion(
-            new RedisStorageProvider(redis, new RedisStorageOptions { KeyPrefix = prefix }), workers: 4).Build();
+        var resumedPipeline = CountByRegion(
+            new RedisStorageProvider(redis, new RedisStorageOptions { KeyPrefix = prefix }), workers: 4);
+        await using var resumed = resumedPipeline.Builder.Build();
         resumed.Start();
         Assert.Equal(59L, resumed.CommittedOffset("orders"));
 
-        var replay = resumed.Input<(int Id, string Region)>("orders");
-        var counts = resumed.Output<KeyedValue<string, long>>("counts");
+        var replay = resumed.Handle(resumedPipeline.Orders);
+        var counts = resumed.Handle(resumedPipeline.Counts);
         for (var i = 50; i < 150; i++) // overlaps the checkpoint by 10 records
             await replay.SendAsync(Record(i), 1, offset: i);
         await resumed.StepAsync();

@@ -23,24 +23,28 @@ public class ClusterResilienceTests
         ExchangeTimeout = exchangeTimeout,
     };
 
-    private static CircuitBuilder CountPipeline(CircuitOptions options)
+    private static (CircuitBuilder Builder, InputStream<int> Numbers, Output<KeyedValue<int, long>> Counts)
+        CountPipeline(CircuitOptions options)
     {
         var builder = new CircuitBuilder(options);
-        builder.Input<int>("numbers").IndexBy(n => n % 4).Count().Output("counts");
-        return builder;
+        var numbers = builder.Input<int>("numbers");
+        var counts = numbers.GroupBy(n => n % 4).Count().ToOutput(bootstrap: false);
+        return (builder, numbers, counts);
     }
 
     [Fact]
     public async Task Stuck_peer_trips_the_exchange_timeout_and_faults_instead_of_hanging()
     {
         var mesh = InMemoryExchangeTransport.CreateMesh(2);
-        await using var process0 = CountPipeline(Clustered(mesh[0], TimeSpan.FromMilliseconds(500))).Build();
-        await using var process1 = CountPipeline(Clustered(mesh[1], TimeSpan.FromMilliseconds(500))).Build();
+        var defs0 = CountPipeline(Clustered(mesh[0], TimeSpan.FromMilliseconds(500)));
+        var defs1 = CountPipeline(Clustered(mesh[1], TimeSpan.FromMilliseconds(500)));
+        await using var process0 = defs0.Builder.Build();
+        await using var process1 = defs1.Builder.Build();
         process0.Start();
         process1.Start();
 
         for (var n = 0; n < 8; n++)
-            await process0.Input<int>("numbers").InsertAsync(n);
+            await process0.Handle(defs0.Numbers).InsertAsync(n);
 
         // Process 1 never steps — alive as far as the transport can tell, but stuck. The
         // designated worker's wait for its shards must time out and fault, never hang.
@@ -60,13 +64,15 @@ public class ClusterResilienceTests
     public async Task Slow_but_alive_peer_under_the_timeout_still_completes()
     {
         var mesh = InMemoryExchangeTransport.CreateMesh(2);
-        await using var process0 = CountPipeline(Clustered(mesh[0], TimeSpan.FromSeconds(10))).Build();
-        await using var process1 = CountPipeline(Clustered(mesh[1], TimeSpan.FromSeconds(10))).Build();
+        var defs0 = CountPipeline(Clustered(mesh[0], TimeSpan.FromSeconds(10)));
+        var defs1 = CountPipeline(Clustered(mesh[1], TimeSpan.FromSeconds(10)));
+        await using var process0 = defs0.Builder.Build();
+        await using var process1 = defs1.Builder.Build();
         process0.Start();
         process1.Start();
 
         for (var n = 0; n < 8; n++)
-            await process0.Input<int>("numbers").InsertAsync(n);
+            await process0.Handle(defs0.Numbers).InsertAsync(n);
 
         var step0 = process0.StepAsync();
         await Task.Delay(300); // slower than a healthy step, well under the timeout
@@ -75,7 +81,7 @@ public class ClusterResilienceTests
         Assert.Null(process0.Fault);
         Assert.Null(process1.Fault);
         var counts = new ZSet<KeyedValue<int, long>>();
-        foreach (var output in new[] { process0, process1 }.Select(p => p.Output<KeyedValue<int, long>>("counts")))
+        foreach (var output in new[] { process0.Handle(defs0.Counts), process1.Handle(defs1.Counts) })
             while (output.Reader.TryRead(out var delta))
                 counts.AddAll(delta);
         Assert.Equal(4, counts.DistinctCount); // 8 numbers over 4 key groups, 2 each
@@ -91,7 +97,7 @@ public class ClusterResilienceTests
     {
         var mesh = InMemoryExchangeTransport.CreateMesh(2);
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            CountPipeline(Clustered(mesh[0], TimeSpan.Zero)).Build());
+            CountPipeline(Clustered(mesh[0], TimeSpan.Zero)).Builder.Build());
     }
 
     [Fact]
@@ -125,26 +131,28 @@ public class ClusterResilienceTests
         // the same counts as ever.
         var options = new CircuitOptions { Workers = 2, AutoStep = false };
         var builder = new CircuitBuilder(options);
-        builder.Input<int>("numbers")
-            .Map(n =>
+        var numbers = builder.Input<int>("numbers");
+        var countsDef = numbers
+            .Select(n =>
             {
                 if (n == 0)
                     Thread.Sleep(400);
                 return n;
             })
-            .IndexBy(n => n % 4)
+            .GroupBy(n => n % 4)
             .Count()
-            .Output("counts");
+            .ToOutput(bootstrap: false);
         await using var circuit = builder.Build();
         circuit.Start();
 
+        var input = circuit.Handle(numbers);
         for (var n = 0; n < 8; n++)
-            await circuit.Input<int>("numbers").InsertAsync(n);
+            await input.InsertAsync(n);
         await circuit.StepAsync().WaitAsync(Outer);
 
         Assert.Null(circuit.Fault);
         var counts = new ZSet<KeyedValue<int, long>>();
-        while (circuit.Output<KeyedValue<int, long>>("counts").Reader.TryRead(out var delta))
+        while (circuit.Handle(countsDef).Reader.TryRead(out var delta))
             counts.AddAll(delta);
         Assert.Equal(4, counts.DistinctCount);
     }
@@ -157,22 +165,24 @@ public class ClusterResilienceTests
         // with the original error, not hang.
         var options = new CircuitOptions { Workers = 2, AutoStep = false };
         var builder = new CircuitBuilder(options);
-        builder.Input<int>("numbers")
-            .Map(n =>
+        var numbers = builder.Input<int>("numbers");
+        numbers
+            .Select(n =>
             {
                 if (n != 0)
                     return n;
                 Thread.Sleep(400);
                 throw new InvalidOperationException("boom 0");
             })
-            .IndexBy(n => n % 4)
+            .GroupBy(n => n % 4)
             .Count()
-            .Output("counts");
+            .ToOutput(bootstrap: false);
         await using var circuit = builder.Build();
         circuit.Start();
 
+        var input = circuit.Handle(numbers);
         for (var n = 0; n < 8; n++)
-            await circuit.Input<int>("numbers").InsertAsync(n);
+            await input.InsertAsync(n);
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => circuit.StepAsync()).WaitAsync(Outer);
         Assert.Contains("boom 0", ex.Message);

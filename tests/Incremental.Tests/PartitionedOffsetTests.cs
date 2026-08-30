@@ -12,7 +12,12 @@ namespace Incremental.Tests;
 /// </summary>
 public class PartitionedOffsetTests
 {
-    private static CircuitBuilder CountByRegion(IStorageProvider storage)
+    private sealed record CountCircuit(
+        CircuitBuilder Builder,
+        InputStream<(int Id, string Region)> Orders,
+        Output<KeyedValue<string, long>> Counts);
+
+    private static CountCircuit CountByRegion(IStorageProvider storage)
     {
         var builder = new CircuitBuilder(new CircuitOptions
         {
@@ -20,11 +25,12 @@ public class PartitionedOffsetTests
             Storage = storage,
             CheckpointInterval = 1,
         });
-        builder.Input<(int Id, string Region)>("orders")
-            .IndexBy(o => o.Region)
+        var orders = builder.Input<(int Id, string Region)>("orders");
+        var counts = orders
+            .GroupBy(o => o.Region)
             .Count()
-            .Output("counts");
-        return builder;
+            .ToOutput(bootstrap: false);
+        return new CountCircuit(builder, orders, counts);
     }
 
     private static KeyedValue<string, long> Row(string region, long count) => new(region, count);
@@ -34,11 +40,12 @@ public class PartitionedOffsetTests
     {
         var storage = new InMemoryCheckpointStorageProvider();
 
-        await using (var circuit = CountByRegion(storage).Build())
+        var first = CountByRegion(storage);
+        await using (var circuit = first.Builder.Build())
         {
             circuit.Start();
-            var input = circuit.Input<(int Id, string Region)>("orders");
-            var output = circuit.Output<KeyedValue<string, long>>("counts");
+            var input = circuit.Handle(first.Orders);
+            var output = circuit.Handle(first.Counts);
             await input.SendAsync((1, "emea"), 1, partition: 0, offset: 10);
             await input.SendAsync((2, "emea"), 1, partition: 0, offset: 11);
             await input.SendAsync((3, "emea"), 1, partition: 1, offset: 5);
@@ -49,12 +56,13 @@ public class PartitionedOffsetTests
 
         // "Restart": each partition resumes at its own committed position — a replay on one
         // partition cannot be deduplicated against another's offsets.
-        await using var resumed = CountByRegion(storage).Build();
+        var second = CountByRegion(storage);
+        await using var resumed = second.Builder.Build();
         resumed.Start();
         Assert.Equal(new Dictionary<int, long> { [0] = 11, [1] = 5 }, resumed.CommittedOffsets("orders"));
 
-        var replay = resumed.Input<(int Id, string Region)>("orders");
-        var counts = resumed.Output<KeyedValue<string, long>>("counts");
+        var replay = resumed.Handle(second.Orders);
+        var counts = resumed.Handle(second.Counts);
         await replay.SendAsync((1, "emea"), 1, partition: 0, offset: 10); // replayed — dropped
         await replay.SendAsync((2, "emea"), 1, partition: 0, offset: 11); // replayed — dropped
         await replay.SendAsync((4, "emea"), 1, partition: 0, offset: 12); // new
@@ -73,9 +81,10 @@ public class PartitionedOffsetTests
     public async Task CommittedOffset_reads_the_single_partition_and_refuses_several()
     {
         var storage = new InMemoryCheckpointStorageProvider();
-        await using var circuit = CountByRegion(storage).Build();
+        var pipeline = CountByRegion(storage);
+        await using var circuit = pipeline.Builder.Build();
         circuit.Start();
-        var input = circuit.Input<(int Id, string Region)>("orders");
+        var input = circuit.Handle(pipeline.Orders);
 
         // The partitionless overloads stamp partition 0, so the legacy single-offset shape
         // keeps its one-value read.
@@ -93,19 +102,21 @@ public class PartitionedOffsetTests
     [Fact]
     public async Task Mixing_stamped_and_unstamped_throws_at_the_handle()
     {
-        await using var circuit = CountByRegion(new InMemoryCheckpointStorageProvider()).Build();
+        var pipeline = CountByRegion(new InMemoryCheckpointStorageProvider());
+        await using var circuit = pipeline.Builder.Build();
         circuit.Start();
 
-        var input = circuit.Input<(int Id, string Region)>("orders");
+        var input = circuit.Handle(pipeline.Orders);
         await input.SendAsync((1, "emea"), 1, offset: 0);
         var error = await Assert.ThrowsAsync<InvalidOperationException>(
             async () => await input.InsertAsync((2, "emea")));
         Assert.Contains("replay position", error.Message);
 
         // And the other way round, on a fresh circuit.
-        await using var other = CountByRegion(new InMemoryCheckpointStorageProvider()).Build();
+        var otherPipeline = CountByRegion(new InMemoryCheckpointStorageProvider());
+        await using var other = otherPipeline.Builder.Build();
         other.Start();
-        var unstamped = other.Input<(int Id, string Region)>("orders");
+        var unstamped = other.Handle(otherPipeline.Orders);
         await unstamped.InsertAsync((1, "emea"));
         await Assert.ThrowsAsync<InvalidOperationException>(
             async () => await unstamped.SendAsync((2, "emea"), 1, offset: 0));
@@ -116,19 +127,21 @@ public class PartitionedOffsetTests
     {
         var storage = new InMemoryCheckpointStorageProvider();
 
-        await using (var circuit = CountByRegion(storage).Build())
+        var first = CountByRegion(storage);
+        await using (var circuit = first.Builder.Build())
         {
             circuit.Start();
-            var input = circuit.Input<(int Id, string Region)>("orders");
+            var input = circuit.Handle(first.Orders);
             await input.SendAsync((1, "emea"), 1, offset: 10);
             await circuit.StepAsync();
         }
 
         // A fresh handle has no send history, so only the input's recovered committed
         // position can catch the switch — at the step, as a fault, not silently.
-        await using var resumed = CountByRegion(storage).Build();
+        var second = CountByRegion(storage);
+        await using var resumed = second.Builder.Build();
         resumed.Start();
-        var replay = resumed.Input<(int Id, string Region)>("orders");
+        var replay = resumed.Handle(second.Orders);
         await replay.InsertAsync((2, "emea"));
         var error = await Assert.ThrowsAsync<InvalidOperationException>(() => resumed.StepAsync());
         Assert.Contains("orders", error.Message);
@@ -141,22 +154,24 @@ public class PartitionedOffsetTests
     {
         var storage = new InMemoryCheckpointStorageProvider();
 
-        await using (var circuit = CountByRegion(storage).Build())
+        var first = CountByRegion(storage);
+        await using (var circuit = first.Builder.Build())
         {
             circuit.Start();
-            var input = circuit.Input<(int Id, string Region)>("orders");
+            var input = circuit.Handle(first.Orders);
             await input.InsertAsync((1, "emea"));
             await input.InsertAsync((2, "emea"));
             await circuit.StepAsync();
             Assert.Equal(1L, circuit.CommittedOffset("orders")); // numbered 0, 1, ...
         }
 
-        await using var resumed = CountByRegion(storage).Build();
+        var second = CountByRegion(storage);
+        await using var resumed = second.Builder.Build();
         resumed.Start();
         Assert.Equal(1L, resumed.CommittedOffset("orders"));
         Assert.Empty(resumed.CommittedOffsets("orders")); // a running count has no partitions
 
-        var input2 = resumed.Input<(int Id, string Region)>("orders");
+        var input2 = resumed.Handle(second.Orders);
         await input2.InsertAsync((3, "emea"));
         await resumed.StepAsync();
         Assert.Equal(2L, resumed.CommittedOffset("orders"));
@@ -169,10 +184,11 @@ public class PartitionedOffsetTests
         var prefix = $"sp-test:{Guid.NewGuid():N}";
         RedisStorageProvider Storage() => new(redis, new RedisStorageOptions { KeyPrefix = prefix });
 
-        await using (var circuit = CountByRegion(Storage()).Build())
+        var first = CountByRegion(Storage());
+        await using (var circuit = first.Builder.Build())
         {
             circuit.Start();
-            var input = circuit.Input<(int Id, string Region)>("orders");
+            var input = circuit.Handle(first.Orders);
             await input.SendAsync((1, "emea"), 1, partition: 0, offset: 7);
             await input.SendAsync((2, "emea"), 1, partition: 3, offset: 40);
             await circuit.StepAsync();
@@ -180,12 +196,13 @@ public class PartitionedOffsetTests
 
         // A fresh provider over the same prefix: the per-partition marker is durable, and
         // replays deduplicate per partition against it.
-        await using var resumed = CountByRegion(Storage()).Build();
+        var second = CountByRegion(Storage());
+        await using var resumed = second.Builder.Build();
         resumed.Start();
         Assert.Equal(new Dictionary<int, long> { [0] = 7, [3] = 40 }, resumed.CommittedOffsets("orders"));
 
-        var replay = resumed.Input<(int Id, string Region)>("orders");
-        var counts = resumed.Output<KeyedValue<string, long>>("counts");
+        var replay = resumed.Handle(second.Orders);
+        var counts = resumed.Handle(second.Counts);
         await replay.SendAsync((1, "emea"), 1, partition: 0, offset: 7);  // replayed — dropped
         await replay.SendAsync((3, "emea"), 1, partition: 3, offset: 41); // new
         await resumed.StepAsync();

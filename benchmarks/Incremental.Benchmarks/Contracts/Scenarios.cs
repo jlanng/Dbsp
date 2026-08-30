@@ -4,6 +4,8 @@ namespace Incremental.Benchmarks.Contracts;
 /// One measurable workload for a performance contract: a circuit with preloaded operator
 /// state whose size is the scenario's scale, plus a fixed-size delta that
 /// <see cref="RunCycleAsync"/> asserts and retracts, leaving state at its baseline.
+/// Keyed outputs opt out of bootstrap so the contracts measure the operators themselves,
+/// not snapshot maintenance.
 /// </summary>
 internal interface IDeltaScenario : IAsyncDisposable
 {
@@ -48,17 +50,17 @@ internal static class Scenarios
         var builder = new CircuitBuilder(Rig.Options());
         var orders = builder.Input<(int OrderId, int CustomerId)>("orders");
         var customers = builder.Input<(int CustomerId, int Rank)>("customers");
-        orders.IndexBy(o => o.CustomerId)
-            .Join(customers.IndexBy(c => c.CustomerId), (_, order, customer) => (order.OrderId, customer.Rank))
-            .Output("joined");
+        var joined = orders.GroupBy(o => o.CustomerId)
+            .Join(customers.GroupBy(c => c.CustomerId), (_, order, customer) => (order.OrderId, customer.Rank))
+            .ToOutput();
 
         var circuit = builder.Build();
         circuit.Start();
         var rig = new Rig(circuit);
-        rig.Watch<(int OrderId, int Rank)>("joined");
+        rig.Watch(joined);
 
-        var ordersIn = circuit.Input<(int OrderId, int CustomerId)>("orders");
-        await rig.FeedAsync(circuit.Input<(int CustomerId, int Rank)>("customers"),
+        var ordersIn = circuit.Handle(orders);
+        await rig.FeedAsync(circuit.Handle(customers),
             Enumerable.Range(0, stateSize).Select(i => new WeightedValue<(int, int)>((i, i), 1)));
         await rig.FeedAsync(ordersIn,
             Enumerable.Range(0, stateSize).Select(i => new WeightedValue<(int, int)>((i, i), 1)));
@@ -73,17 +75,18 @@ internal static class Scenarios
     public static async Task<IDeltaScenario> SumAsync(int groupCount)
     {
         var builder = new CircuitBuilder(Rig.Options());
-        builder.Input<(int Key, long Amount)>("rows")
-            .IndexBy(r => r.Key)
+        var rows = builder.Input<(int Key, long Amount)>("rows");
+        var sums = rows
+            .GroupBy(r => r.Key)
             .Sum(r => r.Amount)
-            .Output("sums");
+            .ToOutput(bootstrap: false);
 
         var circuit = builder.Build();
         circuit.Start();
         var rig = new Rig(circuit);
-        rig.Watch<KeyedValue<int, long>>("sums");
+        rig.Watch(sums);
 
-        var input = circuit.Input<(int Key, long Amount)>("rows");
+        var input = circuit.Handle(rows);
         await rig.FeedAsync(input,
             Enumerable.Range(0, groupCount).Select(i => new WeightedValue<(int, long)>((i, i), 1)));
 
@@ -99,17 +102,18 @@ internal static class Scenarios
     {
         const int groups = 16;
         var builder = new CircuitBuilder(Rig.Options());
-        builder.Input<(int Key, int Value)>("rows")
-            .IndexBy(r => r.Key)
+        var rows = builder.Input<(int Key, int Value)>("rows");
+        var mins = rows
+            .GroupBy(r => r.Key)
             .Min(r => r.Value)
-            .Output("mins");
+            .ToOutput(bootstrap: false);
 
         var circuit = builder.Build();
         circuit.Start();
         var rig = new Rig(circuit);
-        rig.Watch<KeyedValue<int, int>>("mins");
+        rig.Watch(mins);
 
-        var input = circuit.Input<(int Key, int Value)>("rows");
+        var input = circuit.Handle(rows);
         await rig.FeedAsync(input,
             from key in Enumerable.Range(0, groups)
             from value in Enumerable.Range(1, groupSize)
@@ -127,17 +131,15 @@ internal static class Scenarios
     {
         const int keys = 16;
         var builder = new CircuitBuilder(Rig.Options());
-        builder.Input<(int Key, int Value)>("rows")
-            .IndexBy(r => r.Key)
-            .Distinct()
-            .Output("distinct");
+        var rows = builder.Input<(int Key, int Value)>("rows");
+        var distinct = rows.GroupBy(r => r.Key).Distinct().ToOutput(bootstrap: false);
 
         var circuit = builder.Build();
         circuit.Start();
         var rig = new Rig(circuit);
-        rig.Watch<KeyedValue<int, (int Key, int Value)>>("distinct");
+        rig.Watch(distinct);
 
-        var input = circuit.Input<(int Key, int Value)>("rows");
+        var input = circuit.Handle(rows);
         await rig.FeedAsync(input,
             from key in Enumerable.Range(0, keys)
             from value in Enumerable.Range(0, valuesPerKey)

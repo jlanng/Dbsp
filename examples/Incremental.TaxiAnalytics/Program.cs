@@ -77,40 +77,30 @@ var trips = builder.Input<Trip>("trips");
 var zones = builder.KeyedInput<int, ZoneInfo>("zones", z => z.Id);
 
 var enriched = trips
-    .IndexBy(t => t.Zone)
-    .Join(zones.IndexBy(z => z.Id), (_, trip, zone) => (zone.Borough, zone.Name, trip.Total));
+    .GroupBy(t => t.Zone)
+    .Join(zones.GroupBy(z => z.Id), (_, trip, zone) => (zone.Borough, zone.Name, trip.Total));
 
-var byBorough = enriched.IndexBy(e => e.Borough);
-byBorough.Count().Output("trips-per-borough");
-byBorough.Sum(e => e.Total).Output("revenue-per-borough");
+var byBorough = enriched.GroupBy(e => e.Borough);
+var tripsPerBorough = byBorough.Count().ToOutput();
+var revenuePerBorough = byBorough.Sum(e => e.Total).ToOutput();
 
-enriched.IndexBy(e => (e.Borough, e.Name))
+var topZones = enriched.GroupBy(e => (e.Borough, e.Name))
     .Count()
-    .IndexBy(c => c.Key.Borough)
+    .GroupBy(c => c.Key.Borough)
     .TopK(5, c => c.Value)
-    .Output("top-zones");
+    .ToOutput();
 
 await using var circuit = builder.Build();
 circuit.Start();
 
-var tripsIn = circuit.Input<Trip>("trips");
-var zonesIn = circuit.KeyedInput<int, ZoneInfo>("zones");
-var countsOut = circuit.Output<KeyedValue<string, long>>("trips-per-borough");
-var revenueOut = circuit.Output<KeyedValue<string, double>>("revenue-per-borough");
-var topZonesOut = circuit.Output<KeyedValue<string, KeyedValue<(string Borough, string Name), long>>>("top-zones");
+var tripsIn = circuit.Handle(trips);
+var zonesIn = circuit.Handle(zones);
 
-var countsView = new ZSet<KeyedValue<string, long>>();
-var revenueView = new ZSet<KeyedValue<string, double>>();
-var topZonesView = new ZSet<KeyedValue<string, KeyedValue<(string Borough, string Name), long>>>();
-
-long DrainOutputs()
-{
-    long deltaRows = 0;
-    while (countsOut.Reader.TryRead(out var d)) { countsView.AddAll(d); deltaRows += d.DistinctCount; }
-    while (revenueOut.Reader.TryRead(out var d)) { revenueView.AddAll(d); deltaRows += d.DistinctCount; }
-    while (topZonesOut.Reader.TryRead(out var d)) { topZonesView.AddAll(d); deltaRows += d.DistinctCount; }
-    return deltaRows;
-}
+// Each view is its output's single consumer: a background task integrates the changefeed
+// and Current() serves consistent snapshots on demand.
+await using var countsView = circuit.Handle(tripsPerBorough).MaterializeInMemory();
+await using var revenueView = circuit.Handle(revenuePerBorough).MaterializeInMemory();
+await using var topZonesView = circuit.Handle(topZones).MaterializeInMemory();
 
 // ── 1 · bulk load ───────────────────────────────────────────────────────────────
 
@@ -123,7 +113,6 @@ AnsiConsole.MarkupLine(
 foreach (var zone in zoneRows)
     await zonesIn.UpsertAsync(zone);
 await circuit.StepAsync();
-DrainOutputs();
 
 var distinctEntries = new HashSet<(int, long)>();
 var loadTimer = Stopwatch.StartNew();
@@ -142,16 +131,12 @@ await AnsiConsole.Progress()
             if (++pending == BatchSize)
             {
                 await circuit.StepAsync();
-                DrainOutputs();
                 task.Value = i + 1;
                 pending = 0;
             }
         }
         if (pending > 0)
-        {
             await circuit.StepAsync();
-            DrainOutputs();
-        }
         task.Value = totalRows;
     });
 loadTimer.Stop();
@@ -162,6 +147,9 @@ AnsiConsole.MarkupLine(
     $"Z-set weights compressed them to {distinctEntries.Count:N0} distinct weighted entries");
 AnsiConsole.WriteLine();
 
+// The views' background consumers drain the output channels asynchronously; give them a
+// beat to absorb the final bulk-load batch before rendering.
+await Task.Delay(100);
 RenderResults();
 
 // ── 2 · the naive baseline ──────────────────────────────────────────────────────
@@ -201,7 +189,6 @@ for (var i = 0; i < 15; i++)
     await tripsIn.SendAsync(warmupTrip, -1);
     await circuit.StepAsync();
 }
-DrainOutputs();
 
 var updateCount = 0L;
 var updateTicks = 0L;
@@ -238,7 +225,6 @@ await AnsiConsole.Live(BuildLiveView()).AutoClear(false).StartAsync(async ctx =>
         await tripsIn.SendAsync(dryRun, -1);
         await circuit.StepAsync();
     }
-    DrainOutputs();
     // Match the churn cadence before the first timed update: a step fired immediately
     // after the hot dry-run burst measures ~4× slower than one following the same idle
     // gap the real updates get (scheduler state after a burst differs from steady state).
@@ -314,7 +300,6 @@ async Task<double> ApplyUpdateAsync(Trip trip, long weight)
     var timer = Stopwatch.StartNew();
     await circuit.StepAsync();
     timer.Stop();
-    DrainOutputs();
     updateCount++;
     updateTicks += timer.Elapsed.Ticks;
     return timer.Elapsed.TotalMicroseconds;
@@ -333,7 +318,7 @@ IRenderable BuildLiveView()
     table.AddColumn(new TableColumn("revenue").RightAligned().Width(12));
     table.AddColumn(new TableColumn("busiest zone").Width(36));
 
-    var busiest = topZonesView
+    var busiest = topZonesView.Current()
         .GroupBy(e => e.Value.Key)
         .ToDictionary(
             g => g.Key,
@@ -341,10 +326,11 @@ IRenderable BuildLiveView()
                 .Select(e => $"{e.Value.Value.Key.Name} ({e.Value.Value.Value:N0})")
                 .FirstOrDefault(""));
 
-    foreach (var entry in countsView.OrderByDescending(e => e.Value.Value))
+    var revenues = revenueView.Current();
+    foreach (var entry in countsView.Current().OrderByDescending(e => e.Value.Value))
     {
         var borough = entry.Value.Key;
-        var revenue = revenueView.SingleOrDefault(e => e.Value.Key == borough).Value.Value;
+        var revenue = revenues.SingleOrDefault(e => e.Value.Key == borough).Value.Value;
         table.AddRow(
             Markup.Escape(Truncate(borough, 14)),
             $"{entry.Value.Value:N0}",
@@ -396,7 +382,7 @@ void RenderResults()
     table.AddColumn(new TableColumn("revenue").RightAligned());
     table.AddColumn("top zones");
 
-    var topByBorough = topZonesView
+    var topByBorough = topZonesView.Current()
         .GroupBy(e => e.Value.Key)
         .ToDictionary(
             g => g.Key,
@@ -404,10 +390,11 @@ void RenderResults()
                 .Take(5)
                 .Select(e => $"{e.Value.Value.Key.Name} ({e.Value.Value.Value:N0})")));
 
-    foreach (var entry in countsView.OrderByDescending(e => e.Value.Value))
+    var revenues = revenueView.Current();
+    foreach (var entry in countsView.Current().OrderByDescending(e => e.Value.Value))
     {
         var borough = entry.Value.Key;
-        var rev = revenueView.SingleOrDefault(e => e.Value.Key == borough).Value.Value;
+        var rev = revenues.SingleOrDefault(e => e.Value.Key == borough).Value.Value;
         table.AddRow(
             Markup.Escape(borough),
             $"{entry.Value.Value:N0}",

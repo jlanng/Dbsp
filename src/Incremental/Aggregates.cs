@@ -13,7 +13,7 @@ public interface IAggregateFunction<TValue, out TResult> where TValue : notnull
     TResult Aggregate(IReadOnlyList<WeightedValue<TValue>> group);
 }
 
-/// <summary>Built-in aggregate functions for <see cref="KeyedZStream{TKey,TValue}.Aggregate{TResult}"/>.</summary>
+/// <summary>Built-in aggregate functions for <see cref="GroupedZStream{TKey,TValue}.Aggregate{TResult}"/>.</summary>
 public static class Aggregates
 {
     /// <summary>Number of rows in the group (sum of weights — duplicates count).</summary>
@@ -48,7 +48,7 @@ public static class Aggregates
             return sum;
         });
 
-    /// <summary>MIN by full-group recompute. <see cref="KeyedZStream{TKey,TValue}.Min{TProjected}"/>
+    /// <summary>MIN by full-group recompute. <see cref="GroupedZStream{TKey,TValue}.Min{TProjected}"/>
     /// uses the tournament-tree operator instead; this exists for use with <c>Aggregate</c>.</summary>
     public static IAggregateFunction<TValue, TProjected> Min<TValue, TProjected>(Func<TValue, TProjected> selector)
         where TValue : notnull

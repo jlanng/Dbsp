@@ -20,6 +20,7 @@ namespace Incremental;
 /// </summary>
 public sealed class Circuit : IAsyncDisposable
 {
+    private readonly CircuitBuilder _builder;
     private readonly NodeDefinition[] _nodes;
     private readonly CircuitOptions _options;
 
@@ -96,6 +97,7 @@ public sealed class Circuit : IAsyncDisposable
     private readonly ILogger _log;
 
     internal Circuit(
+        CircuitBuilder builder,
         NodeDefinition[] nodes,
         LoopRegion[] loopRegions,
         IReadOnlyList<InputRegistration> inputRegistrations,
@@ -103,6 +105,7 @@ public sealed class Circuit : IAsyncDisposable
         CircuitOptions options,
         WatermarkClock? watermarkClock)
     {
+        _builder = builder;
         _nodes = nodes;
         _options = options;
 
@@ -261,31 +264,41 @@ public sealed class Circuit : IAsyncDisposable
         }
     }
 
-    public InputHandle<T> Input<T>(string name) where T : notnull
+    /// <summary>Redeems an input definition for its live handle. The definition must come
+    /// from the builder that built this circuit.</summary>
+    public InputHandle<T> Handle<T>(InputStream<T> input) where T : notnull
     {
-        var port = _inputs.FirstOrDefault(p => p.Name == name)
-            ?? throw new KeyNotFoundException($"No input named '{name}'.");
-        return port.Handle as InputHandle<T>
-            ?? throw new InvalidOperationException($"Input '{name}' does not carry elements of type {typeof(T).Name}.");
+        RequireOwnDefinition(input.Builder);
+        var port = _inputs.First(p => p.Name == input.InputName);
+        return (InputHandle<T>)port.Handle;
     }
 
-    public KeyedInputHandle<TKey, TValue> KeyedInput<TKey, TValue>(string name)
+    /// <summary>Redeems a keyed-input definition for its live upsert/delete handle. The
+    /// definition must come from the builder that built this circuit.</summary>
+    public KeyedInputHandle<TKey, TValue> Handle<TKey, TValue>(KeyedInputStream<TKey, TValue> input)
         where TKey : notnull
         where TValue : notnull
     {
-        var port = _inputs.FirstOrDefault(p => p.Name == name)
-            ?? throw new KeyNotFoundException($"No input named '{name}'.");
-        return port.Handle as KeyedInputHandle<TKey, TValue>
-            ?? throw new InvalidOperationException(
-                $"Input '{name}' is not a keyed input of ({typeof(TKey).Name}, {typeof(TValue).Name}); declare it with CircuitBuilder.KeyedInput.");
+        RequireOwnDefinition(input.Builder);
+        var port = _inputs.First(p => p.Name == input.InputName);
+        return (KeyedInputHandle<TKey, TValue>)port.Handle;
     }
 
-    public OutputHandle<T> Output<T>(string name) where T : notnull
+    /// <summary>Redeems an output definition for its live handle. The definition must come
+    /// from the builder that built this circuit.</summary>
+    public OutputHandle<T> Handle<T>(Output<T> output) where T : notnull
     {
-        var port = _outputs.FirstOrDefault(p => p.Name == name)
-            ?? throw new KeyNotFoundException($"No output named '{name}'.");
-        return port.Handle as OutputHandle<T>
-            ?? throw new InvalidOperationException($"Output '{name}' does not carry elements of type {typeof(T).Name}.");
+        RequireOwnDefinition(output.Builder);
+        var port = _outputs.First(p => p.Name == output.RegistrationName);
+        return (OutputHandle<T>)port.Handle;
+    }
+
+    private void RequireOwnDefinition(CircuitBuilder source)
+    {
+        if (!ReferenceEquals(source, _builder))
+            throw new ArgumentException(
+                "This definition belongs to a different CircuitBuilder; redeem definitions against the circuit " +
+                "their builder built.");
     }
 
     /// <summary>
@@ -401,7 +414,7 @@ public sealed class Circuit : IAsyncDisposable
         }
     }
 
-    /// <summary>Services <see cref="OutputHandle{T}.ReadSnapshotAsync"/> for a snapshot
+    /// <summary>Services the bootstrap read of <see cref="OutputHandle{T}.Changes"/> for a snapshot
     /// output: merges the per-worker integrated shards of the output's snapshot node, under
     /// the step gate so the read never interleaves with a step. While waiting for the gate
     /// it discards the output's buffered deltas — they are subsumed by the snapshot about to
@@ -536,10 +549,12 @@ public sealed class Circuit : IAsyncDisposable
     private string BuildStateManifest(IEnumerable<string> storeNames)
     {
         var manifest = new System.Text.StringBuilder();
-        // format 2: the committed-offsets marker became per-partition (OffsetKeys) — a
-        // format-1 checkpoint's stamped positions live under plain input names and cannot
-        // be resumed unambiguously, so restoring one is refused via the manifest check.
-        manifest.Append("format=2\n");
+        // format 3: the 0.2 API surface rewrite — operator kinds and node layouts changed
+        // (groupBy/select naming, windowed groupings' composite WindowKey state, snapshot
+        // nodes on table-shaped outputs), so store names moved wholesale. No deployed
+        // format-2 checkpoints existed; the bump is hygiene.
+        // (format 2: the committed-offsets marker became per-partition — see OffsetKeys.)
+        manifest.Append("format=3\n");
         manifest.Append($"workers={_options.Workers}\n");
         manifest.Append($"processes={_cluster?.ProcessCount ?? 1}\n");
         foreach (var store in storeNames)

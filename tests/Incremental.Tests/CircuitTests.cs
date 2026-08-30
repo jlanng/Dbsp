@@ -2,7 +2,9 @@ namespace Incremental.Tests;
 
 /// <summary>
 /// Single-worker circuits driven with AutoStep = false, so each test controls step
-/// boundaries and can assert exact per-step deltas.
+/// boundaries and can assert exact per-step deltas (via the raw <c>Reader</c>; keyed
+/// outputs opt out of bootstrap so the graph carries no snapshot state the assertions
+/// don't exercise).
 /// </summary>
 public class CircuitTests
 {
@@ -10,18 +12,19 @@ public class CircuitTests
         new(new CircuitOptions { AutoStep = false });
 
     [Fact]
-    public async Task Map_and_filter_transform_deltas()
+    public async Task Select_and_where_transform_deltas()
     {
         var builder = ManualBuilder();
-        builder.Input<int>("numbers")
-            .Filter(n => n % 2 == 0)
-            .Map(n => n * 10)
-            .Output("result");
+        var numbers = builder.Input<int>("numbers");
+        var result = numbers
+            .Where(n => n % 2 == 0)
+            .Select(n => n * 10)
+            .ToOutput();
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<int>("numbers");
-        var output = circuit.Output<int>("result");
+        var input = circuit.Handle(numbers);
+        var output = circuit.Handle(result);
 
         await input.InsertAsync(1);
         await input.InsertAsync(2);
@@ -41,15 +44,15 @@ public class CircuitTests
         var orders = builder.Input<(int OrderId, int CustomerId)>("orders");
         var customers = builder.Input<(int Id, string Name)>("customers");
 
-        orders.IndexBy(o => o.CustomerId)
-            .Join(customers.IndexBy(c => c.Id), (_, order, customer) => (order.OrderId, customer.Name))
-            .Output("joined");
+        var joinedDef = orders.GroupBy(o => o.CustomerId)
+            .Join(customers.GroupBy(c => c.Id), (_, order, customer) => (order.OrderId, customer.Name))
+            .ToOutput();
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var ordersIn = circuit.Input<(int OrderId, int CustomerId)>("orders");
-        var customersIn = circuit.Input<(int Id, string Name)>("customers");
-        var joined = circuit.Output<(int OrderId, string Name)>("joined");
+        var ordersIn = circuit.Handle(orders);
+        var customersIn = circuit.Handle(customers);
+        var joined = circuit.Handle(joinedDef);
 
         // Left side arrives first: no matches yet, so no delta is published.
         await ordersIn.InsertAsync((100, 1));
@@ -79,15 +82,16 @@ public class CircuitTests
     public async Task Count_retracts_stale_results()
     {
         var builder = ManualBuilder();
-        builder.Input<string>("words")
-            .IndexBy(w => w)
+        var words = builder.Input<string>("words");
+        var countsDef = words
+            .GroupBy(w => w)
             .Count()
-            .Output("counts");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<string>("words");
-        var output = circuit.Output<KeyedValue<string, long>>("counts");
+        var input = circuit.Handle(words);
+        var output = circuit.Handle(countsDef);
 
         await input.InsertAsync("a");
         await circuit.StepAsync();
@@ -111,15 +115,16 @@ public class CircuitTests
     public async Task Sum_is_linear_and_retracts_a_vanished_group()
     {
         var builder = ManualBuilder();
-        builder.Input<(string Region, int Amount)>("orders")
-            .IndexBy(o => o.Region)
+        var orders = builder.Input<(string Region, int Amount)>("orders");
+        var revenueDef = orders
+            .GroupBy(o => o.Region)
             .Sum(o => o.Amount)
-            .Output("revenue");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string Region, int Amount)>("orders");
-        var output = circuit.Output<KeyedValue<string, int>>("revenue");
+        var input = circuit.Handle(orders);
+        var output = circuit.Handle(revenueDef);
 
         await input.InsertAsync(("emea", 10));
         await input.InsertAsync(("emea", 5));
@@ -146,14 +151,14 @@ public class CircuitTests
     public async Task Sum_overflow_faults_the_step_instead_of_wrapping()
     {
         var builder = ManualBuilder();
-        builder.Input<(string Key, int Amount)>("orders")
-            .IndexBy(o => o.Key)
+        var orders = builder.Input<(string Key, int Amount)>("orders");
+        orders.GroupBy(o => o.Key)
             .Sum(o => o.Amount)
-            .Output("sums");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string Key, int Amount)>("orders");
+        var input = circuit.Handle(orders);
 
         await input.InsertAsync(("a", int.MaxValue));
         await input.InsertAsync(("a", 1));
@@ -165,14 +170,14 @@ public class CircuitTests
     public async Task Long_sum_overflow_faults_the_step_instead_of_wrapping()
     {
         var builder = ManualBuilder();
-        builder.Input<(string Key, long Amount)>("orders")
-            .IndexBy(o => o.Key)
+        var orders = builder.Input<(string Key, long Amount)>("orders");
+        orders.GroupBy(o => o.Key)
             .Sum(o => o.Amount)
-            .Output("sums");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string Key, long Amount)>("orders");
+        var input = circuit.Handle(orders);
 
         await input.InsertAsync(("a", long.MaxValue));
         await circuit.StepAsync();
@@ -185,15 +190,16 @@ public class CircuitTests
     public async Task Min_recovers_after_deleting_the_minimum()
     {
         var builder = ManualBuilder();
-        builder.Input<(string Key, int Value)>("readings")
-            .IndexBy(r => r.Key)
+        var readings = builder.Input<(string Key, int Value)>("readings");
+        var minimumsDef = readings
+            .GroupBy(r => r.Key)
             .Min(r => r.Value)
-            .Output("minimums");
+            .ToOutput(bootstrap: false);
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<(string Key, int Value)>("readings");
-        var output = circuit.Output<KeyedValue<string, int>>("minimums");
+        var input = circuit.Handle(readings);
+        var output = circuit.Handle(minimumsDef);
 
         await input.InsertAsync(("k", 5));
         await input.InsertAsync(("k", 3));
@@ -214,12 +220,13 @@ public class CircuitTests
     public async Task Distinct_collapses_duplicates_and_tracks_presence()
     {
         var builder = ManualBuilder();
-        builder.Input<string>("values").Distinct().Output("distinct");
+        var values = builder.Input<string>("values");
+        var distinctDef = values.Distinct().ToOutput();
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<string>("values");
-        var output = circuit.Output<string>("distinct");
+        var input = circuit.Handle(values);
+        var output = circuit.Handle(distinctDef);
 
         await input.InsertAsync("x");
         await input.InsertAsync("x");
@@ -247,11 +254,12 @@ public class CircuitTests
             AutoStep = false,
             InputChannelCapacity = 2,
         });
-        builder.Input<int>("numbers").Output("result");
+        var numbers = builder.Input<int>("numbers");
+        numbers.ToOutput();
 
         await using var circuit = builder.Build();
         circuit.Start();
-        var input = circuit.Input<int>("numbers");
+        var input = circuit.Handle(numbers);
 
         await input.InsertAsync(1);
         await input.InsertAsync(2);

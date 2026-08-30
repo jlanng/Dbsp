@@ -41,12 +41,14 @@ var options = new CircuitOptions
 if (scenario != "revenue")
     throw new ArgumentException($"Unknown scenario '{scenario}'.");
 
-await using var circuit = ClusterScenario.RevenuePipeline(options).Build();
+var pipeline = ClusterScenario.RevenuePipeline(options);
+await using var circuit = pipeline.Builder.Build();
 circuit.Start();
 var committedStepAtStart = circuit.CommittedStep;
 
-var orders = circuit.Input<(int Id, int CustomerId, decimal Amount)>("orders");
-var customers = circuit.Input<(int Id, string Region)>("customers");
+var orders = circuit.Handle(pipeline.Orders);
+var customers = circuit.Handle(pipeline.Customers);
+var revenue = circuit.Handle(pipeline.Revenue);
 
 // Both processes execute the identical StepAsync sequence — the lockstep contract. Which
 // order range runs, and whether the reference-data step happens, depends only on the phase.
@@ -74,18 +76,22 @@ for (var i = firstOrder; i < lastOrder; i++)
     await circuit.StepAsync();
 }
 
+var committedStep = circuit.CommittedStep;
+
 // This process's output handle carries the deltas its own workers produced; the parent
-// merges both processes' shards into the full stream.
+// merges both processes' shards into the full stream. Disposing first completes the output
+// (clustered circuits never step implicitly on dispose), so the changefeed yields exactly
+// the batches the explicit steps buffered, then ends.
+await circuit.DisposeAsync();
 var shard = new ZSet<KeyedValue<string, decimal>>();
-var revenue = circuit.Output<KeyedValue<string, decimal>>("revenue");
-while (revenue.Reader.TryRead(out var delta))
+await foreach (var delta in revenue.Changes())
     shard.AddAll(delta);
 
 var result = new
 {
     Pid = Environment.ProcessId,
     CommittedStepAtStart = committedStepAtStart,
-    CommittedStep = circuit.CommittedStep,
+    CommittedStep = committedStep,
     Shard = shard
         .Select(e => new
         {
