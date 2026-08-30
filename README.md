@@ -412,6 +412,37 @@ benchmarks/Incremental.Benchmarks  BenchmarkDotNet suite (Z-set primitives, stat
                                        `-- --assert`: CI performance contracts that check scaling
                                        ratios (delta cost must not grow with state size) instead of
                                        wall-clock numbers, so they hold on noisy shared runners
+examples/Incremental.Showcase      the all-features demo: a marketplace payments desk, served as a
+                                       local web app (`dotnet run`, then http://localhost:5170) in
+                                       five tabs — enrichment joins (inner/left/full/anti) and
+                                       aggregates with one upsert re-attributing history, event-time
+                                       windows (tumbling/hopping/session, live vs OnClose, late
+                                       events), recursive fraud-ring closure with live edge
+                                       deletion, a mid-stream crash recovered exactly-once from
+                                       checkpoints (in-memory by default, `--redis` for real), and
+                                       scaling out: the same declaration measured at 1/2/4 worker
+                                       threads (sharding costs latency and buys throughput — the tab
+                                       measures both rather than asserting either) and, with
+                                       `--cluster`, re-spawned as a second OS process exchanging
+                                       shards over TCP. Picking a topology relaunches the showcase
+                                       into it and the page reconnects itself. Each tab shows the
+                                       fluent declaration that runs it and buttons that fire its
+                                       scripted moments; a sidebar streams the raw enriched
+                                       changefeed with z-set weights, so retract-then-assert is
+                                       visible rather than described; the footer reads the
+                                       `Incremental` meter. `--workers N` sets the thread count
+                                       (default 2, so the other tabs really exercise the exchange
+                                       path). Still no NuGet dependency beyond the
+                                       library: `Microsoft.NET.Sdk.Web` resolves ASP.NET Core from
+                                       the shared framework, the page is one dependency-free HTML
+                                       file, and state reaches it over server-sent events.
+                                       `--headless` runs every tab and trigger unattended, prints
+                                       the panels as text, and exits non-zero if a verified act
+                                       (crash recovery, cluster shard merge) fails to verify — that
+                                       is the CI smoke test. Deliberately not shown: the escape
+                                       hatches (Minus/Negate, EvictWhen, WindowCloses, Rows,
+                                       weighted SendAsync) — reference material (docs/intro.md),
+                                       not headline features
 examples/Incremental.TaxiAnalytics genuine big data: ~13M real NYC yellow-taxi trips (parquet, read
                                        via Parquet.Net, downloaded and cached on first run, ~50MB/month;
                                        `--months N`, `--synthetic`) through join + counts + revenue +
@@ -531,8 +562,11 @@ disclosed trade-offs (below), not missing semantics:
 
 ### Headroom
 
-- [ ] All-singing, all-dancing demo showing every feature together
+- [x] All-singing, all-dancing demo showing every feature together
+      (`examples/Incremental.Showcase` — see Project layout)
 - [ ] Keyed-input restart story (checkpoint the upsert map, or derive retractions from
-      operator state)
+      operator state; the Showcase's Act 4 demonstrates the current behavior honestly —
+      after a restore it does *not* re-feed keyed inputs, because replaying upserts on top
+      of checkpointed state double-counts)
 - [ ] Investigate off-heap in-process storage to reduce GC (RocksDB, SQLite candidates)
 - [ ] Cluster transport TLS/authentication

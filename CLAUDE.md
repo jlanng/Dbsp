@@ -8,6 +8,12 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
 - Test: `dotnet test tests/Incremental.Tests` (Redis tests skip unless `docker compose up -d` has run)
 - Examples: `dotnet run --project examples/Incremental.Example`,
   `dotnet run --project examples/Incremental.LogAnalytics [-- --redis]`
+- Showcase (the all-features demo): `dotnet run --project examples/Incremental.Showcase`
+  serves a web app on http://localhost:5170 (`--port`, `--no-open`, `--redis`, `--cluster`,
+  `--workers N`); `-- --headless` runs every tab unattended and exits non-zero if a verified
+  act fails — that is the smoke test. Web-only: `Microsoft.NET.Sdk.Web` costs no NuGet
+  packages. Tab 5 measures worker-count scaling and can relaunch the process into another
+  topology; run it `-c Release` if the throughput column is the point (Debug flattens it).
 - Benchmarks: `dotnet run -c Release --project benchmarks/Incremental.Benchmarks -- --filter '*'`
   (BenchmarkDotNet); `-- --assert` runs the CI performance contracts — scaling-ratio
   assertions (delta cost vs state size), which is what `.github/workflows/ci.yml` gates on
