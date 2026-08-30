@@ -1,6 +1,7 @@
 # Incremental
 
-DBSP-style incremental stream processing library for .NET (net10.0, SDK pinned via mise.toml).
+DBSP-style incremental stream processing library for .NET (libraries multi-target
+net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
 
 ## Commands
 - Build: `dotnet build`
@@ -20,5 +21,11 @@ DBSP-style incremental stream processing library for .NET (net10.0, SDK pinned v
   state is keyed must sit downstream of an exchange on that key (`IndexBy` inserts it;
   `Distinct` shuffles by value) — adding a stateful operator without this breaks
   multi-worker correctness silently.
+- Exchange routing must be process-stable: route by `StableHash` (or a user-supplied
+  stable hash), never `GetHashCode` — .NET randomizes string hashes per process, which
+  silently breaks cluster routing and multi-worker checkpoint restore.
+- Checkpointed state identity is covered by the state manifest (committed with every
+  checkpoint, validated at `Start()`); store names are positional unless pinned with
+  `.Named()` — changing store naming or the manifest format needs a format-version bump.
 - Backpressure comes only from bounded channels (inputs, outputs). Never buffer unboundedly.
 - Public API is fluent delegates, intentionally not LINQ/expression trees.
