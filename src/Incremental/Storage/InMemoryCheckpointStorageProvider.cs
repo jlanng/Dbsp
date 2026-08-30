@@ -12,6 +12,8 @@ namespace Incremental.Storage;
 public sealed class InMemoryCheckpointStorageProvider : ICheckpointStorageProvider
 {
     private readonly Dictionary<string, IStagedStore> _stores = new();
+    private readonly Dictionary<string, string> _stagedManifests = new();
+    private readonly Dictionary<string, string> _committedManifests = new();
     private Dictionary<string, long> _committedOffsets = new();
 
     public IWeightStore<T> CreateWeightStore<T>(string name) where T : notnull =>
@@ -31,6 +33,7 @@ public sealed class InMemoryCheckpointStorageProvider : ICheckpointStorageProvid
         {
             foreach (var store in _stores.Values)
                 store.Rollback();
+            _stagedManifests.Clear();
             return new Dictionary<string, long>(_committedOffsets);
         }
     }
@@ -41,8 +44,23 @@ public sealed class InMemoryCheckpointStorageProvider : ICheckpointStorageProvid
         {
             foreach (var store in _stores.Values)
                 store.Promote();
+            foreach (var (scope, manifest) in _stagedManifests)
+                _committedManifests[scope] = manifest;
+            _stagedManifests.Clear();
             _committedOffsets = new Dictionary<string, long>(inputOffsets);
         }
+    }
+
+    public string? CommittedManifest(string scope)
+    {
+        lock (_stores)
+            return _committedManifests.GetValueOrDefault(scope);
+    }
+
+    public void StageManifest(string scope, string manifest)
+    {
+        lock (_stores)
+            _stagedManifests[scope] = manifest;
     }
 
     private TStore GetOrCreate<TStore>(string name, Func<TStore> factory) where TStore : class, IStagedStore

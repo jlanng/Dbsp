@@ -1,10 +1,26 @@
 using Incremental.Cluster;
 using Incremental.Storage;
+using Microsoft.Extensions.Logging;
 
 namespace Incremental;
 
 public sealed class CircuitOptions
 {
+    /// <summary>Names the circuit in its logs and as the <c>circuit</c> tag on every metric
+    /// from the <c>Incremental</c> meter, so circuits sharing a process stay
+    /// distinguishable. Null (default) auto-assigns <c>circuit-1</c>, <c>circuit-2</c>, …
+    /// in construction order.</summary>
+    public string? Name { get; init; }
+
+    /// <summary>Receives the circuit's logs, under the categories
+    /// <c>Incremental.Circuit</c> and <c>Incremental.Cluster</c>: lifecycle at
+    /// Information, checkpoint commits at Debug, faults and cluster timeouts at Error.
+    /// Record contents are never logged. Null (default) — no logging. Metrics need no
+    /// wiring: the <c>Incremental</c> <see cref="System.Diagnostics.Metrics.Meter"/> is
+    /// always on (steps, step duration, records, queue depths, watermark lag, checkpoint
+    /// commits, faults, cluster frames/bytes) and costs nothing unlistened.</summary>
+    public ILoggerFactory? LoggerFactory { get; init; }
+
     /// <summary>Number of worker threads <em>on this process</em>. Keyed operators shard
     /// their state across workers via exchange operators inserted by
     /// <c>IndexBy</c>/<c>Distinct</c> — across all processes' workers when
@@ -41,6 +57,20 @@ public sealed class CircuitOptions
     /// runs on every process, each hosting a contiguous slice of the global worker set, and
     /// exchange operators shuffle across all of them. Null (default) — single process.</summary>
     public ClusterOptions? Cluster { get; init; }
+
+    /// <summary>Upper bound on any single cross-process wait in a clustered step: receiving
+    /// an exchange node's shards from a peer, the end-of-step alignment frames, or space in
+    /// a peer's bounded send queue. Null (default) waits forever — a peer that is merely
+    /// slow (a long GC pause, a big shard) then stalls the step, which is ordinary
+    /// backpressure. Set it in production clusters so a peer that is <em>stuck</em> — a
+    /// wedged user delegate, a half-dead host that still holds its connections — faults the
+    /// circuit with a descriptive <see cref="TimeoutException"/> instead of hanging every
+    /// process forever. A fired timeout is terminal, like any other fault: rebuild the
+    /// circuit from the last committed checkpoint once the cluster is healthy. Size it well
+    /// above the slowest healthy step (including output-consumer backpressure, which crosses
+    /// the wire). Ignored when <see cref="Cluster"/> is null: local waits are in-process and
+    /// diagnosable, and a stuck local delegate is a bug the timeout could only mislabel.</summary>
+    public TimeSpan? ExchangeTimeout { get; init; }
 
     /// <summary>Whether exchange nodes are needed: more than one worker shard exists, either
     /// as local threads or across cluster processes.</summary>

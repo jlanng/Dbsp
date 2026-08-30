@@ -6,10 +6,18 @@ namespace Incremental;
 internal sealed class NodeDefinition
 {
     public required int Id { get; init; }
-    public required string Name { get; init; }
+    public required string Kind { get; init; }
     public required int[] Inputs { get; init; }
     public bool IsExchange { get; init; }
     public required Func<OperatorContext, IStepOperator> Factory { get; init; }
+
+    /// <summary>Explicit state identity from <see cref="ZStream{T}.Named"/>, or null for positional.</summary>
+    public string? StateId { get; set; }
+
+    /// <summary>Root of the node's state store names: positional (declaration order) by
+    /// default, so any topology change upstream renumbers it — unless an explicit name pins
+    /// it, letting the node's checkpointed state survive circuit evolution.</summary>
+    public string Name => StateId is null ? $"n{Id}.{Kind}" : $"named.{StateId}.{Kind}";
 }
 
 /// <summary>
@@ -48,6 +56,9 @@ public sealed class CircuitBuilder
         Options = options ?? new CircuitOptions();
         ArgumentOutOfRangeException.ThrowIfLessThan(Options.Workers, 1, nameof(Options.Workers));
         ArgumentOutOfRangeException.ThrowIfLessThan(Options.CheckpointInterval, 1, nameof(Options.CheckpointInterval));
+        ArgumentOutOfRangeException.ThrowIfLessThan(Options.InputChannelCapacity, 1, nameof(Options.InputChannelCapacity));
+        ArgumentOutOfRangeException.ThrowIfLessThan(Options.OutputChannelCapacity, 1, nameof(Options.OutputChannelCapacity));
+        ArgumentOutOfRangeException.ThrowIfLessThan(Options.MaxStepItemsPerInput, 1, nameof(Options.MaxStepItemsPerInput));
         if (Options.Cluster is { } cluster)
         {
             ArgumentOutOfRangeException.ThrowIfLessThan(cluster.ProcessCount, 1, nameof(Options.Cluster));
@@ -120,7 +131,7 @@ public sealed class CircuitBuilder
         _nodes.Add(new NodeDefinition
         {
             Id = id,
-            Name = $"n{id}.{kind}",
+            Kind = kind,
             Inputs = inputs,
             IsExchange = isExchange,
             Factory = factory,
@@ -128,14 +139,28 @@ public sealed class CircuitBuilder
         return id;
     }
 
-    internal void AddOutput<T>(string name, int nodeId) where T : notnull
+    internal void SetStateId(int nodeId, string name)
+    {
+        ThrowIfBuilt();
+        ArgumentException.ThrowIfNullOrEmpty(name);
+        if (!name.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_'))
+            throw new ArgumentException(
+                $"Operator name '{name}' is invalid: use ASCII letters, digits, '-' and '_' — the name becomes part of state store names.",
+                nameof(name));
+        var node = _nodes[nodeId];
+        if (node.StateId is not null)
+            throw new InvalidOperationException($"This operator is already named '{node.StateId}'.");
+        node.StateId = name;
+    }
+
+    internal void AddOutput<T>(string name, int nodeId, bool snapshot = false) where T : notnull
     {
         ThrowIfBuilt();
         RequireOutsideRecursion("Output");
         RequireVisible(nodeId);
         if (_outputs.Any(o => o.Name == name))
             throw new ArgumentException($"An output named '{name}' already exists.", nameof(name));
-        _outputs.Add(new OutputRegistration<T> { Name = name, NodeId = nodeId });
+        _outputs.Add(new OutputRegistration<T> { Name = name, NodeId = nodeId, Snapshot = snapshot });
     }
 
     /// <summary>Streams defined inside a Recurse body carry per-iteration deltas that are
@@ -199,6 +224,14 @@ public sealed class CircuitBuilder
                 "Recurse is not supported in clustered circuits: the per-iteration convergence decision is a global " +
                 "reduction, which would need a cross-process round trip every loop iteration. Run recursive circuits " +
                 "on a single process (Workers may still be > 1).");
+        var duplicateNames = _nodes.Where(n => n.StateId is not null)
+            .GroupBy(n => n.StateId!, StringComparer.Ordinal)
+            .Where(g => g.Count() > 1)
+            .Select(g => $"'{g.Key}'")
+            .ToArray();
+        if (duplicateNames.Length > 0)
+            throw new InvalidOperationException(
+                $"Operator names must be unique within a circuit — they key checkpointed state. Duplicated: {string.Join(", ", duplicateNames)}.");
         _built = true;
         return new Circuit([.. _nodes], [.. _loopRegions], _inputs, _outputs, Options, WatermarkClock);
     }

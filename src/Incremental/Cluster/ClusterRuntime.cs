@@ -2,8 +2,10 @@ using System.Buffers.Binary;
 using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Threading.Channels;
+using Incremental.Diagnostics;
 using Incremental.Operators;
 using Incremental.Runtime;
+using Microsoft.Extensions.Logging;
 
 namespace Incremental.Cluster;
 
@@ -23,7 +25,9 @@ namespace Incremental.Cluster;
 /// fails both queues, so a peer's death faults this circuit through the ordinary worker
 /// fault path instead of hanging a barrier.
 /// </summary>
-internal sealed class ClusterRuntime(IExchangeTransport transport, int localWorkers, SpinBarrier barrier) : IAsyncDisposable
+internal sealed class ClusterRuntime(
+    IExchangeTransport transport, int localWorkers, SpinBarrier barrier, TimeSpan? exchangeTimeout,
+    CircuitDiagnostics diagnostics) : IAsyncDisposable
 {
     internal const int StepEndNode = -1;
     internal const int FaultNode = -2;
@@ -63,6 +67,9 @@ internal sealed class ClusterRuntime(IExchangeTransport transport, int localWork
     private async Task StartAsync()
     {
         await _transport.ConnectAsync(_stop.Token).ConfigureAwait(false);
+        diagnostics.ClusterLogger.LogInformation(
+            "Cluster mesh connected: process {ProcessIndex} of {ProcessCount}, {GlobalWorkers} global workers",
+            ProcessIndex, ProcessCount, GlobalWorkers);
         _demux = [.. Peers().Select(p => Task.Run(() => DemuxAsync(p)))];
     }
 
@@ -75,12 +82,15 @@ internal sealed class ClusterRuntime(IExchangeTransport transport, int localWork
             while (true)
             {
                 var frame = await _transport.ReceiveAsync(peer, _stop.Token).ConfigureAwait(false);
+                diagnostics.FrameReceived(peer, frame.Payload.Length);
                 switch (frame.NodeId)
                 {
                     case StepEndNode:
                         await _stepEnds[peer].Writer.WriteAsync(frame, _stop.Token).ConfigureAwait(false);
                         break;
                     case FaultNode:
+                        diagnostics.ClusterLogger.LogError(
+                            "Cluster process {Peer} reported a fault: {PeerFault}", peer, Encoding.UTF8.GetString(frame.Payload));
                         Fail(peer, new InvalidOperationException(
                             $"Cluster process {peer} faulted: {Encoding.UTF8.GetString(frame.Payload)}"));
                         return;
@@ -97,6 +107,7 @@ internal sealed class ClusterRuntime(IExchangeTransport transport, int localWork
         }
         catch (Exception ex)
         {
+            diagnostics.ClusterLogger.LogWarning(ex, "Lost the connection to cluster process {Peer}", peer);
             Fail(peer, new InvalidOperationException($"Lost the connection to cluster process {peer}: {ex.Message}", ex));
         }
     }
@@ -118,10 +129,12 @@ internal sealed class ClusterRuntime(IExchangeTransport transport, int localWork
     {
         var payload = clock is null ? [] : EncodeWatermarks(clock.CollectMaxSeen());
         foreach (var peer in Peers())
-            await _transport.SendAsync(peer, new ExchangeFrame(step, StepEndNode, payload), _stop.Token).ConfigureAwait(false);
+            await SendAsync(peer, new ExchangeFrame(step, StepEndNode, payload),
+                $"waiting for room to send the step-end frame of step {step} to process {peer}").ConfigureAwait(false);
         foreach (var peer in Peers())
         {
-            var frame = await ReadAsync(_stepEnds[peer], _stop.Token).ConfigureAwait(false);
+            var frame = await ReadAsync(_stepEnds[peer],
+                $"waiting for process {peer} to finish step {step}").ConfigureAwait(false);
             Validate(frame, step, StepEndNode, peer);
             if (clock is not null && frame.Payload.Length > 0)
                 clock.ObserveRemote(DecodeWatermarks(frame.Payload));
@@ -130,16 +143,20 @@ internal sealed class ClusterRuntime(IExchangeTransport transport, int localWork
 
     /// <summary>Ships one exchange node's shards for one peer process (called by the
     /// designated worker, mid-step, in node order). Blocks the worker thread when the
-    /// bounded send queue is full — backpressure from a slow peer stalls the step.</summary>
+    /// bounded send queue is full — backpressure from a slow peer stalls the step, bounded
+    /// by the exchange timeout when one is configured.</summary>
     public void SendShards(long step, int node, int targetProcess, byte[] payload) =>
-        Wait(_transport.SendAsync(targetProcess, new ExchangeFrame(step, node, payload), _stop.Token).AsTask());
+        Wait(SendAsync(targetProcess, new ExchangeFrame(step, node, payload),
+            $"waiting for room to ship the shards of exchange node {node} (step {step}) to process {targetProcess}").AsTask());
 
     /// <summary>The inbound shards of one exchange node from one peer (designated worker,
-    /// mid-step). Blocks until the frame arrives, the peer dies (descriptive fault), or the
-    /// local circuit is poisoned (silent unwind, like a poisoned barrier).</summary>
+    /// mid-step). Blocks until the frame arrives, the peer dies (descriptive fault), the
+    /// exchange timeout lapses (descriptive fault), or the local circuit is poisoned
+    /// (silent unwind, like a poisoned barrier).</summary>
     public byte[] ReceiveShards(long step, int node, int fromProcess)
     {
-        var frame = Wait(ReadAsync(_shards[fromProcess], _stop.Token));
+        var frame = Wait(ReadAsync(_shards[fromProcess],
+            $"waiting for the shards of exchange node {node} (step {step}) from process {fromProcess}"));
         Validate(frame, step, node, fromProcess);
         return frame.Payload;
     }
@@ -191,11 +208,16 @@ internal sealed class ClusterRuntime(IExchangeTransport transport, int localWork
                 "Every process must run the same circuit definition with the same options and step in lockstep.");
     }
 
-    private async ValueTask<ExchangeFrame> ReadAsync(Channel<ExchangeFrame> channel, CancellationToken cancellationToken)
+    private async ValueTask<ExchangeFrame> ReadAsync(Channel<ExchangeFrame> channel, string awaiting)
     {
+        using var deadline = StartDeadline();
         try
         {
-            return await channel.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            return await channel.Reader.ReadAsync(deadline?.Token ?? _stop.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (deadline is not null && !_stop.IsCancellationRequested)
+        {
+            throw Timeout(awaiting);
         }
         catch (ChannelClosedException ex) when (ex.InnerException is { } inner)
         {
@@ -207,6 +229,43 @@ internal sealed class ClusterRuntime(IExchangeTransport transport, int localWork
             // Completed without an error: local shutdown/poison raced ahead of the token.
             throw new BarrierPoisonedException();
         }
+    }
+
+    private async ValueTask SendAsync(int peer, ExchangeFrame frame, string awaiting)
+    {
+        using var deadline = StartDeadline();
+        try
+        {
+            await _transport.SendAsync(peer, frame, deadline?.Token ?? _stop.Token).ConfigureAwait(false);
+            diagnostics.FrameSent(peer, frame.Payload.Length);
+        }
+        catch (OperationCanceledException) when (deadline is not null && !_stop.IsCancellationRequested)
+        {
+            throw Timeout(awaiting);
+        }
+    }
+
+    /// <summary>Null when no exchange timeout is configured — waits then ride the plain
+    /// poison/shutdown token, exactly as before the timeout existed.</summary>
+    private CancellationTokenSource? StartDeadline()
+    {
+        if (exchangeTimeout is not { } timeout)
+            return null;
+        var deadline = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+        deadline.CancelAfter(timeout);
+        return deadline;
+    }
+
+    private TimeoutException Timeout(string awaiting)
+    {
+        diagnostics.ClusterLogger.LogError(
+            "Cluster process {ProcessIndex} timed out after {Timeout} {Awaiting}; faulting the circuit",
+            ProcessIndex, exchangeTimeout, awaiting);
+        return new TimeoutException(
+            $"Cluster process {ProcessIndex} timed out after {exchangeTimeout} {awaiting}. The peer is stalled or " +
+            "unreachable; this circuit is now faulted (terminal). Rebuild every process from the last committed " +
+            "checkpoint once the cluster is healthy, or raise CircuitOptions.ExchangeTimeout if healthy steps can " +
+            "legitimately take this long.");
     }
 
     private T Wait<T>(ValueTask<T> task) => Wait(task.AsTask());

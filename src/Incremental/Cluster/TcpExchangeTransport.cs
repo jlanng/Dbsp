@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading.Channels;
+using Incremental.Diagnostics;
 
 namespace Incremental.Cluster;
 
@@ -16,14 +17,22 @@ namespace Incremental.Cluster;
 /// queue drained by a pump task: a slow peer fills the queue and stalls the sender's step —
 /// bounded backpressure, never an unbounded buffer. A failed or closed connection fails the
 /// transport's pending reads and writes, which faults the circuit instead of hanging it.
+///
+/// <para><b>Security: this transport is unauthenticated cleartext.</b> The handshake is a
+/// bare peer index and frames are plain JSON on the socket — anything that can reach the
+/// port can join the mesh and inject data, and every exchanged record crosses the wire
+/// readable. Run it only on a trusted, isolated network segment (or over an encrypted
+/// tunnel the deployment provides); the <c>maxFrameBytes</c> cap bounds what a single
+/// frame can make the receiver allocate, but it is a robustness cap, not an
+/// authentication mechanism.</para>
 /// </summary>
-public sealed class TcpExchangeTransport : IExchangeTransport
+public sealed class TcpExchangeTransport : IExchangeTransport, ITransportDiagnostics
 {
     // Frame header: [int32 payload length][int64 step][int32 nodeId], little-endian.
     private const int HeaderSize = 16;
-    private const int MaxPayloadBytes = 1 << 30;
 
     private readonly string[] _endpoints;
+    private readonly int _maxFrameBytes;
     private readonly TimeSpan _connectTimeout;
     private readonly Channel<ExchangeFrame>[] _sendQueues;
     private readonly NetworkStream?[] _inbound;
@@ -33,19 +42,32 @@ public sealed class TcpExchangeTransport : IExchangeTransport
     private readonly Task[] _pumps;
     private TcpListener? _listener;
 
+    /// <param name="processIndex">This process's index into <paramref name="endpoints"/>.</param>
+    /// <param name="endpoints">One <c>host:port</c> per process; identical on every process.</param>
+    /// <param name="connectTimeout">How long <see cref="ConnectAsync"/> retries for the full
+    /// mesh before giving up (default 15 s).</param>
+    /// <param name="sendQueueCapacity">Frames buffered per peer before senders block.</param>
+    /// <param name="maxFrameBytes">Largest frame payload this process will send or accept
+    /// (default 64 MB). An inbound length prefix beyond it is rejected as a corrupt or
+    /// hostile frame — a descriptive fault instead of an attacker-sized allocation. Must be
+    /// identical on every process, and larger than the biggest shard a step can ship (scale
+    /// with batch sizes when raising it).</param>
     public TcpExchangeTransport(
         int processIndex,
         IReadOnlyList<string> endpoints,
         TimeSpan? connectTimeout = null,
-        int sendQueueCapacity = 256)
+        int sendQueueCapacity = 256,
+        int maxFrameBytes = 64 << 20)
     {
         ArgumentNullException.ThrowIfNull(endpoints);
         ArgumentOutOfRangeException.ThrowIfLessThan(endpoints.Count, 1, nameof(endpoints));
         ArgumentOutOfRangeException.ThrowIfNegative(processIndex, nameof(processIndex));
         ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(processIndex, endpoints.Count, nameof(processIndex));
         ArgumentOutOfRangeException.ThrowIfLessThan(sendQueueCapacity, 1, nameof(sendQueueCapacity));
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxFrameBytes, 1024, nameof(maxFrameBytes));
 
         ProcessIndex = processIndex;
+        _maxFrameBytes = maxFrameBytes;
         _endpoints = [.. endpoints];
         _connectTimeout = connectTimeout ?? TimeSpan.FromSeconds(15);
         _inbound = new NetworkStream?[endpoints.Count];
@@ -64,6 +86,17 @@ public sealed class TcpExchangeTransport : IExchangeTransport
 
     public int ProcessIndex { get; }
     public int ProcessCount => _endpoints.Length;
+
+    /// <summary>Feeds the <c>incremental.cluster.send_queue_depth</c> gauge.</summary>
+    IEnumerable<(int Peer, int Depth)> ITransportDiagnostics.SendQueueDepths
+    {
+        get
+        {
+            for (var p = 0; p < _sendQueues.Length; p++)
+                if (_sendQueues[p] is { } queue)
+                    yield return (p, queue.Reader.Count);
+        }
+    }
 
     public async Task ConnectAsync(CancellationToken cancellationToken)
     {
@@ -173,7 +206,11 @@ public sealed class TcpExchangeTransport : IExchangeTransport
 
     public async ValueTask SendAsync(int targetProcess, ExchangeFrame frame, CancellationToken cancellationToken)
     {
-        ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(frame.Payload.Length, MaxPayloadBytes, nameof(frame));
+        if (frame.Payload.Length > _maxFrameBytes)
+            throw new InvalidOperationException(
+                $"Refusing to send a {frame.Payload.Length}-byte frame to cluster process {targetProcess}: " +
+                $"it exceeds maxFrameBytes ({_maxFrameBytes}), so the peer would reject it as corrupt. " +
+                "Raise maxFrameBytes identically on every process, or reduce the step batch size.");
         try
         {
             await _sendQueues[targetProcess].Writer.WriteAsync(frame, cancellationToken).ConfigureAwait(false);
@@ -192,9 +229,14 @@ public sealed class TcpExchangeTransport : IExchangeTransport
 
         var header = new byte[HeaderSize];
         await stream.ReadExactlyAsync(header, linked.Token).ConfigureAwait(false);
+        // Validate before allocating: the length prefix is untrusted input, and a corrupt or
+        // hostile value must produce a descriptive fault, not an attacker-sized allocation.
         var length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0));
-        if (length < 0 || length > MaxPayloadBytes)
-            throw new InvalidOperationException($"Corrupt frame from cluster process {senderProcess} (payload length {length}).");
+        if (length < 0 || length > _maxFrameBytes)
+            throw new InvalidOperationException(
+                $"Corrupt frame from cluster process {senderProcess}: payload length {length} is outside " +
+                $"[0, {_maxFrameBytes}] (maxFrameBytes). Either the connection carries non-cluster traffic " +
+                "or the peers were configured with different maxFrameBytes values.");
         var payload = length == 0 ? [] : new byte[length];
         if (length > 0)
             await stream.ReadExactlyAsync(payload, linked.Token).ConfigureAwait(false);

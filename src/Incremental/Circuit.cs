@@ -1,7 +1,11 @@
+using System.Diagnostics;
 using Incremental.Cluster;
+using Incremental.Diagnostics;
 using Incremental.Operators;
 using Incremental.Runtime;
 using Incremental.Storage;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Incremental;
 
@@ -52,6 +56,11 @@ public sealed class Circuit : IAsyncDisposable
     private long _committedStepMarker = -1;
 
     private readonly CancellationTokenSource _shutdown = new();
+
+    // Serializes steps against snapshot reads: a snapshot must never observe a half-applied
+    // step, so RunStepAsync holds this for the whole step (publish included) and
+    // ReadOutputSnapshotAsync reads only while no step is in flight.
+    private readonly SemaphoreSlim _stepGate = new(1, 1);
     private TaskCompletionSource _stepDone = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _workersRemaining;
     private bool _stopping;
@@ -61,8 +70,13 @@ public sealed class Circuit : IAsyncDisposable
 
     // Checkpointing: staged operator state and the input offsets it reflects are committed
     // together, every CheckpointInterval steps, once all workers' shards for those steps
-    // are complete — one commit point for the whole circuit.
+    // are complete — one commit point for the whole circuit. The state manifest — every
+    // store name this circuit's operators mint, plus the worker/process shape — is committed
+    // alongside and compared on Start, so a rebuilt circuit whose layout no longer matches
+    // the checkpoint (renumbered positional state, changed worker count) refuses to run
+    // instead of silently reading the wrong operators' state.
     private readonly ICheckpointStorageProvider? _checkpoint;
+    private readonly string _stateManifest = "";
     private Dictionary<string, long> _committedOffsets = new();
     private int _stepsSinceCommit;
 
@@ -74,6 +88,12 @@ public sealed class Circuit : IAsyncDisposable
     // state — _fault is the first (or aggregated) exception, null while healthy.
     private readonly List<Exception> _stepFaults = [];
     private Exception? _fault;
+
+    // Observability: per-circuit tag + loggers + gauge state (metrics ride the static
+    // "Incremental" meter). Everything here is step-granular — never per record.
+    private static int _autoNames;
+    private readonly CircuitDiagnostics _diag;
+    private readonly ILogger _log;
 
     internal Circuit(
         NodeDefinition[] nodes,
@@ -92,9 +112,24 @@ public sealed class Circuit : IAsyncDisposable
         _loopContinue = loopRegions.Select(_ => new bool[options.Workers]).ToArray();
         _watermarkClock = watermarkClock;
         _checkpoint = options.Storage as ICheckpointStorageProvider;
-        _barrier = new SpinBarrier(options.Workers);
-        _cluster = options.Cluster is { } cluster ? new ClusterRuntime(cluster.Transport, options.Workers, _barrier) : null;
+        if (options.ExchangeTimeout is { } timeout && timeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(options), "CircuitOptions.ExchangeTimeout must be positive (or null for no timeout).");
+        Name = options.Name ?? $"circuit-{Interlocked.Increment(ref _autoNames)}";
+        _diag = new CircuitDiagnostics(
+            Name,
+            options.LoggerFactory ?? NullLoggerFactory.Instance,
+            options.Cluster?.ProcessCount ?? 1);
+        _log = _diag.CircuitLogger;
 
+        _barrier = new SpinBarrier(options.Workers);
+        _cluster = options.Cluster is { } cluster
+            ? new ClusterRuntime(cluster.Transport, options.Workers, _barrier, options.ExchangeTimeout, _diag)
+            : null;
+
+        // Operators create their stores in their constructors, all through
+        // OperatorContext.StateName — so by the end of this loop the collected names are the
+        // complete state layout of this process's slice of the circuit.
+        var manifestStores = _checkpoint is null ? null : new SortedSet<string>(StringComparer.Ordinal);
         _workers = new Worker[options.Workers];
         for (var w = 0; w < options.Workers; w++)
         {
@@ -108,11 +143,14 @@ public sealed class Circuit : IAsyncDisposable
                     GlobalWorkerId = (_cluster?.FirstGlobalWorker ?? 0) + w,
                     Storage = options.Storage,
                     NodeName = nodes[n].Name,
+                    ManifestObserver = manifestStores is null ? null : name => manifestStores.Add(name),
                 };
                 operators[n] = nodes[n].Factory(context);
             }
             _workers[w] = new Worker(w, operators, new object?[nodes.Length]);
         }
+        if (manifestStores is not null)
+            _stateManifest = BuildStateManifest(manifestStores);
 
         _mailboxes = new object[nodes.Length][][];
         _remoteShards = new object[nodes.Length][][];
@@ -128,7 +166,20 @@ public sealed class Circuit : IAsyncDisposable
 
         _inputs = inputRegistrations.Select(r => r.CreatePort(options)).ToArray();
         _outputs = outputRegistrations.Select(r => r.CreatePort(options)).ToArray();
+        foreach (var output in _outputs)
+            output.BindSnapshot(this);
+
+        _diag.RegisterGauges(_inputs, _outputs, () => CurrentWatermark, options.Cluster?.Transport);
+        _log.LogInformation(
+            "Circuit {Circuit} built: {Workers} workers, {Nodes} nodes, {Inputs} inputs, {Outputs} outputs, " +
+            "cluster process {ProcessIndex} of {ProcessCount}, checkpointing {Checkpointing}",
+            Name, options.Workers, nodes.Length, _inputs.Length, _outputs.Length,
+            _cluster?.ProcessIndex ?? 0, _cluster?.ProcessCount ?? 1, _checkpoint is not null ? "on" : "off");
     }
+
+    /// <summary>The circuit's name — <see cref="CircuitOptions.Name"/>, or the auto-assigned
+    /// one — as used in its logs and as the <c>circuit</c> metric tag.</summary>
+    public string Name { get; }
 
     /// <summary>Starts the worker threads (and, with <see cref="CircuitOptions.AutoStep"/>, the pump).</summary>
     public void Start()
@@ -143,9 +194,37 @@ public sealed class Circuit : IAsyncDisposable
             // seed every input's position from the committed offsets, so records replayed
             // with explicit offsets at or below the checkpoint are dropped as duplicates.
             var offsets = FilterOwnOffsets(_checkpoint.Recover());
-            foreach (var input in _inputs)
-                if (offsets.TryGetValue(input.Name, out var offset))
-                    input.SeedOffset(offset);
+
+            // Refuse a mismatched restore before anything runs: resuming a checkpoint whose
+            // state layout this circuit no longer matches would read the wrong operators'
+            // state (or none) silently. No committed manifest means a fresh store — nothing
+            // to disagree with. The current manifest is staged so it lands with the next
+            // commit, always describing exactly the state committed beside it.
+            var scope = ManifestScope;
+            if (_checkpoint.CommittedManifest(scope) is { } committedManifest)
+            {
+                ValidateStateManifest(committedManifest, _stateManifest);
+                _log.LogInformation(
+                    "Circuit {Circuit} resuming from a committed checkpoint: state manifest validated, {Offsets} committed input offsets seeded",
+                    Name, offsets.Count);
+            }
+            _checkpoint.StageManifest(scope, _stateManifest);
+
+            foreach (var (key, offset) in offsets)
+            {
+                // Plain keys are unstamped running counts; "{name}#p{partition}" keys are a
+                // stamped input's per-partition positions (see OffsetKeys). Entries for
+                // inputs this circuit no longer declares are ignored, as ever.
+                var (name, partition) = OffsetKeys.TryDecode(key, out var decodedName, out var decodedPartition)
+                    ? (decodedName, (int?)decodedPartition)
+                    : (key, null);
+                if (Array.Find(_inputs, p => p.Name == name) is not { } input)
+                    continue;
+                if (partition is { } p)
+                    input.SeedPartition(p, offset);
+                else
+                    input.SeedUnstamped(offset);
+            }
             Volatile.Write(ref _committedOffsets, offsets);
         }
 
@@ -165,6 +244,9 @@ public sealed class Circuit : IAsyncDisposable
 
         if (_options.AutoStep)
             _pump = Task.Run(PumpAsync);
+
+        _log.LogInformation("Circuit {Circuit} started ({Stepping})",
+            Name, _options.AutoStep ? "auto-stepping" : "manual stepping");
     }
 
     /// <summary>The circuit's current event-time watermark: the frozen value as of the end
@@ -225,6 +307,19 @@ public sealed class Circuit : IAsyncDisposable
         if (Volatile.Read(ref _fault) is { } fault)
             throw new CircuitFaultedException(fault);
 
+        await _stepGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await RunStepGatedAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _stepGate.Release();
+        }
+    }
+
+    private async Task RunStepGatedAsync(CancellationToken cancellationToken)
+    {
         try
         {
             // Connect the cluster mesh before the first step (peers may start in any order).
@@ -238,11 +333,18 @@ public sealed class Circuit : IAsyncDisposable
         }
 
         _stepNumber++;
-        foreach (var input in _inputs)
-            input.DrainInto(_workers, _options.MaxStepItemsPerInput);
-
+        var stepStarted = Stopwatch.GetTimestamp();
         try
         {
+            // Draining belongs to the step's fault domain too: it consumes records from the
+            // input channels and advances replay positions, so a drain that throws (a
+            // stamped/unstamped mode violation) must fault the circuit, not leave it
+            // "healthy" with records silently gone.
+            var drained = 0L;
+            foreach (var input in _inputs)
+                drained += input.DrainInto(_workers, _options.MaxStepItemsPerInput);
+            _diag.RecordsDrained(drained);
+
             if (RunsInline)
             {
                 // Clustered inline steps block on remote frames mid-step; that must never
@@ -278,15 +380,63 @@ public sealed class Circuit : IAsyncDisposable
             // previous checkpoint intact, and the circuit must not run on unsure durability.
             if (_checkpoint is not null && ++_stepsSinceCommit >= _options.CheckpointInterval)
                 CommitCheckpoint();
+
+            // Publishing belongs to the step's fault domain: state has already advanced, so
+            // a failed or cancelled publish would silently lose this step's deltas and
+            // permanently desynchronize every consumer's integrated view. Fault instead —
+            // the committed checkpoint (taken above, before publishing) stays the intact
+            // resume point.
+            foreach (var output in _outputs)
+                await output.PublishAsync(_workers, cancellationToken).ConfigureAwait(false);
+
+            _diag.StepCompleted(Stopwatch.GetElapsedTime(stepStarted).TotalSeconds);
+            if (_watermarkClock is not null && _log.IsEnabled(LogLevel.Trace))
+                _log.LogTrace("Circuit {Circuit} step {Step} complete; watermark {Watermark:O}",
+                    Name, _stepNumber, CurrentWatermark);
         }
         catch (Exception ex)
         {
             FaultCircuit(ex);
             throw;
         }
+    }
 
-        foreach (var output in _outputs)
-            await output.PublishAsync(_workers, cancellationToken).ConfigureAwait(false);
+    /// <summary>Services <see cref="OutputHandle{T}.ReadSnapshotAsync"/> for a snapshot
+    /// output: merges the per-worker integrated shards of the output's snapshot node, under
+    /// the step gate so the read never interleaves with a step. While waiting for the gate
+    /// it discards the output's buffered deltas — they are subsumed by the snapshot about to
+    /// be taken, and a step blocked publishing into this output's full channel could
+    /// otherwise never finish and release the gate (deadlock).</summary>
+    internal async Task<ZSet<T>> ReadOutputSnapshotAsync<T>(
+        int nodeId, Action discardPending, CancellationToken cancellationToken) where T : notnull
+    {
+        if (!_started)
+            throw new InvalidOperationException("Start the circuit before reading a snapshot.");
+
+        while (true)
+        {
+            if (Volatile.Read(ref _fault) is { } fault)
+                throw new CircuitFaultedException(fault);
+            if (await _stepGate.WaitAsync(TimeSpan.FromMilliseconds(10), cancellationToken).ConfigureAwait(false))
+                break;
+            discardPending();
+        }
+
+        try
+        {
+            if (Volatile.Read(ref _fault) is { } fault)
+                throw new CircuitFaultedException(fault);
+            discardPending();
+
+            var merged = new ZSet<T>();
+            foreach (var worker in _workers)
+                ((SnapshotOperator<T>)worker.Operators[nodeId]).ReadInto(merged);
+            return merged;
+        }
+        finally
+        {
+            _stepGate.Release();
+        }
     }
 
     /// <summary>The exception that faulted the circuit — the original worker fault, an
@@ -309,7 +459,12 @@ public sealed class Circuit : IAsyncDisposable
     /// already surfaced on the step, the handles, and <see cref="Fault"/>.</summary>
     private void FaultCircuit(Exception exception)
     {
-        Interlocked.CompareExchange(ref _fault, exception, null);
+        if (Interlocked.CompareExchange(ref _fault, exception, null) is null)
+        {
+            _diag.CircuitFaulted();
+            _log.LogError(exception, "Circuit {Circuit} faulted on step {Step}; terminal — rebuild from the last committed checkpoint to recover",
+                Name, _stepNumber);
+        }
         var fault = _fault!;
 
         // Peers must learn promptly (Fault frame, backstopped by disconnect) and local
@@ -334,10 +489,10 @@ public sealed class Circuit : IAsyncDisposable
     /// commit covers the whole circuit.</summary>
     private void CommitCheckpoint()
     {
+        var started = Stopwatch.GetTimestamp();
         var offsets = new Dictionary<string, long>(_inputs.Length);
         foreach (var input in _inputs)
-            if (input.ConsumedOffset >= 0)
-                offsets[input.Name] = input.ConsumedOffset;
+            input.AppendConsumedOffsets(offsets);
 
         if (_cluster is { } cluster)
         {
@@ -361,9 +516,91 @@ public sealed class Circuit : IAsyncDisposable
 
         _stepsSinceCommit = 0;
         Volatile.Write(ref _committedOffsets, offsets);
+
+        var elapsed = Stopwatch.GetElapsedTime(started);
+        _diag.CheckpointCommitted(elapsed.TotalSeconds);
+        _log.LogDebug("Circuit {Circuit} committed a checkpoint at step {Step} in {ElapsedMs:F1} ms",
+            Name, _stepNumber, elapsed.TotalMilliseconds);
     }
 
     private const string StepMarkerKey = "$step";
+
+    /// <summary>Manifests are per process: processes sharing one physical store commit
+    /// disjoint shards (store names carry global worker ids) and validate their own slice.</summary>
+    private string ManifestScope => _cluster is { } cluster ? $"p{cluster.ProcessIndex}" : "local";
+
+    /// <summary>A stable, line-based description of this process's state layout: format
+    /// version, worker/process shape, then every store name, sorted. Store names encode the
+    /// operator's identity (positional, or explicit via <c>.Named</c>), kind, purpose, and
+    /// worker — so any change that would misdirect a restore changes the manifest.</summary>
+    private string BuildStateManifest(IEnumerable<string> storeNames)
+    {
+        var manifest = new System.Text.StringBuilder();
+        // format 2: the committed-offsets marker became per-partition (OffsetKeys) — a
+        // format-1 checkpoint's stamped positions live under plain input names and cannot
+        // be resumed unambiguously, so restoring one is refused via the manifest check.
+        manifest.Append("format=2\n");
+        manifest.Append($"workers={_options.Workers}\n");
+        manifest.Append($"processes={_cluster?.ProcessCount ?? 1}\n");
+        foreach (var store in storeNames)
+            manifest.Append($"store={store}\n");
+        return manifest.ToString();
+    }
+
+    private static void ValidateStateManifest(string committed, string current)
+    {
+        if (committed == current)
+            return;
+
+        static (Dictionary<string, string> Facts, List<string> Stores) Parse(string manifest)
+        {
+            var facts = new Dictionary<string, string>();
+            var stores = new List<string>();
+            foreach (var line in manifest.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var separator = line.IndexOf('=');
+                var (key, value) = (line[..separator], line[(separator + 1)..]);
+                if (key == "store")
+                    stores.Add(value);
+                else
+                    facts[key] = value;
+            }
+            return (facts, stores);
+        }
+
+        var (committedFacts, committedStores) = Parse(committed);
+        var (currentFacts, currentStores) = Parse(current);
+
+        var problems = new List<string>();
+        foreach (var fact in new[] { "format", "workers", "processes" })
+            if (committedFacts.GetValueOrDefault(fact) != currentFacts.GetValueOrDefault(fact))
+                problems.Add($"{fact} changed: the checkpoint was committed with {fact}={committedFacts.GetValueOrDefault(fact)}, " +
+                             $"this circuit has {fact}={currentFacts.GetValueOrDefault(fact)}");
+
+        // New stores are fine — they start empty. Committed stores this circuit no longer
+        // mints are not: their state would be orphaned, and whatever operator inherited
+        // their position would be reading someone else's.
+        var currentSet = new HashSet<string>(currentStores, StringComparer.Ordinal);
+        var missing = committedStores.Where(s => !currentSet.Contains(s)).ToList();
+        if (missing.Count > 0)
+        {
+            const int shown = 12;
+            problems.Add($"committed state with no home in this circuit:\n      " +
+                         string.Join("\n      ", missing.Take(shown)) +
+                         (missing.Count > shown ? $"\n      … and {missing.Count - shown} more" : ""));
+        }
+
+        if (problems.Count == 0)
+            return;
+
+        throw new InvalidOperationException(
+            "This circuit does not match the checkpoint it is resuming from — refusing to start, because a mismatched " +
+            "restore silently reads the wrong operators' state:\n  - " + string.Join("\n  - ", problems) + "\n" +
+            "Operator state is keyed by circuit position unless named, so inserting, removing, or reordering operators " +
+            "renumbers everything downstream. Options: revert the topology or worker-count change; give stateful " +
+            "operators stable identities with .Named(\"…\") (before their first checkpoint) so unrelated changes leave " +
+            "them alone; or start fresh against an empty state store (for Redis, a new KeyPrefix).");
+    }
 
     /// <summary>Clustered circuits: the step number this process's last committed checkpoint
     /// reflects — the recovered marker until the first new commit, then the current run's
@@ -407,12 +644,55 @@ public sealed class Circuit : IAsyncDisposable
     /// are in the durably committed checkpoint, or null when nothing has been committed for
     /// it (or <see cref="CircuitOptions.Storage"/> does not checkpoint). After a restart
     /// this is where a producer should resume its source; records re-sent with explicit
-    /// offsets at or below it are dropped as duplicates.</summary>
+    /// offsets at or below it are dropped as duplicates. For an unstamped input this is the
+    /// committed running count; for a stamped one it is the single committed partition's
+    /// position — an input with several committed partitions has no one offset, so this
+    /// throws: use <see cref="CommittedOffsets"/>.</summary>
     public long? CommittedOffset(string inputName)
+    {
+        RequireInput(inputName);
+        var committed = Volatile.Read(ref _committedOffsets);
+        if (committed.TryGetValue(inputName, out var count))
+            return count;
+
+        var partitions = 0;
+        var single = 0L;
+        foreach (var (key, offset) in committed)
+        {
+            if (OffsetKeys.TryDecode(key, out var name, out _) && name == inputName)
+                (partitions, single) = (partitions + 1, offset);
+        }
+        return partitions switch
+        {
+            0 => null,
+            1 => single,
+            _ => throw new InvalidOperationException(
+                $"Input '{inputName}' has committed offsets on {partitions} partitions; use CommittedOffsets to read them per partition."),
+        };
+    }
+
+    /// <summary>The committed position of every partition of <paramref name="inputName"/>:
+    /// partition → offset of the last record whose effects are in the durably committed
+    /// checkpoint. Empty when nothing has been committed for it, or when the input carries
+    /// unstamped records (their running count has no partitions — see
+    /// <see cref="CommittedOffset"/>). After a restart, resume each partition of the source
+    /// just above its committed position; replayed records at or below it are dropped.</summary>
+    public IReadOnlyDictionary<int, long> CommittedOffsets(string inputName)
+    {
+        RequireInput(inputName);
+        var offsets = new Dictionary<int, long>();
+        foreach (var (key, offset) in Volatile.Read(ref _committedOffsets))
+        {
+            if (OffsetKeys.TryDecode(key, out var name, out var partition) && name == inputName)
+                offsets[partition] = offset;
+        }
+        return offsets;
+    }
+
+    private void RequireInput(string inputName)
     {
         if (_inputs.All(p => p.Name != inputName))
             throw new KeyNotFoundException($"No input named '{inputName}'.");
-        return Volatile.Read(ref _committedOffsets).TryGetValue(inputName, out var offset) ? offset : null;
     }
 
     private async Task PumpAsync()
@@ -722,5 +1002,7 @@ public sealed class Circuit : IAsyncDisposable
 
         _shutdown.Cancel();
         _shutdown.Dispose();
+        _diag.Dispose();
+        _log.LogInformation("Circuit {Circuit} disposed after {Steps} steps", Name, _stepNumber);
     }
 }

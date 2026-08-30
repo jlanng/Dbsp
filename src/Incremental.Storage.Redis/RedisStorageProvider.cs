@@ -6,8 +6,10 @@ namespace Incremental.Storage.Redis;
 
 public sealed class RedisStorageOptions
 {
-    /// <summary>Prefix for every Redis key this provider writes.</summary>
-    public string KeyPrefix { get; init; } = "sp";
+    /// <summary>Prefix for every Redis key this provider writes. Required, and must be
+    /// unique per circuit: store names inside a prefix are positional (node/worker ids),
+    /// so two circuits sharing one prefix silently interleave their state.</summary>
+    public required string KeyPrefix { get; init; }
 
     /// <summary>Redis database number, or -1 for the connection default.</summary>
     public int Database { get; init; } = -1;
@@ -28,6 +30,7 @@ public sealed class RedisStorageOptions
 ///   indexed store      {prefix}:{store}:{key}      hash: serialized value → weight, one hash per group
 ///   value store        {prefix}:{store}            hash: serialized key → serialized value
 ///   checkpoint         {prefix}:checkpoint         hash: input name → committed offset
+///   manifest           {prefix}:manifest           hash: scope (process) → committed state manifest
 ///
 /// Store names already encode the node and worker id, so concurrent workers never share a
 /// store. The batch operations still cost one pipelined round trip per wave (HMGET/HGETALL
@@ -39,39 +42,48 @@ public sealed class RedisStorageProvider : ICheckpointStorageProvider
     private readonly IDatabase _db;
     private readonly RedisStorageOptions _options;
     private readonly string _checkpointKey;
-    private readonly List<IStagedStore> _stores = [];
+    private readonly string _manifestKey;
+    private readonly Dictionary<string, IStagedStore> _stores = [];
+    private readonly Dictionary<string, string> _stagedManifests = [];
 
-    public RedisStorageProvider(IConnectionMultiplexer connection, RedisStorageOptions? options = null)
+    public RedisStorageProvider(IConnectionMultiplexer connection, RedisStorageOptions options)
     {
-        _options = options ?? new RedisStorageOptions();
+        ArgumentNullException.ThrowIfNull(options);
+        if (string.IsNullOrEmpty(options.KeyPrefix) || options.KeyPrefix.Any(char.IsWhiteSpace))
+            throw new ArgumentException(
+                "KeyPrefix must be a non-empty string without whitespace, and unique per circuit sharing the Redis instance.",
+                nameof(options));
+        _options = options;
         _db = connection.GetDatabase(_options.Database);
         _checkpointKey = $"{_options.KeyPrefix}:checkpoint";
+        _manifestKey = $"{_options.KeyPrefix}:manifest";
     }
 
     public IWeightStore<T> CreateWeightStore<T>(string name) where T : notnull =>
-        Track(new RedisWeightStore<T>(_db, $"{_options.KeyPrefix}:{name}", _options.Serializer));
+        GetOrCreate(name, () => new RedisWeightStore<T>(_db, $"{_options.KeyPrefix}:{name}", _options.Serializer));
 
     public IIndexedWeightStore<TKey, TValue> CreateIndexedWeightStore<TKey, TValue>(string name)
         where TKey : notnull
         where TValue : notnull =>
-        Track(new RedisIndexedWeightStore<TKey, TValue>(_db, $"{_options.KeyPrefix}:{name}", _options.Serializer));
+        GetOrCreate(name, () => new RedisIndexedWeightStore<TKey, TValue>(_db, $"{_options.KeyPrefix}:{name}", _options.Serializer));
 
     public IValueStore<TKey, TValue> CreateValueStore<TKey, TValue>(string name) where TKey : notnull =>
-        Track(new RedisValueStore<TKey, TValue>(_db, $"{_options.KeyPrefix}:{name}", _options.Serializer));
+        GetOrCreate(name, () => new RedisValueStore<TKey, TValue>(_db, $"{_options.KeyPrefix}:{name}", _options.Serializer));
 
     public IReadOnlyDictionary<string, long> Recover()
     {
         lock (_stores)
         {
-            foreach (var store in _stores)
+            foreach (var store in _stores.Values)
                 store.Discard();
-        }
+            _stagedManifests.Clear();
 
-        var entries = _db.HashGetAll(_checkpointKey);
-        var offsets = new Dictionary<string, long>(entries.Length);
-        foreach (var entry in entries)
-            offsets[entry.Name!] = (long)entry.Value;
-        return offsets;
+            var entries = _db.HashGetAll(_checkpointKey);
+            var offsets = new Dictionary<string, long>(entries.Length);
+            foreach (var entry in entries)
+                offsets[entry.Name!] = (long)entry.Value;
+            return offsets;
+        }
     }
 
     public void Commit(IReadOnlyDictionary<string, long> inputOffsets)
@@ -79,8 +91,9 @@ public sealed class RedisStorageProvider : ICheckpointStorageProvider
         lock (_stores)
         {
             var transaction = _db.CreateTransaction();
-            foreach (var store in _stores)
-                store.Flush(transaction);
+            var pending = new List<Task>();
+            foreach (var store in _stores.Values)
+                store.Flush(transaction, pending);
 
             if (inputOffsets.Count > 0)
             {
@@ -88,24 +101,66 @@ public sealed class RedisStorageProvider : ICheckpointStorageProvider
                 var i = 0;
                 foreach (var (input, offset) in inputOffsets)
                     marker[i++] = new HashEntry(input, offset);
-                _ = transaction.HashSetAsync(_checkpointKey, marker);
+                pending.Add(transaction.HashSetAsync(_checkpointKey, marker));
             }
+
+            // The staged manifests ride the same transaction, so a committed manifest always
+            // describes committed state; once landed they need no rewriting (cleared below).
+            foreach (var (scope, manifest) in _stagedManifests)
+                pending.Add(transaction.HashSetAsync(_manifestKey, scope, manifest));
 
             // MULTI/EXEC: the commands travel as one unit and Redis applies them on EXEC,
             // so a crash anywhere before that leaves the previous checkpoint fully intact.
             if (!transaction.Execute())
                 throw new InvalidOperationException("The checkpoint commit transaction was rejected by Redis.");
 
-            foreach (var store in _stores)
+            // EXEC does not roll back on per-command errors (e.g. WRONGTYPE against a
+            // colliding key), so a true Execute() is not enough: every queued command must
+            // have succeeded, or the checkpoint must not be reported committed.
+            try
+            {
+                Task.WaitAll([.. pending]);
+            }
+            catch (AggregateException ex)
+            {
+                throw new InvalidOperationException(
+                    "The checkpoint commit transaction executed, but one or more of its commands failed; " +
+                    "the committed checkpoint may be incomplete and must not be trusted.",
+                    ex.InnerExceptions.Count == 1 ? ex.InnerException : ex);
+            }
+
+            foreach (var store in _stores.Values)
                 store.Discard(); // the overlays' content is now the committed state
+            _stagedManifests.Clear();
         }
     }
 
-    private TStore Track<TStore>(TStore store) where TStore : IStagedStore
+    public string? CommittedManifest(string scope)
     {
         lock (_stores)
-            _stores.Add(store);
-        return store;
+        {
+            var stored = _db.HashGet(_manifestKey, scope);
+            return stored.IsNull ? null : (string?)stored;
+        }
+    }
+
+    public void StageManifest(string scope, string manifest)
+    {
+        lock (_stores)
+            _stagedManifests[scope] = manifest;
+    }
+
+    private TStore GetOrCreate<TStore>(string name, Func<TStore> factory) where TStore : class, IStagedStore
+    {
+        lock (_stores)
+        {
+            if (_stores.TryGetValue(name, out var existing))
+                return existing as TStore
+                    ?? throw new InvalidOperationException($"Store '{name}' was already created with a different shape.");
+            var store = factory();
+            _stores[name] = store;
+            return store;
+        }
     }
 
     /// <summary>Staged-overlay store: <see cref="Flush"/> queues every staged write into the
@@ -114,7 +169,7 @@ public sealed class RedisStorageProvider : ICheckpointStorageProvider
     /// <see cref="RedisStorageProvider.Recover"/> (rolling back a crashed run).</summary>
     private interface IStagedStore
     {
-        void Flush(ITransaction transaction);
+        void Flush(ITransaction transaction, List<Task> pending);
         void Discard();
     }
 
@@ -182,7 +237,7 @@ public sealed class RedisStorageProvider : ICheckpointStorageProvider
                 Remove(value);
         }
 
-        public void Flush(ITransaction transaction)
+        public void Flush(ITransaction transaction, List<Task> pending)
         {
             List<RedisValue>? deletes = null;
             List<HashEntry>? sets = null;
@@ -194,9 +249,9 @@ public sealed class RedisStorageProvider : ICheckpointStorageProvider
                     (sets ??= []).Add(new HashEntry(field, weight));
             }
             if (deletes is not null)
-                _ = transaction.HashDeleteAsync(key, [.. deletes]);
+                pending.Add(transaction.HashDeleteAsync(key, [.. deletes]));
             if (sets is not null)
-                _ = transaction.HashSetAsync(key, [.. sets]);
+                pending.Add(transaction.HashSetAsync(key, [.. sets]));
         }
 
         public void Discard()
@@ -349,14 +404,14 @@ public sealed class RedisStorageProvider : ICheckpointStorageProvider
                 RemoveGroup(key);
         }
 
-        public void Flush(ITransaction transaction)
+        public void Flush(ITransaction transaction, List<Task> pending)
         {
             foreach (var (groupKey, group) in _groups)
             {
                 // A cleared group is deleted wholesale; staged survivors are re-asserted
                 // after it (MULTI preserves command order).
                 if (group.Cleared)
-                    _ = transaction.KeyDeleteAsync(groupKey);
+                    pending.Add(transaction.KeyDeleteAsync(groupKey));
 
                 List<RedisValue>? deletes = null;
                 List<HashEntry>? sets = null;
@@ -368,9 +423,9 @@ public sealed class RedisStorageProvider : ICheckpointStorageProvider
                         (sets ??= []).Add(new HashEntry(field, weight));
                 }
                 if (!group.Cleared && deletes is not null)
-                    _ = transaction.HashDeleteAsync(groupKey, [.. deletes]);
+                    pending.Add(transaction.HashDeleteAsync(groupKey, [.. deletes]));
                 if (sets is not null)
-                    _ = transaction.HashSetAsync(groupKey, [.. sets]);
+                    pending.Add(transaction.HashSetAsync(groupKey, [.. sets]));
             }
         }
 
@@ -519,7 +574,7 @@ public sealed class RedisStorageProvider : ICheckpointStorageProvider
                 Remove(k);
         }
 
-        public void Flush(ITransaction transaction)
+        public void Flush(ITransaction transaction, List<Task> pending)
         {
             List<RedisValue>? deletes = null;
             List<HashEntry>? sets = null;
@@ -531,9 +586,9 @@ public sealed class RedisStorageProvider : ICheckpointStorageProvider
                     (sets ??= []).Add(new HashEntry(field, value));
             }
             if (deletes is not null)
-                _ = transaction.HashDeleteAsync(key, [.. deletes]);
+                pending.Add(transaction.HashDeleteAsync(key, [.. deletes]));
             if (sets is not null)
-                _ = transaction.HashSetAsync(key, [.. sets]);
+                pending.Add(transaction.HashSetAsync(key, [.. sets]));
         }
 
         public void Discard()

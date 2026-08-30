@@ -15,8 +15,18 @@ public sealed class OperatorContext
     /// state store names distinct when processes share one physical store.</summary>
     public int GlobalWorkerId { get; init; }
 
+    /// <summary>Collects every store name the circuit's operators mint (all creation goes
+    /// through <see cref="StateName"/>, in operator constructors), so the circuit can commit
+    /// a state manifest with each checkpoint and refuse a mismatched restore.</summary>
+    internal Action<string>? ManifestObserver { get; init; }
+
     /// <summary>A store name unique to this node, worker, and purpose (cluster-wide).</summary>
-    public string StateName(string suffix) => $"{NodeName}.{suffix}.w{GlobalWorkerId}";
+    public string StateName(string suffix)
+    {
+        var name = $"{NodeName}.{suffix}.w{GlobalWorkerId}";
+        ManifestObserver?.Invoke(name);
+        return name;
+    }
 }
 
 /// <summary>
@@ -134,7 +144,10 @@ internal sealed class PlusOperator<T> : IStepOperator where T : notnull
     }
 }
 
-internal sealed class ExchangeOperator<T>(Func<T, int> routingHash) : IExchangeStepOperator where T : notnull
+/// <summary>The routing hash must be process- and machine-stable (see <see cref="StableHash"/>):
+/// cluster peers partition independently and must agree, and a restart against checkpointed
+/// state must route every key to the worker whose shard holds it.</summary>
+internal sealed class ExchangeOperator<T>(Func<T, uint> routingHash) : IExchangeStepOperator where T : notnull
 {
     // Single-worker fast path: no shuffle, pass the delta through untouched.
     public object Step(object?[] inputs) => inputs[0]!;
@@ -148,7 +161,7 @@ internal sealed class ExchangeOperator<T>(Func<T, int> routingHash) : IExchangeS
 
         foreach (var (value, weight) in delta)
         {
-            var target = (int)((uint)routingHash(value) % (uint)parts);
+            var target = (int)(routingHash(value) % (uint)parts);
             fragments[target].Add(value, weight);
         }
         return fragments;

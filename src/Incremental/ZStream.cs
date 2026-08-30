@@ -20,6 +20,25 @@ public class ZStream<T> where T : notnull
     internal CircuitBuilder Builder { get; }
     internal int NodeId { get; }
 
+    /// <summary>
+    /// Gives the operator this stream carries a stable state identity. By default an
+    /// operator's checkpointed state is keyed by its position in the circuit, so inserting,
+    /// removing, or reordering upstream operators renumbers it and orphans its committed
+    /// state (a mismatch the circuit detects at restart and refuses to run on). A named
+    /// operator keys its state by the name instead: the circuit can evolve around it and a
+    /// rebuilt circuit still finds its state. Name the streams returned by stateful
+    /// operators — joins, aggregations, <c>Distinct</c>, <c>TopK</c>, session windows;
+    /// names must be unique within the circuit. The name pins identity, not meaning: state
+    /// is resumed as-is, so an operator whose computation changes (say, a different
+    /// aggregate behind the same name) silently reinterprets old state — rename it when
+    /// the meaning changes.
+    /// </summary>
+    public ZStream<T> Named(string name)
+    {
+        Builder.SetStateId(NodeId, name);
+        return this;
+    }
+
     public ZStream<TOut> Map<TOut>(Func<T, TOut> selector) where TOut : notnull =>
         new(Builder, Builder.AddNode("map", [NodeId], _ => new MapOperator<T, TOut>(selector)));
 
@@ -44,7 +63,21 @@ public class ZStream<T> where T : notnull
     public ZStream<T> Minus(ZStream<T> other) => Plus(other.Negate());
 
     /// <summary>Collapses the multiset to a set: every present value gets weight exactly 1.</summary>
-    public ZStream<T> Distinct()
+    public ZStream<T> Distinct() =>
+        DistinctCore(Builder.Options.IsSharded ? StableHash.RoutingHasherFor<T>("Distinct") : null);
+
+    /// <summary>Collapses the multiset to a set, routing values across workers by
+    /// <paramref name="stableHash"/> instead of the built-in structural hash — for value
+    /// types the structural hash cannot derive (or types whose equality diverges from their
+    /// public structure). The hash must return the same value for equal records in every
+    /// process, on every machine: exchange routing and checkpoint restore depend on it.</summary>
+    public ZStream<T> Distinct(Func<T, uint> stableHash)
+    {
+        ArgumentNullException.ThrowIfNull(stableHash);
+        return DistinctCore(stableHash);
+    }
+
+    private ZStream<T> DistinctCore(Func<T, uint>? routingHash)
     {
         var upstream = NodeId;
         if (Builder.Options.IsSharded)
@@ -53,7 +86,7 @@ public class ZStream<T> where T : notnull
             upstream = Builder.AddNode(
                 "shuffle",
                 [upstream],
-                _ => new ExchangeOperator<T>(static v => EqualityComparer<T>.Default.GetHashCode(v)),
+                _ => new ExchangeOperator<T>(routingHash!),
                 isExchange: true);
         }
         // Inside a Recurse body the operator must be incremental in the iteration dimension
@@ -108,8 +141,28 @@ public class ZStream<T> where T : notnull
     /// Keys the stream by <paramref name="keySelector"/>, inserting an exchange so that all
     /// records with equal keys are processed by the same worker. This is the entry point to
     /// joins and grouped aggregation, and the DBSP equivalent of a shuffle/repartition.
+    /// Sharded circuits route by <see cref="StableHash"/>, so a key type it cannot derive a
+    /// hash for is rejected here, at definition time — supply one via the overload.
     /// </summary>
-    public KeyedZStream<TKey, T> IndexBy<TKey>(Func<T, TKey> keySelector) where TKey : notnull
+    public KeyedZStream<TKey, T> IndexBy<TKey>(Func<T, TKey> keySelector) where TKey : notnull =>
+        IndexByCore(keySelector, Builder.Options.IsSharded ? StableHash.RoutingHasherFor<TKey>("IndexBy") : null);
+
+    /// <summary>
+    /// Keys the stream by <paramref name="keySelector"/>, routing keys across workers by
+    /// <paramref name="stableHash"/> instead of the built-in structural hash — for key types
+    /// the structural hash cannot derive (or whose equality diverges from their public
+    /// structure). The hash must return the same value for equal keys in every process, on
+    /// every machine: exchange routing and checkpoint restore depend on it.
+    /// </summary>
+    public KeyedZStream<TKey, T> IndexBy<TKey>(Func<T, TKey> keySelector, Func<TKey, uint> stableHash)
+        where TKey : notnull
+    {
+        ArgumentNullException.ThrowIfNull(stableHash);
+        return IndexByCore(keySelector, stableHash);
+    }
+
+    private KeyedZStream<TKey, T> IndexByCore<TKey>(Func<T, TKey> keySelector, Func<TKey, uint>? keyHash)
+        where TKey : notnull
     {
         var keyed = Builder.AddNode(
             "index",
@@ -122,17 +175,28 @@ public class ZStream<T> where T : notnull
             node = Builder.AddNode(
                 "exchange",
                 [keyed],
-                _ => new ExchangeOperator<KeyedValue<TKey, T>>(
-                    static kv => EqualityComparer<TKey>.Default.GetHashCode(kv.Key)),
+                _ => new ExchangeOperator<KeyedValue<TKey, T>>(kv => keyHash!(kv.Key)),
                 isExchange: true);
         }
         return new KeyedZStream<TKey, T>(Builder, node);
     }
 
-    /// <summary>Registers this stream as a named output, readable after <c>Build</c> via <see cref="Circuit.Output{T}"/>.</summary>
-    public ZStream<T> Output(string name)
+    /// <summary>Registers this stream as a named output, readable after <c>Build</c> via
+    /// <see cref="Circuit.Output{T}"/>. With <paramref name="snapshot"/> the output also
+    /// maintains the integrated state of the view (behind the circuit's storage provider, so
+    /// it checkpoints and recovers with everything else), and the handle's
+    /// <see cref="OutputHandle{T}.ReadSnapshotAsync"/> returns the current view — the
+    /// bootstrap point for consumers that cannot replay every delta since the beginning,
+    /// e.g. after a restart.</summary>
+    public ZStream<T> Output(string name, bool snapshot = false)
     {
-        Builder.AddOutput<T>(name, NodeId);
+        var nodeId = NodeId;
+        if (snapshot)
+        {
+            Builder.RequireOutsideRecursion("Output");
+            nodeId = Builder.AddNode("snapshot", [nodeId], ctx => new SnapshotOperator<T>(ctx));
+        }
+        Builder.AddOutput<T>(name, nodeId, snapshot);
         return this;
     }
 
@@ -157,6 +221,14 @@ public sealed class KeyedZStream<TKey, TValue> : ZStream<KeyedValue<TKey, TValue
         : base(builder, nodeId)
     {
         _eviction = eviction;
+    }
+
+    /// <summary>Names the operator this stream carries, keeping the result keyed; see
+    /// <see cref="ZStream{T}.Named"/>.</summary>
+    public new KeyedZStream<TKey, TValue> Named(string name)
+    {
+        Builder.SetStateId(NodeId, name);
+        return this;
     }
 
     /// <summary>
@@ -358,7 +430,7 @@ public sealed class KeyedZStream<TKey, TValue> : ZStream<KeyedValue<TKey, TValue
             _eviction);
     }
 
-    /// <summary>Collapses the multiset to a set, like the unkeyed <see cref="ZStream{T}.Distinct"/>,
+    /// <summary>Collapses the multiset to a set, like the unkeyed <see cref="ZStream{T}.Distinct()"/>,
     /// but keeps the result keyed and its state grouped by key so an eviction policy applies.
     /// The stream is already partitioned by key, so no extra exchange is needed.</summary>
     public new KeyedZStream<TKey, TValue> Distinct()
