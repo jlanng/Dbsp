@@ -152,8 +152,22 @@ synchronized), so joins and grouped aggregations are correct and scale with the 
 count. `Distinct` shuffles by value automatically. There is no locking on operator state:
 one shard, one thread. The engine adapts to the worker count: with `Workers = 1` steps
 run inline on the coordinator (no worker thread, no handoff — hundreds-of-µs step
-latency for small workloads), while multi-worker exchanges synchronize on a spinning
-barrier rather than kernel block/wake, since mid-step the workers are already hot.
+latency for small workloads), while multi-worker exchanges synchronize on a barrier that
+spins briefly — mid-step the workers are already hot — and parks on a kernel wait after a
+spin budget, so a long wait (a network round trip, a slow peer) stops burning cores.
+
+**Routing hashes.** Exchanges route by `StableHash`, a process- and machine-stable
+structural hash (FNV-1a over string contents, raw bit patterns for numbers, a compiled
+per-type fold over public members for records/tuples/collections) — never by
+`GetHashCode`, whose string hashing is randomized per process. A randomized route would
+send the same key to different workers on different processes, silently splitting a
+join's state across a cluster or orphaning it across a checkpoint restart. A key type
+`StableHash` cannot derive a hash for (interfaces, delegates, unordered collections,
+types with no public readable members) is rejected at definition time; a type whose
+equality diverges from its public structure (say, a case-insensitive key) takes the
+`IndexBy(keySelector, stableHash)` / `Distinct(stableHash)` overloads — the supplied
+`Func<TKey, uint>` must return the same value for equal keys in every process, on every
+machine.
 
 **Cross-process exchange (clustering).** The same shuffle spans machines, behind the same
 operator API: the circuit definition is built unchanged on every process — user code
@@ -166,6 +180,13 @@ JSON — a delta batch is just (value, weight) pairs, retractions included) and 
 length-prefixed frames over a transport: `TcpExchangeTransport` (plain sockets, no
 dependencies; each process gets the shared endpoint list and its own index, connections are
 retried until the mesh is up) or `InMemoryExchangeTransport` for tests.
+
+> **Security**: the TCP transport is unauthenticated cleartext — the handshake is a bare
+> process index, and anyone who can reach the port can join the mesh and inject state.
+> Run it only on a trusted, isolated network segment (or inside a mesh/tunnel the
+> deployment provides); TLS/authentication is deliberately deferred. Frame payloads are
+> capped (`maxFrameBytes`, default 64 MB, same value everywhere) so a corrupt or hostile
+> length prefix is rejected rather than allocated.
 
 ```csharp
 // process 0 of 2 — process 1 runs the identical code with processIndex: 1
@@ -199,8 +220,14 @@ bounded, so a slow peer — or its slow output consumer — stalls the cluster's
 of buffering unboundedly.
 
 A peer disconnecting or faulting poisons the local circuit through the ordinary fault path
-(a descriptive exception on the step, the handles, and `Circuit.Fault`) — never a hang.
-Checkpointing stays per process: each commits its own shards' state and its own inputs'
+(a descriptive exception on the step, the handles, and `Circuit.Fault`) — never a hang. A
+peer that is *stuck* rather than dead — a wedged delegate, a half-dead host holding its
+connections — is covered by `CircuitOptions.ExchangeTimeout` (null by default: wait
+forever): when set, any single cross-process wait — an exchange's shards, the step-end
+alignment, space in a peer's bounded send queue — that outlasts it faults the circuit with
+a descriptive `TimeoutException` instead of stalling every process. Size it well above the
+slowest healthy step; a fired timeout is terminal like any fault — rebuild from the last
+committed checkpoint once the cluster is healthy. Checkpointing stays per process: each commits its own shards' state and its own inputs'
 offsets, under keys carrying the process index plus a step marker, so processes sharing one
 physical store never clobber each other; lockstep steps and equal `CheckpointInterval`s
 mean every process commits the same step boundaries, and after a crash all processes must
@@ -228,10 +255,36 @@ within that step. The faulting `StepAsync` throws the original exception (an
 `AggregateException` when several workers fault in the same step), consumers' `ReadAllAsync`
 observes it after the pre-fault deltas, producers blocked in `InsertAsync` are released with
 a `CircuitFaultedException` (original fault as its inner) instead of hanging, and
-`Circuit.Fault` exposes it; `DisposeAsync` of a faulted circuit completes quietly. A faulted
+`Circuit.Fault` exposes it; `DisposeAsync` of a faulted circuit completes quietly. A failed
+or cancelled output publish faults the circuit too — by then state has already advanced, so
+dropping the step's merged deltas would silently desynchronize every consumer's integrated
+view. A faulted
 circuit's in-memory state is unusable — the faulting step is half-applied — but that step is
 never committed, so with a checkpointing storage provider the last committed checkpoint is
 intact: rebuild the circuit against the same provider to recover exactly-once (below).
+
+**Observability.** `CircuitOptions.Name` names the circuit in its logs and as the
+`circuit` tag on every metric, so circuits sharing a process stay distinguishable;
+`CircuitOptions.LoggerFactory` receives the logs (categories `Incremental.Circuit` and
+`Incremental.Cluster`: lifecycle at Information, checkpoint commits at Debug, faults and
+cluster timeouts at Error — record contents are never logged):
+
+```csharp
+var options = new CircuitOptions { Name = "orders", LoggerFactory = loggerFactory };
+```
+
+Metrics need no wiring: the `Incremental` `Meter` is always on and costs nothing
+unlistened.
+
+| Instrument | Meaning |
+| --- | --- |
+| `incremental.circuit.steps`, `.step_duration` | steps completed; wall-clock per step, drain through publish |
+| `incremental.circuit.records` | input records drained into steps (after replay dedup) |
+| `incremental.circuit.faults` | transitions to the terminal faulted state |
+| `incremental.circuit.checkpoint_commits`, `.checkpoint_commit_duration` | atomic state+offsets commits |
+| `incremental.circuit.input_queue_depth`, `.output_queue_depth` | bounded-channel depths, per port |
+| `incremental.circuit.watermark_lag` | now minus the frozen watermark, seconds |
+| `incremental.cluster.frames_sent/received`, `.bytes_sent/received`, `.send_queue_depth` | exchange traffic, per peer |
 
 **Keyed inputs.** `builder.KeyedInput<K,V>(name, keySelector)` declares an input with
 upsert/delete-by-key semantics: the handle tracks the current row per key, so
@@ -240,17 +293,35 @@ upsert/delete-by-key semantics: the handle tracks the current row per key, so
 master data (and any stream whose rows are amended in place) — one upsert to a reference
 row re-attributes everything joined against it.
 
+**What your types must satisfy.** Values are Z-set members and dictionary keys, so every
+type flowing through a stream needs value equality — records are the natural fit. A
+`class` without `Equals`/`GetHashCode` overrides breaks silently: a retraction never finds
+the insertion it should cancel, and the two coexist at weights +1/−1. With Redis-backed
+state or a cluster, values must additionally round-trip losslessly through the storage
+serializer's JSON (public properties/fields; no polymorphism, no reference cycles, no
+private-only state — a type serializing as `{}` collapses every instance into one). Types
+whose equality diverges from their public structure need the custom stable-hash overloads
+(above). Delegates handed to operators — selectors, predicates, aggregates, eviction
+deadlines — must be pure. `Sum` over integer accumulators is checked (overflow faults the
+circuit instead of wrapping); floating-point sums drift permanently under retraction
+(adding x then −x does not restore the accumulator), so prefer `decimal` or `long`.
+
 **Storage.** Stateful operators keep their state behind `IStorageProvider`
 (`IWeightStore`, `IIndexedWeightStore`, `IValueStore`), created per operator *per worker*
 so implementations never see cross-thread access to one store.
 
 - `InMemoryStorageProvider` (default) — heap dictionaries.
 - `RedisStorageProvider` (`Incremental.Storage.Redis`) — state in Redis hashes; survives
-  restarts, can exceed the heap, and checkpoints (below):
+  restarts, can exceed the heap, and checkpoints (below). `KeyPrefix` is required and must
+  be unique per circuit sharing the Redis instance — two circuits under one prefix would
+  silently interleave state:
 
   ```csharp
   var redis = await ConnectionMultiplexer.ConnectAsync("localhost");
-  var options = new CircuitOptions { Storage = new RedisStorageProvider(redis) };
+  var options = new CircuitOptions
+  {
+      Storage = new RedisStorageProvider(redis, new RedisStorageOptions { KeyPrefix = "orders-prod" }),
+  };
   ```
 
 - Candidates that make sense next: RocksDB (large state, embedded, fast scans), SQLite.
@@ -263,14 +334,42 @@ circuit commits {all staged state changes + the input offsets those steps consum
 atomically — for Redis, one MULTI/EXEC transaction covering every worker's shard plus a
 `{prefix}:checkpoint` offsets marker, issued only after all workers have finished their
 steps. Either the whole checkpoint lands or none of it does, so durable state and offsets
-always agree, even across a crash mid-commit. Producers can stamp records with source
-offsets — `SendAsync(value, weight, offset)`, e.g. a Kafka partition offset; unstamped
-records are numbered as they are consumed. After a crash, rebuild the circuit against the
-same provider: the state is already there, `circuit.CommittedOffset("orders")` says where
-each input got to, and replayed records stamped at or below the checkpoint are dropped on
-arrival — resuming a log-style source is exactly-once from the state's point of view.
-(Output deltas are transient and not checkpointed: consumers re-derive views by
-integrating, they don't replay.)
+always agree, even across a crash mid-commit. The commit verifies every command in the
+transaction landed — a checkpoint is never reported committed with writes missing.
+
+Producers stamp records with source offsets — `SendAsync(value, weight, partition, offset)`
+(and matching `InsertAsync`/`RemoveAsync` overloads), e.g. a Kafka (partition, offset);
+dedup is per partition, so one input fronts a whole topic. The single-offset overloads map
+to partition 0, and unstamped records are numbered as they are consumed — but an input is
+one or the other: mixing stamped and unstamped records throws (immediately at the handle,
+and as a circuit fault for a producer that switches kinds across a restart) instead of
+silently corrupting the replay position. After a crash, rebuild the circuit against the
+same provider: the state is already there, `circuit.CommittedOffsets("orders")` says where
+each partition got to (`CommittedOffset` still serves the unstamped and single-partition
+cases), and replayed records stamped at or below their partition's checkpoint are dropped
+on arrival — resuming a log-style source is exactly-once from the state's point of view.
+
+Restarts are guarded by a **state manifest**: every checkpoint commits a description of
+the state it belongs to — each store's identity, the worker and process counts, a format
+version — and a rebuilt circuit refuses to start against a checkpoint whose manifest does
+not match, listing the mismatches, instead of silently reading another operator's state.
+By default a store's identity is its position in the circuit, so inserting or reordering
+operators orphans downstream state (detected, loudly); `.Named("revenue")` on the stream a
+stateful operator returns pins its identity by name instead, so the circuit can evolve
+around it and a rebuild still finds its state. Pure additions — new operators, whose state
+starts empty — are always allowed. A name pins identity, not meaning: state is resumed
+as-is, so rename the operator when its computation changes.
+
+Output deltas are transient and not checkpointed — consumers re-derive views by
+integrating. A consumer that cannot replay every delta since the beginning bootstraps from
+a **snapshot output**: `.Output("revenue", snapshot: true)` also maintains the view's
+integrated state (behind the storage provider, so it checkpoints and recovers with
+everything else), and `OutputHandle.ReadSnapshotAsync()` returns the current view as of
+the last completed step — take the snapshot first, then integrate the deltas read
+afterwards on top of it. Deltas published between the last commit and a crash are never
+replayed; a restarted consumer re-bootstraps from the snapshot rather than expecting the
+gap to be filled. (In a cluster the snapshot covers the local process's workers, like the
+delta stream itself.)
 
 **Stepping modes.** By default a pump task steps the circuit whenever input is available.
 With `AutoStep = false` the circuit advances only on explicit `StepAsync()` calls — exact,
@@ -326,6 +425,15 @@ shows up as a ~64× ratio, so the check is high-signal without being flaky. The 
 runs on demand via the *Benchmarks* GitHub workflow (`workflow_dispatch`), which uploads
 the BenchmarkDotNet artifacts.
 
+## Packaging
+
+MIT-licensed (see `LICENSE`). The two shipped libraries (`Incremental`,
+`Incremental.Storage.Redis`) multi-target **net8.0 and net10.0** and carry full NuGet
+metadata — `dotnet pack` produces consumable packages with XML docs, SourceLink, and
+symbol packages (not yet published to nuget.org; consume by project reference or a local
+feed). The only runtime dependency of the core library is
+`Microsoft.Extensions.Logging.Abstractions`.
+
 ## Running with Redis
 
 ```sh
@@ -336,9 +444,8 @@ dotnet run --project examples/Incremental.LogAnalytics -- --redis
 
 ## Status / roadmap
 
-The semantics above are implemented and tested, and the roadmap below is fully ticked —
-what remains is headroom (more storage backends, more operators, cluster tooling), not
-missing semantics:
+The semantics above are implemented and tested. The known limitations are deliberate,
+disclosed trade-offs (below), not missing semantics:
 
 - [x] Linear-aggregate fast path: `COUNT`/`SUM` maintained from the delta alone with O(keys)
       state (`ILinearAggregate`); custom linear aggregates via `AggregateLinear`
@@ -380,7 +487,33 @@ missing semantics:
       tests; explicit lockstep steps with dense per-exchange frame alignment, globally
       min-reduced watermarks, cross-process fault propagation, per-process checkpoints
       keyed by process index; `Recurse` + cluster is rejected at build time)
-- [ ] Build all singing, all dancing demo showing all features
-- [ ] Remove redis dependency from core assembly.
-- [ ] Investigate off-heap in-processs storage to reduce GC
-- [ ] Investigate higher order APIs with more user friendly or domain specific applications
+- [x] Production hardening pass: process-stable exchange routing (`StableHash` — the
+      randomized string hash silently broke cluster routing and multi-worker restore),
+      state manifests + `.Named()` checkpoint identities, per-partition input offsets,
+      snapshot outputs for consumer bootstrap, output-publish failures fault the circuit,
+      `ILogger` + `Meter` observability, cluster exchange timeouts + frame caps + parking
+      barrier, verified Redis commits + required key prefix, checked integer sums, MIT
+      license, net8.0/net10.0 NuGet packaging
+
+### Known limitations (deliberate, disclosed)
+
+- The TCP cluster transport is **unauthenticated cleartext** — trusted, isolated networks
+  only; TLS/authentication is deferred.
+- No peer reconnection: a disconnect or fired `ExchangeTimeout` is terminal — rebuild
+  every process from the last committed checkpoint.
+- Cluster checkpoints commit per process with no distributed commit protocol: a crash can
+  leave processes one checkpoint apart — compare `Circuit.CommittedStep` across processes
+  before feeding data.
+- Exactly-once ends at the output edge: deltas published after the last commit are not
+  replayed after a crash; consumers recover by re-bootstrapping from a snapshot output.
+- Floating-point sums drift under retraction — prefer `decimal`/`long` accumulators.
+- Changing a persisted value type's shape (renaming/retyping members) invalidates its
+  serialized state; there is no schema migration — change the key prefix and rebuild from
+  source, or keep state types stable.
+
+### Headroom
+
+- [ ] All-singing, all-dancing demo showing every feature together
+- [ ] Investigate off-heap in-process storage to reduce GC (RocksDB, SQLite candidates)
+- [ ] Investigate higher-order APIs with more user-friendly or domain-specific applications
+- [ ] Cluster transport TLS/authentication
