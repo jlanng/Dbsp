@@ -81,34 +81,38 @@ internal interface IExchangeStepOperator : IStepOperator
     byte[] SerializeShards(object[][] senderFragments, int firstShard, int count);
 
     /// <summary>Inverse of <see cref="SerializeShards"/>: the received shards as Z-sets,
-    /// indexed by the receiving process's local worker id.</summary>
-    object[] DeserializeShards(byte[] payload);
+    /// indexed by the receiving process's local worker id. <paramref name="peer"/> is the
+    /// sending process, so the decoder can reuse per-peer buffers.</summary>
+    object[] DeserializeShards(byte[] payload, int peer);
 }
 
 /// <summary>Entry point of a circuit: emits whatever batch the coordinator staged for this worker.</summary>
 internal sealed class InputOperator<T> : IStepOperator where T : notnull
 {
-    private ZSet<T> _pending = new();
+    // Double-buffered like an OutputBuffer, with the filling split across threads: the
+    // coordinator fills Pending between steps (InputPort.DrainInto — steps are gated, so a
+    // fill never overlaps a running step), and Step hands the filled buffer downstream and
+    // flips. The buffer handed out is cleared one step later, once its consumers —
+    // downstream operators within the step, the output ports' between-step copies — are
+    // done with it. An idle input keeps returning the same empty buffer without flipping,
+    // which costs nothing and stays correct: the next fill lands in it between steps.
+    private readonly ZSet<T> _a = new(), _b = new();
+    private bool _useB;
 
-    /// <summary>Called by the coordinator (between steps) to stage a batch for the next step.</summary>
-    public void Enqueue(ZSet<T> batch)
-    {
-        if (_pending.IsEmpty)
-            _pending = batch;
-        else
-            _pending.AddAll(batch);
-    }
+    public InputOperator() => Pending = _a;
+
+    /// <summary>The batch being staged for the next step. Only the coordinator writes it,
+    /// between steps.</summary>
+    public ZSet<T> Pending { get; private set; }
 
     public object Step(object?[] inputs)
     {
-        var batch = _pending;
-        // Only mint a replacement once this one has been filled: an idle input would
-        // otherwise allocate a fresh empty Z-set every step, on every worker. Handing the
-        // same empty batch out repeatedly is safe — downstream reads it and PublishAsync
-        // copies before anything reaches a consumer — and Enqueue only writes to it between
-        // steps, once the step that saw it has finished.
+        var batch = Pending;
         if (!batch.IsEmpty)
-            _pending = new ZSet<T>();
+        {
+            Pending = (_useB = !_useB) ? _b : _a;
+            Pending.Clear();
+        }
         return batch;
     }
 }
@@ -387,7 +391,15 @@ internal sealed class ExchangeOperator<T>(Func<T, uint> routingHash) : IExchange
                 into.AddAll(fragment);
     }
 
-    public object[] DeserializeShards(byte[] payload)
+    // Received shards decode into per-peer reused Z-sets: by the time a peer's next frame
+    // for this node is deserialized, every local worker has consumed the previous one — a
+    // worker must finish the execution that read it before it can arrive at (and, in
+    // point-to-point mode, publish for) this node again — and Merge copies rather than
+    // adopting. Keyed by peer because all peers' shards are alive at once during the merge.
+    // The JSON fallback keeps allocating: it is the rare path for types with no dense codec.
+    private Dictionary<int, (object[] Boxed, ZSet<T>[] Shards)>? _decoded;
+
+    public object[] DeserializeShards(byte[] payload, int peer)
     {
         if (payload.Length == 0)
             throw new InvalidDataException("Received an empty exchange frame.");
@@ -413,18 +425,28 @@ internal sealed class ExchangeOperator<T>(Func<T, uint> routingHash) : IExchange
         reader.Reset(payload);
         reader.ReadByte(); // format, already checked
         var count = (int)reader.ReadUInt32();
-        var result = new object[count];
+
+        var cache = _decoded ??= [];
+        if (!cache.TryGetValue(peer, out var buffers) || buffers.Shards.Length != count)
+        {
+            buffers = (new object[count], new ZSet<T>[count]);
+            for (var k = 0; k < count; k++)
+                buffers.Boxed[k] = buffers.Shards[k] = new ZSet<T>();
+            cache[peer] = buffers;
+        }
+
         for (var k = 0; k < count; k++)
         {
             var entries = (int)reader.ReadUInt32();
-            var zset = new ZSet<T>(entries);
+            var zset = buffers.Shards[k];
+            zset.Clear();
+            zset.EnsureCapacity(entries);
             for (var i = 0; i < entries; i++)
             {
                 var value = read(reader);
                 zset.Add(value, reader.ReadInt64());
             }
-            result[k] = zset;
         }
-        return result;
+        return buffers.Boxed;
     }
 }

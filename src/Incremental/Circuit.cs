@@ -1149,7 +1149,7 @@ public sealed class Circuit : IAsyncDisposable
                                 exchange.SerializeShards(_mailboxes[n], p * _workers.Length, _workers.Length));
                     for (var p = 0; p < cluster.ProcessCount; p++)
                         if (p != cluster.ProcessIndex)
-                            _remoteShards[n][p] = exchange.DeserializeShards(cluster.ReceiveShards(step, n, p));
+                            _remoteShards[n][p] = exchange.DeserializeShards(cluster.ReceiveShards(step, n, p), p);
                 }
                 BarrierWait(worker);
             }

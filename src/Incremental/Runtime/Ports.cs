@@ -147,18 +147,17 @@ internal sealed class InputPort<T> : IInputPort where T : notnull
                 into[OffsetKeys.Encode(Name, partition)] = offset;
     }
 
-    // Reused across drains (the coordinator drains one input at a time, between steps), plus
-    // a running estimate of how many records a worker gets per step: a batch Z-set built from
-    // empty otherwise walks the dictionary's doubling ladder on every step of every input.
-    private ZSet<T>?[]? _buffers;
-    private int _perWorkerHint;
+    // The staging targets — each worker's input operator's current pending buffer — fetched
+    // per drain (which of an operator's two buffers is current changes as steps run); only
+    // the reference array is reused across drains, the Z-sets belong to the operators.
+    private ZSet<T>[]? _staging;
 
     /// <summary>Moves up to <paramref name="maxItems"/> buffered records into the workers'
-    /// input operators for the next step, round-robin. Keyed operators re-shard via exchange
-    /// anyway, so initial placement only needs to spread load.</summary>
+    /// input operators' pending batches for the next step, round-robin. Keyed operators
+    /// re-shard via exchange anyway, so initial placement only needs to spread load.</summary>
     public int DrainInto(Worker[] workers, int maxItems)
     {
-        ZSet<T>?[]? buffers = null;
+        ZSet<T>[]? staging = null;
         var target = 0;
         var drained = 0;
         while (drained < maxItems && _channel.Reader.TryRead(out var entry))
@@ -186,22 +185,16 @@ internal sealed class InputPort<T> : IInputPort where T : notnull
                 _unstamped++; // unstamped records are numbered as they are consumed
             }
 
-            buffers ??= _buffers is { } cached && cached.Length == workers.Length
-                ? cached
-                : _buffers = new ZSet<T>?[workers.Length];
-            (buffers[target] ??= new ZSet<T>(_perWorkerHint)).Add(entry.Value, entry.Weight);
-            target = (target + 1) % workers.Length;
-        }
-
-        if (buffers is not null)
-        {
-            for (var i = 0; i < workers.Length; i++)
+            if (staging is null)
             {
-                if (buffers[i] is { } batch)
-                    ((InputOperator<T>)workers[i].Operators[_nodeId]).Enqueue(batch);
-                buffers[i] = null;  // the batch belongs to the worker now
+                staging = _staging is { } cached && cached.Length == workers.Length
+                    ? cached
+                    : _staging = new ZSet<T>[workers.Length];
+                for (var i = 0; i < workers.Length; i++)
+                    staging[i] = ((InputOperator<T>)workers[i].Operators[_nodeId]).Pending;
             }
-            _perWorkerHint = drained / workers.Length;
+            staging[target].Add(entry.Value, entry.Weight);
+            target = (target + 1) % workers.Length;
         }
         return drained;
     }
