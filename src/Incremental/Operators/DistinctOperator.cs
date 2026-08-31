@@ -20,11 +20,12 @@ internal sealed class DistinctOperator<T> : IStepOperator where T : notnull
         _integrated = context.Storage.CreateWeightStore<T>(context.StateName("integrated"));
 
     private readonly List<(T, long)> _entries = [];
+    private readonly OutputBuffer<T> _output = new();
 
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<T>)inputs[0]!;
-        var output = new ZSet<T>(delta.DistinctCount);
+        var output = _output.Next(delta.DistinctCount);
 
         var entries = _entries;
         entries.Clear();
@@ -72,11 +73,12 @@ internal sealed class KeyedDistinctOperator<TKey, TValue> : IStepOperator
     public object? EmptyStepResult => _eviction is null ? _empty : null;
 
     private readonly List<(TKey, TValue, long)> _entries = [];
+    private readonly OutputBuffer<KeyedValue<TKey, TValue>> _output = new();
 
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
-        var output = new ZSet<KeyedValue<TKey, TValue>>(delta.DistinctCount);
+        var output = _output.Next(delta.DistinctCount);
 
         var entries = _entries;
         entries.Clear();

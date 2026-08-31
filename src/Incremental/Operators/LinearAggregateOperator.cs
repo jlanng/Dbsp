@@ -39,6 +39,7 @@ internal sealed class LinearAggregateOperator<TKey, TValue, TResult> : IStepOper
     private readonly List<TKey> _keys = [];
     private readonly List<(TKey, (long, TResult))> _puts = [];
     private readonly List<TKey> _removes = [];
+    private readonly OutputBuffer<KeyedValue<TKey, TResult>> _output = new();
 
     public object Step(object?[] inputs)
     {
@@ -56,7 +57,7 @@ internal sealed class LinearAggregateOperator<TKey, TValue, TResult> : IStepOper
         }
 
         // At most one retraction and one assertion per touched key.
-        var output = new ZSet<KeyedValue<TKey, TResult>>(perKey.Count * 2);
+        var output = _output.Next(perKey.Count * 2);
 
         var keys = _keys;
         keys.Clear();

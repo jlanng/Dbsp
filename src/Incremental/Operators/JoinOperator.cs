@@ -46,12 +46,13 @@ internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IStepOperator
     private readonly List<int> _bounds = [];
     private readonly List<WeightedValue<TLeft>> _leftRows = [];
     private readonly List<WeightedValue<TRight>> _rightRows = [];
+    private readonly OutputBuffer<TOut> _output = new();
 
     public object Step(object?[] inputs)
     {
         var deltaLeft = (ZSet<KeyedValue<TKey, TLeft>>)inputs[0]!;
         var deltaRight = (ZSet<KeyedValue<TKey, TRight>>)inputs[1]!;
-        var output = new ZSet<TOut>(deltaLeft.DistinctCount + deltaRight.DistinctCount);
+        var output = _output.Next(deltaLeft.DistinctCount + deltaRight.DistinctCount);
 
         // ΔL ⋈ R (right state not yet updated with ΔR)
         Flatten(deltaLeft, _leftEntries);

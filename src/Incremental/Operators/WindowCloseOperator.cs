@@ -18,6 +18,7 @@ internal sealed class WindowCloseOperator<TKey, TValue>(KeyEviction<TKey> policy
     // deadline, so ClosesAt runs once per key and its result is reused at close.
     private readonly PriorityQueue<(TKey Key, DateTimeOffset ClosesAt), long> _deadlines = new();
     private readonly HashSet<TKey> _tracked = [];
+    private readonly OutputBuffer<KeyedValue<TKey, DateTimeOffset>> _output = new();
 
     public object Step(object?[] inputs)
     {
@@ -32,7 +33,7 @@ internal sealed class WindowCloseOperator<TKey, TValue>(KeyEviction<TKey> policy
         }
 
         var watermark = policy.Clock.FrozenTicks;
-        var output = new ZSet<KeyedValue<TKey, DateTimeOffset>>();
+        var output = _output.Next(0);
         while (_deadlines.TryPeek(out var entry, out var deadline) && deadline <= watermark)
         {
             _deadlines.Dequeue();

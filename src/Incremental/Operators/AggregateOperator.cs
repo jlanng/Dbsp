@@ -43,6 +43,7 @@ internal sealed class AggregateOperator<TKey, TValue, TResult> : IStepOperator
     private readonly HashSet<TKey> _seen = [];
     private readonly List<(TKey, TResult)> _puts = [];
     private readonly List<TKey> _removes = [];
+    private readonly OutputBuffer<KeyedValue<TKey, TResult>> _output = new();
 
     public object Step(object?[] inputs)
     {
@@ -64,7 +65,7 @@ internal sealed class AggregateOperator<TKey, TValue, TResult> : IStepOperator
         _groups.ApplyAll(entries);
 
         // At most one retraction and one assertion per touched key.
-        var output = new ZSet<KeyedValue<TKey, TResult>>(touched.Count * 2);
+        var output = _output.Next(touched.Count * 2);
 
         // The group here is handed to a user aggregate, so it stays a plain materialized
         // list rather than a reused window over shared scratch.

@@ -38,8 +38,13 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   stable hash), never `GetHashCode` — .NET randomizes string hashes per process, which
   silently breaks cluster routing and multi-worker checkpoint restore.
 - Per-step allocation is the dominant cost at throughput, because the GC's share of process
-  CPU scales with it while a circuit's live set stays large and mostly static. Operators size
-  their output Z-sets from the delta they derive them from, keep their flatten/probe/put
+  CPU scales with it while a circuit's live set stays large and mostly static. Operators draw
+  their output Z-set from a per-operator `OutputBuffer` (double-buffered, cleared per
+  execution) instead of allocating one, sized from the delta they derive it from. The
+  contract that makes this safe (`OutputBuffer.cs`): nothing an operator returns from `Step`
+  is written after return, nothing retains a delta past one more execution of its producer,
+  and output ports copy — never adopt — worker slots. Operators also keep their
+  flatten/probe/put
   scratch as cleared-per-step fields rather than rebuilding it, and use the stores' `ApplyAll`
   / `GetGroupsInto` (batched update with no result array; batched group read into caller-owned
   buffers) rather than the allocating variants wherever the results are not themselves needed —

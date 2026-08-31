@@ -121,11 +121,12 @@ internal sealed class ExtremumOperator<TKey, TValue, TProjected> : IStepOperator
     private readonly List<int> _bounds = [];
     private readonly List<WeightedValue<TProjected>> _merged = [];
     private readonly List<(ExtremumSlot<TKey>, TProjected, long)> _updates = [];
+    private readonly OutputBuffer<KeyedValue<TKey, TProjected>> _output = new();
 
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
-        var output = new ZSet<KeyedValue<TKey, TProjected>>();
+        var output = _output.Next(delta.DistinctCount);
 
         // Level-major walk (all keys advance together) so each level is one batched read
         // and one batched write against the store, regardless of how many keys the delta

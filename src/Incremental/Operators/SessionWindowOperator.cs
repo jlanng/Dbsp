@@ -59,10 +59,12 @@ internal sealed class SessionWindowOperator<TKey, TValue> : IStepOperator
     private readonly List<(long Ticks, TValue Value, long Weight)> _newItems = [];
     private readonly Dictionary<TValue, long> _merged = [];
 
+    private readonly OutputBuffer<KeyedValue<TKey, Windowed<TValue>>> _output = new();
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
-        var output = new ZSet<KeyedValue<TKey, Windowed<TValue>>>(delta.DistinctCount * 2);
+        var output = _output.Next(delta.DistinctCount * 2);
 
         var entries = _entries;
         var touched = _touched;

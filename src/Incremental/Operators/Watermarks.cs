@@ -100,12 +100,13 @@ internal sealed class WatermarkOperator<T>(
     where T : notnull
 {
     private readonly int _worker = context.WorkerId;
+    private readonly OutputBuffer<T> _output = new();
 
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<T>)inputs[0]!;
         var watermark = clock.FrozenTicks;
-        var output = new ZSet<T>();
+        var output = _output.Next(delta.DistinctCount);
         var maxSeen = long.MinValue;
 
         foreach (var (value, weight) in delta)
