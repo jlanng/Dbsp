@@ -349,6 +349,39 @@ state). If you rename or restructure a
 circuit, pin operator identity with `.Named("…")` on the stages that carry state you want to
 survive the change.
 
+### Running it fast
+
+A circuit holds a large, mostly-static live set and allocates a little on every step, which
+is the workload shape the .NET GC defaults handle worst: the garbage collector's share of
+process CPU can exceed the workers'. Three settings in your project file are worth more than
+any code change, and none of them is something the library can set for you — they are read
+before your `Main` runs:
+
+```xml
+<PropertyGroup>
+  <ServerGarbageCollection>true</ServerGarbageCollection>
+  <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+  <GarbageCollectionAdaptationMode>0</GarbageCollectionAdaptationMode>   <!-- DATAS off -->
+</PropertyGroup>
+<ItemGroup>
+  <!-- Heap count: match CircuitOptions.Workers, not the core count. -->
+  <RuntimeHostConfigurationOption Include="System.GC.HeapCount" Value="4" />
+</ItemGroup>
+```
+
+Server GC otherwise gives one heap per logical core, so a 4-worker circuit on a 20-thread
+machine collects 20 heaps with 20 threads, most of them for memory no worker ever touches.
+DATAS (on by default for server GC since .NET 9) then keeps trimming the heap, which against
+a large static live set is close to continuous gen2 work. On the throughput rig the pair is
+worth 16.6 µs → 11.6 µs of CPU per record, paid for in working set (2.2 GB → 2.6 GB).
+
+If the worker count is only known at launch — a command-line flag, a container knob — set
+`DOTNET_GCHeapCount` in the environment instead of the runtimeconfig option. **It is read as
+hexadecimal**, so twelve heaps is `DOTNET_GCHeapCount=c`.
+
+Every example in this repo ships with this applied; see `examples/Directory.Build.props` and
+the `<CircuitWorkers>` property in each example's `.csproj`.
+
 > **TODO:** hosting & DI integration (`services.AddIncremental(…)`, `IHostedService`) — planned,
 > not yet designed.
 > **TODO:** cluster deployment (multi-process exchange over a transport), checkpoint

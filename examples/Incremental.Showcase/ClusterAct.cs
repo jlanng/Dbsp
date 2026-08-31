@@ -98,7 +98,8 @@ public static class ClusterAct
         var resultPath = Path.Combine(Path.GetTempPath(), $"showcase-cluster-{Environment.ProcessId}.json");
 
         var start = Child.Spawn(
-            ["--cluster-child", "--index", "1", "--endpoints", string.Join(',', endpoints), "--result", resultPath]);
+            ["--cluster-child", "--index", "1", "--endpoints", string.Join(',', endpoints), "--result", resultPath],
+            workers: 2);                   // the peer builds Options(1, …), which is Workers = 2
         start.RedirectStandardOutput = true;
         start.RedirectStandardError = true;
         var child = Process.Start(start)

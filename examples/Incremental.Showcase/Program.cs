@@ -139,13 +139,15 @@ app.MapPost("/api/trigger/{id}", async (string id) =>
 // Kestrel has released the port by the time RunAsync returns, so the successor binds the
 // same one and the browser's EventSource reconnects to it on its own.
 string[]? relaunchArgs = null;
+var relaunchWorkers = workers;
 app.MapPost("/api/relaunch", (int? workers, bool? cluster, IHostApplicationLifetime lifetime) =>
 {
+    relaunchWorkers = Math.Clamp(workers ?? show.CurrentWorkers, 1, 32);
     var next = new List<string>
     {
         "--port", port.ToString(),
         "--no-open",                       // the browser that asked for this is already open
-        "--workers", Math.Clamp(workers ?? show.CurrentWorkers, 1, 32).ToString(),
+        "--workers", relaunchWorkers.ToString(),
     };
     if (useRedis) next.Add("--redis");
     if (cluster ?? withCluster) next.Add("--cluster");
@@ -184,6 +186,7 @@ var driver = Task.Run(async () =>
 var url = $"http://localhost:{port}";
 Console.WriteLine($"Incremental showcase — a marketplace payments desk");
 Console.WriteLine($"  {url}   ({storageLabel}, {workers} worker{(workers == 1 ? "" : "s")}{(p2p ? ", point-to-point exchanges" : "")}{(withCluster ? ", cluster armed" : "")})");
+if (GcAdvice.Mismatch(workers) is { } heapAdvice) Console.WriteLine($"  note: {heapAdvice}");
 Console.WriteLine("  Ctrl-C to stop.");
 if (!args.Contains("--no-open")) OpenBrowser(url);
 
@@ -202,7 +205,7 @@ finally
 if (relaunchArgs is not null)
 {
     Console.WriteLine($"  relaunching: {string.Join(' ', relaunchArgs)}");
-    Process.Start(Child.Spawn(relaunchArgs));
+    Process.Start(Child.Spawn(relaunchArgs, relaunchWorkers));
 }
 return 0;
 

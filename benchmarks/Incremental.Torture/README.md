@@ -36,7 +36,8 @@ path.
 ## Results
 
 13th-gen i7-13700H, 4 workers, default dataset (150k live orders, 50k customers, 2k
-merchants), unpaced, default GC:
+merchants), unpaced, with this rig's own GC settings — server and concurrent GC, default heap
+count, DATAS on (the "Runtime tuning" section below is measured on top of this baseline):
 
 | | before | after |
 |---|---|---|
@@ -67,6 +68,21 @@ the library can set for you — they are startup configuration:
 ```
 ```sh
 DOTNET_GCHeapCount=4      # match CircuitOptions.Workers, not the core count
+```
+
+`DOTNET_GCHeapCount` is read as **hexadecimal** — twelve heaps is `c`, and `16` gets you 22.
+Where the worker count is fixed at build time, prefer the runtimeconfig form, which is
+decimal: `<RuntimeHostConfigurationOption Include="System.GC.HeapCount" Value="4" />`.
+
+The examples apply all of this by default — `examples/Directory.Build.props` for the three
+properties, a `<CircuitWorkers>` property per example for the heap count. This rig
+deliberately stops at server + concurrent GC: the table above is measured with DATAS on and
+the default heap count, so that the tuning stays a separately visible number, and `--workers`
+makes the right heap count a runtime choice anyway. To measure a tuned run, set the variable
+on the command line:
+
+```sh
+DOTNET_GCHeapCount=4 dotnet run -c Release --project benchmarks/Incremental.Torture -- --workers 4
 ```
 
 The server GC defaults to one heap per logical core, so a 4-worker circuit on a 20-thread

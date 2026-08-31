@@ -521,7 +521,10 @@ public sealed class Show : IAsyncDisposable
                     bulk batch and the exchange is what lets the extra workers earn their keep. The
                     trigger measures both on this machine at 1, 2 and 4 workers rather than asking
                     you to take the claim on trust. Pick a topology below and the showcase
-                    relaunches itself into it — the page reconnects on its own.
+                    relaunches itself into it — the page reconnects on its own, and the relaunch
+                    is what gets the GC heap count sized to the new worker count. The rows
+                    measured in one process all share this process's heap count, so treat them as
+                    comparing exchange cost, not as tuned per-topology throughput.
 
                     Processes second. `--cluster` respawns this binary as a peer; both processes
                     build the identical circuit and only CircuitOptions.Cluster tells each its
