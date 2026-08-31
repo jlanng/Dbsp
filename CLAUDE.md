@@ -42,8 +42,17 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   their output Z-sets from the delta they derive them from, keep their flatten/probe/put
   scratch as cleared-per-step fields rather than rebuilding it, and use the stores' `ApplyAll`
   / `GetGroupsInto` (batched update with no result array; batched group read into caller-owned
-  buffers) rather than the allocating variants. A new operator that allocates per delta row —
+  buffers) rather than the allocating variants wherever the results are not themselves needed —
+  `AggregateOperator` keeps `GetGroups` because the group is handed to a user aggregate, and
+  `AntiJoinOperator` keeps `UpdateAll` because it reads the updated counts; both say so in a
+  comment, and an operator that needs the results should do the same rather than be "fixed".
+  A new operator that allocates per delta row —
   or worse, per touched key — is a regression even when its asymptotics are right.
+  The matching startup configuration (server + concurrent GC, DATAS off, GC heap count sized to
+  `CircuitOptions.Workers`) is applied to every example by `examples/Directory.Build.props` plus a
+  `<CircuitWorkers>` property per example csproj — keep that property in step with the worker
+  count the example's `CircuitOptions` actually uses. The torture rig deliberately opts out so
+  its published numbers stay stock-GC.
 - The cross-process exchange wire format is the dense codec in `Cluster/ShardCodec.cs`
   (compiled per type from the same structural rules as `StableHash`), with a JSON fallback for
   types it cannot round-trip and a format byte on every frame. Redis state serialization is

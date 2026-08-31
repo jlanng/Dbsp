@@ -214,9 +214,6 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
         }
     }
 
-    /// <summary>True when this step's delta rows provably cannot change the emitted top:
-    /// it is full (K rows counting multiplicity) and every delta row ranks strictly worse
-    /// than the K-th entry. Ties with the cutoff conservatively force a re-rank.</summary>
     /// <summary>Element-wise comparison of the freshly ranked top against the stored one,
     /// without the enumerator pair a LINQ SequenceEqual would allocate on every re-rank.</summary>
     private static bool SameTop(List<WeightedValue<TValue>> top, WeightedValue<TValue>[] previous)
@@ -229,6 +226,9 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
         return true;
     }
 
+    /// <summary>True when this step's delta rows provably cannot change the emitted top:
+    /// it is full (K rows counting multiplicity) and every delta row ranks strictly worse
+    /// than the K-th entry. Ties with the cutoff conservatively force a re-rank.</summary>
     private bool TopUnaffected(WeightedValue<TValue>[] emitted, int keyIndex, Comparer<TOrder> comparer)
     {
         long emittedWeight = 0;

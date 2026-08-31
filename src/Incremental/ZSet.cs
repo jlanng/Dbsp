@@ -84,7 +84,7 @@ public sealed class ZSet<T> : IZSet, IEnumerable<WeightedValue<T>> where T : not
     /// <summary>Reserves room for <paramref name="count"/> entries, so filling a Z-set whose
     /// size is known (or bounded) up front does not walk the dictionary's doubling ladder —
     /// which allocates, and then abandons, every intermediate size on the way up.</summary>
-    public void EnsureCapacity(int count)
+    internal void EnsureCapacity(int count)
     {
         if (count > _weights.Count)
             _weights.EnsureCapacity(count);
@@ -94,7 +94,7 @@ public sealed class ZSet<T> : IZSet, IEnumerable<WeightedValue<T>> where T : not
     /// every step stops re-growing after the first few. Only for Z-sets whose owner knows no
     /// one else still holds them — operators treat their inputs as read-only, which is what
     /// makes reuse safe where it is used (see <c>ExchangeOperator.Partition</c>).</summary>
-    public void Clear() => _weights.Clear();
+    internal void Clear() => _weights.Clear();
 
     /// <summary>Returns a new Z-set with every weight negated (turns insertions into retractions).</summary>
     public ZSet<T> Negated()
