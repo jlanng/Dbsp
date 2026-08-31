@@ -14,6 +14,8 @@ dotnet run -c Release --project benchmarks/Incremental.Torture -- --workers 4 --
 |---|---|
 | `--alloc-types` | byte-weighted allocation histogram by type (an in-process `GCAllocationTick` listener — no external tooling) |
 | `--rate N` | pace at N orders/second instead of running unpaced |
+| `--p2p` | point-to-point exchange synchronization instead of the barrier |
+| `--streaming` | fragment streaming on the exchanges (implies `--p2p`; see docs/design/fragment-streaming.md) |
 | `--processes N` | cluster mode: N co-hosted processes stepped in lockstep, which puts the exchange wire format on the measured path |
 | `--batch`, `--live-orders`, `--workers`, `--customers`, `--merchants`, `--json` | see `Options.cs` |
 

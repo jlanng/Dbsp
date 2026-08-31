@@ -28,6 +28,9 @@ internal sealed record Options
     public double WarmupSeconds { get; init; } = 5;
     public int Seed { get; init; } = 42;
     public bool PointToPoint { get; init; }
+
+    /// <summary>Fragment streaming (implies point-to-point, which it builds on).</summary>
+    public bool Streaming { get; init; }
     public int StepBatch { get; init; } = 8_192;
     public int InputCapacity { get; init; } = 32_768;
 
@@ -51,6 +54,7 @@ internal sealed record Options
                 throw new ArgumentException($"Unexpected argument '{arg}'.");
             var name = arg[2..];
             if (name == "p2p") { options = options with { PointToPoint = true }; continue; }
+            if (name == "streaming") { options = options with { Streaming = true, PointToPoint = true }; continue; }
             if (name == "json") { options = options with { Json = true }; continue; }
             if (name == "alloc-types") { options = options with { AllocationTypes = true }; continue; }
 

@@ -53,6 +53,7 @@ var builder = new CircuitBuilder(new CircuitOptions
     MaxStepItemsPerInput = options.StepBatch,
     OutputChannelCapacity = 1024,
     PointToPointExchange = options.PointToPoint,
+    FragmentStreaming = options.Streaming,
 });
 var defs = ShowcasePipeline.Declare(builder);
 var circuit = builder.Build();

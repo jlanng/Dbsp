@@ -210,6 +210,29 @@ fragments a step moves. The `incremental.circuit.barrier_wait` gauge is unaffect
 Separate from the p2p flag so A/B measurement stays honest: streaming's null hypothesis is
 p2p, not the barrier.
 
+## Measured (v1, 2026-08-31)
+
+Torture rig on the full showcase pipeline, 4 workers, Release, back-to-back A/B pairs run
+in both orders (this host thermally degrades over a session), ~20k warm steps per run —
+`--p2p` vs `--streaming`, post-allocation-work baseline (`088105d`):
+
+| regime | metric | p2p | +streaming |
+| --- | --- | --- | --- |
+| paced 20k orders/s (~90 records/step) | coordinator µs/step | 950–967 | **911–922** (−4…−6%) |
+| | worker span µs/step | 765–790 | **706–730** (−5…−10%) |
+| | worker sync-wait µs/step | ~242–262 | ~215–235 (−10%) |
+| paced 2k orders/s (~9 records/step) | coordinator µs/step | 699 | **680** (−2.8%) |
+| unpaced (saturated, ~17k records/step) | records/s | 361k | 367k (parity) |
+
+Reading: exactly what the model predicts for v1. The win comes from merge and sink work
+overlapping producer tails, so it grows with per-step delta size and vanishes into noise
+both at trickle deltas (nothing to overlap) and at saturation (throughput is compute-bound
+and pipelined across steps by the input channels anyway). The serialized owner chain's
+dominant term — strict-operator compute between exchanges — is untouched by design in v1;
+shortening it further is the v2 list below, cross-exchange streaming and the early-emitting
+join first. Fragment counts confirm the mechanics engage: ~17 fragments published per
+worker-step across 27 exchanges at the 20k rate, sinks fed on every data-bearing step.
+
 ## What v2 would add (explicitly out of scope)
 
 1. **Cross-exchange streaming**: fragments flowing through a linear chain *between* two
