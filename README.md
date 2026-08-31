@@ -480,6 +480,14 @@ numbers and for the two runtime GC settings that matter more than any single cod
 and turn DATAS off** — a circuit's live set is large and mostly static, which is the shape
 DATAS handles worst.
 
+Every example ships with that configuration applied. `examples/Directory.Build.props` turns
+on server and concurrent GC and turns DATAS off for all of them, and each example declares
+the worker count it builds its circuit with as `<CircuitWorkers>`, which becomes the
+runtimeconfig heap count. So `dotnet run` on any example measures the library rather than
+the default GC's idea of what to do with a 20-thread machine. It is startup configuration —
+a library cannot set it for you — so an application gets it by copying those four lines into
+its own project; `docs/intro.md` has them under *Running it fast*.
+
 ## Packaging
 
 MIT-licensed (see `LICENSE`). The two shipped libraries (`Incremental`,

@@ -13,6 +13,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <CircuitWorkers>1</CircuitWorkers>   <!-- GC heap count; matches CircuitOptions.Workers in Program.cs -->
   </PropertyGroup>
 
 </Project>

@@ -8,5 +8,9 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- GC heap count for the default topology. The workers flag picks another one, so the
+         showcase also sets DOTNET_GCHeapCount on every process it spawns, and says so on startup
+         when the heap count it was launched with does not match. -->
+    <CircuitWorkers>2</CircuitWorkers>
   </PropertyGroup>
 </Project>
