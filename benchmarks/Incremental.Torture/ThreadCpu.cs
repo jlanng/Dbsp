@@ -13,11 +13,18 @@ internal static class ThreadCpu
     private static readonly double TicksPerSecond = 100.0;   // USER_HZ, fixed at 100 on Linux
 
     internal readonly record struct Snapshot(
-        double WorkerSeconds, double GcSeconds, double ProducerSeconds, double ProcessSeconds, int WorkerThreads);
+        double WorkerSeconds, double GcServerSeconds, double GcBgcSeconds, double ProducerSeconds,
+        double ProcessSeconds, int WorkerThreads)
+    {
+        /// <summary>All GC-thread CPU. The two components answer different questions: the
+        /// server-GC threads do the blocking collections (overwhelmingly gen0/1 churn), the
+        /// BGC threads do concurrent gen2 marking — work proportional to the live set.</summary>
+        public double GcSeconds => GcServerSeconds + GcBgcSeconds;
+    }
 
     public static Snapshot Take()
     {
-        double workers = 0, gc = 0, producer = 0, total = 0;
+        double workers = 0, gcServer = 0, gcBgc = 0, producer = 0, total = 0;
         var workerThreads = 0;
         foreach (var task in Directory.EnumerateDirectories("/proc/self/task"))
         {
@@ -52,15 +59,19 @@ internal static class ThreadCpu
                 workers += seconds;
                 workerThreads++;
             }
-            else if (comm.StartsWith(".NET Server GC") || comm.StartsWith(".NET BGC"))
+            else if (comm.StartsWith(".NET Server GC"))
             {
-                gc += seconds;
+                gcServer += seconds;
+            }
+            else if (comm.StartsWith(".NET BGC"))
+            {
+                gcBgc += seconds;
             }
             else if (comm.StartsWith("torture-producer"))
             {
                 producer += seconds;
             }
         }
-        return new Snapshot(workers, gc, producer, total, workerThreads);
+        return new Snapshot(workers, gcServer, gcBgc, producer, total, workerThreads);
     }
 }

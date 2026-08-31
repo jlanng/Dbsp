@@ -169,6 +169,9 @@ await Task.Delay(TimeSpan.FromSeconds(options.WarmupSeconds));
 // ── measured window ────────────────────────────────────────────────────────────
 using var allocations = options.AllocationTypes ? new AllocationProfiler() : null;
 allocations?.Begin();
+using var gcProfile = new GcProfiler();
+gcProfile.Begin();
+var pause0 = GC.GetTotalPauseDuration();
 var cpu0 = ThreadCpu.Take();
 var records0 = Volatile.Read(ref recordsDrained);
 var steps0 = Volatile.Read(ref stepsRun);
@@ -184,6 +187,8 @@ var records = Volatile.Read(ref recordsDrained) - records0;
 var steps = Volatile.Read(ref stepsRun) - steps0;
 var allocated = GC.GetTotalAllocatedBytes(precise: false) - alloc0;
 var gc1 = (GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2));
+var gcTime = gcProfile.End();
+var pause = GC.GetTotalPauseDuration() - pause0;
 var workingSet = Environment.WorkingSet;
 
 var seconds = wall.Elapsed.TotalSeconds;
@@ -211,6 +216,11 @@ Console.WriteLine($"  allocated       {allocated / (double)records:N0} B/record 
                   $"   (producer share {Volatile.Read(ref producerAllocated) / (double)Math.Max(1, Volatile.Read(ref producedOrders)):N0} B/order)");
 Console.WriteLine($"  GC              gen0 {gc1.Item1 - gc0.Item1}   gen1 {gc1.Item2 - gc0.Item2}   gen2 {gc1.Item3 - gc0.Item3}" +
                   $"   working set {workingSet / (1024 * 1024):N0} MB");
+Console.WriteLine($"  GC time         blocking gen0 {gcTime.Gen0} / gen1 {gcTime.Gen1} / gen2 {gcTime.Gen2Blocking} " +
+                  $"(EE pause {pause.TotalSeconds:F2}s total)   background gen2 {gcTime.Background}x {gcTime.BackgroundSeconds:F2}s concurrent");
+Console.WriteLine($"  gen2 triggers   {gcProfile.Gen2ReasonSummary()}");
+Console.WriteLine($"  GC CPU          blocking collections (server threads) {cpu1.GcServerSeconds - cpu0.GcServerSeconds:F2}s + " +
+                  $"background gen2 (BGC threads) {cpu1.GcBgcSeconds - cpu0.GcBgcSeconds:F2}s");
 
 if (allocations is not null)
 {
