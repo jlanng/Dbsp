@@ -353,7 +353,7 @@ survive the change.
 
 A circuit holds a large, mostly-static live set and allocates a little on every step, which
 is the workload shape the .NET GC defaults handle worst: the garbage collector's share of
-process CPU can exceed the workers'. Three settings in your project file are worth more than
+process CPU can exceed the workers'. A few settings in your project file are worth more than
 any code change, and none of them is something the library can set for you — they are read
 before your `Main` runs:
 
@@ -366,6 +366,9 @@ before your `Main` runs:
 <ItemGroup>
   <!-- Heap count: match CircuitOptions.Workers, not the core count. -->
   <RuntimeHostConfigurationOption Include="System.GC.HeapCount" Value="4" />
+  <!-- Belt-and-braces: keep occasional medium arrays (input batches, store growth)
+       off the LOH, where their churn would trigger gen2 collections. -->
+  <RuntimeHostConfigurationOption Include="System.GC.LOHThreshold" Value="1048576" />
 </ItemGroup>
 ```
 
@@ -374,6 +377,16 @@ machine collects 20 heaps with 20 threads, most of them for memory no worker eve
 DATAS (on by default for server GC since .NET 9) then keeps trimming the heap, which against
 a large static live set is close to continuous gen2 work. On the throughput rig the pair is
 worth 16.6 µs → 11.6 µs of CPU per record, paid for in working set (2.2 GB → 2.6 GB).
+
+The other lever is yours, not the runtime's: **declare small row and accumulator types as
+`readonly record struct`**. The library's own machinery reuses its buffers, so at
+throughput most remaining allocation is the records *your* lambdas return — and a linear
+aggregate constructs a fresh accumulator on every fold, because records are immutable. A
+small struct (`Spend(long Orders, decimal Amount)`) lives inline in operator state and
+Z-set entries and never touches the heap, while keeping the value equality Z-sets need and
+the JSON shape Redis state needs. Keep wide rows (many fields, several strings) as
+reference records: there, one reference is what every probe and entry copy moves. The
+showcase's `Records.cs` and `Aggregates.cs` show the split.
 
 If the worker count is only known at launch — a command-line flag, a container knob — set
 `DOTNET_GCHeapCount` in the environment instead of the runtimeconfig option. **It is read as

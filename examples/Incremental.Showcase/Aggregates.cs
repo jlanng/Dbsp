@@ -3,13 +3,16 @@ using Incremental;
 namespace Incremental.Showcase;
 
 // Linear-aggregate accumulators are operator state: records, not tuples, so they
-// round-trip JSON under --redis.
+// round-trip JSON under --redis. Record *structs*, because every Combine constructs a
+// fresh accumulator — as reference records these three were the largest allocations in
+// the whole pipeline (~220 B per input record on the torture rig); as structs they live
+// inline in the operator's state and Z-set entries and never touch the heap.
 
-public record FeeStats(long Orders, decimal Gross, decimal Fees);
+public readonly record struct FeeStats(long Orders, decimal Gross, decimal Fees);
 
-public record Acceptance(long Approved, long Total);
+public readonly record struct Acceptance(long Approved, long Total);
 
-public record Spend(long Orders, decimal Amount);
+public readonly record struct Spend(long Orders, decimal Amount);
 
 // A linear aggregate is a homomorphism over weights: no per-key group contents are
 // stored, just one accumulator — retractions arrive as negative weights and fold in.
