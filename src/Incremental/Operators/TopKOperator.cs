@@ -63,6 +63,7 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
     private readonly List<WeightedValue<TValue>> _top = [];
     private readonly List<(TKey, WeightedValue<TValue>[])> _puts = [];
     private readonly List<TKey> _removes = [];
+    private readonly OutputBuffer<KeyedValue<TKey, TValue>> _output = new();
     private readonly List<WeightedValue<TValue>> _groupRows = [];
     private readonly List<int> _groupBounds = [];
 
@@ -127,7 +128,7 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
             return _empty;
         }
 
-        var output = new ZSet<KeyedValue<TKey, TValue>>(rerankKeys.Count * _count * 2);
+        var output = _output.Next(rerankKeys.Count * _count * 2);
         // A re-rank reads the whole group, which is the largest read this operator makes;
         // GetGroupsInto keeps it in one reused buffer rather than an array per key.
         _groupRows.Clear();

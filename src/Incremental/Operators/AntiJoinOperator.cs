@@ -42,12 +42,13 @@ internal sealed class AntiJoinOperator<TKey, TLeft, TRight> : IStepOperator
     private readonly List<(TKey, TLeft, long)> _leftEntries = [];
     private readonly List<TKey> _leftKeys = [];
     private readonly Dictionary<TKey, int> _matchIndex = [];
+    private readonly OutputBuffer<KeyedValue<TKey, TLeft>> _output = new();
 
     public object Step(object?[] inputs)
     {
         var deltaLeft = (ZSet<KeyedValue<TKey, TLeft>>)inputs[0]!;
         var deltaRight = (ZSet<KeyedValue<TKey, TRight>>)inputs[1]!;
-        var output = new ZSet<KeyedValue<TKey, TLeft>>(deltaLeft.DistinctCount);
+        var output = _output.Next(deltaLeft.DistinctCount);
 
         var rightKeyDeltas = _rightKeyDeltas;
         rightKeyDeltas.Clear();

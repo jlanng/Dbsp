@@ -55,6 +55,10 @@ internal sealed class LoopFeedbackOperator<T> : IStepOperator, ILoopFeedbackOper
 {
     private ZSet<T>? _pending;
 
+    /// <summary>Iteration 0's output — nothing has circulated yet. Shared across steps and
+    /// read-only downstream, like every <see cref="IStepOperator.EmptyStepResult"/>.</summary>
+    private readonly ZSet<T> _empty = new();
+
     public void BeginOuterStep() => _pending = null;
     public void BeginIteration(int iteration) { }
     public bool HasPendingWork(int iteration) => false;
@@ -63,7 +67,7 @@ internal sealed class LoopFeedbackOperator<T> : IStepOperator, ILoopFeedbackOper
     public void SetPending(object? delta) => _pending = (ZSet<T>?)delta;
     public bool PendingIsNonEmpty => _pending is { IsEmpty: false };
 
-    public object Step(object?[] inputs) => _pending ?? new ZSet<T>();
+    public object Step(object?[] inputs) => _pending ?? _empty;
 }
 
 /// <summary>
@@ -97,9 +101,20 @@ internal sealed class LoopImportOperator : IStepOperator, ILoopOperator
 /// step's fixed point versus the previous step's.</summary>
 internal sealed class LoopExitOperator<T> : IStepOperator, ILoopOperator where T : notnull
 {
-    private ZSet<T> _outerDelta = new();
+    // Double-buffered like an OutputBuffer, but flipped per outer step rather than per
+    // execution: the accumulation must survive every iteration of the step, and the
+    // previous step's delta must stay readable until its consumers are done with it.
+    private readonly ZSet<T> _a = new(), _b = new();
+    private ZSet<T> _outerDelta;
+    private bool _useB;
 
-    public void BeginOuterStep() => _outerDelta = new ZSet<T>();
+    public LoopExitOperator() => _outerDelta = _a;
+
+    public void BeginOuterStep()
+    {
+        _outerDelta = (_useB = !_useB) ? _b : _a;
+        _outerDelta.Clear();
+    }
     public void BeginIteration(int iteration) { }
     public bool HasPendingWork(int iteration) => false;
     public void EndOuterStep() { }
@@ -159,12 +174,14 @@ internal sealed class LoopDistinctOperator<T> : IStepOperator, ILoopOperator whe
         Reset();
     }
 
+    private readonly OutputBuffer<T> _output = new();
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<T>)inputs[0]!;
         Activate(delta);
 
-        var output = new ZSet<T>();
+        var output = _output.Next(delta.DistinctCount);
         foreach (var (value, state) in _active)
         {
             var historyAt = state.History?.GetValueOrDefault(_iteration) ?? 0;
@@ -274,6 +291,7 @@ internal sealed class LoopJoinOperator<TKey, TLeft, TRight, TOut> : IStepOperato
     private readonly Dictionary<TKey, KeyState> _active = new();
     private readonly List<(TKey Key, (TLeft Value, int Iteration) Entry, long Delta)> _leftFold = [];
     private readonly List<(TKey Key, (TRight Value, int Iteration) Entry, long Delta)> _rightFold = [];
+    private readonly OutputBuffer<TOut> _output = new();
     private int _iteration;
     private int _maxPendingIteration = -1;
 
@@ -306,7 +324,7 @@ internal sealed class LoopJoinOperator<TKey, TLeft, TRight, TOut> : IStepOperato
         var nowLeft = Bucket(deltaLeft, _leftFold);
         var nowRight = Bucket(deltaRight, _rightFold);
 
-        var output = new ZSet<TOut>();
+        var output = _output.Next(0);
         foreach (var (key, state) in _active)
         {
             var historyLeft = state.Left.History?.GetValueOrDefault(_iteration);

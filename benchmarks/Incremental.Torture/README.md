@@ -127,6 +127,23 @@ collections per window whose cost is dominated by scanning the card table of a l
 heavily-written gen2 (the stores) — churn interacting with live-set size, and the reason
 allocation per record stays the number this rig watches.
 
+## Output-buffer reuse (code, not tuning)
+
+The LOH findings above led to removing the churn at its source: every operator now draws
+its output Z-set from a double-buffered `OutputBuffer` instead of allocating one per step
+(safe because output ports copy and nothing retains a delta past one more execution of its
+producer — the argument is in `OutputBuffer.cs`). The delta-sized dictionary arrays were
+~60% of every record's allocation, so this cut **2,544 B/record to ~970 B/record**, and
+what's left is mostly the pipeline's own projection rows plus input batches and store
+growth. The tuned configuration now measures 11.2 us of CPU per record with GC at 1.3 us
+**without** the LOH threshold — the setting stays worthwhile as belt-and-braces for input
+batches and store growth, but the library no longer depends on any host GC configuration
+to avoid the LOH-triggered gen2 pathology. The configuration a library cannot ask of its
+consumers — completely stock workstation GC — goes from 133.8k records/s (11 gen2s and
+25.9 us of GC+worker CPU per record) to 144.2k with 2 gen2s and GC-thread time near zero;
+its remaining gap to server GC is ephemeral pauses card-scanning the ~2 GB live set,
+which only the server GC settings address.
+
 Step batch size trades the same way in miniature: bigger batches amortize per-step cost
 across more records (worker CPU falls) but keep more step-scoped garbage alive across a
 collection (GC CPU rises). On this workload `MaxStepItemsPerInput` around 4096 is the

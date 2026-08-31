@@ -93,7 +93,8 @@ public sealed class ZSet<T> : IZSet, IEnumerable<WeightedValue<T>> where T : not
     /// <summary>Empties the Z-set while keeping its capacity, so a buffer that is refilled
     /// every step stops re-growing after the first few. Only for Z-sets whose owner knows no
     /// one else still holds them — operators treat their inputs as read-only, which is what
-    /// makes reuse safe where it is used (see <c>ExchangeOperator.Partition</c>).</summary>
+    /// makes reuse safe where it is used (see <c>ExchangeOperator.Partition</c> and
+    /// <c>OutputBuffer</c>, which extends the argument to every operator's output).</summary>
     internal void Clear() => _weights.Clear();
 
     /// <summary>Returns a new Z-set with every weight negated (turns insertions into retractions).</summary>

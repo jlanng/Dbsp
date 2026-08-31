@@ -118,13 +118,14 @@ internal sealed class MapOperator<TIn, TOut>(Func<TIn, TOut> selector) : IStepOp
     where TOut : notnull
 {
     private readonly ZSet<TOut> _empty = new();
+    private readonly OutputBuffer<TOut> _output = new();
 
     public object? EmptyStepResult => _empty;
 
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<TIn>)inputs[0]!;
-        var output = new ZSet<TOut>(delta.DistinctCount);
+        var output = _output.Next(delta.DistinctCount);
         foreach (var (value, weight) in delta)
             output.Add(selector(value), weight);
         return output;
@@ -134,13 +135,14 @@ internal sealed class MapOperator<TIn, TOut>(Func<TIn, TOut> selector) : IStepOp
 internal sealed class FilterOperator<T>(Func<T, bool> predicate) : IStepOperator where T : notnull
 {
     private readonly ZSet<T> _empty = new();
+    private readonly OutputBuffer<T> _output = new();
 
     public object? EmptyStepResult => _empty;
 
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<T>)inputs[0]!;
-        var output = new ZSet<T>(delta.DistinctCount);
+        var output = _output.Next(delta.DistinctCount);
         foreach (var (value, weight) in delta)
             if (predicate(value))
                 output.Add(value, weight);
@@ -153,13 +155,14 @@ internal sealed class FlatMapOperator<TIn, TOut>(Func<TIn, IEnumerable<TOut>> se
     where TOut : notnull
 {
     private readonly ZSet<TOut> _empty = new();
+    private readonly OutputBuffer<TOut> _output = new();
 
     public object? EmptyStepResult => _empty;
 
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<TIn>)inputs[0]!;
-        var output = new ZSet<TOut>(delta.DistinctCount);
+        var output = _output.Next(delta.DistinctCount);
         foreach (var (value, weight) in delta)
             foreach (var expanded in selector(value))
                 output.Add(expanded, weight);
@@ -182,6 +185,7 @@ internal sealed class WindowAssignOperator<TKey, TValue>(
     where TValue : notnull
 {
     private readonly ZSet<KeyedValue<WindowKey<TKey>, TValue>> _empty = new();
+    private readonly OutputBuffer<KeyedValue<WindowKey<TKey>, TValue>> _output = new();
     private readonly int _windowsPerRecord = (int)((sizeTicks + hopTicks - 1) / hopTicks);
 
     public object? EmptyStepResult => _empty;
@@ -189,7 +193,7 @@ internal sealed class WindowAssignOperator<TKey, TValue>(
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
-        var output = new ZSet<KeyedValue<WindowKey<TKey>, TValue>>(delta.DistinctCount * _windowsPerRecord);
+        var output = _output.Next(delta.DistinctCount * _windowsPerRecord);
         foreach (var ((key, value), weight) in delta)
         {
             var ticks = eventTicks(value);
@@ -211,16 +215,25 @@ internal sealed class WindowAssignOperator<TKey, TValue>(
 internal sealed class NegateOperator<T> : IStepOperator where T : notnull
 {
     private readonly ZSet<T> _empty = new();
+    private readonly OutputBuffer<T> _output = new();
 
     public object? EmptyStepResult => _empty;
 
-    public object Step(object?[] inputs) => ((ZSet<T>)inputs[0]!).Negated();
+    public object Step(object?[] inputs)
+    {
+        var delta = (ZSet<T>)inputs[0]!;
+        var output = _output.Next(delta.DistinctCount);
+        foreach (var (value, weight) in delta)
+            output.Add(value, -weight);
+        return output;
+    }
 }
 
 /// <summary>Z-set addition (bag union) of any number of input streams.</summary>
 internal sealed class PlusOperator<T> : IStepOperator where T : notnull
 {
     private readonly ZSet<T> _empty = new();
+    private readonly OutputBuffer<T> _output = new();
 
     public object? EmptyStepResult => _empty;
 
@@ -229,7 +242,7 @@ internal sealed class PlusOperator<T> : IStepOperator where T : notnull
         var total = 0;
         foreach (var input in inputs)
             total += ((ZSet<T>)input!).DistinctCount;
-        var output = new ZSet<T>(total);
+        var output = _output.Next(total);
         foreach (var input in inputs)
             output.AddAll((ZSet<T>)input!);
         return output;
@@ -293,13 +306,15 @@ internal sealed class ExchangeOperator<T>(Func<T, uint> routingHash) : IExchange
     /// as it still publishes/consumes sequences where peers expect them.</summary>
     public object? EmptyStepResult => _emptyMerge;
 
+    private readonly OutputBuffer<T> _merge = new();
+
     public object Merge(object?[] parts)
     {
         // An exchange cannot be skipped the way a plain operator can — its barrier keeps the
         // workers aligned — but the worker no key routed to this step still need not allocate
         // a Z-set to say so. Sizing the merge up front is the point of the counting pass:
         // the shards are disjoint by key, so their entry counts sum to the merged size
-        // exactly, and the result is allocated once at its final size.
+        // exactly, and the reused buffer is filled once at its final size.
         var total = 0;
         foreach (var part in parts)
             if (part is ZSet<T> fragment)
@@ -307,7 +322,7 @@ internal sealed class ExchangeOperator<T>(Func<T, uint> routingHash) : IExchange
         if (total == 0)
             return _emptyMerge;
 
-        var merged = new ZSet<T>(total);
+        var merged = _merge.Next(total);
         foreach (var part in parts)
             if (part is ZSet<T> { IsEmpty: false } fragment)
                 merged.AddAll(fragment);
