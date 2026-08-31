@@ -14,8 +14,8 @@ namespace Incremental.Benchmarks.Contracts;
 /// </summary>
 internal static class PerfContracts
 {
-    private const double TimeRatioLimit = 5.0;
-    private const double AllocRatioLimit = 1.5;
+    private const double TimeRatioLimit = 3.5;
+    private const double AllocRatioLimit = 1.1;
     private const int WarmupTrials = 3;
     private const int MeasuredTrials = 9;
     private const int CyclesPerTrial = 40;
