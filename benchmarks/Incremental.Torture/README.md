@@ -144,6 +144,15 @@ consumers — completely stock workstation GC — goes from 133.8k records/s (11
 its remaining gap to server GC is ephemeral pauses card-scanning the ~2 GB live set,
 which only the server GC settings address.
 
+The last slice belongs to the pipeline, not the library: with the showcase's small row
+and accumulator types declared as `readonly record struct` (see `Records.cs` /
+`Aggregates.cs` and *Running it fast* in `docs/intro.md`), the fold-per-record aggregate
+accumulators and per-delta-row projections stop touching the heap — **~950 B/record
+becomes ~650 B**, GC CPU per record 1.5 us to 0.8 us measured back-to-back. What remains
+is the publish-boundary copy (~285 B, the fee that makes every internal buffer reusable)
+and the wide reference rows (`EnrichedOrder`, `Order`) that are better off as one
+reference than as a dozen inline fields.
+
 Step batch size trades the same way in miniature: bigger batches amortize per-step cost
 across more records (worker CPU falls) but keep more step-scoped garbage alive across a
 collection (GC CPU rises). On this workload `MaxStepItemsPerInput` around 4096 is the

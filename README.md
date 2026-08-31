@@ -475,17 +475,26 @@ showcase pipeline over a sliding population of orders (inserting order *N* retra
 process CPU split between workers and the GC, and has an in-process allocation profiler by
 type (`--alloc-types`). `--processes N` runs the cluster graph across co-hosted processes,
 which is what puts the exchange wire format on the measured path. See its README for current
-numbers and for the two runtime GC settings that matter more than any single code change:
+numbers and for the runtime GC settings that matter more than any single code change:
 **size the server GC's heap count to `CircuitOptions.Workers` rather than to the core count,
-and turn DATAS off** — a circuit's live set is large and mostly static, which is the shape
-DATAS handles worst.
+turn DATAS off** — a circuit's live set is large and mostly static, which is the shape
+DATAS handles worst — **and raise the LOH threshold to 1 MB** so medium arrays stop
+triggering gen2 collections.
+
+The operators themselves allocate almost nothing per step — outputs, input batches and the
+exchange wire path all run on reused buffers — so at throughput the remaining allocation is
+mostly the rows *your* lambdas return. The one consumer-side lever worth knowing: declare
+small row and accumulator types as `readonly record struct` (a linear aggregate constructs
+a fresh accumulator every fold; as a struct it never touches the heap). `docs/intro.md` has
+the details under *Running it fast*, and the showcase's `Records.cs` / `Aggregates.cs` show
+the struct-vs-record split.
 
 Every example ships with that configuration applied. `examples/Directory.Build.props` turns
 on server and concurrent GC and turns DATAS off for all of them, and each example declares
 the worker count it builds its circuit with as `<CircuitWorkers>`, which becomes the
 runtimeconfig heap count. So `dotnet run` on any example measures the library rather than
 the default GC's idea of what to do with a 20-thread machine. It is startup configuration —
-a library cannot set it for you — so an application gets it by copying those four lines into
+a library cannot set it for you — so an application gets it by copying those few lines into
 its own project; `docs/intro.md` has them under *Running it fast*.
 
 ## Packaging
