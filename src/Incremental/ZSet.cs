@@ -12,11 +12,20 @@ public readonly record struct KeyedValue<TKey, TValue>(TKey Key, TValue Value)
     where TValue : notnull;
 
 /// <summary>Type-erased view of a <see cref="ZSet{T}"/>, so the runtime — which moves deltas
-/// around as <see cref="object"/> — can ask whether one is empty without knowing its element
-/// type. Deliberately minimal: emptiness is the only property the scheduler needs.</summary>
+/// around as <see cref="object"/> — can ask about one without knowing its element type.
+/// Deliberately minimal: emptiness, size, and the fragment-streaming chunk split are the only
+/// things the scheduler needs.</summary>
 internal interface IZSet
 {
     bool IsEmpty { get; }
+    int DistinctCount { get; }
+
+    /// <summary>Deals this Z-set's entries into <paramref name="chunks"/> disjoint chunk
+    /// Z-sets whose sum is this one — the producer side of fragment streaming. Missing
+    /// targets are created (same element type); present ones are cleared and refilled, so a
+    /// caller-owned scratch array is reused across steps. Only the first
+    /// <paramref name="chunks"/> targets are touched.</summary>
+    void SplitInto(IZSet?[] targets, int chunks);
 }
 
 /// <summary>
@@ -96,6 +105,20 @@ public sealed class ZSet<T> : IZSet, IEnumerable<WeightedValue<T>> where T : not
     /// makes reuse safe where it is used (see <c>ExchangeOperator.Partition</c> and
     /// <c>OutputBuffer</c>, which extends the argument to every operator's output).</summary>
     internal void Clear() => _weights.Clear();
+
+    void IZSet.SplitInto(IZSet?[] targets, int chunks)
+    {
+        var perChunk = (_weights.Count + chunks - 1) / chunks;
+        var enumerator = _weights.GetEnumerator();
+        for (var k = 0; k < chunks; k++)
+        {
+            var target = (ZSet<T>?)targets[k] ?? (ZSet<T>)(targets[k] = new ZSet<T>());
+            target.Clear();
+            target.EnsureCapacity(Math.Min(perChunk, _weights.Count - k * perChunk));
+            for (var i = 0; i < perChunk && enumerator.MoveNext(); i++)
+                target._weights.Add(enumerator.Current.Key, enumerator.Current.Value);
+        }
+    }
 
     /// <summary>Returns a new Z-set with every weight negated (turns insertions into retractions).</summary>
     public ZSet<T> Negated()

@@ -59,6 +59,11 @@ public sealed class CircuitBuilder
         ArgumentOutOfRangeException.ThrowIfLessThan(Options.InputChannelCapacity, 1, nameof(Options.InputChannelCapacity));
         ArgumentOutOfRangeException.ThrowIfLessThan(Options.OutputChannelCapacity, 1, nameof(Options.OutputChannelCapacity));
         ArgumentOutOfRangeException.ThrowIfLessThan(Options.MaxStepItemsPerInput, 1, nameof(Options.MaxStepItemsPerInput));
+        ArgumentOutOfRangeException.ThrowIfLessThan(Options.StreamChunkRows, 1, nameof(Options.StreamChunkRows));
+        if (Options.FragmentStreaming && !Options.PointToPointExchange)
+            throw new NotSupportedException(
+                "FragmentStreaming builds on the point-to-point exchange: set PointToPointExchange = true " +
+                "(both are local-only — the cluster shuffle keeps its barrier).");
         if (Options.Cluster is { } cluster)
         {
             ArgumentOutOfRangeException.ThrowIfLessThan(cluster.ProcessCount, 1, nameof(Options.Cluster));

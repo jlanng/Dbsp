@@ -42,6 +42,39 @@ internal sealed class Worker(
     /// expects from every peer. Empty when the circuit synchronizes on the barrier.</summary>
     public long[] ExchangeSeq { get; set; } = [];
 
+    // Fragment streaming only (all empty otherwise; see docs/design/fragment-streaming.md).
+    // All are written only by the owning worker thread — the cross-thread words are the
+    // circuit's fragment-counter and sequence arrays, not these.
+
+    /// <summary>Cumulative fragments this worker has consumed per (node, sender), indexed
+    /// <c>node * workers + sender</c>. Monotonic across executions, so no per-step reset and
+    /// no ambiguity about which execution a published counter belongs to.</summary>
+    public long[] FragConsumed { get; set; } = [];
+
+    /// <summary>Cumulative fragments this worker has published per exchange node — the value
+    /// it last release-wrote to its fragment-counter slot, kept here so publishing does not
+    /// re-read the shared line.</summary>
+    public long[] FragPublished { get; set; } = [];
+
+    /// <summary>Per fragment-sink node: fragments fed to the sink since its last completion,
+    /// so the sink's sweep position knows it must run <c>Step</c> even though the streamed
+    /// input slots are empty. Read and reset by the sink's node execution.</summary>
+    public long[] SinkPending { get; set; } = [];
+
+    /// <summary>Consume-loop scratch: which senders have completed the streamed exchange
+    /// being consumed. One array serves every node — the loop finishes a node before the
+    /// sweep reaches the next.</summary>
+    public bool[] SenderDone { get; set; } = [];
+
+    /// <summary>Per streamed exchange node, the reused chunk Z-sets the producer splits its
+    /// input into (created lazily from the input's own type; only deltas above the chunk
+    /// target ever populate more than the sweep already had).</summary>
+    public IZSet?[]?[] ChunkScratch { get; set; } = [];
+
+    /// <summary>Fragments this worker published/consumed, cumulative (phase-stats reporting;
+    /// the counters are cheap enough to keep unconditionally).</summary>
+    public long FragmentsPublished, FragmentsConsumed;
+
     // PHASE-STATS (temporary probe instrumentation — revert before committing). Cumulative
     // ticks per phase of the exchange path, plus per-step span timestamps for launch/land
     // attribution. Written only by the owning worker thread; read racily at dispose.

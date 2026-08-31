@@ -60,6 +60,34 @@ internal interface IStepOperator
     /// </para>
     /// </summary>
     object? EmptyStepResult => null;
+
+    /// <summary>
+    /// Whether this operator is linear: running <see cref="Step"/> on the fragments of a
+    /// delta and summing the outputs equals running it on the summed delta — including any
+    /// state effects. Only stateless record-wise operators qualify; the fragment-streaming
+    /// scheduler fuses a chain of them into the exchange they feed and runs them per chunk
+    /// (see docs/design/fragment-streaming.md). Declare true only when the property holds
+    /// for any partition of any input, retractions included.
+    /// </summary>
+    bool IsLinear => false;
+}
+
+/// <summary>
+/// A stateful operator that can consume its exchanged input in fragments, as producers
+/// publish them, instead of as one merged delta: <see cref="OnFragment"/> is called from the
+/// exchange's sweep position with each non-empty fragment addressed to this worker (in
+/// arrival order — any order is correct, which is what qualifies an operator for this
+/// interface: bilinear probe-then-integrate for the join, a homomorphism fold for linear
+/// aggregates), and the operator's ordinary <see cref="IStepOperator.Step"/> then runs at
+/// its own sweep position as the completion call — the streamed inputs' slots hold empty
+/// deltas by then, so <c>Step</c> processes whatever was not streamed and emits the step's
+/// single output delta. Output content and timing are exactly the unstreamed operator's.
+/// An implementation must copy what it keeps: a fragment is a producer-owned reused buffer,
+/// dead after the call returns.
+/// </summary>
+internal interface IFragmentSinkOperator : IStepOperator
+{
+    void OnFragment(int input, object fragment);
 }
 
 /// <summary>
@@ -73,6 +101,32 @@ internal interface IExchangeStepOperator : IStepOperator
 {
     object[] Partition(object? input, int parts);
     object Merge(object?[] parts);
+
+    /// <summary>Fragment streaming (point-to-point mode only; see
+    /// docs/design/fragment-streaming.md). A producer partitions each chunk of its input
+    /// into a ring slot via <see cref="PartitionFragment"/> and
+    /// release-publishes a cumulative fragment counter; <see cref="FragmentRing"/> is the
+    /// ring the runtime hands consumers (its elements are written before the counter, so the
+    /// counter's release/acquire pair publishes them). A consumer folds arriving fragments
+    /// with <see cref="AccumulateFragment"/> and takes the step's merged delta — value-equal
+    /// to <see cref="Merge"/> over the same parts — from <see cref="CompleteMerge"/>. The
+    /// ring is single-buffered for the same reason the mailboxes are: every consumer
+    /// finishes the execution that reads a fragment before its producer executes the node
+    /// again.</summary>
+    object?[][] FragmentRing { get; }
+
+    /// <inheritdoc cref="FragmentRing"/>
+    object[] PartitionFragment(object? chunk, int parts, int ringIndex);
+
+    /// <inheritdoc cref="FragmentRing"/>
+    void AccumulateFragment(object fragment);
+
+    /// <inheritdoc cref="FragmentRing"/>
+    object CompleteMerge();
+
+    /// <summary>Ring depth — the most fragments one execution may publish. Chunk sizing
+    /// scales up to respect it, so an execution never laps its own ring.</summary>
+    public const int FragmentRingSize = 8;
 
     /// <summary>Cluster path: merges every local sender's fragments for the
     /// <paramref name="count"/> partitions starting at <paramref name="firstShard"/> (a peer
@@ -126,6 +180,8 @@ internal sealed class MapOperator<TIn, TOut>(Func<TIn, TOut> selector) : IStepOp
 
     public object? EmptyStepResult => _empty;
 
+    public bool IsLinear => true;
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<TIn>)inputs[0]!;
@@ -142,6 +198,8 @@ internal sealed class FilterOperator<T>(Func<T, bool> predicate) : IStepOperator
     private readonly OutputBuffer<T> _output = new();
 
     public object? EmptyStepResult => _empty;
+
+    public bool IsLinear => true;
 
     public object Step(object?[] inputs)
     {
@@ -162,6 +220,8 @@ internal sealed class FlatMapOperator<TIn, TOut>(Func<TIn, IEnumerable<TOut>> se
     private readonly OutputBuffer<TOut> _output = new();
 
     public object? EmptyStepResult => _empty;
+
+    public bool IsLinear => true;
 
     public object Step(object?[] inputs)
     {
@@ -194,6 +254,8 @@ internal sealed class WindowAssignOperator<TKey, TValue>(
 
     public object? EmptyStepResult => _empty;
 
+    public bool IsLinear => true;
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
@@ -223,6 +285,8 @@ internal sealed class NegateOperator<T> : IStepOperator where T : notnull
 
     public object? EmptyStepResult => _empty;
 
+    public bool IsLinear => true;
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<T>)inputs[0]!;
@@ -240,6 +304,8 @@ internal sealed class PlusOperator<T> : IStepOperator where T : notnull
     private readonly OutputBuffer<T> _output = new();
 
     public object? EmptyStepResult => _empty;
+
+    public bool IsLinear => true;
 
     public object Step(object?[] inputs)
     {
@@ -331,6 +397,53 @@ internal sealed class ExchangeOperator<T>(Func<T, uint> routingHash) : IExchange
             if (part is ZSet<T> { IsEmpty: false } fragment)
                 merged.AddAll(fragment);
         return merged;
+    }
+
+    // Fragment streaming (see the interface doc and docs/design/fragment-streaming.md).
+    // The ring is the chunked analogue of _fragments: per ring slot, one reused Z-set per
+    // target plus the boxed array the runtime publishes. Single-buffered like the mailboxes —
+    // every consumer finishes the execution that reads a fragment before this worker executes
+    // the node again — and rarely more than one slot deep in practice: only a delta larger
+    // than the chunk target ever advances past slot 0.
+    private readonly object?[][] _ring = new object?[IExchangeStepOperator.FragmentRingSize][];
+    private readonly ZSet<T>[]?[] _ringFragments = new ZSet<T>[]?[IExchangeStepOperator.FragmentRingSize];
+
+    public object?[][] FragmentRing => _ring;
+
+    public object[] PartitionFragment(object? chunk, int parts, int ringIndex)
+    {
+        var fragments = _ringFragments[ringIndex];
+        if (fragments is null || fragments.Length != parts)
+        {
+            fragments = _ringFragments[ringIndex] = new ZSet<T>[parts];
+            var boxed = new object[parts];
+            for (var i = 0; i < parts; i++)
+                boxed[i] = fragments[i] = new ZSet<T>();
+            _ring[ringIndex] = boxed;
+        }
+        else
+        {
+            foreach (var fragment in fragments)
+                fragment.Clear();
+        }
+
+        foreach (var (value, weight) in (ZSet<T>)chunk!)
+            fragments[(int)(routingHash(value) % (uint)parts)].Add(value, weight);
+        return _ring[ringIndex]!;
+    }
+
+    /// <summary>The partial-merge accumulator: the same double-buffered <see cref="_merge"/>
+    /// the batch <see cref="Merge"/> fills — streaming fills it earlier, not longer.</summary>
+    private ZSet<T>? _accumulating;
+
+    public void AccumulateFragment(object fragment) =>
+        (_accumulating ??= _merge.Next(0)).AddAll((ZSet<T>)fragment);
+
+    public object CompleteMerge()
+    {
+        var merged = _accumulating;
+        _accumulating = null;
+        return merged is { IsEmpty: false } ? merged : _emptyMerge;
     }
 
     // Wire encoding: a frame is one shard per target worker, each a run of (value, weight)

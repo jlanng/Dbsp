@@ -8,8 +8,15 @@ namespace Incremental.Operators;
 /// indexed store, and each step only probes the state with the new deltas — no
 /// recomputation over historical data. Both inputs must be co-partitioned by key, which
 /// <c>IndexBy</c> guarantees via its exchange.
+/// <para>
+/// Bilinearity is also what makes this a fragment sink: applying a fragment of either
+/// side's delta means probing the other side's <em>current</em> state and then integrating
+/// into its own, and under that discipline every ΔL×ΔR pair is counted exactly once no
+/// matter how the deltas are cut into fragments or interleaved — the whole-delta
+/// <see cref="Step"/> is just the two-fragment special case.
+/// </para>
 /// </summary>
-internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IStepOperator
+internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IFragmentSinkOperator
     where TKey : notnull
     where TLeft : notnull
     where TRight : notnull
@@ -48,14 +55,49 @@ internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IStepOperator
     private readonly List<WeightedValue<TRight>> _rightRows = [];
     private readonly OutputBuffer<TOut> _output = new();
 
+    // The output delta under construction: opened by the first fragment (or by Step) from
+    // the shared double-buffered OutputBuffer, grown per applied delta, handed out once by
+    // Step. Streaming fills it earlier, never keeps it longer.
+    private ZSet<TOut>? _current;
+
+    public void OnFragment(int input, object fragment)
+    {
+        if (input == 0)
+            ApplyLeft((ZSet<KeyedValue<TKey, TLeft>>)fragment);
+        else
+            ApplyRight((ZSet<KeyedValue<TKey, TRight>>)fragment);
+    }
+
     public object Step(object?[] inputs)
     {
-        var deltaLeft = (ZSet<KeyedValue<TKey, TLeft>>)inputs[0]!;
-        var deltaRight = (ZSet<KeyedValue<TKey, TRight>>)inputs[1]!;
-        var output = _output.Next(deltaLeft.DistinctCount + deltaRight.DistinctCount);
+        // When this operator streams, its exchanged inputs arrived via OnFragment and the
+        // slots hold empty deltas — Step is then just the completion call (cross terms were
+        // covered as the fragments integrated) plus the eviction drain.
+        if ((ZSet<KeyedValue<TKey, TLeft>>)inputs[0]! is { IsEmpty: false } deltaLeft)
+            ApplyLeft(deltaLeft);
+        if ((ZSet<KeyedValue<TKey, TRight>>)inputs[1]! is { IsEmpty: false } deltaRight)
+            ApplyRight(deltaRight);
 
-        // ΔL ⋈ R (right state not yet updated with ΔR)
-        Flatten(deltaLeft, _leftEntries);
+        // Closed keys can never be probed again (the watermark drops their events), so
+        // both sides' state for them is deleted; results already emitted remain final.
+        if (_eviction?.DrainClosed() is { Count: > 0 } closed)
+        {
+            _left.RemoveGroups(closed);
+            _right.RemoveGroups(closed);
+        }
+
+        var output = _current ?? _output.Next(0);
+        _current = null;
+        return output;
+    }
+
+    /// <summary>ΔL ⋈ R with R's current state, then ΔL integrated — so later right-side
+    /// deltas (fragments or Step's) cover their ΔL ⋈ ΔR cross terms by probing L.</summary>
+    private void ApplyLeft(ZSet<KeyedValue<TKey, TLeft>> delta)
+    {
+        var output = _current ??= _output.Next(delta.DistinctCount);
+        output.EnsureCapacity(output.DistinctCount + delta.DistinctCount);
+        Flatten(delta, _leftEntries);
         _rightRows.Clear();
         _bounds.Clear();
         _right.GetGroupsInto(_probeKeys, _rightRows, _bounds);
@@ -70,12 +112,15 @@ internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IStepOperator
             }
             _eviction?.Track(key);
         }
-
-        // Integrate ΔL, so the pass below also covers the ΔL ⋈ ΔR cross term.
         _left.ApplyAll(_leftEntries);
+    }
 
-        // (L + ΔL) ⋈ ΔR
-        Flatten(deltaRight, _rightEntries);
+    /// <summary>The mirror image: ΔR ⋈ L (ΔL applied so far included), then ΔR integrated.</summary>
+    private void ApplyRight(ZSet<KeyedValue<TKey, TRight>> delta)
+    {
+        var output = _current ??= _output.Next(delta.DistinctCount);
+        output.EnsureCapacity(output.DistinctCount + delta.DistinctCount);
+        Flatten(delta, _rightEntries);
         _leftRows.Clear();
         _bounds.Clear();
         _left.GetGroupsInto(_probeKeys, _leftRows, _bounds);
@@ -90,18 +135,7 @@ internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IStepOperator
             }
             _eviction?.Track(key);
         }
-
         _right.ApplyAll(_rightEntries);
-
-        // Closed keys can never be probed again (the watermark drops their events), so
-        // both sides' state for them is deleted; results already emitted remain final.
-        if (_eviction?.DrainClosed() is { Count: > 0 } closed)
-        {
-            _left.RemoveGroups(closed);
-            _right.RemoveGroups(closed);
-        }
-
-        return output;
     }
 
     /// <summary>Flattens a delta into <paramref name="entries"/> (the list its own side

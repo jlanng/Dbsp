@@ -68,6 +68,26 @@ public sealed class CircuitOptions
     /// this with <see cref="Cluster"/> throws (the cluster shuffle stays barrier-based).</summary>
     public bool PointToPointExchange { get; init; }
 
+    /// <summary>EXPERIMENTAL. When true, exchanges stream fragments (requires
+    /// <see cref="PointToPointExchange"/>, and is therefore local-only like it): a worker
+    /// publishes its partition of a large delta in chunks as it produces them — with any
+    /// single-consumer chain of linear operators feeding the exchange fused into that loop —
+    /// and consumers process whichever sender's fragments have arrived instead of waiting
+    /// for the slowest producer, merging as data lands; a join or linear aggregate that is
+    /// the exchange's sole consumer integrates the fragments directly. Every operator still
+    /// sees one complete delta per step and outputs, checkpoints, and fault semantics are
+    /// unchanged — streaming moves work earlier inside a step, which is what shortens the
+    /// serialized chain of busy workers that dominates multi-worker step latency. Exchanges
+    /// inside <c>Recurse</c> regions keep the plain point-to-point path. See
+    /// docs/design/fragment-streaming.md.</summary>
+    public bool FragmentStreaming { get; init; }
+
+    /// <summary>Rows per published fragment on a streamed exchange. A delta at or below this
+    /// publishes as a single fragment (the fast path, mechanically identical to plain
+    /// point-to-point); above it, chunks scale up so one execution never exceeds the
+    /// fragment ring. Internal so tests can force chunking on tiny deltas.</summary>
+    internal int StreamChunkRows { get; init; } = 256;
+
     /// <summary>Upper bound on any single cross-process wait in a clustered step: receiving
     /// an exchange node's shards from a peer, the end-of-step alignment frames, or space in
     /// a peer's bounded send queue. Null (default) waits forever — a peer that is merely
