@@ -33,4 +33,15 @@
     <RuntimeHostConfigurationOption Include="System.GC.HeapCount" Value="$(CircuitWorkers)" Trim="false" />
   </ItemGroup>
 
+  <!--
+    A step's output Z-sets are sized from the delta they carry, so at a few thousand records
+    per step their dictionary backing arrays pass the default 85 KB large-object threshold —
+    and on the torture rig every remaining gen2 collection was LOH-budget-triggered by exactly
+    those arrays, each one re-marking the whole live set. Raising the threshold to 1 MB makes
+    them ordinary gen0 garbage (10.5 us of CPU per record, from 11.6).
+  -->
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="System.GC.LOHThreshold" Value="1048576" Trim="false" />
+  </ItemGroup>
+
 </Project>

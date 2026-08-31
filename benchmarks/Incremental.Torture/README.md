@@ -31,7 +31,13 @@ through the inputs is roughly 3.8x the order rate.
 Worker saturation and the CPU split come from `/proc/self/task`: the circuit names its
 threads `circuit-worker-N`, so utime+stime of exactly those threads — against the GC threads
 and everything else — answers "where is the machine going?" without instrumenting the step
-path.
+path. The GC's share is further split by thread name — `.NET Server GC` threads do the
+blocking collections, `.NET BGC` threads the concurrent gen2 marking — which separates the
+cost of allocation churn from the cost of owning a large live set. An in-process
+`GCStart`/`GCEnd` listener (`GcProfiler`) adds per-generation collection counts and the
+trigger reason of every gen2, the datum that says what to fix. (Blocking-GC wall time is
+not observable from inside the process — a managed listener cannot run while the world is
+stopped — so blocking time is reported as the `GC.GetTotalPauseDuration` delta instead.)
 
 ## Results
 
@@ -88,9 +94,38 @@ DOTNET_GCHeapCount=4 dotnet run -c Release --project benchmarks/Incremental.Tort
 The server GC defaults to one heap per logical core, so a 4-worker circuit on a 20-thread
 machine collects 20 heaps with 20 threads — most of them for memory the workers never touch.
 DATAS (on by default for server GC since .NET 9) then keeps trimming the heap, which on a
-large, mostly-static live set means near-continuous gen2 work. Setting the heap count to the
-worker count and turning DATAS off takes this workload from **16.6 us to 11.6 us of CPU per
-record** at the cost of a larger working set (2.2 GB to 2.6 GB).
+large, mostly-static live set means near-continuous gen2 work — measured: a background gen2
+every second, 21 in a 20 s window. Setting the heap count to the worker count and turning
+DATAS off takes this workload from **16.6 us to 11.6 us of CPU per record** at the cost of a
+larger working set (2.2 GB to 2.6 GB).
+
+Even then a background gen2 fires every ~1.5 s, and every one of them is `AllocLarge`-
+triggered: at ~17 k records per step the output Z-sets' dictionary backing arrays pass the
+default 85 KB large-object threshold, and that LOH churn keeps exhausting the gen2 budget —
+each collection re-marking a ~2.5 GB live set that barely changed. Raising the threshold
+so those arrays are ordinary gen0 garbage removes almost all of it (13 gen2s in the window
+becomes 2, BGC-thread CPU 5.9 s becomes 0.9 s) and takes the workload from **11.6 us to
+10.5 us of CPU per record**, GC's share from 2.4 us to 1.6 us:
+
+```sh
+DOTNET_GCLOHThreshold=100000     # hexadecimal, like all DOTNET_GC* variables: 1 MB
+```
+
+or in runtimeconfig form (decimal), which is what `examples/Directory.Build.props` bakes in:
+`<RuntimeHostConfigurationOption Include="System.GC.LOHThreshold" Value="1048576" />`.
+
+The value is sized to the object population, not plucked: a delta-sized dictionary is a
+prime-capacity `Entry[]` of 24–64 B entries (reference-record rows keep entries small;
+`DateTimeOffset`-bearing window keys are the fat end), so the busiest edges at the default
+8192-per-input batch allocate ~420–560 KB arrays. Measured across thresholds: 256 KB still
+leaves 5 LOH-triggered gen2s in the window, 512 KB is the floor (2, same as 1 MB). The
+needed threshold scales linearly with `--batch`, so 1 MB is the floor plus 2x headroom, and
+a much larger batch wants a larger value again.
+
+What remains after all three settings is ~15% of process CPU: a dozen ephemeral gen0/1
+collections per window whose cost is dominated by scanning the card table of a large,
+heavily-written gen2 (the stores) — churn interacting with live-set size, and the reason
+allocation per record stays the number this rig watches.
 
 Step batch size trades the same way in miniature: bigger batches amortize per-step cost
 across more records (worker CPU falls) but keep more step-scoped garbage alive across a
