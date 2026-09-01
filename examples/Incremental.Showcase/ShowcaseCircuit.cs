@@ -61,6 +61,27 @@ public sealed class ShowcaseCircuit
     public int LastEnrichedDelta;
     public int LastRingDelta;
 
+    /// <summary>Every step's wall time in microseconds, cumulative, plus a rolling window of
+    /// the most recent ones — the header's p50 / p95 and the exchange-wait share (wait per
+    /// worker over summed step time) are read off these, so the effect of a topology shows
+    /// on the live pipeline itself, not only in the measurement table.</summary>
+    public double TotalStepMicros;
+    public long StepCount;
+    const int WindowSize = 300;
+    readonly double[] window = new double[WindowSize];
+
+    /// <summary>p50 and p95 of the last <see cref="WindowSize"/> steps (fewer while warming
+    /// up), and how many steps that is.</summary>
+    public (double P50, double P95, int Steps) StepPercentiles()
+    {
+        var n = (int)Math.Min(StepCount, WindowSize);
+        if (n == 0) return (0, 0, 0);
+        var sorted = new double[n];
+        Array.Copy(window, sorted, n);
+        Array.Sort(sorted);
+        return (sorted[n / 2], sorted[Math.Min(n - 1, (int)(n * 0.95))], n);
+    }
+
     public readonly int Workers;
     public readonly ExchangeMode Exchange;
 
@@ -140,6 +161,8 @@ public sealed class ShowcaseCircuit
         await Circuit.StepAsync();
         timer.Stop();
         LastStepMicros = timer.Elapsed.TotalMicroseconds;
+        TotalStepMicros += LastStepMicros;
+        window[StepCount++ % WindowSize] = LastStepMicros;
 
         var enrichedDelta = 0;
         var stepRows = new List<FeedRow>();

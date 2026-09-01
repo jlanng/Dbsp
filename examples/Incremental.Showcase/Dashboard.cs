@@ -88,6 +88,7 @@ public sealed class IncrementalMetrics : IDisposable
         "incremental.circuit.input_queue_depth",
         "incremental.circuit.output_queue_depth",
         "incremental.circuit.watermark_lag",
+        "incremental.circuit.barrier_wait",       // cumulative seconds per worker, summed
         "incremental.cluster.send_queue_depth",
     ];
 

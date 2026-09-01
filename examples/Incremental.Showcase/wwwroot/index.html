@@ -220,6 +220,49 @@ const panel = (title, sub, inner, wide) =>
   `<div class="panel${wide ? " span2" : ""}"><h2>${esc(title)}${sub ? `<em>· ${esc(sub)}</em>` : ""}</h2>${inner}</div>`;
 const boxed = (inner) => `<div class="body">${inner}</div>`;
 
+const us = (micros) => micros >= 10000 ? (micros / 1000).toFixed(1) + " ms" : n0(micros) + " µs";
+
+// ── tab 5 history: the live numbers of every configuration this browser has run ─────
+// Kept in localStorage because a relaunch is a new process: it is the only place the
+// previous configuration's p50 can survive to be compared with the next one's.
+const HISTORY_KEY = "showcase:topology-history";
+const exchangeName = (e) => ({ barrier: "barrier", pointToPoint: "point-to-point", streaming: "streaming" })[e] || e;
+const topologyKey = (t) => `${t.workers}w·${t.nodes}n·${t.exchange}`;
+function loadHistory() {
+  try { return JSON.parse(localStorage.getItem(HISTORY_KEY)) || {}; } catch { return {}; }
+}
+let historyFrames = 0;
+function rememberHistory(h) {
+  if (h.stepWindow < 100 || !h.running) return;            // warm and moving, not a paused snapshot
+  if (++historyFrames % 12 !== 0) return;                  // ~2 s at the browser's pace
+  try {
+    const history = loadHistory();
+    history[topologyKey(h)] = {
+      workers: h.workers, nodes: h.nodes, exchange: h.exchange, build: h.build,
+      p50: h.stepP50, p95: h.stepP95, wait: h.workers === 1 ? null : h.syncWaitPct, steps: h.stepWindow, at: Date.now(),
+    };
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+  } catch { /* private mode or storage disabled: the table just stays empty */ }
+}
+function historyPanel(h) {
+  const rows = Object.values(loadHistory()).sort((a, b) => a.p50 - b.p50);
+  const key = topologyKey(h);
+  const age = (t) => { const s = (Date.now() - t) / 1000; return s < 90 ? "just now" : s < 5400 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`; };
+  return panel("configurations tried", "live step time, this machine, this browser", rows.length
+    ? table("hist", [
+        { label: "configuration", cls: (r) => (topologyKey(r) === key ? "run" : ""), get: (r) => `${r.workers}w × ${r.nodes}n · ${exchangeName(r.exchange)}${topologyKey(r) === key ? "  ← running" : ""}` },
+        { label: "step p50", num: 1, get: (r) => us(r.p50) },
+        { label: "step p95", num: 1, get: (r) => us(r.p95) },
+        { label: "exchange wait", num: 1, get: (r) => r.wait == null ? "—" : r.wait.toFixed(0) + "%" },
+        { label: "build", get: (r) => r.build },
+        { label: "measured", get: (r) => age(r.at) },
+      ], rows, (r) => topologyKey(r))
+      + boxed(`<div class="controls" style="margin:0"><button class="act" data-forget="1">forget these</button>
+          <span style="color:var(--faint)">Rows update while a configuration runs (after its first 100 steps); sorted by p50. Compare Debug with Debug and Release with Release.</span></div>`)
+    : `<div class="body" style="color:var(--dim)">Nothing remembered yet — the running configuration's numbers land here after its first 100 steps; apply another one and the two sit side by side.</div>`,
+    true);
+}
+
 // ── per-tab panel rendering ───────────────────────────────────────────────
 const render = {
   living(s) {
@@ -336,6 +379,7 @@ const render = {
   cluster(s) {
     const h = s.header, sc = s.scaling, c = s.cluster;
     const out = [];
+    rememberHistory(h);
     const running = { workers: h.workers, nodes: h.nodes, exchange: h.exchange };
     if (!target) target = { ...running };
     const exchangeLabel = (e) => ({ barrier: "barrier", pointToPoint: "point-to-point", streaming: "streaming" })[e] || e;
@@ -353,8 +397,19 @@ const render = {
          <div><span class="k">nodes</span><b>${h.nodes}</b><span class="d">${h.nodes === 1 ? "this process only" : `this process + ${plural(h.nodes - 1, "peer")} (cluster act)`}</span></div>
          <div><span class="k">exchange</span><b>${esc(exchangeLabel(h.exchange))}</b><span class="d">${h.exchange === "barrier" ? "rendezvous at every exchange" : h.exchange === "pointToPoint" ? "wait only for the data about to be read" : "point-to-point + fragments through fused chains"}</span></div>
          <div><span class="k">storage</span><b>${esc(h.storage)}</b></div>
-         <div><span class="k">circuit</span><b>${esc(h.circuit)}</b><span class="d">last step ${(h.lastStepMicros / 1000).toFixed(2)} ms</span></div>
-       </div>`)));
+         <div><span class="k">circuit</span><b>${esc(h.circuit)}</b></div>
+       </div>
+       <div class="config" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
+         <div><span class="k">live step time</span><b>p50 ${us(h.stepP50)} · p95 ${us(h.stepP95)}</b><span class="d">last ${n0(h.stepWindow)} steps of the real pipeline, ${plural(h.workers, "worker")}</span></div>
+         <div><span class="k">exchange wait</span><b>${h.workers === 1 ? "—" : h.syncWaitPct.toFixed(0) + "% of worker time"}</b><span class="d">${h.workers === 1 ? "no exchanges with one worker" : "blocked at exchanges, not computing (last ~20 s)"}</span></div>
+       </div>
+       <div style="color:var(--dim);margin-top:10px">What to look for: at this batch size (a handful of orders per tick) a step is mostly
+       exchange synchronization, so the exchange-wait share is the part each mode attacks — <b>barrier</b> makes every worker wait for every
+       worker at each of the pipeline's exchanges; <b>point-to-point</b> waits only for the shards it is about to read, so one slow worker
+       no longer convoys the rest; <b>streaming</b> also starts on partial deltas so downstream work overlaps upstream tails. More workers
+       per node add exchanges: they buy bulk throughput (measured below), not live latency. The history table remembers each
+       configuration's numbers so a relaunch can be compared with the one before.</div>`)));
+    out.push(historyPanel(h));
     out.push(panel("target configuration", changed ? "differs from running — apply to relaunch" : "same as running", boxed(
       `<div class="config">
          <div><span class="k">workers per node</span>${sel("workers", [1, 2, 4, 8, 16], target.workers, (w) => plural(w, "worker"))}</div>
@@ -429,7 +484,7 @@ function paint(s) {
     `tick <b>${n0(h.tick)}</b>`,
     `virtual clock <b>${h.virtualNow}</b>`,
     `watermark <b>${h.watermark ?? "—"}</b>${h.watermarkBehind == null ? "" : ` <span style="color:var(--faint)">(${h.watermarkBehind.toFixed(1)}s behind)</span>`}`,
-    `last step <b>${(h.lastStepMicros / 1000).toFixed(2)} ms</b>`,
+    `step p50 <b>${us(h.stepP50)}</b> · p95 <b>${us(h.stepP95)}</b>${h.workers > 1 ? ` · exchange wait <b>${h.syncWaitPct.toFixed(0)}%</b>` : ""}`,
     `${h.storage} · <b>${h.workers}</b> worker${h.workers === 1 ? "" : "s"} × <b>${h.nodes}</b> node${h.nodes === 1 ? "" : "s"} · ${
       ({ barrier: "barrier", pointToPoint: "point-to-point", streaming: "streaming" })[h.exchange] || h.exchange} · gen <b>${h.generation}</b>`,
   ].join(""));
@@ -510,6 +565,12 @@ document.addEventListener("click", async (e) => {
     const q = new URLSearchParams({ workers: target.workers, nodes: target.nodes, exchange: target.exchange });
     const res = await fetch(`/api/relaunch?${q}`, { method: "POST" });
     if (!res.ok) { relaunching = false; apply.disabled = false; }
+    if (last) paint(last);
+    return;
+  }
+  const forget = e.target.closest("[data-forget]");
+  if (forget) {
+    try { localStorage.removeItem(HISTORY_KEY); } catch { /* nothing to forget */ }
     if (last) paint(last);
     return;
   }

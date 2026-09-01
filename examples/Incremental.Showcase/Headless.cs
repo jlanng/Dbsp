@@ -157,6 +157,9 @@ public static class Headless
                 break;
 
             case "cluster":
+                Line("live step time", $"p50 {s.Header.StepP50:N0} µs · p95 {s.Header.StepP95:N0} µs over {s.Header.StepWindow} steps; " +
+                    $"exchange wait {s.Header.SyncWaitPct:N0}% of worker time ({topology.Label})");
+                if (s.Header.StepWindow > 0 && s.Header.StepP50 <= 0) failures.Add("scaling: live p50 is not positive");
                 if (s.Scaling is { } sc)
                 {
                     Table($"threads · same declaration, {sc.Cores} logical cores{(sc.DebugBuild ? " · DEBUG BUILD, throughput is a lower bound" : "")}",

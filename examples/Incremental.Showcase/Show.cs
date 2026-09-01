@@ -32,7 +32,8 @@ public record BeatState(string Id, string Label, bool Armed, string? Reason);
 public record HeaderState(
     int Tick, int Generation, string VirtualNow, string? Watermark, double? WatermarkBehind,
     string Storage, int Workers, int Nodes, ExchangeMode Exchange, string Build,
-    bool Running, string Circuit, double LastStepMicros, int LastEnrichedDelta);
+    bool Running, string Circuit, double LastStepMicros, int LastEnrichedDelta,
+    double StepP50, double StepP95, int StepWindow, double SyncWaitPct, double SyncWaitSeconds);
 public record Snapshot(
     HeaderState Header, MeterSnapshot Meter, List<Notice> Notices,
     Act1View Act1, Act2View Act2, Act3View Act3,
@@ -78,6 +79,31 @@ public sealed class Show : IAsyncDisposable
     RecoveryView? recovery;
     ScalingView? scaling;
     ClusterView? cluster;
+
+    // Exchange-wait share of the live pipeline over a trailing window of frames: each frame
+    // samples the circuit's summed per-worker barrier/p2p wait (cumulative seconds, from the
+    // library's gauge) against its summed step time; the share is Δwait / (workers ×
+    // Δstep time) between the oldest and newest sample. Tagged by generation so a crash
+    // rebuild (new circuit, new gauge series) starts the window over.
+    const int WaitWindow = 120;              // frames ≈ 20 s at the browser's pace
+    readonly (int Generation, double WaitSeconds, double StepSeconds)[] waitSamples = new (int, double, double)[WaitWindow];
+    int waitSampleCount;
+
+    (double Pct, double Seconds) SyncWaitShare()
+    {
+        (int Generation, double WaitSeconds, double StepSeconds) sample =
+            (generation, Metrics.Gauge(live.Circuit.Name, "incremental.circuit.barrier_wait"), live.TotalStepMicros / 1e6);
+        waitSamples[waitSampleCount++ % WaitWindow] = sample;
+        var oldest = sample;
+        for (var i = Math.Max(0, waitSampleCount - WaitWindow); i < waitSampleCount; i++)
+        {
+            var s = waitSamples[i % WaitWindow];
+            if (s.Generation == generation) { oldest = s; break; }
+        }
+        var stepSeconds = sample.StepSeconds - oldest.StepSeconds;
+        var waitSeconds = sample.WaitSeconds - oldest.WaitSeconds;
+        return stepSeconds <= 0 ? (0, 0) : (100 * waitSeconds / (live.Workers * stepSeconds), waitSeconds);
+    }
 
     public Show(IStorageProvider storage, string storageLabel, Topology topology,
         NoticeLog notices, IncrementalMetrics metrics, ILoggerFactory loggerFactory)
@@ -198,11 +224,14 @@ public sealed class Show : IAsyncDisposable
     Snapshot Compose()
     {
         var wm = live.Circuit.CurrentWatermark;
+        var (p50, p95, windowSteps) = live.StepPercentiles();
+        var (waitPct, waitSeconds) = SyncWaitShare();
         var header = new HeaderState(
             globalTick, generation, director.VirtualNow.ToString("HH:mm:ss"),
             wm?.ToString("HH:mm:ss"), wm is null ? null : (director.VirtualNow - wm.Value).TotalSeconds,
             StorageLabel, live.Workers, Topology.Nodes, Topology.Exchange, Build,
-            Running, live.Circuit.Name, live.LastStepMicros, live.LastEnrichedDelta);
+            Running, live.Circuit.Name, live.LastStepMicros, live.LastEnrichedDelta,
+            p50, p95, windowSteps, waitPct, waitSeconds);
 
         return new Snapshot(
             header, Metrics.Footer(live.Circuit.Name), Notices.Snapshot(),
