@@ -56,6 +56,15 @@ public sealed class Circuit : IAsyncDisposable
     private bool _exchangePoisoned;
     private const int SeqStride = 8; // longs per slot: one 64-byte cache line each
 
+    // Park path for point-to-point waits (mirrors SpinBarrier): a waiter that exhausts the
+    // spin budget registers itself in _parkedWaiters and waits on the gate; a publication
+    // is a full fence followed by a read of _parkedWaiters, so it either sees the waiter
+    // (and pulses) or the waiter's re-check under the lock sees the publication — the
+    // Dekker pattern, never a lost wake-up. Poisoning pulses unconditionally.
+    private readonly object _exchangeGate = new();
+    private int _parkedWaiters;
+    private readonly int _exchangeSpinBudget;
+
     // Fragment streaming (CircuitOptions.FragmentStreaming, point-to-point only; see
     // docs/design/fragment-streaming.md): per non-loop exchange node, a build-time plan —
     // the fused upstream linear chain, the chain's head slot, the optional sole-consumer
@@ -174,6 +183,7 @@ public sealed class Circuit : IAsyncDisposable
             ? new long[nodes.Length * options.Workers * SeqStride]
             : null;
         _streaming = options.FragmentStreaming && options.Workers > 1; // p2p is validated, so _exchangeSeqs exists
+        _exchangeSpinBudget = options.ExchangeSpinBudget;
         _fragSeqs = _streaming ? new long[nodes.Length * options.Workers * SeqStride] : null;
         _cluster = options.Cluster is { } cluster
             ? new ClusterRuntime(cluster.Transport, options.Workers, _barrier, options.ExchangeTimeout, _diag)
@@ -431,6 +441,10 @@ public sealed class Circuit : IAsyncDisposable
     /// <summary>One line per streamed exchange: production mode, head, fused chain, sink, and
     /// forwarding — the structural decisions <see cref="BuildStreamPlans"/> made, for tests
     /// and the phase-stats report.</summary>
+    /// <summary>Point-to-point waits that outlived the spin budget and parked, summed over
+    /// the workers (racy read of per-worker counters; for tests and diagnostics).</summary>
+    internal long ExchangeParks => _workers.Sum(w => Volatile.Read(ref w.ExchangeParks));
+
     internal IReadOnlyList<string> DescribeStreamPlans() =>
         _streamPlans.Where(p => p is not null).Select(p => p!.ToString()).ToArray();
 
@@ -1169,8 +1183,11 @@ public sealed class Circuit : IAsyncDisposable
                 lock (_stepFaults)
                     _stepFaults.Add(ex);
                 // Point-to-point waiters poll this flag: peers spinning on a publication
-                // this worker will never make unwind instead of spinning forever.
+                // this worker will never make unwind instead of spinning forever — and
+                // parked ones are pulsed awake to find it.
                 Volatile.Write(ref _exchangePoisoned, true);
+                lock (_exchangeGate)
+                    Monitor.PulseAll(_exchangeGate);
                 _barrier.Poison();
                 // Remote peers must not wait on shards this worker will never ship, and the
                 // designated worker may be blocked on inbound cluster traffic.
@@ -1253,7 +1270,8 @@ public sealed class Circuit : IAsyncDisposable
     /// barrier-wait counter as barrier mode so the gauge means "synchronization wait" in
     /// both. The already-published fast path costs one volatile read and no timestamps.
     /// Waiters poll the poison flag so a faulted peer's never-coming publication unwinds
-    /// the step (mirroring <see cref="SpinBarrier.Poison"/>) instead of hanging it.
+    /// the step (mirroring <see cref="SpinBarrier.Poison"/>) instead of hanging it. Past
+    /// the spin budget the waiter parks on the exchange gate (see <see cref="PublishSeq"/>).
     /// Returns the published value, whose low bit carries the sender's "I shuffled data"
     /// flag — exactly this execution's, never a later one, because a sender's next
     /// publication is ordered behind this worker's completion of the current execution
@@ -1272,11 +1290,14 @@ public sealed class Circuit : IAsyncDisposable
             {
                 if (Volatile.Read(ref _exchangePoisoned))
                     throw new BarrierPoisonedException();
-                // Prototype-grade escalation: pure spins, then yields — never Sleep(1),
-                // whose ≥1 ms oversleep would dwarf the waits it replaces. A production
-                // version would park on a per-producer event past a budget, as
-                // SpinBarrier does, instead of yield-polling a badly stalled peer.
-                spinner.SpinOnce(sleep1Threshold: -1);
+                if (spinner.Count < _exchangeSpinBudget)
+                {
+                    // Pure spins, then yields — never Sleep(1), whose ≥1 ms oversleep
+                    // would dwarf the waits it replaces.
+                    spinner.SpinOnce(sleep1Threshold: -1);
+                    continue;
+                }
+                return ParkUntilPublished(worker, seqs, slot, expected);
             }
             return observed;
         }
@@ -1284,6 +1305,90 @@ public sealed class Circuit : IAsyncDisposable
         {
             worker.BarrierWaitTicks += Stopwatch.GetTimestamp() - started;
         }
+    }
+
+    /// <summary>Publishes a point-to-point sequence or fragment counter and wakes parked
+    /// waiters if there are any. The exchange is a full fence, which is what lets the
+    /// parked-waiter read that follows it pair with the waiter's registration (a full fence
+    /// too) — one of the two must see the other. The fast path — nobody parked, the normal
+    /// state of a healthy step — costs the fence and one cache-line read.</summary>
+    private void PublishSeq(long[] slots, int slot, long value)
+    {
+        Interlocked.Exchange(ref slots[slot], value);
+        if (Volatile.Read(ref _parkedWaiters) != 0)
+            lock (_exchangeGate)
+                Monitor.PulseAll(_exchangeGate);
+    }
+
+    /// <summary>Parks until one sender's sequence reaches <paramref name="expected"/> or the
+    /// exchange is poisoned. The condition is re-checked under the gate after registering,
+    /// so a publication that raced the registration is seen here instead of slept
+    /// through; every later publication pulses because it sees the registration.</summary>
+    private long ParkUntilPublished(Worker worker, long[] seqs, int slot, long expected)
+    {
+        worker.ExchangeParks++;
+        Interlocked.Increment(ref _parkedWaiters);
+        try
+        {
+            lock (_exchangeGate)
+            {
+                long observed;
+                while ((observed = Volatile.Read(ref seqs[slot])) < expected)
+                {
+                    if (Volatile.Read(ref _exchangePoisoned))
+                        throw new BarrierPoisonedException();
+                    Monitor.Wait(_exchangeGate);
+                }
+                return observed;
+            }
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _parkedWaiters);
+        }
+    }
+
+    /// <summary>The streamed consume loop's park: until any not-yet-complete sender has a
+    /// fragment this worker has not consumed or has published this execution's completion
+    /// (either is progress for the loop), or the exchange is poisoned.</summary>
+    private void ParkUntilStreamedProgress(Worker worker, int n, long expected)
+    {
+        worker.ExchangeParks++;
+        Interlocked.Increment(ref _parkedWaiters);
+        try
+        {
+            lock (_exchangeGate)
+            {
+                while (!StreamedProgressAvailable(worker, n, expected))
+                {
+                    if (Volatile.Read(ref _exchangePoisoned))
+                        throw new BarrierPoisonedException();
+                    Monitor.Wait(_exchangeGate);
+                }
+            }
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _parkedWaiters);
+        }
+    }
+
+    private bool StreamedProgressAvailable(Worker worker, int n, long expected)
+    {
+        var parts = _workers.Length;
+        var seqs = _exchangeSeqs!;
+        var fragSeqs = _fragSeqs!;
+        var done = worker.SenderDone;
+        var consumed = worker.FragConsumed;
+        for (var s = 0; s < parts; s++)
+        {
+            if (done[s])
+                continue;
+            var slot = (n * parts + s) * SeqStride;
+            if (Volatile.Read(ref fragSeqs[slot]) > consumed[n * parts + s] || Volatile.Read(ref seqs[slot]) >= expected)
+                return true;
+        }
+        return false;
     }
 
     /// <summary>
@@ -1302,8 +1407,8 @@ public sealed class Circuit : IAsyncDisposable
     /// completion seq for this execution is visible and everything it published is consumed.
     /// Completion is release-published after the sender's last counter write, so a counter
     /// read taken after seeing it is final. Idle polls flush the open forwarded fragment,
-    /// check the poison flag like <see cref="AwaitPublication"/>, and count toward the same
-    /// barrier-wait gauge.
+    /// check the poison flag and escalate to a park like <see cref="AwaitPublication"/>, and
+    /// count toward the same barrier-wait gauge.
     /// </summary>
     private void RunStreamedExchange(Worker worker, int n, StreamPlan plan)
     {
@@ -1411,9 +1516,12 @@ public sealed class Circuit : IAsyncDisposable
                 worker.BarrierWaitTicks += waited + Stopwatch.GetTimestamp() - waitStarted;
                 throw new BarrierPoisonedException();
             }
-            // Prototype-grade escalation, as in AwaitPublication: spins then yields, never
-            // Sleep(1) — a production version would park past a budget.
-            spinner.SpinOnce(sleep1Threshold: -1);
+            // The same escalation as AwaitPublication: spins, then yields, then a park
+            // that any publication wakes — the loop then re-polls every sender.
+            if (spinner.Count < _exchangeSpinBudget)
+                spinner.SpinOnce(sleep1Threshold: -1);
+            else
+                ParkUntilStreamedProgress(worker, n, expected);
         }
         if (waitStarted != 0)
             waited += Stopwatch.GetTimestamp() - waitStarted;
@@ -1507,7 +1615,7 @@ public sealed class Circuit : IAsyncDisposable
     private void PublishOpenFragment(Worker worker, int x)
     {
         var published = ++worker.FragPublished[x];
-        Volatile.Write(ref _fragSeqs![(x * _workers.Length + worker.Id) * SeqStride], published);
+        PublishSeq(_fragSeqs!, (x * _workers.Length + worker.Id) * SeqStride, published);
         worker.FragExecCount[x]++;
         worker.FragOpenRows[x] = 0;
         worker.FragmentsPublished++;
@@ -1525,7 +1633,7 @@ public sealed class Circuit : IAsyncDisposable
         var shipped = worker.FragExecCount[x] > 0;
         worker.FragExecCount[x] = 0;
         var expected = ++worker.ExchangeSeq[x] << 1;
-        Volatile.Write(ref _exchangeSeqs![(x * _workers.Length + worker.Id) * SeqStride], shipped ? expected | 1 : expected);
+        PublishSeq(_exchangeSeqs!, (x * _workers.Length + worker.Id) * SeqStride, shipped ? expected | 1 : expected);
         worker.ExchangeExecutions++; // PHASE-STATS
     }
 
@@ -1593,7 +1701,7 @@ public sealed class Circuit : IAsyncDisposable
                 var count = ++worker.ExchangeSeq[n];
                 var expected = count << 1;
                 var shuffled = input is not IZSet { IsEmpty: true };
-                Volatile.Write(ref seqs[(n * _workers.Length + worker.Id) * SeqStride],
+                PublishSeq(seqs, (n * _workers.Length + worker.Id) * SeqStride,
                     shuffled ? expected | 1 : expected);
                 for (var sender = 0; sender < _workers.Length; sender++)
                     if (sender != worker.Id)
@@ -1828,7 +1936,8 @@ public sealed class Circuit : IAsyncDisposable
                     $"partition {Us(w.PartitionTicks):F1} merge {Us(w.MergeTicks):F1} " +
                     $"compute {Us(w.SpanTicks - w.BarrierWaitTicks - w.PartitionTicks - w.MergeTicks):F1} " +
                     $"slowWaits/step {(double)w.SlowWaits / _psSteps:F1} of {(double)w.ExchangeExecutions * Math.Max(0, _workers.Length - 1) / _psSteps:F1} " +
-                    $"emptySkips/step {(double)w.EmptyExchangeSkips / _psSteps:F1} of {(double)w.ExchangeExecutions / _psSteps:F1}" +
+                    $"emptySkips/step {(double)w.EmptyExchangeSkips / _psSteps:F1} of {(double)w.ExchangeExecutions / _psSteps:F1} " +
+                    $"parks/step {(double)w.ExchangeParks / _psSteps:F2}" +
                     (_streaming ? $" frags/step {(double)w.FragmentsPublished / _psSteps:F1} out {(double)w.FragmentsConsumed / _psSteps:F1} in" : ""));
         }
 

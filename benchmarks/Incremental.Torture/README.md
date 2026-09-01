@@ -16,6 +16,7 @@ dotnet run -c Release --project benchmarks/Incremental.Torture -- --workers 4 --
 | `--rate N` | pace at N orders/second instead of running unpaced |
 | `--p2p` | point-to-point exchange synchronization instead of the barrier |
 | `--streaming` | fragment streaming on the exchanges (implies `--p2p`; see docs/design/fragment-streaming.md) |
+| `--spin-budget N` | point-to-point waits spin N iterations before parking (`CircuitOptions.ExchangeSpinBudget`); `parks/step` on the phase-stats line shows how often they park |
 | `--processes N` | cluster mode: N co-hosted processes stepped in lockstep, which puts the exchange wire format on the measured path |
 | `--batch`, `--live-orders`, `--workers`, `--customers`, `--merchants`, `--json` | see `Options.cs` |
 

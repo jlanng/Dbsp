@@ -54,6 +54,7 @@ var builder = new CircuitBuilder(new CircuitOptions
     OutputChannelCapacity = 1024,
     PointToPointExchange = options.PointToPoint,
     FragmentStreaming = options.Streaming,
+    ExchangeSpinBudget = options.SpinBudget ?? new CircuitOptions().ExchangeSpinBudget,
 });
 var defs = ShowcasePipeline.Declare(builder);
 var circuit = builder.Build();

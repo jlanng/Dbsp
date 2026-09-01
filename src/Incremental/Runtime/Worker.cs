@@ -87,6 +87,11 @@ internal sealed class Worker(
     // ticks per phase of the exchange path, plus per-step span timestamps for launch/land
     // attribution. Written only by the owning worker thread; read racily at dispose.
     public long PartitionTicks, MergeTicks, SpanTicks, SlowWaits, ExchangeExecutions, EmptyExchangeSkips;
+
+    /// <summary>Point-to-point waits that outlived the spin budget and parked (cumulative;
+    /// cheap enough to keep unconditionally — it says whether parking is ever on a healthy
+    /// step's path).</summary>
+    public long ExchangeParks;
     public long StepStartTs, StepEndTs;
 
     /// <summary>Released once by the coordinator for every step this worker should run.</summary>

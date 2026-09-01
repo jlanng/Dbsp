@@ -154,6 +154,23 @@ round-robin, consuming any fragment with `published > consumed`, checking comple
 the sequence slot; when idle it spins with the same escalation and poison poll as
 `AwaitPublication`, attributing the wait to `BarrierWaitTicks`.
 
+**Parking (2026-09-01).** Both waits — `AwaitPublication` and the consume loop's idle path
+— spin for `CircuitOptions.ExchangeSpinBudget` iterations (default 2048: a short burst of
+spins, then yields, a millisecond or two in all) and then park on one circuit-wide exchange
+gate, as `SpinBarrier` does, instead of yield-polling a stalled peer forever. Every
+publication (sequence or fragment counter) is an `Interlocked.Exchange` followed by a read
+of the parked-waiter count, and a waiter registers with an interlocked increment before
+re-checking its condition under the gate: two full fences, so one side always sees the
+other — a publication either pulses or is seen by the re-check, never lost. Poisoning
+pulses unconditionally. The healthy-step fast path pays the fence and one cache-line read
+per publication (measured as noise: before/after parity at 20k and 2k orders/s, streaming
+and plain p2p); a parked wake-up costs a kernel wake, which is why the budget is longer
+than a healthy local wait and `parks/step` is on the phase-stats line. Sweeping the budget
+on the paced 20k run (`--spin-budget`): 128 parks 0.36–0.38 times per step, 512 0.02–0.05,
+2048 0.00–0.01, 8192 0.00, with step time flat across all four (591–618 µs, run-to-run
+noise) — so the default sits at 2048, where a healthy step never parks and a stalled peer's
+waiters are asleep within a few milliseconds.
+
 **Coalescing (v2).** Forwarded chunks are small — a fragment addressed to one worker is
 about `targetChunk / workers` rows, and an emitting join's per-fragment output smaller
 still — and an execution may see `workers × R` of them, so they are not published one to

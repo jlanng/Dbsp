@@ -31,6 +31,9 @@ internal sealed record Options
 
     /// <summary>Fragment streaming (implies point-to-point, which it builds on).</summary>
     public bool Streaming { get; init; }
+
+    /// <summary>Point-to-point spin budget before a wait parks (CircuitOptions.ExchangeSpinBudget); null keeps the default.</summary>
+    public int? SpinBudget { get; init; }
     public int StepBatch { get; init; } = 8_192;
     public int InputCapacity { get; init; } = 32_768;
 
@@ -64,6 +67,7 @@ internal sealed record Options
             options = name switch
             {
                 "workers" => options with { Workers = Int() },
+                "spin-budget" => options with { SpinBudget = Int() },
                 "merchants" => options with { Merchants = Int() },
                 "customers" => options with { Customers = Int() },
                 "categories" => options with { Categories = Int() },
