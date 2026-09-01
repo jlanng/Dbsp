@@ -80,6 +80,7 @@
 
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 14px; align-items: start; }
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .slot { display: contents; }               /* per-panel diff container; the grid still sees the panels */
   .panel > h2 {
     margin: 0; padding: 9px 12px; font-size: 12px; font-weight: 600;
     border-bottom: 1px solid var(--line); background: var(--panel-2);
@@ -259,7 +260,7 @@ const render = {
         ? `<span style="color:var(--good)">empty — every order matched a known merchant</span>`
         : a.compliance.recent.map((l) => `<div style="color:var(--dim)">${esc(l)}</div>`).join("") +
           `<div class="kv" style="margin-top:6px;color:var(--warn)"><span>orders held</span><span>${n0(a.compliance.held)}</span></div>`)),
-    ].join("");
+    ];
   },
 
   time(s) {
@@ -287,7 +288,7 @@ const render = {
         { label: "span", get: (r) => r.span },
         { label: "state", get: (r) => (r.open ? "open" : "closing") },
       ], a.sessions, (r) => r.customer + "/" + r.span)),
-    ].join("");
+    ];
   },
 
   graph(s) {
@@ -302,7 +303,7 @@ const render = {
       panel("linkage evidence", "keyed upsert input", a.edges.length
         ? boxed(a.edges.map((e) => `<div class="kv"><span>${e.a} ↔ ${e.b}</span><span style="color:var(--faint)">${esc(e.reason)}</span></div>`).join(""))
         : `<div class="empty">no edges yet — the triggers add them</div>`),
-    ].join("");
+    ];
   },
 
   kill(s) {
@@ -329,7 +330,7 @@ const render = {
         { label: "gross", num: 1, get: (r2) => n2(r2.gross) },
         { label: "fee take", num: 1, get: (r2) => n2(r2.fees) },
       ], s.act4Categories, (r2) => r2.category), true),
-    ].join("");
+    ];
   },
 
   cluster(s) {
@@ -414,7 +415,7 @@ const render = {
               ? `✓ shards are pairwise disjoint (${n0(c.localRows)} + ${n0(c.remoteRows)} merchants) and their union matches the single-process answer exactly`
               : "✗ merged shards did NOT match the expected totals — this is a bug worth reporting"}</div>`), true));
 
-    return out.join("");
+    return out;                             // one slot per panel (see paint)
   },
 };
 
@@ -437,7 +438,17 @@ function paint(s) {
   setText($("explainer").querySelector("div"), tab.explainer);
   setText($("code").querySelector("pre"), tab.code || "");
   $("code").style.display = tab.code ? "" : "none";
-  setHTML($("panels"), render[active](s));
+  // Each panel gets its own slot and its own setHTML diff — the same fix as the controls:
+  // a panel whose markup did not change keeps its DOM, so an open <select> on the target
+  // configuration card survives the frames that redraw the running card next to it.
+  const parts = render[active](s);
+  const panels = $("panels");
+  const list = Array.isArray(parts) ? parts : [parts];
+  if (panels.children.length !== list.length) {
+    for (const slot of panels.children) lastHTML.delete(slot);
+    panels.innerHTML = list.map(() => `<div class="slot"></div>`).join("");
+  }
+  list.forEach((html, i) => setHTML(panels.children[i], html));
 
   const beats = s.beats[active] || [];
   setHTML($("controls"),
