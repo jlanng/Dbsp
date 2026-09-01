@@ -62,10 +62,14 @@ public sealed class Circuit : IAsyncDisposable
     // fragment sink, and every sender's fragment ring. _fragSeqs parallels _exchangeSeqs
     // with a cumulative published-fragment counter per (node, sender); the existing seq
     // publication doubles as the completion marker. _fused marks nodes whose execution
-    // moved into an exchange's produce loop — the sweep skips them.
+    // moved into an exchange's produce path — the sweep skips them. _produceAfter lists,
+    // per node, the exchanges produced from its slot right after it runs; _emitInto marks
+    // an emitting fragment sink with the exchange its per-fragment output is forwarded to.
     private readonly bool _streaming;
     private readonly StreamPlan?[] _streamPlans;
     private readonly bool[] _fused;
+    private readonly StreamPlan[]?[] _produceAfter;
+    private readonly StreamPlan?[] _emitInto;
     private readonly long[]? _fragSeqs;
 
     // Cross-process exchange (null when not clustered): the runtime shipping remote-bound
@@ -214,6 +218,8 @@ public sealed class Circuit : IAsyncDisposable
             {
                 _workers[w].FragConsumed = new long[nodes.Length * options.Workers];
                 _workers[w].FragPublished = new long[nodes.Length];
+                _workers[w].FragExecCount = new int[nodes.Length];
+                _workers[w].FragOpenRows = new int[nodes.Length];
                 _workers[w].SinkPending = new long[nodes.Length];
                 _workers[w].SenderDone = new bool[options.Workers];
                 _workers[w].ChunkScratch = new IZSet?[nodes.Length][];
@@ -236,6 +242,8 @@ public sealed class Circuit : IAsyncDisposable
 
         _fused = new bool[nodes.Length];
         _streamPlans = new StreamPlan?[nodes.Length];
+        _produceAfter = new StreamPlan[]?[nodes.Length];
+        _emitInto = new StreamPlan?[nodes.Length];
         if (_streaming)
             BuildStreamPlans(nodes, loopRegions, outputRegistrations);
 
@@ -256,16 +264,40 @@ public sealed class Circuit : IAsyncDisposable
     /// one — as used in its logs and as the <c>circuit</c> metric tag.</summary>
     public string Name { get; }
 
+    /// <summary>Where a streamed exchange's production runs (fragment streaming v2; see
+    /// docs/design/fragment-streaming.md).</summary>
+    internal enum ProduceMode
+    {
+        /// <summary>From the head's slot at the exchange's own sweep position — the head is
+        /// inside a loop region, so it has no single "after it ran" moment in the step.</summary>
+        AtSelf,
+
+        /// <summary>From the head's slot right after the head runs — as early in the sweep as
+        /// the input exists.</summary>
+        AfterHead,
+
+        /// <summary>Fragment by fragment, before the head's own execution is complete: the head
+        /// is an upstream streamed exchange whose only reader is this chain, forwarding each
+        /// arriving fragment straight through, or an emitting fragment sink whose per-fragment
+        /// output is final. Completion follows the head's.</summary>
+        Forwarded,
+    }
+
     /// <summary>Build-time plan for one streamed exchange node (fragment streaming).</summary>
     private sealed class StreamPlan
     {
-        /// <summary>Linear single-consumer nodes fused into the produce loop, in execution
+        /// <summary>The exchange node.</summary>
+        public required int Node { get; init; }
+
+        /// <summary>Linear single-consumer nodes fused into the produce path, in execution
         /// (upstream-first) order; the sweep skips them.</summary>
         public required int[] FusedChain { get; init; }
 
-        /// <summary>The node whose slot feeds the fused chain (the exchange's input when
-        /// nothing fused) — complete by sweep order when the exchange runs.</summary>
-        public required int ChainHeadInput { get; init; }
+        /// <summary>The node whose delta feeds the fused chain (the exchange's input when
+        /// nothing fused).</summary>
+        public required int Head { get; init; }
+
+        public required ProduceMode Produce { get; init; }
 
         /// <summary>The sole-consumer <see cref="IFragmentSinkOperator"/> node fragments are
         /// fed to, or -1 when the exchange partial-merges into its own slot instead.</summary>
@@ -277,14 +309,28 @@ public sealed class Circuit : IAsyncDisposable
         /// <summary>Every sender's fragment ring, indexed [sender][ring slot][target] —
         /// the per-worker exchange operators' own rings, captured at build.</summary>
         public required object?[][][] Rings { get; init; }
+
+        /// <summary>The downstream streamed exchange this one's consume loop forwards every
+        /// arriving fragment into (through that exchange's fused chain), completing it when
+        /// this one completes — set when this exchange's only reader is that chain. Null
+        /// when the merge materializes in the slot or feeds a sink.</summary>
+        public StreamPlan? ForwardTo { get; set; }
+
+        public override string ToString() =>
+            $"#{Node} {Produce} from #{Head}" +
+            (FusedChain.Length > 0 ? $" via [{string.Join(",", FusedChain)}]" : "") +
+            (SinkNode >= 0 ? $" -> sink #{SinkNode}[{SinkInput}]" : "") +
+            (ForwardTo is not null ? $" -> forward #{ForwardTo.Node}" : "");
     }
 
     /// <summary>Plans fragment streaming for every exchange outside a <c>Recurse</c> region:
     /// walks the fused chain (linear, single-input, single-consumer, outside loops), finds
-    /// the sole-consumer fragment sink if any, and captures the senders' rings. Consumer
-    /// counts include output ports (they read slots between steps) and the loop scheduler's
-    /// direct read of each region's result slot, so fusion and sink feeding never bypass a
-    /// reader the graph alone would not show.</summary>
+    /// the sole-consumer fragment sink if any, decides where production runs, and captures
+    /// the senders' rings. Consumer counts include output ports (they read slots between
+    /// steps) and the loop scheduler's direct read of each region's result slot, so fusion,
+    /// sink feeding, and forwarding never bypass a reader the graph alone would not show.
+    /// Nodes are visited in id (topological) order, so a head's own plan — when the head is
+    /// an exchange — already exists when the exchange it forwards into is planned.</summary>
     private void BuildStreamPlans(
         NodeDefinition[] nodes, LoopRegion[] loopRegions, IReadOnlyList<OutputRegistration> outputs)
     {
@@ -303,6 +349,7 @@ public sealed class Circuit : IAsyncDisposable
             consumers[region.ResultNode]++;
 
         var probe = _workers[0].Operators; // operator types are identical on every worker
+        var produceAfter = new List<StreamPlan>?[nodes.Length];
         for (var n = 0; n < nodes.Length; n++)
         {
             if (!nodes[n].IsExchange || inLoop[n])
@@ -331,22 +378,61 @@ public sealed class Circuit : IAsyncDisposable
                             break;
                         }
 
+            // Where production runs. A head that only this chain reads can hand its delta
+            // over before it is complete: an upstream streamed exchange forwards arriving
+            // fragments from its consume loop; an emitting sink hands over each fragment's
+            // (final) output as it is fed, and its Step's output — the non-streamed inputs —
+            // completes the production. Everything else produces from the head's slot,
+            // right after the head runs, or at this node when the head lives in a loop.
+            var produce = ProduceMode.AfterHead;
+            var forwardingHead = false;
+            if (inLoop[head])
+                produce = ProduceMode.AtSelf;
+            else if (consumers[head] == 1 && nodes[head].IsExchange)
+            {
+                produce = ProduceMode.Forwarded;
+                forwardingHead = true;
+            }
+            else if (consumers[head] == 1 && probe[head] is IEmittingFragmentSinkOperator
+                     && nodes[head].Inputs.Any(input => _streamPlans[input]?.SinkNode == head))
+                produce = ProduceMode.Forwarded;
+
             var rings = new object?[_workers.Length][][];
             for (var w = 0; w < _workers.Length; w++)
                 rings[w] = ((IExchangeStepOperator)_workers[w].Operators[n]).FragmentRing;
 
-            _streamPlans[n] = new StreamPlan
+            var plan = _streamPlans[n] = new StreamPlan
             {
+                Node = n,
                 FusedChain = [.. chain],
-                ChainHeadInput = head,
+                Head = head,
+                Produce = produce,
                 SinkNode = sinkNode,
                 SinkInput = sinkInput,
                 Rings = rings,
             };
             foreach (var fused in chain)
                 _fused[fused] = true;
+
+            if (forwardingHead)
+                _streamPlans[head]!.ForwardTo = plan;
+            else if (produce != ProduceMode.AtSelf)
+            {
+                if (produce == ProduceMode.Forwarded)
+                    _emitInto[head] = plan;
+                (produceAfter[head] ??= []).Add(plan);
+            }
         }
+        for (var n = 0; n < nodes.Length; n++)
+            if (produceAfter[n] is { } plans)
+                _produceAfter[n] = [.. plans];
     }
+
+    /// <summary>One line per streamed exchange: production mode, head, fused chain, sink, and
+    /// forwarding — the structural decisions <see cref="BuildStreamPlans"/> made, for tests
+    /// and the phase-stats report.</summary>
+    internal IReadOnlyList<string> DescribeStreamPlans() =>
+        _streamPlans.Where(p => p is not null).Select(p => p!.ToString()).ToArray();
 
     /// <summary>Starts the worker threads (and, with <see cref="CircuitOptions.AutoStep"/>, the pump).</summary>
     public void Start()
@@ -1130,10 +1216,16 @@ public sealed class Circuit : IAsyncDisposable
             }
             else
             {
-                // A fused node's work happens inside its exchange's produce loop; its slot
-                // has no reader (fusion requires a single consumer, which is the chain).
+                // A fused node's work happens inside its exchange's produce path; its slot
+                // has no reader (fusion requires a single consumer, which is the chain). A
+                // node heading one or more streamed exchanges' chains produces them from
+                // its slot as soon as it has run.
                 if (!_fused[n])
+                {
                     RunNode(worker, n);
+                    if (_produceAfter[n] is not null)
+                        ProduceAfterNode(worker, n);
+                }
                 n++;
             }
         }
@@ -1195,17 +1287,23 @@ public sealed class Circuit : IAsyncDisposable
     }
 
     /// <summary>
-    /// A streamed exchange execution (fragment streaming; docs/design/fragment-streaming.md).
-    /// Produce first: run the fused linear chain over the input in chunks, partitioning and
-    /// release-publishing each chunk as a fragment under the cumulative per-(node, sender)
-    /// counter, then publish the execution's completion seq — every worker finishes
-    /// publishing before it waits, which keeps the mesh deadlock-free. Then consume: poll
-    /// every sender (self included) and process fragments in arrival order — into the
-    /// sole-consumer sink, or the exchange's partial-merge accumulator — until every
-    /// sender's completion seq for this execution is visible and everything it published is
-    /// consumed. Completion is release-published after the sender's last counter write, so
-    /// a counter read taken after seeing it is final. Idle polls check the poison flag like
-    /// <see cref="AwaitPublication"/> and count toward the same barrier-wait gauge.
+    /// The consume half of a streamed exchange execution (fragment streaming;
+    /// docs/design/fragment-streaming.md). Production — running the fused chain over the
+    /// head's delta in chunks, partitioning each into the ring and release-publishing it under
+    /// the cumulative per-(node, sender) counter, then the execution's completion seq — has
+    /// already happened at the head's sweep position (<see cref="ProduceFromSlot"/> after the
+    /// head ran, or forwarded fragment by fragment from an upstream exchange's consume loop or
+    /// an emitting sink), except for a head inside a loop region, which is produced here from
+    /// its slot. Every worker publishes before it waits, at a sweep position no later than
+    /// any wait for it, which keeps the mesh deadlock-free. Consuming polls every sender (self
+    /// included) and processes fragments in arrival order — forwarding them through the next
+    /// exchange's chain, feeding the sole-consumer sink (taking its per-fragment output
+    /// onward when it emits), or accumulating the partial merge — until every sender's
+    /// completion seq for this execution is visible and everything it published is consumed.
+    /// Completion is release-published after the sender's last counter write, so a counter
+    /// read taken after seeing it is final. Idle polls flush the open forwarded fragment,
+    /// check the poison flag like <see cref="AwaitPublication"/>, and count toward the same
+    /// barrier-wait gauge.
     /// </summary>
     private void RunStreamedExchange(Worker worker, int n, StreamPlan plan)
     {
@@ -1215,45 +1313,26 @@ public sealed class Circuit : IAsyncDisposable
         var parts = _workers.Length;
         var seqs = _exchangeSeqs!;
         var fragSeqs = _fragSeqs!;
-        var mySlot = (n * parts + worker.Id) * SeqStride;
 
-        var psT0 = PhaseStats ? Stopwatch.GetTimestamp() : 0; // PHASE-STATS
-
-        var published = worker.FragPublished[n];
-        var publishedBefore = published;
-        if (slots[plan.ChainHeadInput] is IZSet { IsEmpty: false } head)
+        if (plan.Produce == ProduceMode.AtSelf)
         {
-            var chunks = Math.Clamp(
-                (head.DistinctCount + _options.StreamChunkRows - 1) / _options.StreamChunkRows,
-                1, IExchangeStepOperator.FragmentRingSize);
-            if (chunks == 1)
-            {
-                published = PublishFragment(worker, plan, exchange, fragSeqs, mySlot, published, head);
-            }
-            else
-            {
-                var scratch = worker.ChunkScratch[n] ??= new IZSet?[IExchangeStepOperator.FragmentRingSize];
-                head.SplitInto(scratch, chunks);
-                for (var c = 0; c < chunks; c++)
-                    published = PublishFragment(worker, plan, exchange, fragSeqs, mySlot, published, scratch[c]!);
-            }
-            worker.FragPublished[n] = published;
-            worker.FragmentsPublished += published - publishedBefore;
+            var psP = PhaseStats ? Stopwatch.GetTimestamp() : 0; // PHASE-STATS
+            ProduceFromSlot(worker, plan, slots[plan.Head]);
+            CompleteProduce(worker, plan);
+            if (PhaseStats) // PHASE-STATS
+                worker.PartitionTicks += Stopwatch.GetTimestamp() - psP;
         }
+        // Every other mode completed this node's production earlier in the sweep, bumping
+        // the execution count then; the count is the seq every sender must have reached.
+        var expected = worker.ExchangeSeq[n] << 1;
 
-        // Completion: the same execution-count publication as the plain point-to-point
-        // path, the low bit saying whether any fragment actually shipped.
-        var expected = ++worker.ExchangeSeq[n] << 1;
-        Volatile.Write(ref seqs[mySlot], published > publishedBefore ? expected | 1 : expected);
-
-        if (PhaseStats) // PHASE-STATS
-        {
-            worker.PartitionTicks += Stopwatch.GetTimestamp() - psT0;
-            worker.ExchangeExecutions++;
-        }
         var psT1 = PhaseStats ? Stopwatch.GetTimestamp() : 0; // PHASE-STATS
 
         var sink = plan.SinkNode >= 0 ? (IFragmentSinkOperator)worker.Operators[plan.SinkNode] : null;
+        var emitInto = plan.SinkNode >= 0 ? _emitInto[plan.SinkNode] : null;
+        var emitter = emitInto is null ? null : (IEmittingFragmentSinkOperator)sink!;
+        var forwardTo = plan.ForwardTo;
+        var flushInto = forwardTo ?? emitInto;
         var consumed = worker.FragConsumed;
         var done = worker.SenderDone;
         Array.Clear(done, 0, parts);
@@ -1280,7 +1359,16 @@ public sealed class Circuit : IAsyncDisposable
                     if (fragment is IZSet { IsEmpty: false })
                     {
                         consumedAny = true;
-                        if (sink is not null)
+                        if (forwardTo is not null)
+                        {
+                            ForwardChunk(worker, forwardTo, fragment);
+                        }
+                        else if (emitter is not null)
+                        {
+                            ForwardChunk(worker, emitInto!, emitter.OnFragmentEmitting(plan.SinkInput, fragment));
+                            worker.SinkPending[plan.SinkNode]++;
+                        }
+                        else if (sink is not null)
                         {
                             sink.OnFragment(plan.SinkInput, fragment);
                             worker.SinkPending[plan.SinkNode]++;
@@ -1309,6 +1397,10 @@ public sealed class Circuit : IAsyncDisposable
                 }
                 continue;
             }
+            // About to idle: whatever has been forwarded so far is worth more to the
+            // downstream consumers now than coalesced later.
+            if (flushInto is not null)
+                FlushOpenFragment(worker, flushInto);
             if (waitStarted == 0)
             {
                 worker.SlowWaits++; // PHASE-STATS
@@ -1327,26 +1419,60 @@ public sealed class Circuit : IAsyncDisposable
             waited += Stopwatch.GetTimestamp() - waitStarted;
         worker.BarrierWaitTicks += waited;
 
-        // A sink consumed its fragments already; anything else takes the accumulated merge,
-        // or the canonical empty when nothing shipped — which the downstream empty-input
-        // skip then propagates, exactly like the plain path's empty-exchange skip.
-        slots[n] = sink is null && consumedAny
+        // Forwarding an exchange completes the next one's production here — nothing else
+        // contributes to it. An emitting sink's completes after its own Step instead (its
+        // non-streamed inputs still flow through Step), so only the open fragment is flushed.
+        if (forwardTo is not null)
+            CompleteProduce(worker, forwardTo);
+        else if (emitInto is not null)
+            FlushOpenFragment(worker, emitInto);
+
+        // A sink consumed its fragments already and a forwarded exchange has no reader;
+        // anything else takes the accumulated merge, or the canonical empty when nothing
+        // shipped — which the downstream empty-input skip then propagates, exactly like the
+        // plain path's empty-exchange skip.
+        slots[n] = sink is null && forwardTo is null && consumedAny
             ? exchange.CompleteMerge()
             : op.EmptyStepResult!;
         if (PhaseStats) // PHASE-STATS
         {
             worker.MergeTicks += Stopwatch.GetTimestamp() - psT1 - waited;
-            if (sink is null && !consumedAny)
+            if (sink is null && forwardTo is null && !consumedAny)
                 worker.EmptyExchangeSkips++;
         }
     }
 
-    /// <summary>Runs the fused chain over one chunk, partitions the result into the ring
-    /// slot the cumulative counter maps to, and release-publishes the counter. An all-empty
-    /// result (a fused Where can filter a whole chunk away) publishes nothing.</summary>
-    private long PublishFragment(
-        Worker worker, StreamPlan plan, IExchangeStepOperator exchange,
-        long[] fragSeqs, int mySlot, long published, object chunk)
+    /// <summary>Produces a streamed exchange's fragments from a complete delta (its head's
+    /// slot, or an emitting sink's <c>Step</c> output): split into chunks of about
+    /// <see cref="CircuitOptions.StreamChunkRows"/>, bounded by what is left of the ring for
+    /// this execution, and forwarded one by one. Does not complete the execution — the
+    /// caller does, once nothing more can contribute.</summary>
+    private void ProduceFromSlot(Worker worker, StreamPlan plan, object? delta)
+    {
+        if (delta is not IZSet { IsEmpty: false } head)
+            return;
+        var budget = IExchangeStepOperator.FragmentRingSize - worker.FragExecCount[plan.Node];
+        var chunks = Math.Clamp(
+            (head.DistinctCount + _options.StreamChunkRows - 1) / _options.StreamChunkRows, 1, budget);
+        if (chunks == 1)
+        {
+            ForwardChunk(worker, plan, head);
+            return;
+        }
+        var scratch = worker.ChunkScratch[plan.Node] ??= new IZSet?[IExchangeStepOperator.FragmentRingSize];
+        head.SplitInto(scratch, chunks);
+        for (var c = 0; c < chunks; c++)
+            ForwardChunk(worker, plan, scratch[c]!);
+    }
+
+    /// <summary>Runs the exchange's fused chain over one chunk and partitions the result into
+    /// the open ring slot — appending to whatever earlier chunks routed there since the last
+    /// publication, so many small forwarded fragments coalesce into few published ones. The
+    /// slot is published once it holds a chunk's worth of rows, unless this execution has
+    /// used all but the last ring slot: the last one then absorbs everything until
+    /// completion, so an execution never publishes more fragments than the ring holds. An
+    /// all-empty result (a fused Where can filter a whole chunk away) routes nothing.</summary>
+    private void ForwardChunk(Worker worker, StreamPlan plan, object chunk)
     {
         foreach (var m in plan.FusedChain)
         {
@@ -1354,12 +1480,70 @@ public sealed class Circuit : IAsyncDisposable
             inputs[0] = chunk;
             chunk = worker.Operators[m].Step(inputs);
         }
-        if (chunk is IZSet { IsEmpty: true })
-            return published;
-        exchange.PartitionFragment(chunk, _workers.Length,
-            (int)(published % IExchangeStepOperator.FragmentRingSize));
-        Volatile.Write(ref fragSeqs[mySlot], published + 1);
-        return published + 1;
+        if (chunk is not IZSet { IsEmpty: false } rows)
+            return;
+        var x = plan.Node;
+        var open = worker.FragOpenRows[x];
+        ((IExchangeStepOperator)worker.Operators[x]).PartitionFragment(
+            chunk, _workers.Length, (int)(worker.FragPublished[x] % IExchangeStepOperator.FragmentRingSize), append: open > 0);
+        open += rows.DistinctCount;
+        worker.FragOpenRows[x] = open;
+        if (open >= _options.StreamChunkRows && worker.FragExecCount[x] < IExchangeStepOperator.FragmentRingSize - 1)
+            PublishOpenFragment(worker, x);
+    }
+
+    /// <summary>Publishes the open fragment if it holds anything and the ring still has a
+    /// slot to spare for it (see <see cref="ForwardChunk"/>).</summary>
+    private void FlushOpenFragment(Worker worker, StreamPlan plan)
+    {
+        var x = plan.Node;
+        if (worker.FragOpenRows[x] > 0 && worker.FragExecCount[x] < IExchangeStepOperator.FragmentRingSize - 1)
+            PublishOpenFragment(worker, x);
+    }
+
+    /// <summary>Release-publishes the open ring slot under the next cumulative fragment
+    /// counter value — its Z-sets were written before this, so the counter's release/acquire
+    /// pair publishes them.</summary>
+    private void PublishOpenFragment(Worker worker, int x)
+    {
+        var published = ++worker.FragPublished[x];
+        Volatile.Write(ref _fragSeqs![(x * _workers.Length + worker.Id) * SeqStride], published);
+        worker.FragExecCount[x]++;
+        worker.FragOpenRows[x] = 0;
+        worker.FragmentsPublished++;
+    }
+
+    /// <summary>Completes this worker's production of a streamed exchange for the step:
+    /// publishes the open fragment (the ring always has a slot left for it), then the
+    /// execution-count completion seq — the same publication as the plain point-to-point
+    /// path, the low bit saying whether any fragment actually shipped.</summary>
+    private void CompleteProduce(Worker worker, StreamPlan plan)
+    {
+        var x = plan.Node;
+        if (worker.FragOpenRows[x] > 0)
+            PublishOpenFragment(worker, x);
+        var shipped = worker.FragExecCount[x] > 0;
+        worker.FragExecCount[x] = 0;
+        var expected = ++worker.ExchangeSeq[x] << 1;
+        Volatile.Write(ref _exchangeSeqs![(x * _workers.Length + worker.Id) * SeqStride], shipped ? expected | 1 : expected);
+        worker.ExchangeExecutions++; // PHASE-STATS
+    }
+
+    /// <summary>Production that runs right after a head node's own execution, from its now
+    /// complete slot: every streamed exchange whose chain starts at this node, produced and
+    /// completed here — as early in the sweep as its input exists, so peers can consume while
+    /// this worker gets on with the nodes in between.</summary>
+    private void ProduceAfterNode(Worker worker, int n)
+    {
+        var psT0 = PhaseStats ? Stopwatch.GetTimestamp() : 0; // PHASE-STATS
+        var delta = worker.Slots[n];
+        foreach (var plan in _produceAfter[n]!)
+        {
+            ProduceFromSlot(worker, plan, delta);
+            CompleteProduce(worker, plan);
+        }
+        if (PhaseStats) // PHASE-STATS
+            worker.PartitionTicks += Stopwatch.GetTimestamp() - psT0;
     }
 
     private void RunNode(Worker worker, int n)
@@ -1629,7 +1813,11 @@ public sealed class Circuit : IAsyncDisposable
             double Us(long ticks) => ticks * 1e6 / Stopwatch.Frequency / _psSteps;
             var exchanges = _nodes.Count(n => n.IsExchange);
             Console.Error.WriteLine(
-                $"[phase-stats] {Name}: steps {_psSteps}, nodes {_nodes.Length}, exchanges {exchanges}, workers {_workers.Length}");
+                $"[phase-stats] {Name}: steps {_psSteps}, nodes {_nodes.Length}, exchanges {exchanges}, workers {_workers.Length}" +
+                (_streaming
+                    ? $", streamed {_streamPlans.Count(p => p is not null)} (forwarded {_streamPlans.Count(p => p?.Produce == ProduceMode.Forwarded)}" +
+                      $", sinks {_streamPlans.Count(p => p?.SinkNode >= 0)}, emitting {_emitInto.Count(p => p is not null)})"
+                    : ""));
             Console.Error.WriteLine(
                 $"[phase-stats]   coord us/step: drain {Us(_psDrain):F1} workerPhase {Us(_psWorkerPhase):F1} " +
                 $"(launch {Us(_psLaunch):F1} land {Us(_psLand):F1}) checkpoint {Us(_psCheckpoint):F1} " +

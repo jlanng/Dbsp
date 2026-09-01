@@ -56,6 +56,14 @@ internal sealed class Worker(
     /// re-read the shared line.</summary>
     public long[] FragPublished { get; set; } = [];
 
+    /// <summary>Per streamed exchange node: fragments published in the current execution
+    /// (reset at completion — it bounds an execution to the ring depth) and rows routed into
+    /// the open, not yet published ring slot (forwarded chunks coalesce there).</summary>
+    public int[] FragExecCount { get; set; } = [];
+
+    /// <inheritdoc cref="FragExecCount"/>
+    public int[] FragOpenRows { get; set; } = [];
+
     /// <summary>Per fragment-sink node: fragments fed to the sink since its last completion,
     /// so the sink's sweep position knows it must run <c>Step</c> even though the streamed
     /// input slots are empty. Read and reset by the sink's node execution.</summary>

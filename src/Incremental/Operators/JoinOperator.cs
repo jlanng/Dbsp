@@ -13,10 +13,13 @@ namespace Incremental.Operators;
 /// side's delta means probing the other side's <em>current</em> state and then integrating
 /// into its own, and under that discipline every ΔL×ΔR pair is counted exactly once no
 /// matter how the deltas are cut into fragments or interleaved — the whole-delta
-/// <see cref="Step"/> is just the two-fragment special case.
+/// <see cref="Step"/> is just the two-fragment special case. And because a fragment's
+/// probe results are its final contribution (no later fragment revises them), the join is
+/// also an <em>emitting</em> sink: the runtime may forward each fragment's output onward
+/// the moment it is produced.
 /// </para>
 /// </summary>
-internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IFragmentSinkOperator
+internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IEmittingFragmentSinkOperator
     where TKey : notnull
     where TLeft : notnull
     where TRight : notnull
@@ -66,6 +69,17 @@ internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IFragmentSinkOpe
             ApplyLeft((ZSet<KeyedValue<TKey, TLeft>>)fragment);
         else
             ApplyRight((ZSet<KeyedValue<TKey, TRight>>)fragment);
+    }
+
+    /// <summary>Emitting mode: the fragment's probe results, handed out immediately rather
+    /// than accumulated — nothing carries across calls, so <see cref="Step"/> later opens a
+    /// fresh buffer for what its non-streamed inputs produce.</summary>
+    public object OnFragmentEmitting(int input, object fragment)
+    {
+        OnFragment(input, fragment);
+        var output = _current ?? _empty;
+        _current = null;
+        return output;
     }
 
     public object Step(object?[] inputs)

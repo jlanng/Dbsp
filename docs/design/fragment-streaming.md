@@ -1,6 +1,7 @@
 # Linear-segment fragment streaming
 
-Design sketch, August 2026. Companion to `docs/research/timely-dataflow.md`, which
+Design sketch, August 2026; v1 shipped 2026-08-31, v2 (production at the head, cross-exchange
+forwarding, the emitting join) 2026-09-01 — see "v2" below. Companion to `docs/research/timely-dataflow.md`, which
 motivates the mechanism (findings 1 & 3): after the point-to-point exchange and the
 land/publish staging work, the remaining multi-worker step cost is ~450 µs/worker of
 dependency wait on the *owner chain* — each exchange segment typically has one busy worker
@@ -49,9 +50,10 @@ Three roles, all per exchange node, all local to the existing sweep:
    instead of following it. This is where the owner chain actually shortens: the busy
    segment's work is mostly inside these operators.
 
-What this deliberately is *not*: no operator emits early (no intermediate retract/insert
-churn downstream), no dynamic scheduler, no change to step atomicity, watermarks,
-checkpoint commit points, outputs, or the cluster path.
+What this deliberately is *not*: no operator emits anything downstream that a later fragment
+could revise (no intermediate retract/insert churn — the v2 emitting join forwards only
+per-fragment output that is already final), no dynamic scheduler, no change to step
+atomicity, watermarks, checkpoint commit points, outputs, or the cluster path.
 
 ## Which operators declare linearity
 
@@ -100,10 +102,33 @@ Per streamed exchange node `n`:
   sweep position runs `Complete` instead of `Step`; its non-streamed inputs (e.g. a
   `Grouped()` side of a join, which arrives without an exchange) are passed to `Complete`
   from slots as usual.
+- **Production mode (v2).** Where `n`'s fragments get produced is decided from the head `H`
+  (`StreamPlan.Produce`):
+  - `AfterHead` — the default: right after `H` runs in the sweep, from its now complete
+    slot, chunked as below. Production moves as *early* as its input exists, so peers
+    consume this worker's fragments while it runs the nodes between `H` and `n`.
+  - `Forwarded` — `H` is read by nothing but this chain, and can hand its delta over before
+    it is complete: an upstream streamed exchange (`plan[H].ForwardTo = n`) forwards every
+    fragment addressed to this worker from its consume loop, through `n`'s chain, into
+    `n`'s ring, and completes `n` when it completes itself (cross-exchange streaming); or
+    an `IEmittingFragmentSinkOperator` — the join — fed by at least one streamed exchange
+    (`_emitInto[H] = n`) hands over each fed fragment's output as it is produced, and its
+    `Step` output (the non-streamed inputs' contribution, plus nothing when every input
+    streamed) completes `n` right after `H`'s own position. Emission is decided per sink
+    node, so every exchange feeding it uses `OnFragmentEmitting`.
+  - `AtSelf` — `H` is inside a loop region (a `Recurse` exit feeding an outside grouping):
+    it runs once per iteration, so there is no single "after it ran" moment; `n` produces
+    from the slot at its own position, exactly v1.
 
-Nothing else changes shape: node ids remain the topological sweep order, and a fused
-chain's work moves *later* in the sweep (to the exchange's position), which is safe because
-slots stay valid for the whole step and the chain's nodes have no other consumer.
+  A head with several readers (the fan-out of an enriched stream into many groupings) is
+  `AfterHead` for each exchange it heads, produced one after another from the same slot.
+
+Nothing else changes shape: node ids remain the topological sweep order. A fused chain's
+work moves to its head's position (or the exchange's, `AtSelf`), which is safe because
+slots stay valid for the whole step and the chain's nodes have no other consumer; every
+worker publishes each exchange's completion at a sweep position no later than the
+position where any worker waits for it, which is what keeps the mesh deadlock-free under
+every mode.
 
 ## The protocol
 
@@ -128,6 +153,19 @@ The consumer keeps a cumulative consumed counter per (node, sender) and polls se
 round-robin, consuming any fragment with `published > consumed`, checking completion via
 the sequence slot; when idle it spins with the same escalation and poison poll as
 `AwaitPublication`, attributing the wait to `BarrierWaitTicks`.
+
+**Coalescing (v2).** Forwarded chunks are small — a fragment addressed to one worker is
+about `targetChunk / workers` rows, and an emitting join's per-fragment output smaller
+still — and an execution may see `workers × R` of them, so they are not published one to
+one. Every chunk is partitioned into the *open* ring slot (appending; the slot is cleared
+only when first opened), and the slot is published once it holds `targetChunk` rows, when
+the consume loop is about to idle (whatever is there is worth more downstream now than
+coalesced later), and at completion. An execution may publish at most `R − 1` fragments
+this way; after that the open slot absorbs everything until completion publishes it as the
+`R`-th, so an execution never laps its own ring whatever the arrival pattern. Whole-slot
+production (`AfterHead`, `AtSelf`, an emitting sink's `Step` output) splits into
+`clamp(⌈rows / targetChunk⌉, 1, R − published-this-execution)` chunks that go through the
+same open slot.
 
 ## "Partial merge" on `IExchangeStepOperator`
 
@@ -168,6 +206,13 @@ and output ports copy. Streaming keeps every piece of that argument and adds thr
   runs on the same thread, and fused nodes have no other consumer. A sink's `OnFragment`
   must copy what it keeps (both sinks do: probe results go to the output buffer, weights
   into stores/scratch) and must not retain the fragment reference past the call.
+- **An emitting sink's per-fragment output** (v2) comes from the same double-buffered
+  `OutputBuffer` its `Step` uses, flipped per fragment, and is consumed — run through the
+  downstream chain and partitioned into the ring — before the operator is called again;
+  its `Step` output is consumed the same way right after `Step` returns. The open ring slot
+  itself is written across several sweep positions (two feeding exchanges' consume loops,
+  then the sink's `Step`), which is safe because nothing reads a slot before its counter is
+  published and the counter is published once.
 
 The addendum's warning about **k-step pipelining** stands and is now sharper: with k steps
 in flight, "next execution of the producer" no longer implies "previous step fully
@@ -233,16 +278,58 @@ shortening it further is the v2 list below, cross-exchange streaming and the ear
 join first. Fragment counts confirm the mechanics engage: ~17 fragments published per
 worker-step across 27 exchanges at the 20k rate, sinks fed on every data-bearing step.
 
-## What v2 would add (explicitly out of scope)
+## Measured (v2, 2026-09-01)
 
-1. **Cross-exchange streaming**: fragments flowing through a linear chain *between* two
-   exchanges without completing at the first — turns per-hop overlap into pipeline depth.
-   Needs per-edge sub-completion tracking; the cumulative-counter protocol already
-   accommodates it.
-2. **Early-emitting join**: `JoinOperator.OnFragment` output is final, so it could publish
-   downstream fragments immediately — the first strict-through-streaming operator. Requires
-   (1).
-3. **Store-write streaming for strict keyed operators** (`AggregateOperator`,
-   `AntiJoinOperator`): integrate per fragment, recompute groups at complete.
-4. **Interleaved sink inputs**: letting a join consume right-side fragments while blocked
-   on the left (bilinearity permits any interleaving); v1 consumes sides in sweep order.
+Same rig and discipline (4 workers, Release, `--live-orders 20000 --seconds 20 --warmup 5`,
+~25k warm steps per run, alternating runs, `DOTNET_GCHeapCount=4`), three engines
+back-to-back: `--p2p`, v1 `--streaming` built from `a0c5bdb` in a worktree, and v2
+`--streaming`. Ranges are across 2–6 runs each; the host was in a different thermal state
+from the v1 table above, so compare within this table only.
+
+| regime | metric | p2p | v1 streaming | v2 streaming |
+| --- | --- | --- | --- | --- |
+| paced 20k orders/s (~60 records/step) | coordinator µs/step | 636–652 | 611–636 | **572–591** (−4…−6% vs v1, −9…−11% vs p2p) |
+| | worker span µs/step | 545–557 | 512–534 | **469–489** (−6…−8% vs v1, −12…−14% vs p2p) |
+| | worker sync-wait µs/step | 180–196 | 170–182 | 134–160 |
+| paced 2k orders/s (~9 records/step) | coordinator µs/step | 580–583 | 567 | **525–538** (−5…−7% vs v1, −8…−10% vs p2p) |
+| | worker span µs/step | 489–495 | 468 | **420–431** |
+| unpaced (saturated) | records/s | 422–435k | 436k | **448k** (+3%) |
+
+One v2 run at 20k landed at 653 µs (compute inflated across the board, immediately after a
+Release build on the same host) and is excluded as thermal; every other v2 run beat every
+v1 run in its regime. Reading: the win now shows at *trickle* deltas too, where v1 had
+nothing to overlap — production after the head and the emitting join move publication
+earlier even when there is one fragment per exchange, and the sync-wait column is where it
+lands (−20–25% vs v1 at 20k). Fragments per worker-step are unchanged (~17 out at 20k), so
+coalescing is doing its job: forwarding did not multiply the fragment count. Saturated
+throughput picks up 3% from the shorter critical path, which pipelined input batches
+previously hid entirely.
+
+## v2 (2026-09-01): production at the head, forwarding, the emitting join
+
+What shipped, in the terms of the original v2 list:
+
+1. **Cross-exchange streaming** — `Produce = Forwarded` with an exchange head: fragments
+   cross the downstream exchange's chain without completing at the upstream one. The
+   cumulative counters needed no change; per-edge sub-completion is the open-slot
+   coalescing above plus "complete the next exchange when this one completes". The public
+   API never puts a linear operator directly on an exchange today (every grouping op is
+   strict or a sink), so this path is exercised by a test built on the internal node API
+   and is mostly the substrate for (2).
+2. **Early-emitting join** — `IEmittingFragmentSinkOperator`, implemented by `JoinOperator`:
+   each fed fragment's probe results are forwarded into the next exchange as they are
+   produced; `Step` contributes the non-streamed side and completes the downstream
+   production. On the showcase pipeline this is the enrichment chain's shape twice over
+   (`GroupBy → Join → GroupBy → Join → …`), which is exactly the serialized owner-chain
+   segment v1 could not shorten.
+3. **Production after the head** — not on the list, but it fell out of unifying (1) and
+   (2): every streamed exchange now publishes from its head's position instead of its
+   own, so the fan-out groupings off a shared stream publish the moment the stream exists.
+
+Still open, unchanged in scope:
+
+- **Store-write streaming for strict keyed operators** (`AggregateOperator`,
+  `AntiJoinOperator`): integrate per fragment, recompute groups at complete.
+- **Interleaved sink inputs**: letting a join consume right-side fragments while blocked on
+  the left (bilinearity permits any interleaving); sides are still consumed in sweep order.
+- **`WatermarkOperator` as a chain link** (see the linearity table).

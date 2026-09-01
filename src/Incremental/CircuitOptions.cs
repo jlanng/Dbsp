@@ -74,18 +74,23 @@ public sealed class CircuitOptions
     /// single-consumer chain of linear operators feeding the exchange fused into that loop —
     /// and consumers process whichever sender's fragments have arrived instead of waiting
     /// for the slowest producer, merging as data lands; a join or linear aggregate that is
-    /// the exchange's sole consumer integrates the fragments directly. Every operator still
-    /// sees one complete delta per step and outputs, checkpoints, and fault semantics are
-    /// unchanged — streaming moves work earlier inside a step, which is what shortens the
-    /// serialized chain of busy workers that dominates multi-worker step latency. Exchanges
-    /// inside <c>Recurse</c> regions keep the plain point-to-point path. See
-    /// docs/design/fragment-streaming.md.</summary>
+    /// the exchange's sole consumer integrates the fragments directly. An exchange publishes
+    /// as soon as its input exists — right after the node heading its chain runs, or, when
+    /// that head is an upstream exchange or a join read by nothing else, fragment by
+    /// fragment as the head itself is fed (the join's per-fragment output is final, so it is
+    /// forwarded on the spot). Every operator still sees one complete delta per step and
+    /// outputs, checkpoints, and fault semantics are unchanged — streaming moves work
+    /// earlier inside a step, which is what shortens the serialized chain of busy workers
+    /// that dominates multi-worker step latency. Exchanges inside <c>Recurse</c> regions
+    /// keep the plain point-to-point path. See docs/design/fragment-streaming.md.</summary>
     public bool FragmentStreaming { get; init; }
 
     /// <summary>Rows per published fragment on a streamed exchange. A delta at or below this
     /// publishes as a single fragment (the fast path, mechanically identical to plain
     /// point-to-point); above it, chunks scale up so one execution never exceeds the
-    /// fragment ring. Internal so tests can force chunking on tiny deltas.</summary>
+    /// fragment ring, and forwarded chunks coalesce until they add up to this many rows
+    /// (or the producer is about to idle). Internal so tests can force chunking on tiny
+    /// deltas.</summary>
     internal int StreamChunkRows { get; init; } = 256;
 
     /// <summary>Upper bound on any single cross-process wait in a clustered step: receiving

@@ -91,6 +91,22 @@ internal interface IFragmentSinkOperator : IStepOperator
 }
 
 /// <summary>
+/// A fragment sink whose per-fragment output is <em>final</em> — the fragment's contribution
+/// to the step's output delta, never revised by later fragments — so the runtime may take
+/// it as it is produced and forward it into a downstream streamed exchange instead of
+/// waiting for the operator's <see cref="IStepOperator.Step"/>. The join qualifies (each
+/// fragment's probe results are exactly its share of ΔL ⋈ R + L ⋈ ΔR + ΔL ⋈ ΔR); an
+/// aggregate whose output depends on the whole step's delta per key does not. When the
+/// runtime forwards, every fed fragment goes through <see cref="OnFragmentEmitting"/> and
+/// <c>Step</c> emits only what the non-streamed inputs produce. The returned delta is a
+/// reused buffer the caller consumes before calling the operator again.
+/// </summary>
+internal interface IEmittingFragmentSinkOperator : IFragmentSinkOperator
+{
+    object OnFragmentEmitting(int input, object fragment);
+}
+
+/// <summary>
 /// An exchange (shuffle) operator: repartitions its input delta across workers by hash so
 /// that all records with the same routing key land on the same worker. The runtime calls
 /// <see cref="Partition"/>, synchronizes all workers on a barrier, then calls
@@ -104,7 +120,8 @@ internal interface IExchangeStepOperator : IStepOperator
 
     /// <summary>Fragment streaming (point-to-point mode only; see
     /// docs/design/fragment-streaming.md). A producer partitions each chunk of its input
-    /// into a ring slot via <see cref="PartitionFragment"/> and
+    /// into a ring slot via <see cref="PartitionFragment"/> — clearing the slot first, or
+    /// appending when coalescing several forwarded chunks into one fragment — and
     /// release-publishes a cumulative fragment counter; <see cref="FragmentRing"/> is the
     /// ring the runtime hands consumers (its elements are written before the counter, so the
     /// counter's release/acquire pair publishes them). A consumer folds arriving fragments
@@ -116,7 +133,7 @@ internal interface IExchangeStepOperator : IStepOperator
     object?[][] FragmentRing { get; }
 
     /// <inheritdoc cref="FragmentRing"/>
-    object[] PartitionFragment(object? chunk, int parts, int ringIndex);
+    void PartitionFragment(object chunk, int parts, int ringIndex, bool append);
 
     /// <inheritdoc cref="FragmentRing"/>
     void AccumulateFragment(object fragment);
@@ -410,7 +427,7 @@ internal sealed class ExchangeOperator<T>(Func<T, uint> routingHash) : IExchange
 
     public object?[][] FragmentRing => _ring;
 
-    public object[] PartitionFragment(object? chunk, int parts, int ringIndex)
+    public void PartitionFragment(object chunk, int parts, int ringIndex, bool append)
     {
         var fragments = _ringFragments[ringIndex];
         if (fragments is null || fragments.Length != parts)
@@ -421,15 +438,14 @@ internal sealed class ExchangeOperator<T>(Func<T, uint> routingHash) : IExchange
                 boxed[i] = fragments[i] = new ZSet<T>();
             _ring[ringIndex] = boxed;
         }
-        else
+        else if (!append)
         {
             foreach (var fragment in fragments)
                 fragment.Clear();
         }
 
-        foreach (var (value, weight) in (ZSet<T>)chunk!)
+        foreach (var (value, weight) in (ZSet<T>)chunk)
             fragments[(int)(routingHash(value) % (uint)parts)].Add(value, weight);
-        return _ring[ringIndex]!;
     }
 
     /// <summary>The partial-merge accumulator: the same double-buffered <see cref="_merge"/>
