@@ -59,6 +59,17 @@
   button.act.trigger { border-color: rgba(232,187,90,.35); }
   button.act.trigger:hover:not(:disabled) { border-color: var(--warn); color: var(--warn); }
   .controls .sep { width: 1px; height: 20px; background: var(--line); margin: 0 4px; }
+  /* tab 5: running / target configuration */
+  .config { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; align-items: center; }
+  .config > div { display: contents; }
+  .config .k { color: var(--dim); font-size: 12px; }
+  .config b { font-weight: 600; }
+  .config .d { color: var(--faint); font-size: 12px; margin-left: 8px; }
+  .config select {
+    appearance: auto; background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 8px; font: inherit; max-width: 100%;
+  }
+  ul.diff { margin: 10px 0 0; padding-left: 18px; color: var(--dim); font-size: 12px; }
 
   /* ── panels ─────────────────────────────────────────────────────────── */
   details.note { border: 1px solid var(--line); border-radius: 8px; margin-bottom: 14px; background: var(--panel); }
@@ -324,6 +335,41 @@ const render = {
   cluster(s) {
     const h = s.header, sc = s.scaling, c = s.cluster;
     const out = [];
+    const running = { workers: h.workers, nodes: h.nodes, exchange: h.exchange };
+    if (!target) target = { ...running };
+    const exchangeLabel = (e) => ({ barrier: "barrier", pointToPoint: "point-to-point", streaming: "streaming" })[e] || e;
+    const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+
+    // ── running vs target configuration ──────────────────────────────────
+    const changed = target.workers !== running.workers || target.nodes !== running.nodes || target.exchange !== running.exchange;
+    const sel = (axis, options, value, labelOf) =>
+      `<select data-target="${axis}">${options.map((o) =>
+        `<option value="${o}"${String(o) === String(value) ? " selected" : ""}>${esc(labelOf(o))}</option>`).join("")}</select>`;
+    const diff = (axis, from, to, labelOf) => from === to ? "" : `<li>${esc(axis)}: ${esc(labelOf(from))} → <b>${esc(labelOf(to))}</b></li>`;
+    out.push(panel("running configuration", `generation ${h.generation} · ${h.build} build`, boxed(
+      `<div class="config">
+         <div><span class="k">workers per node</span><b>${h.workers}</b></div>
+         <div><span class="k">nodes</span><b>${h.nodes}</b><span class="d">${h.nodes === 1 ? "this process only" : `this process + ${plural(h.nodes - 1, "peer")} (cluster act)`}</span></div>
+         <div><span class="k">exchange</span><b>${esc(exchangeLabel(h.exchange))}</b><span class="d">${h.exchange === "barrier" ? "rendezvous at every exchange" : h.exchange === "pointToPoint" ? "wait only for the data about to be read" : "point-to-point + fragments through fused chains"}</span></div>
+         <div><span class="k">storage</span><b>${esc(h.storage)}</b></div>
+         <div><span class="k">circuit</span><b>${esc(h.circuit)}</b><span class="d">last step ${(h.lastStepMicros / 1000).toFixed(2)} ms</span></div>
+       </div>`)));
+    out.push(panel("target configuration", changed ? "differs from running — apply to relaunch" : "same as running", boxed(
+      `<div class="config">
+         <div><span class="k">workers per node</span>${sel("workers", [1, 2, 4, 8, 16], target.workers, (w) => plural(w, "worker"))}</div>
+         <div><span class="k">nodes</span>${sel("nodes", [1, 2, 3, 4], target.nodes, (n) => n === 1 ? "1 node (this process)" : `${n} nodes (OS processes over TCP)`)}</div>
+         <div><span class="k">exchange</span>${sel("exchange", ["barrier", "pointToPoint", "streaming"], target.exchange, exchangeLabel)}</div>
+       </div>
+       <ul class="diff">${changed
+         ? diff("workers per node", running.workers, target.workers, String)
+           + diff("nodes", running.nodes, target.nodes, String)
+           + diff("exchange", running.exchange, target.exchange, exchangeLabel)
+         : `<li style="color:var(--faint)">change any axis above; all changes apply in one relaunch</li>`}</ul>
+       <div class="controls" style="margin:8px 0 0">
+         <button class="act${changed ? " trigger" : ""}" data-apply="1"${changed && !relaunching ? "" : " disabled"}>${relaunching ? "relaunching…" : "apply → relaunch"}</button>
+         <button class="act" data-reset="1"${changed ? "" : " disabled"}>reset to running</button>
+       </div>
+       <div style="color:var(--dim);margin-top:8px">Worker count decides how operator state is sharded, so nothing here can change under a live circuit — the showcase relaunches itself into the target and this page reconnects on its own. Nodes above one arm the multi-process act below (barrier-synchronized over TCP whatever the live exchange mode); the live pipeline stays in this process because Recurse is rejected in clustered circuits.</div>`)));
 
     // ── threads: measured, not asserted ──────────────────────────────────
     out.push(panel("threads · one process", `live batch ${sc ? sc.liveBatch : 8} rows/step`, sc
@@ -339,45 +385,33 @@ const render = {
             Sync wait is the share of worker time spent blocked at exchanges, not computing —
             measured over the live-batch section and the bulk section separately, because it amortizes with batch size.
             Barrier rows rendezvous every worker at every exchange; point-to-point rows (experimental) wait only for
-            the data they are about to read, so skew stops convoying the whole worker set.
-            Lowest latency at ${sc.samples.reduce((a, b) => (a.latencyP50 <= b.latencyP50 ? a : b)).workers} worker(s);
-            highest throughput at ${sc.samples.reduce((a, b) => (a.bulkRowsPerSec >= b.bulkRowsPerSec ? a : b)).workers}.
+            the data they are about to read, so skew stops convoying the whole worker set; streaming rows (experimental)
+            also publish partial deltas in fragments so downstream work overlaps upstream tails.
+            Lowest latency at ${sc.samples.reduce((a, b) => (a.latencyP50 <= b.latencyP50 ? a : b)).label};
+            highest throughput at ${sc.samples.reduce((a, b) => (a.bulkRowsPerSec >= b.bulkRowsPerSec ? a : b)).label}.
             The web host is serving this page while it measures, which costs the p99 a little.</div>`
           + (sc.debugBuild
             ? `<div class="verdict no" style="margin-top:8px">Debug build — treat the throughput column as a lower bound. Debug penalises per-row work, which is exactly what extra workers parallelise, so the spread between 1 and 4 workers collapses here. Re-run with <code>dotnet run -c Release</code> for representative numbers.</div>`
             : ""))
-      : `<div class="body" style="color:var(--dim)">Not measured yet. The trigger runs the identical pipeline at 1, 2 and 4 workers and reports p50/p99 latency at the live batch size next to bulk throughput — the two numbers point in opposite directions, which is the whole point of the tab.</div>`,
+      : `<div class="body" style="color:var(--dim)">Not measured yet. The trigger runs the identical pipeline at 1, 2 and 4 workers in every exchange mode and reports p50/p99 latency at the live batch size next to bulk throughput — the two numbers point in opposite directions, which is the whole point of the tab.</div>`,
       true));
-
-    // ── relaunch into another topology ───────────────────────────────────
-    const btn = (label, q, on) =>
-      `<button class="act${on ? " on" : ""}" data-relaunch="${esc(q)}"${on ? " disabled" : ""}>${esc(label)}</button>`;
-    out.push(panel("run it that way", "the process restarts; this page reconnects itself", boxed(
-      `<div style="color:var(--dim);margin-bottom:8px">Worker count decides how operator state is sharded, so it cannot change under a live circuit — the showcase relaunches itself instead. Everything else about the run is preserved.</div>
-       <div class="controls" style="margin:0">
-         ${[1, 2, 4, 8].map((w) => btn(`${w} worker${w === 1 ? "" : "s"}`, `workers=${w}`, w === h.workers)).join("")}
-       </div>
-       <div class="controls" style="margin:8px 0 0">
-         ${btn(clusterArmed ? "turn off the second process" : "add a second process (--cluster)",
-               `cluster=${!clusterArmed}`, false)}
-       </div>`), true));
 
     // ── processes ────────────────────────────────────────────────────────
     out.push(!c
       ? panel("processes · TCP exchange", null, `<div class="body" style="color:var(--dim)">${
-          clusterArmed
-            ? "Not run yet. The trigger respawns this binary as a peer process: both build the identical circuit, every GroupBy exchange ships remote shards over TCP, steps run in lockstep, and the merged shards are verified against a single-process reference."
-            : "Needs the two-process mode above (or <code>-- --cluster</code> on the command line)."
+          h.nodes > 1
+            ? `Not run yet. The trigger respawns this binary as ${plural(h.nodes - 1, "peer process")}: all ${h.nodes} build the identical circuit at ${plural(h.workers, "worker")} each, every GroupBy exchange ships remote shards over TCP, steps run in lockstep, and the merged shards are verified against a single-process reference.`
+            : "Needs more than one node — set nodes in the target configuration and apply (or <code>-- --nodes 2</code> on the command line)."
         }</div>`, true)
-      : panel("one circuit, two OS processes", "TCP exchange", table("clu", [
+      : panel(`one circuit, ${c.nodes} OS processes × ${plural(c.workersPerNode, "worker")}`, "TCP exchange", table("clu", [
           { label: "process", get: (r) => r.process },
           { label: "workers", get: (r) => r.workers },
           { label: "merchants on shard", num: 1, get: (r) => r.merchants },
           { label: "exchange frames", num: 1, get: (r) => r.frames },
         ], c.processes, (r) => r.process) + boxed(`
-            <div style="color:var(--faint)">${n0(c.orders)} orders fed on p0 only; ${c.steps} lockstep steps on both processes; avg step ${c.avgStepMs.toFixed(1)} ms (includes TCP round trips)</div>
+            <div style="color:var(--faint)">${n0(c.orders)} orders fed on p0 only; ${c.steps} lockstep steps on every process; avg step ${c.avgStepMs.toFixed(1)} ms (includes TCP round trips)</div>
             <div class="verdict ${c.correct ? "ok" : "no"}" style="margin-top:8px">${c.correct
-              ? `✓ shards are disjoint (${n0(c.localRows)} + ${n0(c.remoteRows)} merchants) and their union matches the single-process answer exactly`
+              ? `✓ shards are pairwise disjoint (${n0(c.localRows)} + ${n0(c.remoteRows)} merchants) and their union matches the single-process answer exactly`
               : "✗ merged shards did NOT match the expected totals — this is a bug worth reporting"}</div>`), true));
 
     return out.join("");
@@ -395,7 +429,8 @@ function paint(s) {
     `virtual clock <b>${h.virtualNow}</b>`,
     `watermark <b>${h.watermark ?? "—"}</b>${h.watermarkBehind == null ? "" : ` <span style="color:var(--faint)">(${h.watermarkBehind.toFixed(1)}s behind)</span>`}`,
     `last step <b>${(h.lastStepMicros / 1000).toFixed(2)} ms</b>`,
-    `${h.storage} · ${h.workers} worker${h.workers === 1 ? "" : "s"} · gen <b>${h.generation}</b>`,
+    `${h.storage} · <b>${h.workers}</b> worker${h.workers === 1 ? "" : "s"} × <b>${h.nodes}</b> node${h.nodes === 1 ? "" : "s"} · ${
+      ({ barrier: "barrier", pointToPoint: "point-to-point", streaming: "streaming" })[h.exchange] || h.exchange} · gen <b>${h.generation}</b>`,
   ].join(""));
 
   const tab = tabs.find((t) => t.id === active);
@@ -445,7 +480,9 @@ function paint(s) {
 }
 
 // ── wiring ────────────────────────────────────────────────────────────────
-let clusterArmed = false, relaunching = false;
+// The target configuration on tab 5 lives here, not in the DOM: panels are re-rendered on
+// every frame, so a select's pending value has to survive the repaint.
+let target = null, relaunching = false;
 
 document.addEventListener("click", async (e) => {
   const beat = e.target.closest("[data-beat]");
@@ -455,15 +492,32 @@ document.addEventListener("click", async (e) => {
     if (!res.ok) beat.disabled = false;
     return;
   }
-  const relaunch = e.target.closest("[data-relaunch]");
-  if (relaunch) {
-    relaunch.disabled = true;
+  const apply = e.target.closest("[data-apply]");
+  if (apply && target) {
+    apply.disabled = true;
     relaunching = true;                 // the reconnect after this one reloads the page
-    await fetch(`/api/relaunch?${relaunch.dataset.relaunch}`, { method: "POST" });
+    const q = new URLSearchParams({ workers: target.workers, nodes: target.nodes, exchange: target.exchange });
+    const res = await fetch(`/api/relaunch?${q}`, { method: "POST" });
+    if (!res.ok) { relaunching = false; apply.disabled = false; }
+    if (last) paint(last);
+    return;
+  }
+  const reset = e.target.closest("[data-reset]");
+  if (reset) {
+    target = null;                      // the next paint re-seeds it from the running header
+    if (last) paint(last);
     return;
   }
   const run = e.target.closest("[data-run]");
   if (run) await fetch(`/api/run/${run.dataset.run}`, { method: "POST" });
+});
+
+document.addEventListener("change", (e) => {
+  const axis = e.target.closest("[data-target]");
+  if (!axis || !target) return;
+  const v = e.target.value;
+  target = { ...target, [axis.dataset.target]: axis.dataset.target === "exchange" ? v : Number(v) };
+  if (last) paint(last);
 });
 
 function selectTab(id) {
@@ -480,7 +534,6 @@ function selectTab(id) {
 (async () => {
   const meta = await (await fetch("/api/tabs")).json();
   tabs = meta.tabs;
-  clusterArmed = meta.cluster;
   $("tabs").innerHTML = tabs.map((t, i) =>
     `<button data-tab="${esc(t.id)}"><i>${i + 1}</i>${esc(t.title)}</button>`).join("");
   for (const b of $("tabs").children) b.onclick = () => selectTab(b.dataset.tab);

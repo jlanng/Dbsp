@@ -14,22 +14,24 @@ if (args.Contains("--cluster-child"))
     return await ClusterAct.RunChildAsync(args);
 
 var useRedis = args.Contains("--redis");
-var withCluster = args.Contains("--cluster");
 // The CI smoke path: run every tab's triggers unattended, print them, exit 0 (or 1 if a
 // verified act did not verify). Explicit rather than inferred from redirected stdin — a
 // server that turns into a batch job under nohup or systemd would be a trap.
 var headless = args.Contains("--headless");
 var port = Arg("--port") is { } p ? int.Parse(p) : 5170;
-// >1 by default so every other tab really exercises the exchange path. Tab 5 measures what
-// that costs and can relaunch the showcase at another count.
-var workers = Arg("--workers") is { } w ? Math.Clamp(int.Parse(w), 1, 32) : 2;
-// Experimental: exchanges synchronize point-to-point (seq-mailbox) instead of on the
-// global barrier. Tab 5 measures both modes side by side regardless of this flag; this
-// switches the LIVE pipeline (and disables --cluster, which stays barrier-based).
-var p2p = args.Contains("--p2p");
-if (p2p && withCluster)
+// The topology: --workers N (2 by default, so every other tab really exercises the exchange
+// path), --nodes N (1; above one arms the multi-process cluster act), --exchange
+// barrier|p2p|streaming (how the LIVE pipeline's exchanges synchronize; the cluster act stays
+// barrier-based). --cluster and --p2p remain as aliases. Tab 5 shows what is running,
+// measures the alternatives side by side, and relaunches the showcase into another topology.
+Topology topology;
+try
 {
-    Console.Error.WriteLine("--p2p and --cluster are mutually exclusive (the cluster shuffle is barrier-based).");
+    topology = Topology.FromArgs(args);
+}
+catch (Exception ex) when (ex is ArgumentException or FormatException)
+{
+    Console.Error.WriteLine(ex.Message);
     return 2;
 }
 
@@ -53,7 +55,7 @@ else
     storageLabel = "in-memory checkpoints";
 }
 
-var show = new Show(storage, storageLabel, withCluster, notices, metrics, loggerFactory, workers, p2p);
+var show = new Show(storage, storageLabel, topology, notices, metrics, loggerFactory);
 var json = new JsonSerializerOptions
 {
     PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -61,7 +63,7 @@ var json = new JsonSerializerOptions
 };
 
 if (headless)
-    try { return await Headless.RunAsync(show, withCluster); }
+    try { return await Headless.RunAsync(show); }
     finally { redis?.Dispose(); }
 
 // ── the web host ───────────────────────────────────────────────────────────────
@@ -82,7 +84,7 @@ var hub = new Hub();
 app.MapGet("/api/tabs", () => Results.Json(new
 {
     tabs = show.Tabs.Select(t => new { t.Id, t.Title, t.Explainer, t.Code }),
-    cluster = withCluster,
+    topology = new { topology.Workers, topology.Nodes, topology.Exchange, maxWorkers = Topology.MaxWorkers, maxNodes = Topology.MaxNodes },
 }, json));
 
 // One SSE stream per browser. Every client gets its own single-slot channel that drops
@@ -134,28 +136,41 @@ app.MapPost("/api/trigger/{id}", async (string id) =>
     }
 });
 
-// Relaunch the showcase into a different topology. Worker count changes how state is
-// sharded, so it cannot be swapped under a running circuit — the process restarts instead.
-// Kestrel has released the port by the time RunAsync returns, so the successor binds the
-// same one and the browser's EventSource reconnects to it on its own.
+// Relaunch the showcase into a different topology — any combination of workers, nodes and
+// exchange mode in one go. Worker count changes how state is sharded, so it cannot be
+// swapped under a running circuit — the process restarts instead. Kestrel has released the
+// port by the time RunAsync returns, so the successor binds the same one and the browser's
+// EventSource reconnects to it on its own. Axes left out of the request keep their current
+// value.
 string[]? relaunchArgs = null;
-var relaunchWorkers = workers;
-app.MapPost("/api/relaunch", (int? workers, bool? cluster, IHostApplicationLifetime lifetime) =>
+var relaunchTopology = topology;
+app.MapPost("/api/relaunch", (int? workers, int? nodes, string? exchange, IHostApplicationLifetime lifetime) =>
 {
-    relaunchWorkers = Math.Clamp(workers ?? show.CurrentWorkers, 1, 32);
+    Topology target;
+    try
+    {
+        target = Topology.Normalize(
+            workers ?? topology.Workers, nodes ?? topology.Nodes,
+            exchange is null ? topology.Exchange : Topology.ParseExchange(exchange));
+    }
+    catch (ArgumentException ex)
+    {
+        return Results.BadRequest(ex.Message);
+    }
+    if (target == topology)
+        return Results.BadRequest("that is the running configuration");
+    relaunchTopology = target;
     var next = new List<string>
     {
         "--port", port.ToString(),
         "--no-open",                       // the browser that asked for this is already open
-        "--workers", relaunchWorkers.ToString(),
     };
+    next.AddRange(target.ToArgs());
     if (useRedis) next.Add("--redis");
-    if (cluster ?? withCluster) next.Add("--cluster");
-    else if (p2p) next.Add("--p2p");
     relaunchArgs = [.. next];
-    notices.Push(NoticeLevel.Info, $"relaunching: {string.Join(' ', next)}");
+    notices.Push(NoticeLevel.Info, $"relaunching into {target.Label}: {string.Join(' ', next)}");
     lifetime.StopApplication();
-    return Results.Ok();
+    return Results.Json(new { target.Workers, target.Nodes, target.Exchange }, json);
 });
 
 app.MapPost("/api/run/{state}", async (string state) =>
@@ -185,8 +200,8 @@ var driver = Task.Run(async () =>
 
 var url = $"http://localhost:{port}";
 Console.WriteLine($"Incremental showcase — a marketplace payments desk");
-Console.WriteLine($"  {url}   ({storageLabel}, {workers} worker{(workers == 1 ? "" : "s")}{(p2p ? ", point-to-point exchanges" : "")}{(withCluster ? ", cluster armed" : "")})");
-if (GcAdvice.Mismatch(workers) is { } heapAdvice) Console.WriteLine($"  note: {heapAdvice}");
+Console.WriteLine($"  {url}   ({storageLabel}, {topology.Label})");
+if (GcAdvice.Mismatch(topology.Workers) is { } heapAdvice) Console.WriteLine($"  note: {heapAdvice}");
 Console.WriteLine("  Ctrl-C to stop.");
 if (!args.Contains("--no-open")) OpenBrowser(url);
 
@@ -205,7 +220,7 @@ finally
 if (relaunchArgs is not null)
 {
     Console.WriteLine($"  relaunching: {string.Join(' ', relaunchArgs)}");
-    Process.Start(Child.Spawn(relaunchArgs, relaunchWorkers));
+    Process.Start(Child.Spawn(relaunchArgs, relaunchTopology.Workers));
 }
 return 0;
 

@@ -18,7 +18,7 @@ public static class ScalingAct
     /// spent waiting at exchange barriers rather than computing — measured separately for
     /// the live-batch and bulk sections, because barrier cost amortizes with batch size.</summary>
     public record Sample(
-        string Label, int Workers, int Processes,
+        string Label, int Workers, int Processes, ExchangeMode Exchange,
         double LatencyP50, double LatencyP99, double BulkRowsPerSec,
         double BarrierPctLive, double BarrierPctBulk, bool Highlight);
 
@@ -50,23 +50,21 @@ public static class ScalingAct
     public const int BulkSteps = 10;
 
     /// <summary>Every in-process topology, measured back to back on this machine — the
-    /// multi-worker ones in both synchronization modes, so the table shows what the barrier
-    /// itself costs against point-to-point publication.</summary>
-    public static async Task<ScalingView> MeasureAllAsync(int currentWorkers, bool currentP2p = false)
+    /// multi-worker ones in every exchange mode, so the table shows what the barrier itself
+    /// costs against point-to-point publication and what streaming adds on top. The row
+    /// matching the running topology is highlighted.</summary>
+    public static async Task<ScalingView> MeasureAllAsync(Topology current)
     {
         var samples = new List<Sample>
         {
-            await MeasureAsync("1 worker · no exchange", 1, currentWorkers == 1),
+            await MeasureAsync("1 worker · no exchange", 1, current.Workers == 1, ExchangeMode.Barrier),
         };
         foreach (var workers in new[] { 2, 4 })
-        {
-            samples.Add(await MeasureAsync($"{workers} workers · barrier", workers,
-                workers == currentWorkers && !currentP2p));
-            samples.Add(await MeasureAsync($"{workers} workers · point-to-point", workers,
-                workers == currentWorkers && currentP2p, p2p: true));
-        }
+            foreach (var mode in new[] { ExchangeMode.Barrier, ExchangeMode.PointToPoint, ExchangeMode.Streaming })
+                samples.Add(await MeasureAsync($"{workers} workers · {Topology.ExchangeLabel(mode)}", workers,
+                    workers == current.Workers && mode == current.Exchange, mode));
         return new ScalingView([.. samples], Environment.ProcessorCount, LiveBatch, BulkBatch,
-            currentWorkers, DebugBuild);
+            current.Workers, current.Exchange, DebugBuild);
     }
 
     // `dotnet run` builds Debug by default, and Debug flatters the single-worker case: the
@@ -79,7 +77,7 @@ public static class ScalingAct
         false;
 #endif
 
-    public static async Task<Sample> MeasureAsync(string label, int workers, bool highlight, bool p2p = false)
+    public static async Task<Sample> MeasureAsync(string label, int workers, bool highlight, ExchangeMode mode)
     {
         var rng = new Random(11);
         var merchants = Enumerable.Range(0, 24)
@@ -90,10 +88,11 @@ public static class ScalingAct
 
         var options = new CircuitOptions
         {
-            Name = $"scaling-w{workers}{(p2p ? "-p2p" : "")}",
+            Name = $"scaling-w{workers}-{Topology.ExchangeArg(mode)}",
             Workers = workers,
             AutoStep = false,
-            PointToPointExchange = p2p,
+            PointToPointExchange = mode != ExchangeMode.Barrier,
+            FragmentStreaming = mode == ExchangeMode.Streaming,
         };
 
         // The library reports cumulative per-worker barrier wait through its meter; polling
@@ -179,7 +178,7 @@ public static class ScalingAct
         merchantInput.Complete();
         await circuit.DisposeAsync();
 
-        return new Sample(label, workers, 1,
+        return new Sample(label, workers, 1, mode,
             micros[micros.Length / 2], micros[(int)(micros.Length * 0.99)],
             BulkBatch * BulkSteps / bulkTimer.Elapsed.TotalSeconds,
             barrierPctLive, barrierPctBulk, highlight);

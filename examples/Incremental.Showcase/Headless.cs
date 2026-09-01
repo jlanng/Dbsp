@@ -10,8 +10,10 @@ public static class Headless
     const int LeadTicks = 10;
     const int SettleTicks = 8;
 
-    public static async Task<int> RunAsync(Show show, bool withCluster)
+    public static async Task<int> RunAsync(Show show)
     {
+        var topology = show.Topology;
+        Console.WriteLine($"topology: {topology.Label}");
         show.PaceMs = 3;
         var stopping = new CancellationTokenSource();
         Snapshot? last = null;
@@ -60,7 +62,7 @@ public static class Headless
                     PrintNewNotices();
                 }
 
-                Report(tab.Id, last, failures, withCluster);
+                Report(tab.Id, last, failures, topology);
             }
         }
         finally
@@ -89,7 +91,7 @@ public static class Headless
         return 1;
     }
 
-    static void Report(string tabId, Snapshot? s, List<string> failures, bool withCluster)
+    static void Report(string tabId, Snapshot? s, List<string> failures, Topology topology)
     {
         if (s is null) { failures.Add($"{tabId}: no snapshot was produced"); return; }
         switch (tabId)
@@ -169,16 +171,23 @@ public static class Headless
                     var fastest = sc.Samples.MaxBy(x => x.BulkRowsPerSec)!;
                     Line("verified", $"lowest latency at {quickest.Workers} worker(s), highest throughput at {fastest.Workers}");
                     if (quickest.LatencyP50 <= 0) failures.Add("scaling: measured a non-positive latency");
+                    foreach (var mode in Enum.GetValues<ExchangeMode>())
+                        if (!sc.Samples.Any(x => x.Exchange == mode && x.Workers > 1))
+                            failures.Add($"scaling: no {Topology.ExchangeLabel(mode)} row was measured");
+                    if (sc.Samples.Count(x => x.Highlight) != 1)
+                        failures.Add("scaling: exactly one row should be marked as the running topology");
                 }
                 else failures.Add("cluster: the worker measurement never ran");
 
-                if (!withCluster)
+                if (topology.Nodes < 2)
                 {
-                    Console.WriteLine("  (two processes skipped — run with --cluster)");
+                    Console.WriteLine("  (multi-process run skipped — run with --nodes 2 or more)");
                     break;
                 }
-                if (s.Cluster is not { } c) { failures.Add("cluster: the peer process never ran"); break; }
-                Table("one circuit, two OS processes, TCP exchange",
+                if (s.Cluster is not { } c) { failures.Add("cluster: the peer processes never ran"); break; }
+                if (c.Nodes != topology.Nodes || c.WorkersPerNode != topology.Workers)
+                    failures.Add($"cluster: ran {c.Nodes}×{c.WorkersPerNode}, expected {topology.Nodes}×{topology.Workers}");
+                Table($"one circuit, {c.Nodes} OS processes × {c.WorkersPerNode} workers, TCP exchange",
                     ["process", "workers", "merchants on shard", "frames"],
                     c.Processes.Select(x => new[] { x.Process, x.Workers, x.Merchants, x.Frames }));
                 Line("verified", c.Correct

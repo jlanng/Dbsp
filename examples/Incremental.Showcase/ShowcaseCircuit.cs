@@ -62,13 +62,13 @@ public sealed class ShowcaseCircuit
     public int LastRingDelta;
 
     public readonly int Workers;
-    public readonly bool PointToPoint;
+    public readonly ExchangeMode Exchange;
 
     public ShowcaseCircuit(string name, IStorageProvider storage, ILoggerFactory loggerFactory, int workers = 2,
-        bool pointToPoint = false, bool autoStep = false)
+        ExchangeMode exchange = ExchangeMode.Barrier, bool autoStep = false)
     {
         Workers = workers;
-        PointToPoint = pointToPoint;
+        Exchange = exchange;
         var builder = new CircuitBuilder(new CircuitOptions
         {
             Name = name,
@@ -79,7 +79,9 @@ public sealed class ShowcaseCircuit
             Storage = storage,
             CheckpointInterval = 4,      // a crash loses up to 3 steps — replay covers the gap
             LoggerFactory = loggerFactory,
-            PointToPointExchange = pointToPoint, // --p2p: exchanges sync point-to-point, not on the barrier
+            // --exchange: barrier (default), point-to-point, or point-to-point with fragment streaming.
+            PointToPointExchange = exchange != ExchangeMode.Barrier,
+            FragmentStreaming = exchange == ExchangeMode.Streaming,
         });
         Defs = ShowcasePipeline.Declare(builder);
         Circuit = builder.Build();

@@ -8,10 +8,11 @@ using Incremental.Cluster;
 namespace Incremental.Showcase;
 
 /// <summary>
-/// Act 5: the same pipeline on two real OS processes, exchanging shards over TCP.
-/// This binary relaunches itself as process 1 (<c>--cluster-child</c>); both processes
-/// build the identical circuit and call StepAsync in lockstep — the cluster contract.
-/// `Recurse` is rejected in clustered circuits, so this act runs its own small pipeline.
+/// Act 5: the same pipeline on several real OS processes (the topology's node count, each
+/// with its worker count), exchanging shards over TCP. This binary relaunches itself as
+/// processes 1…N−1 (<c>--cluster-child</c>); every process builds the identical circuit and
+/// calls StepAsync in lockstep — the cluster contract. `Recurse` is rejected in clustered
+/// circuits, so this act runs its own small pipeline.
 /// </summary>
 public static class ClusterAct
 {
@@ -30,10 +31,10 @@ public static class ClusterAct
         return (builder, orders, revenue);
     }
 
-    static CircuitOptions Options(int processIndex, string[] endpoints) => new()
+    static CircuitOptions Options(int processIndex, string[] endpoints, int workers) => new()
     {
         Name = $"showcase-cluster-p{processIndex}",
-        Workers = 2,
+        Workers = workers,
         AutoStep = false,                  // clustered circuits step explicitly, in lockstep
         ExchangeTimeout = TimeSpan.FromSeconds(30),
         Cluster = new ClusterOptions
@@ -68,8 +69,9 @@ public static class ClusterAct
         var index = int.Parse(arguments["--index"]);
         var endpoints = arguments["--endpoints"].Split(',');
         var resultPath = arguments["--result"];
+        var workers = int.Parse(arguments["--workers"]);
 
-        var (builder, _, revenueDef) = Declare(Options(index, endpoints));
+        var (builder, _, revenueDef) = Declare(Options(index, endpoints, workers));
         await using var circuit = builder.Build();
         circuit.Start();
         var revenue = circuit.Handle(revenueDef);
@@ -90,28 +92,38 @@ public static class ClusterAct
 
     // ── the parent (process 0): spawn, feed, lockstep, merge, verify ───────────
 
-    /// <summary>Runs the two-process verification and returns the report (the caller shows
-    /// it inside the cluster tab — no direct console writes).</summary>
-    public static async Task<ClusterView> RunParentAsync(NoticeLog notices, IncrementalMetrics metrics)
+    /// <summary>Runs the <paramref name="nodes"/>-process verification (this process is node
+    /// 0) and returns the report (the caller shows it inside the cluster tab — no direct
+    /// console writes).</summary>
+    public static async Task<ClusterView> RunParentAsync(NoticeLog notices, IncrementalMetrics metrics, int nodes, int workers)
     {
-        var endpoints = new[] { $"127.0.0.1:{FreePort()}", $"127.0.0.1:{FreePort()}" };
-        var resultPath = Path.Combine(Path.GetTempPath(), $"showcase-cluster-{Environment.ProcessId}.json");
+        if (nodes < 2)
+            throw new InvalidOperationException("the cluster act needs at least two nodes");
+        var endpoints = Enumerable.Range(0, nodes).Select(_ => $"127.0.0.1:{FreePort()}").ToArray();
+        var resultPaths = Enumerable.Range(1, nodes - 1)
+            .Select(i => Path.Combine(Path.GetTempPath(), $"showcase-cluster-{Environment.ProcessId}-p{i}.json"))
+            .ToArray();
 
-        var start = Child.Spawn(
-            ["--cluster-child", "--index", "1", "--endpoints", string.Join(',', endpoints), "--result", resultPath],
-            workers: 2);                   // the peer builds Options(1, …), which is Workers = 2
-        start.RedirectStandardOutput = true;
-        start.RedirectStandardError = true;
-        var child = Process.Start(start)
-            ?? throw new InvalidOperationException("failed to spawn the peer process");
+        var children = new List<Process>();
+        for (var i = 1; i < nodes; i++)
+        {
+            var start = Child.Spawn(
+                ["--cluster-child", "--index", i.ToString(), "--endpoints", string.Join(',', endpoints),
+                 "--result", resultPaths[i - 1], "--workers", workers.ToString()],
+                workers);
+            start.RedirectStandardOutput = true;
+            start.RedirectStandardError = true;
+            children.Add(Process.Start(start)
+                ?? throw new InvalidOperationException($"failed to spawn peer process {i}"));
+        }
 
         var localShard = new ZSet<KeyedValue<int, decimal>>();
-        List<ShardRow> remoteShard;
+        var remoteShards = new List<List<ShardRow>>();
         var orders = DemoOrders();
         var stepMicros = new double[Steps];
         try
         {
-            var (builder, ordersDef, revenueDef) = Declare(Options(0, endpoints));
+            var (builder, ordersDef, revenueDef) = Declare(Options(0, endpoints, workers));
             await using var circuit = builder.Build();
             circuit.Start();               // TCP mesh comes up here; peers retry until connected
             var input = circuit.Handle(ordersDef);
@@ -130,50 +142,60 @@ public static class ClusterAct
             await circuit.DisposeAsync();
             while (revenue.Reader.TryRead(out var batch)) localShard.AddAll(batch);
 
-            if (!child.WaitForExit(30_000))
+            for (var i = 0; i < children.Count; i++)
             {
-                child.Kill(entireProcessTree: true);
-                throw new TimeoutException("peer process did not exit within 30 s");
+                var child = children[i];
+                if (!child.WaitForExit(30_000))
+                {
+                    child.Kill(entireProcessTree: true);
+                    throw new TimeoutException($"peer process {i + 1} did not exit within 30 s");
+                }
+                if (child.ExitCode != 0)
+                    throw new InvalidOperationException(
+                        $"peer process {i + 1} exited {child.ExitCode}: {await child.StandardError.ReadToEndAsync()}");
+                remoteShards.Add(JsonSerializer.Deserialize<List<ShardRow>>(await File.ReadAllTextAsync(resultPaths[i]))!);
             }
-            if (child.ExitCode != 0)
-                throw new InvalidOperationException(
-                    $"peer process exited {child.ExitCode}: {await child.StandardError.ReadToEndAsync()}");
-            remoteShard = JsonSerializer.Deserialize<List<ShardRow>>(await File.ReadAllTextAsync(resultPath))!;
         }
         finally
         {
-            if (!child.HasExited) child.Kill(entireProcessTree: true);
-            if (File.Exists(resultPath)) File.Delete(resultPath);
+            foreach (var child in children)
+                if (!child.HasExited) child.Kill(entireProcessTree: true);
+            foreach (var path in resultPaths)
+                if (File.Exists(path)) File.Delete(path);
         }
 
         // Every exchange routed by StableHash, so each merchant's rows landed on exactly
-        // one global worker: the two shards are disjoint and their union is the answer.
+        // one global worker: the shards are pairwise disjoint and their union is the answer.
         var expected = orders.GroupBy(o => o.MerchantId)
             .ToDictionary(g => g.Key, g => g.Sum(o => o.Amount));
         var merged = new Dictionary<int, decimal>();
         var overlap = 0;
         foreach (var (entry, weight) in localShard)
             if (weight > 0) merged[entry.Key] = entry.Value;
-        foreach (var row in remoteShard.Where(r => r.Weight > 0))
-        {
-            if (merged.ContainsKey(row.MerchantId)) overlap++;
-            merged[row.MerchantId] = row.Revenue;
-        }
+        foreach (var shard in remoteShards)
+            foreach (var row in shard.Where(r => r.Weight > 0))
+            {
+                if (merged.ContainsKey(row.MerchantId)) overlap++;
+                merged[row.MerchantId] = row.Revenue;
+            }
         var correct = overlap == 0 && merged.Count == expected.Count &&
             expected.All(kv => merged.TryGetValue(kv.Key, out var v) && v == kv.Value);
 
         var localRows = localShard.Count(e => e.Weight > 0);
-        var remoteRows = remoteShard.Count(r => r.Weight > 0);
+        var remoteRows = remoteShards.Sum(shard => shard.Count(r => r.Weight > 0));
         metrics.Poll();
         notices.Push(correct ? NoticeLevel.Good : NoticeLevel.Bad, correct
-            ? "cluster: two-process TCP run verified against single-process reference"
+            ? $"cluster: {nodes}-process TCP run verified against single-process reference"
             : "cluster: verification FAILED");
-        return new ClusterView(
-            [
-                new ClusterProcessRow("p0 (this process, fed all orders)", "global 0–1", $"{localRows:N0}",
-                    $"{metrics.Counter("showcase-cluster-p0", "incremental.cluster.frames_sent"):N0}↑ / {metrics.Counter("showcase-cluster-p0", "incremental.cluster.frames_received"):N0}↓"),
-                new ClusterProcessRow("p1 (spawned peer)", "global 2–3", $"{remoteRows:N0}", "reported by peer"),
-            ],
+        string Range(int node) => workers == 1 ? $"global {node * workers}" : $"global {node * workers}–{(node + 1) * workers - 1}";
+        var rows = new List<ClusterProcessRow>
+        {
+            new("p0 (this process, fed all orders)", Range(0), $"{localRows:N0}",
+                $"{metrics.Counter("showcase-cluster-p0", "incremental.cluster.frames_sent"):N0}↑ / {metrics.Counter("showcase-cluster-p0", "incremental.cluster.frames_received"):N0}↓"),
+        };
+        for (var i = 1; i < nodes; i++)
+            rows.Add(new($"p{i} (spawned peer)", Range(i), $"{remoteShards[i - 1].Count(r => r.Weight > 0):N0}", "reported by peer"));
+        return new ClusterView([.. rows], nodes, workers,
             orders.Count, Steps, stepMicros.Average() / 1000, correct, localRows, remoteRows);
     }
 

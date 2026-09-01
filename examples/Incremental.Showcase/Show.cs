@@ -31,7 +31,8 @@ public sealed class Tab
 public record BeatState(string Id, string Label, bool Armed, string? Reason);
 public record HeaderState(
     int Tick, int Generation, string VirtualNow, string? Watermark, double? WatermarkBehind,
-    string Storage, int Workers, bool Running, string Circuit, double LastStepMicros, int LastEnrichedDelta);
+    string Storage, int Workers, int Nodes, ExchangeMode Exchange, string Build,
+    bool Running, string Circuit, double LastStepMicros, int LastEnrichedDelta);
 public record Snapshot(
     HeaderState Header, MeterSnapshot Meter, List<Notice> Notices,
     Act1View Act1, Act2View Act2, Act3View Act3,
@@ -53,7 +54,10 @@ public sealed class Show : IAsyncDisposable
 
     readonly IStorageProvider storage;
     readonly ILoggerFactory loggerFactory;
-    readonly bool withCluster;
+
+    /// <summary>The configuration this process is running: what the header shows and what
+    /// the browser's "apply" is diffed against.</summary>
+    public Topology Topology { get; }
 
     public NoticeLog Notices { get; }
     public IncrementalMetrics Metrics { get; }
@@ -68,7 +72,6 @@ public sealed class Show : IAsyncDisposable
     readonly Dictionary<string, Beat> beats = [];
     readonly Director director = new(DateTimeOffset.UtcNow);
     ShowcaseCircuit live;
-    readonly bool pointToPoint;
     int globalTick;
     int generation = 1;
     bool keyedInputsArmed = true;        // a crash-rebuild disarms keyed upserts (disclosed limitation)
@@ -76,18 +79,16 @@ public sealed class Show : IAsyncDisposable
     ScalingView? scaling;
     ClusterView? cluster;
 
-    public Show(IStorageProvider storage, string storageLabel, bool withCluster,
-        NoticeLog notices, IncrementalMetrics metrics, ILoggerFactory loggerFactory, int workers,
-        bool pointToPoint = false)
+    public Show(IStorageProvider storage, string storageLabel, Topology topology,
+        NoticeLog notices, IncrementalMetrics metrics, ILoggerFactory loggerFactory)
     {
         this.storage = storage;
         this.loggerFactory = loggerFactory;
-        this.withCluster = withCluster;
-        this.pointToPoint = pointToPoint;
+        Topology = topology;
         StorageLabel = storageLabel;
         Notices = notices;
         Metrics = metrics;
-        live = new ShowcaseCircuit("showcase", storage, loggerFactory, workers, pointToPoint);
+        live = new ShowcaseCircuit("showcase", storage, loggerFactory, topology.Workers, topology.Exchange);
         Tabs = BuildTabs();
     }
 
@@ -150,6 +151,13 @@ public sealed class Show : IAsyncDisposable
 
     public int CurrentWorkers => live.Workers;
 
+    public static string Build =>
+#if DEBUG
+        "Debug";
+#else
+        "Release";
+#endif
+
     public bool TryGetBeat(string id, out Beat beat) => beats.TryGetValue(id, out beat!);
 
     public Task FireAsync(Beat beat) => EnqueueAsync(async () =>
@@ -193,7 +201,8 @@ public sealed class Show : IAsyncDisposable
         var header = new HeaderState(
             globalTick, generation, director.VirtualNow.ToString("HH:mm:ss"),
             wm?.ToString("HH:mm:ss"), wm is null ? null : (director.VirtualNow - wm.Value).TotalSeconds,
-            StorageLabel, live.Workers, Running, live.Circuit.Name, live.LastStepMicros, live.LastEnrichedDelta);
+            StorageLabel, live.Workers, Topology.Nodes, Topology.Exchange, Build,
+            Running, live.Circuit.Name, live.LastStepMicros, live.LastEnrichedDelta);
 
         return new Snapshot(
             header, Metrics.Footer(live.Circuit.Name), Notices.Snapshot(),
@@ -297,7 +306,9 @@ public sealed class Show : IAsyncDisposable
         // The crash itself: every reference dropped, nothing disposed, nothing flushed.
         Notices.Push(NoticeLevel.Bad, "💥 crash: circuit abandoned without dispose — views and consumers died with it; rebuilding from the last committed checkpoint");
         generation++;
-        live = new ShowcaseCircuit($"showcase-g{generation}", storage, loggerFactory, pointToPoint: pointToPoint);
+        // The same topology as before the crash — a checkpoint restores into the worker
+        // count that wrote it.
+        live = new ShowcaseCircuit($"showcase-g{generation}", storage, loggerFactory, Topology.Workers, Topology.Exchange);
         var committed = new Dictionary<string, long?>
         {
             ["orders-web"] = live.Circuit.CommittedOffset("orders-web"),
@@ -338,8 +349,8 @@ public sealed class Show : IAsyncDisposable
     async Task MeasureBeat()
     {
         Running = false;         // the measurement must not compete with the live circuit
-        Notices.Push(NoticeLevel.Info, "measuring 1 / 2 / 4 workers, barrier and point-to-point, on this machine — traffic paused, the view holds for ~30 s");
-        scaling = await ScalingAct.MeasureAllAsync(live.Workers, live.PointToPoint);
+        Notices.Push(NoticeLevel.Info, "measuring 1 / 2 / 4 workers — barrier, point-to-point and streaming — on this machine; traffic paused, the view holds for ~40 s");
+        scaling = await ScalingAct.MeasureAllAsync(Topology);
         var best = scaling.Samples.MinBy(s => s.LatencyP50)!;
         var fastest = scaling.Samples.MaxBy(s => s.BulkRowsPerSec)!;
         Notices.Push(NoticeLevel.Good,
@@ -350,8 +361,9 @@ public sealed class Show : IAsyncDisposable
 
     async Task ClusterBeat()
     {
-        Notices.Push(NoticeLevel.Info, "spawning the peer process — TCP mesh, lockstep steps; the view freezes for a few seconds");
-        cluster = await ClusterAct.RunParentAsync(Notices, Metrics);
+        Notices.Push(NoticeLevel.Info,
+            $"spawning {Topology.Nodes - 1} peer process{(Topology.Nodes == 2 ? "" : "es")} — TCP mesh, lockstep steps; the view freezes for a few seconds");
+        cluster = await ClusterAct.RunParentAsync(Notices, Metrics, Topology.Nodes, Topology.Workers);
     }
 
     static bool SnapshotsEqual(Dictionary<string, FeeStats> a, Dictionary<string, FeeStats> b) =>
@@ -388,8 +400,13 @@ public sealed class Show : IAsyncDisposable
             Unavailable = () => director.Edges.ContainsKey((23, 31)) ? null : "add the bridge first",
         });
         Add(new Beat { Id = "crash", Label = "kill -9 the circuit and rebuild from the checkpoint", Fire = CrashBeat });
-        Add(new Beat { Id = "measure", Label = "measure 1 / 2 / 4 workers on this machine (~20 s)", Fire = MeasureBeat });
-        Add(new Beat { Id = "cluster", Label = "spawn a second OS process and verify the shards", Fire = ClusterBeat });
+        Add(new Beat { Id = "measure", Label = "measure 1 / 2 / 4 workers × barrier / point-to-point / streaming on this machine (~40 s)", Fire = MeasureBeat });
+        Add(new Beat
+        {
+            Id = "cluster",
+            Label = $"run {Topology.Nodes} OS processes × {Topology.Workers} workers over TCP and verify the shards",
+            Fire = ClusterBeat,
+        });
 
         return
         [
@@ -509,9 +526,11 @@ public sealed class Show : IAsyncDisposable
             {
                 Id = "cluster", Title = "scaling out",
                 Explainer = """
-                    One declaration, three places to put the work: more threads in this process, or
-                    more processes. Both are one CircuitOptions change — the pipeline code never
-                    mentions either.
+                    One declaration, three knobs: threads in this process, processes, and how the
+                    exchanges between workers synchronize. All three are CircuitOptions — the
+                    pipeline code never mentions any of them. The card on the right shows the
+                    configuration this process is running; compose another one and apply it, and
+                    the showcase relaunches into it in one go.
 
                     Threads first, because sharding is not free. Above one worker every GroupBy
                     inserts an exchange, and an exchange costs a hash, a per-worker queue and a
@@ -520,22 +539,29 @@ public sealed class Show : IAsyncDisposable
                     most of the step, so one worker has the lowest latency; feed the same pipeline a
                     bulk batch and the exchange is what lets the extra workers earn their keep. The
                     trigger measures both on this machine at 1, 2 and 4 workers rather than asking
-                    you to take the claim on trust. Pick a topology below and the showcase
-                    relaunches itself into it — the page reconnects on its own, and the relaunch
-                    is what gets the GC heap count sized to the new worker count. The rows
-                    measured in one process all share this process's heap count, so treat them as
-                    comparing exchange cost, not as tuned per-topology throughput.
+                    you to take the claim on trust — in all three exchange modes. Barrier rows
+                    rendezvous every worker at every exchange; point-to-point rows wait only for the
+                    publications they are about to read; streaming rows also publish partial deltas
+                    in fragments through fused linear chains, so downstream work overlaps upstream
+                    tails (both experimental). The relaunch is what gets the GC heap count sized to
+                    the new worker count; the rows measured in one process all share this
+                    process's heap count, so treat them as comparing exchange cost, not as tuned
+                    per-topology throughput.
 
-                    Processes second. `--cluster` respawns this binary as a peer; both processes
-                    build the identical circuit and only CircuitOptions.Cluster tells each its
-                    place. Exchanges then hash-partition by StableHash across all 2×2 global workers
-                    and ship remote shards over TCP (unauthenticated cleartext — loopback only
-                    here), with steps in lockstep on both. Recurse is rejected in clustered
-                    circuits, so that run uses its own small revenue pipeline.
+                    Processes second. Nodes above one respawn this binary as peers; every process
+                    builds the identical circuit and only CircuitOptions.Cluster tells each its
+                    place. Exchanges then hash-partition by StableHash across all nodes × workers
+                    global workers and ship remote shards over TCP (unauthenticated cleartext —
+                    loopback only here), with steps in lockstep everywhere. The cluster shuffle is
+                    barrier-based whatever exchange mode the live pipeline runs, and Recurse is
+                    rejected in clustered circuits, so that run uses its own small revenue pipeline.
                     """,
                 Code = """
                     // threads: the only change is a number. No pipeline code moves.
                     new CircuitOptions { Workers = 4 };
+
+                    // exchange mode: how those workers synchronize (both experimental).
+                    new CircuitOptions { Workers = 4, PointToPointExchange = true, FragmentStreaming = true };
 
                     // processes: same declaration on every peer, each told its own index.
                     new CircuitOptions {
@@ -543,7 +569,7 @@ public sealed class Show : IAsyncDisposable
                         Cluster = new ClusterOptions { Transport = new TcpExchangeTransport(index, endpoints) },
                     };
                     """,
-                Beats = withCluster ? ["measure", "cluster"] : ["measure"],
+                Beats = Topology.Nodes > 1 ? ["measure", "cluster"] : ["measure"],
             },
         ];
     }
