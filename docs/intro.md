@@ -107,7 +107,7 @@ ZStream<T>                                   deltas of T
            WindowedGroupedZStream<TKey, T>                     aggregates only
               ▼
            aggregate result: WindowedZStream<TKey, TValue>     rows (WindowStart, WindowEnd, Key, Value)
-              │  Select over values · Where · GroupBy (window-sticky)
+              │  MapValues · Where · GroupBy (window-sticky)
               │  TopK (ranks within each window) · OnClose()
               │  Rows()  ← explicit exit: flatten to a plain ZStream, dropping window semantics
               ▼
@@ -142,8 +142,8 @@ Deliberate narrowness, and why:
   session boundaries are inherently per-key.
 
 Method naming follows LINQ where the semantics genuinely match (`Select`, `Where`,
-`SelectMany`, `GroupBy`, `Distinct`) — this is the dialect .NET developers already speak, and
-since `ZStream` is not an `IEnumerable`, none of LINQ's own operators apply to it: the
+`SelectMany`, `GroupBy`, `Distinct`): it is the dialect .NET developers already speak, and
+because `ZStream` is not an `IEnumerable`, none of LINQ's own operators apply to it — the
 familiar names bind unambiguously to Incremental's operators. Operations with no LINQ
 analogue keep their own names (`WithEventTime`, `TumblingWindow`, `TopK`, `AntiJoin`); where
 LINQ semantics would mislead, the LINQ name is deliberately avoided (z-set subtraction is
@@ -161,8 +161,8 @@ consequences for the types you flow through a circuit:
   `GetHashCode`). A mutable class with reference equality silently breaks everything: weights
   never cancel, state grows without bound, and "corrections" become duplications.
 - **Weight zero means gone.** A fully-retracted row vanishes from results; it does not appear
-  with a zero. Correspondingly, `Count()` never emits 0 for an emptied group — the row for
-  that group is retracted instead.
+  with a zero. So `Count()` never emits 0 for an emptied group — the row for that group is
+  retracted instead.
 - **Durable state round-trips through serialization.** With a persistent storage provider
   (Redis today), every stateful operator's records are serialized (`System.Text.Json` by
   default): no cycles, serializable members, and a shape you keep stable across deployments —
@@ -228,17 +228,17 @@ Joins live on groupings that share a key:
 var trades      = builder.KeyedInput<long, Trade>("trades", t => t.Id);
 var instruments = builder.KeyedInput<int, Instrument>("instruments", i => i.Id);
 
-var enriched = trades.Values()
+var enriched = trades
     .GroupBy(t => t.InstrumentId)
-    .Join(instruments.Values().GroupBy(i => i.Id),
-          (trade, instrument) => new EnrichedTrade(trade, instrument.Symbol, instrument.Currency));
+    .Join(instruments.GroupBy(i => i.Id),
+          (_, trade, instrument) => new EnrichedTrade(trade, instrument.Symbol, instrument.Currency));
 ```
 
 `Join` is an incremental equi-join: when either side changes, only affected pairs are
-re-emitted. Reference data is not a special case — it is just another stream, and a
-`LeftJoin`/`FullJoin`/`AntiJoin` cover the outer and negative cases. When an instrument row
-is *upserted*, the old enriched rows are retracted and new ones asserted automatically —
-historical results re-attribute themselves.
+re-emitted. The result selector receives the shared key first. Reference data is not a
+special case — it is just another stream — and `LeftJoin`/`FullJoin`/`AntiJoin` cover the
+outer and negative cases. When an instrument row is *upserted*, the old enriched rows are
+retracted and new ones asserted automatically — historical results re-attribute themselves.
 
 > **TODO:** windowed / interval joins (stream-stream within a time bound) — not yet designed;
 > today this is manual via the escape hatches.
@@ -307,15 +307,16 @@ When you want a live table in memory, opt in — the name says what you are buyi
 ```csharp
 using var view = output.MaterializeInMemory();   // holds the integrated result in memory
 foreach (var entry in view.Current())            // consistent snapshot, on demand
-    Console.WriteLine($"{entry.Row} ×{entry.Weight}");
+    Console.WriteLine($"{entry.Value} ×{entry.Weight}");
 ```
 
 `MaterializeInMemory` is that output's single consumer, and it needs a table-shaped output —
-the automatic resync is what makes it correct across restarts and mid-run attachment. It keeps the fully integrated result set on the heap for the
-lifetime of the view — O(live rows) memory: fine for windowed/evicted results and small
-dimensions, a deliberate decision for anything with an unbounded keyspace. `Current()` is
-taken on demand — nothing re-emits the full result per update — and yields each row once with
-its `Weight` rather than duplicating multi-weight rows.
+the automatic resync is what makes it correct across restarts and mid-run attachment. It
+keeps the fully integrated result set on the heap for the lifetime of the view — O(live
+rows) memory: fine for windowed/evicted results and small dimensions, a deliberate decision
+for anything with an unbounded keyspace. `Current()` is taken on demand — nothing re-emits
+the full result per update — and yields each row once with its `Weight` rather than
+duplicating multi-weight rows.
 
 > **TODO:** point-lookup views (query a key's current value without materializing the whole
 > result) — design pending.
@@ -344,10 +345,9 @@ channel and blocks disposal.
 
 State lives in a pluggable storage provider (in-memory or Redis today). Checkpoints commit
 operator state and input offsets atomically, so a restarted circuit resumes where it left
-off; table-shaped output consumers re-sync automatically (their first batch is the current
-state). If you rename or restructure a
-circuit, pin operator identity with `.Named("…")` on the stages that carry state you want to
-survive the change.
+off; table-shaped output consumers resync automatically (their first batch is the current
+state). If you rename or restructure a circuit, pin operator identity with `.Named("…")` on
+the stages that carry state you want to survive the change.
 
 ### Running it fast
 
@@ -408,7 +408,7 @@ for the cases the paved road doesn't cover:
 
 - **Window-as-data**: windows are just records — `SelectMany` an event into
   `Windowed<T>` values and `GroupBy` a composite key manually when you need non-standard
-  window shapes. You then own eviction:
+  window shapes. You then own eviction, via the next item.
 - **`EvictWhen(key => closesAt)`** on any grouping: declare when a key's state can be
   dropped, for keyed state with a lifecycle that isn't window-derived.
 - **`GroupBy(selector, stableHash: …)`**: custom routing hash for exotic key types.
@@ -452,7 +452,7 @@ considered and rejected: TPL Dataflow owns that word in .NET).
 | `circuit.Input<T>(name)` string lookup | `circuit.Handle(def)` |
 | `OutputHandle.ReadAllAsync()` | `OutputHandle.Changes()` (single consumer, enforced) |
 | hand-rolled integration loops | `MaterializeInMemory()` (opt-in, cost in the name) |
-| `MapValues` / `Values` | kept on keyed/windowed results (`Select` overloads where unambiguous) |
+| `MapValues` / `Values` | kept on keyed/windowed results |
 
 Implementation notes (not consumer-facing):
 

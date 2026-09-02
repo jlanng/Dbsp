@@ -21,7 +21,7 @@ namespace Incremental;
 /// their public readable properties and fields (compiled once per type). Equal values hash
 /// equally as long as equality agrees with the public structure; a type with custom
 /// equality semantics (say, case-insensitive keys) needs a caller-supplied hash instead —
-/// see the <c>IndexBy</c>/<c>Distinct</c> overloads taking a <c>stableHash</c> delegate.
+/// see the <c>GroupBy</c>/<c>Distinct</c> overloads taking a <c>stableHash</c> delegate.
 /// Unsupported types are rejected when the circuit is defined, never mid-step.
 /// </summary>
 public static class StableHash

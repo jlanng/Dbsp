@@ -5,7 +5,7 @@ namespace Incremental.Torture;
 /// <summary>
 /// Per-thread CPU accounting straight from <c>/proc/self/task</c>. The circuit names its
 /// worker threads <c>circuit-worker-N</c>, so "how saturated are the workers?" — the question
-/// the ramp is looking for — is answerable without instrumenting the step path at all:
+/// a worker-count sweep asks — is answerable without instrumenting the step path at all:
 /// utime+stime of exactly those threads, over wall time, over the worker count.
 /// </summary>
 internal static class ThreadCpu

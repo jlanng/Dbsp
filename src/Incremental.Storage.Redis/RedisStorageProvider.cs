@@ -14,6 +14,9 @@ public sealed class RedisStorageOptions
     /// <summary>Redis database number, or -1 for the connection default.</summary>
     public int Database { get; init; } = -1;
 
+    /// <summary>Serializes keys and values into the Redis hashes. This is a persisted format —
+    /// what one run writes, the next run reads back — so it must stay stable across versions;
+    /// the default is JSON.</summary>
     public IStateSerializer Serializer { get; init; } = JsonStateSerializer.Instance;
 }
 
@@ -33,9 +36,9 @@ public sealed class RedisStorageOptions
 ///   manifest           {prefix}:manifest           hash: scope (process) → committed state manifest
 ///
 /// Store names already encode the node and worker id, so concurrent workers never share a
-/// store. The batch operations still cost one pipelined round trip per wave (HMGET/HGETALL
-/// for the committed values the overlay doesn't hold); overlays are dropped once committed,
-/// so memory is bounded by the state touched between checkpoints.
+/// store. Each batch operation costs at most one pipelined round trip (HMGET/HGETALL for the
+/// committed values the overlay does not hold); overlays are dropped once committed, so
+/// memory is bounded by the state touched between checkpoints.
 /// </summary>
 public sealed class RedisStorageProvider : ICheckpointStorageProvider
 {
@@ -112,7 +115,9 @@ public sealed class RedisStorageProvider : ICheckpointStorageProvider
             // MULTI/EXEC: the commands travel as one unit and Redis applies them on EXEC,
             // so a crash anywhere before that leaves the previous checkpoint fully intact.
             if (!transaction.Execute())
-                throw new InvalidOperationException("The checkpoint commit transaction was rejected by Redis.");
+                throw new InvalidOperationException(
+                    "The checkpoint commit transaction was rejected by Redis; nothing was applied, " +
+                    "so the previous checkpoint is intact.");
 
             // EXEC does not roll back on per-command errors (e.g. WRONGTYPE against a
             // colliding key), so a true Execute() is not enough: every queued command must
@@ -156,7 +161,7 @@ public sealed class RedisStorageProvider : ICheckpointStorageProvider
         {
             if (_stores.TryGetValue(name, out var existing))
                 return existing as TStore
-                    ?? throw new InvalidOperationException($"Store '{name}' was already created with a different shape.");
+                    ?? throw new InvalidOperationException($"Store '{name}' was already created with different key/value types.");
             var store = factory();
             _stores[name] = store;
             return store;

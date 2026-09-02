@@ -6,12 +6,12 @@ namespace Incremental.Cluster;
 /// <summary>
 /// A compiled dense binary codec for the values an exchange ships between processes.
 ///
-/// The cross-process shuffle used to encode shards as JSON text and then UTF-8 it, which cost
+/// The cross-process shuffle once encoded shards as JSON text and then UTF-8'd it, which cost
 /// two large intermediates per frame (the string and the bytes) on top of the format's own
 /// verbosity — at a few hundred kilobytes a frame that is large-object-heap traffic on every
-/// step, and the collector, not the shuffle, ends up being the expensive part of clustering.
-/// This writes the values straight into a reused byte buffer: field values in a fixed order,
-/// no names, LEB128 integers.
+/// step, and the collector, not the shuffle, becomes the expensive part of clustering. This
+/// writes the values straight into a reused byte buffer: field values in a fixed order, no
+/// names, LEB128 integers.
 ///
 /// The codec is built once per type from the same structural rules
 /// <see cref="StableHash"/> uses — public readable properties and fields, ordered by name, so
@@ -22,7 +22,7 @@ namespace Incremental.Cluster;
 /// </summary>
 internal static class WireCodec<T>
 {
-    /// <summary>Null when <typeparamref name="T"/> has no dense encoding (JSON fallback).</summary>
+    /// <summary>Both null when <typeparamref name="T"/> has no dense encoding (JSON fallback).</summary>
     internal static readonly Action<WireWriter, T>? Write;
     internal static readonly Func<WireReader, T>? Read;
 
@@ -43,8 +43,9 @@ internal static class WireCodec<T>
 
 internal static class WireCodec
 {
-    /// <summary>Bumped whenever the encoding of any supported type changes. Frames carry it,
-    /// so a mismatched peer fails loudly instead of decoding garbage.</summary>
+    /// <summary>Bumped whenever the encoding of any supported type changes. It is the first
+    /// byte of every dense frame (a JSON fallback frame starts with 0 instead), so a
+    /// mismatched peer fails loudly instead of decoding garbage.</summary>
     internal const byte FormatVersion = 1;
 
     // ---- entry points used by compiled composites ---------------------------------------

@@ -215,7 +215,7 @@ public class WindowCloseTests
         await input.InsertAsync(("home", T0.AddSeconds(12)));
         await circuit.StepAsync(); // watermark still T0+1s: open
         await input.InsertAsync(("home", T0.AddSeconds(13)));
-        await circuit.StepAsync(); // watermark T0+12s: closes T0 and T0+5s? no data in T0+5s — only T0
+        await circuit.StepAsync(); // watermark T0+12s: closes T0 only — T0+5s never saw data
 
         var integrated = new ZSet<KeyedValue<DateTimeOffset, DateTimeOffset>>();
         while (output.Reader.TryRead(out var delta))

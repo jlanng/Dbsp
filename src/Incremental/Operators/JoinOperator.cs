@@ -7,7 +7,7 @@ namespace Incremental.Operators;
 /// Δ(L ⋈ R) = ΔL ⋈ R + L ⋈ ΔR + ΔL ⋈ ΔR: each side keeps its integrated state in an
 /// indexed store, and each step only probes the state with the new deltas — no
 /// recomputation over historical data. Both inputs must be co-partitioned by key, which
-/// <c>IndexBy</c> guarantees via its exchange.
+/// <c>GroupBy</c> guarantees via its exchange.
 /// <para>
 /// Bilinearity is also what makes this a fragment sink: applying a fragment of either
 /// side's delta means probing the other side's <em>current</em> state and then integrating

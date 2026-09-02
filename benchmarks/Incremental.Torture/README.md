@@ -18,14 +18,15 @@ dotnet run -c Release --project benchmarks/Incremental.Torture -- --workers 4 --
 | `--streaming` | fragment streaming on the exchanges (implies `--p2p`; see docs/design/fragment-streaming.md) |
 | `--spin-budget N` | point-to-point waits spin N iterations before parking (`CircuitOptions.ExchangeSpinBudget`); `parks/step` on the phase-stats line shows how often they park |
 | `--processes N` | cluster mode: N co-hosted processes stepped in lockstep, which puts the exchange wire format on the measured path |
-| `--batch`, `--live-orders`, `--workers`, `--customers`, `--merchants`, `--json` | see `Options.cs` |
+| `--seconds N`, `--warmup N` | measured window and warm-up, in seconds (defaults 20 and 5) |
+| `--workers`, `--batch`, `--input-capacity`, `--live-orders`, `--orders-per-vsec`, `--customers`, `--merchants`, `--categories`, `--fee-tiers`, `--regions`, `--rings`, `--seed`, `--json` | see `Options.cs` |
 
 ## What it does
 
 Master data is seeded once. Order traffic is then a **sliding population**: inserting order
 _N_ retracts order _N−LiveOrders_, so operator state settles at a fixed size instead of
-growing for as long as the run lasts. That is what makes a long run measurable — throughput
-is not confounded by dictionaries that keep getting bigger — and it exercises the
+growing for the length of the run. That is what makes a long run measurable — throughput is
+not confounded by dictionaries that keep getting bigger — and it exercises the
 negative-weight paths on every step, which a pure-insert benchmark never touches.
 
 Each order carries an insert, a retraction, and up to two payment rows, so the record rate
@@ -102,13 +103,13 @@ every second, 21 in a 20 s window. Setting the heap count to the worker count an
 DATAS off takes this workload from **16.6 us to 11.6 us of CPU per record** at the cost of a
 larger working set (2.2 GB to 2.6 GB).
 
-Even then a background gen2 fires every ~1.5 s, and every one of them is `AllocLarge`-
-triggered: at ~17 k records per step the output Z-sets' dictionary backing arrays pass the
-default 85 KB large-object threshold, and that LOH churn keeps exhausting the gen2 budget —
-each collection re-marking a ~2.5 GB live set that barely changed. Raising the threshold
-so those arrays are ordinary gen0 garbage removes almost all of it (13 gen2s in the window
-becomes 2, BGC-thread CPU 5.9 s becomes 0.9 s) and takes the workload from **11.6 us to
-10.5 us of CPU per record**, GC's share from 2.4 us to 1.6 us:
+Even then a background gen2 fires every ~1.5 s, and every one of them is
+`AllocLarge`-triggered: at ~17 k records per step the output Z-sets' dictionary backing
+arrays pass the default 85 KB large-object threshold, and that LOH churn keeps exhausting
+the gen2 budget — each collection re-marking a ~2.5 GB live set that barely changed.
+Raising the threshold so those arrays are ordinary gen0 garbage removes almost all of it
+(13 gen2s in the window becomes 2, BGC-thread CPU 5.9 s becomes 0.9 s) and takes the
+workload from **11.6 us to 10.5 us of CPU per record**, GC's share from 2.4 us to 1.6 us:
 
 ```sh
 DOTNET_GCLOHThreshold=100000     # hexadecimal, like all DOTNET_GC* variables: 1 MB
@@ -136,9 +137,9 @@ The LOH findings above led to removing the churn at its source: every operator n
 its output Z-set from a double-buffered `OutputBuffer` instead of allocating one per step
 (safe because output ports copy and nothing retains a delta past one more execution of its
 producer — the argument is in `OutputBuffer.cs`). The delta-sized dictionary arrays were
-~60% of every record's allocation, so this cut **2,544 B/record to ~970 B/record**, and
-what's left is mostly the pipeline's own projection rows plus input batches and store
-growth. The tuned configuration now measures 11.2 us of CPU per record with GC at 1.3 us
+~60% of every record's allocation, so this cut **2,544 B/record to ~970 B/record**; what
+remains is mostly the pipeline's own projection rows plus input batches and store growth.
+The tuned configuration now measures 11.2 us of CPU per record with GC at 1.3 us
 **without** the LOH threshold — the setting stays worthwhile as belt-and-braces for input
 batches and store growth, but the library no longer depends on any host GC configuration
 to avoid the LOH-triggered gen2 pathology. The configuration a library cannot ask of its

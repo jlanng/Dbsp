@@ -16,7 +16,7 @@ public interface IAggregateFunction<TValue, out TResult> where TValue : notnull
 /// <summary>Built-in aggregate functions for <see cref="GroupedZStream{TKey,TValue}.Aggregate{TResult}"/>.</summary>
 public static class Aggregates
 {
-    /// <summary>Number of rows in the group (sum of weights — duplicates count).</summary>
+    /// <summary>Number of rows in the group: the sum of weights, so duplicates count.</summary>
     public static IAggregateFunction<TValue, long> Count<TValue>() where TValue : notnull =>
         new DelegateAggregate<TValue, long>(group =>
         {
@@ -37,6 +37,9 @@ public static class Aggregates
             return count;
         });
 
+    /// <summary>Sum of <paramref name="selector"/> over the group, each value weighted by
+    /// its multiplicity. Prefer <see cref="LinearAggregates.Sum{TValue,TNumber}"/>, which
+    /// needs no group state.</summary>
     public static IAggregateFunction<TValue, TNumber> Sum<TValue, TNumber>(Func<TValue, TNumber> selector)
         where TValue : notnull
         where TNumber : INumber<TNumber> =>
@@ -48,13 +51,15 @@ public static class Aggregates
             return sum;
         });
 
-    /// <summary>MIN by full-group recompute. <see cref="GroupedZStream{TKey,TValue}.Min{TProjected}"/>
-    /// uses the tournament-tree operator instead; this exists for use with <c>Aggregate</c>.</summary>
+    /// <summary>MIN by full-group recompute, for use with <c>Aggregate</c>.
+    /// <see cref="GroupedZStream{TKey,TValue}.Min{TProjected}"/> maintains it incrementally
+    /// with a tournament tree instead.</summary>
     public static IAggregateFunction<TValue, TProjected> Min<TValue, TProjected>(Func<TValue, TProjected> selector)
         where TValue : notnull
         where TProjected : notnull =>
         new ExtremumAggregate<TValue, TProjected>(selector, sign: -1);
 
+    /// <summary>MAX by full-group recompute, for use with <c>Aggregate</c>; see <see cref="Min{TValue,TProjected}"/>.</summary>
     public static IAggregateFunction<TValue, TProjected> Max<TValue, TProjected>(Func<TValue, TProjected> selector)
         where TValue : notnull
         where TProjected : notnull =>
@@ -105,7 +110,7 @@ public static class Aggregates
             return found
                 ? best
                 : throw new InvalidOperationException(
-                    "MIN/MAX over a group with no positively-weighted values; the input stream is not a well-formed multiset.");
+                    "MIN/MAX over a group with no positively weighted values: the input stream is not a well-formed multiset (more retractions than insertions for some value).");
         }
     }
 }

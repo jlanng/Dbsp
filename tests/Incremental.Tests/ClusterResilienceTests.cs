@@ -5,7 +5,7 @@ using Incremental.Cluster;
 namespace Incremental.Tests;
 
 /// <summary>
-/// The fault-instead-of-hang guarantees added for production clusters: a stuck (not dead)
+/// The fault-instead-of-hang guarantees for clusters: a stuck (not dead)
 /// peer trips <see cref="CircuitOptions.ExchangeTimeout"/> and faults the circuit with a
 /// descriptive error; a merely slow peer under the timeout still completes; oversized
 /// frames are rejected before allocation; and barrier waiters that outlive the spin budget

@@ -1,9 +1,10 @@
 # Timely dataflow as a general answer to exchange synchronization
 
-Research note, August 2026. Written against primary sources (cited per claim) to answer:
-how does Timely Dataflow (Naiad) achieve general non-blocking parallel execution, and
-what would Incremental — a DBSP-style step-synchronous engine — need to adopt to escape
-the BSP recurrence we measured (every all-to-all exchange waits on the slowest producer)?
+Research note, August 2026, written against primary sources (cited per claim) to answer
+two questions: how does Timely Dataflow (Naiad) achieve general non-blocking parallel
+execution, and what would Incremental — a DBSP-style step-synchronous engine — need to
+adopt to escape the BSP recurrence we measured (every all-to-all exchange waits on the
+slowest producer)?
 
 Context this note assumes (measured on this repo, Aug 2026): on the full showcase
 pipeline, 42–57% of aggregate worker-step time at 4–8 workers is exchange wait, and the
@@ -151,7 +152,7 @@ instructive what each system actually does:
 - **Naiad**: stop-the-world. "All processes first pause worker and message delivery
   threads, flush message queues … and finally invoke Checkpoint on each stateful
   vertex"; recovery reverts "all live processes … to the last durable checkpoint"
-  [Naiad §3.4]. I.e. the flagship asynchronous system checkpoints by *reimposing a
+  [Naiad §3.4]. That is, the flagship asynchronous system checkpoints by *reimposing a
   global barrier* and draining in-flight work.
 - **Falkirk Wheel**: fixes exactly that, by assigning "a logical time to each event such
   as a message delivery" and doing selective logical-time rollback — an order of

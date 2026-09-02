@@ -198,7 +198,7 @@ public sealed class Show : IAsyncDisposable
     string? Blocked(Beat beat) =>
         beat.Once && beat.Fired ? "already fired — this one only happens once"
         : beat.NeedsKeyedInputs && !keyedInputsArmed
-            ? "disarmed by the crash: the producer-side upsert map is not persisted, so re-feeding reference data would double-count (disclosed roadmap item)"
+            ? "disarmed by the crash: the producer-side upsert map is not persisted, so re-feeding reference data would double-count (roadmap item)"
         : beat.Unavailable?.Invoke();
 
     async Task TrafficTickAsync()
@@ -209,8 +209,8 @@ public sealed class Show : IAsyncDisposable
         globalTick++;
     }
 
-    // Ring accounts keep spending so their flagged exposure stays live. The TUI ran this
-    // only on the graph tab; with several browsers on different tabs it just always runs.
+    // Ring accounts keep spending so their flagged exposure stays live. An earlier TUI ran
+    // this only on the graph tab; with several browsers on different tabs it always runs.
     static readonly int[] RingAccounts = [.. Director.RingA, .. Director.RingB];
     async Task RingTrafficTickAsync()
     {
@@ -372,7 +372,7 @@ public sealed class Show : IAsyncDisposable
         Notices.Push(recovered ? NoticeLevel.Good : NoticeLevel.Bad, recovered
             ? "recovered exactly-once: state + offsets from the checkpoint, replay deduplicated, consumers bootstrapped"
             : "recovery verification FAILED");
-        Notices.Push(NoticeLevel.Info, "keyed upsert triggers disarmed: the producer-side upsert map is not persisted (disclosed roadmap item) — re-feeding or amending reference data would double-count");
+        Notices.Push(NoticeLevel.Info, "keyed upsert triggers disarmed: the producer-side upsert map is not persisted (roadmap item) — re-feeding or amending reference data would double-count");
     }
 
     async Task MeasureBeat()
@@ -443,7 +443,7 @@ public sealed class Show : IAsyncDisposable
             {
                 Id = "living", Title = "living data",
                 Explainer = """
-                    Orders stream in on two channels (web ⌒ mobile); merchants, customers and the fee
+                    Orders stream in on two channels (web + mobile); merchants, customers and the fee
                     schedule are keyed upsert inputs. Everything below is a join or an aggregate over
                     the same enriched stream. Master data can be wrong — the busiest merchant was
                     onboarded under the wrong category — and fixing it is one upsert: every historical
@@ -513,9 +513,9 @@ public sealed class Show : IAsyncDisposable
                     package or task dependency resolution, ancestry and reachability, "who can see
                     this document" through nested groups. What is unusual is that it stays
                     incremental: the fixed point is maintained under deltas, so evidence can arrive
-                    and — the hard half — be withdrawn. Link ring A, link ring B, bridge them into one six-account
-                    ring, then withdraw the bridge — one DeleteAsync unwinds every derived row that
-                    depended on it, in well-founded order, including orders flagged long ago.
+                    and — the hard half — be withdrawn. Link ring A, link ring B, bridge them into one
+                    six-account ring, then withdraw the bridge — one DeleteAsync unwinds every derived
+                    row that depended on it, in well-founded order, including orders flagged long ago.
                     Recursive derivations that cannot retract are usually recomputed from scratch;
                     this one is not.
                     """,
@@ -557,9 +557,9 @@ public sealed class Show : IAsyncDisposable
                 Explainer = """
                     One declaration, three knobs: threads in this process, processes, and how the
                     exchanges between workers synchronize. All three are CircuitOptions — the
-                    pipeline code never mentions any of them. The card on the right shows the
-                    configuration this process is running; compose another one and apply it, and
-                    the showcase relaunches into it in one go.
+                    pipeline code never mentions any of them. The running-configuration card shows
+                    what this process is running; compose another one and apply it, and the
+                    showcase relaunches into it in one go.
 
                     Threads first, because sharding is not free. Above one worker every GroupBy
                     inserts an exchange, and an exchange costs a hash, a per-worker queue and a
@@ -567,19 +567,19 @@ public sealed class Show : IAsyncDisposable
                     the showcase's live batch size — a handful of orders a tick — that overhead is
                     most of the step, so one worker has the lowest latency; feed the same pipeline a
                     bulk batch and the exchange is what lets the extra workers earn their keep. The
-                    trigger measures both on this machine at 1, 2 and 4 workers rather than asking
-                    you to take the claim on trust — in all three exchange modes. Barrier rows
+                    trigger measures both on this machine, at 1, 2 and 4 workers in all three
+                    exchange modes, rather than asking you to take the claim on trust. Barrier rows
                     rendezvous every worker at every exchange; point-to-point rows wait only for the
                     publications they are about to read; streaming rows also publish partial deltas
                     in fragments through fused linear chains, so downstream work overlaps upstream
-                    tails (both experimental). The relaunch is what gets the GC heap count sized to
-                    the new worker count; the rows measured in one process all share this
-                    process's heap count, so treat them as comparing exchange cost, not as tuned
-                    per-topology throughput.
+                    tails (point-to-point and streaming are both experimental). The relaunch is
+                    what gets the GC heap count sized to the new worker count; the rows measured
+                    in one process all share this process's heap count, so treat them as comparing
+                    exchange cost, not as tuned per-topology throughput.
 
                     Processes second. Nodes above one respawn this binary as peers; every process
                     builds the identical circuit and only CircuitOptions.Cluster tells each its
-                    place. Exchanges then hash-partition by StableHash across all nodes × workers
+                    place. Exchanges then hash-partition by StableHash across the nodes × workers
                     global workers and ship remote shards over TCP (unauthenticated cleartext —
                     loopback only here), with steps in lockstep everywhere. The cluster shuffle is
                     barrier-based whatever exchange mode the live pipeline runs, and Recurse is

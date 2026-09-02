@@ -9,12 +9,13 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
 - Examples: `dotnet run --project examples/Incremental.Example`,
   `dotnet run --project examples/Incremental.LogAnalytics [-- --redis]`
 - Showcase (the all-features demo): `dotnet run --project examples/Incremental.Showcase`
-  serves a web app on http://localhost:5170 (`--port`, `--no-open`, `--redis`, `--workers N`,
-  `--nodes N`, `--exchange barrier|p2p|streaming`; `--cluster` and `--p2p` are aliases for
-  `--nodes 2` / `--exchange p2p`); `-- --headless` runs every tab unattended and exits
-  non-zero if a verified act fails — that is the smoke test. Web-only: `Microsoft.NET.Sdk.Web` costs no NuGet
-  packages. Tab 5 measures worker-count scaling and can relaunch the process into another
-  topology; run it `-c Release` if the throughput column is the point (Debug flattens it).
+  serves a web app on http://localhost:5170. Flags: `--port`, `--no-open`, `--redis`,
+  `--workers N`, `--nodes N`, `--exchange barrier|p2p|streaming` (`--cluster`, `--p2p` and
+  `--streaming` are aliases for `--nodes 2`, `--exchange p2p` and `--exchange streaming`).
+  `-- --headless` runs every tab unattended and exits non-zero if a verified act fails —
+  that is the smoke test. `Microsoft.NET.Sdk.Web` alone; no NuGet packages needed. Tab 5
+  measures worker-count scaling and can relaunch the process into another topology; run it
+  `-c Release` if the throughput column is the point (Debug flattens it).
 - Benchmarks: `dotnet run -c Release --project benchmarks/Incremental.Benchmarks -- --filter '*'`
   (BenchmarkDotNet); `-- --assert` runs the CI performance contracts — scaling-ratio
   assertions (delta cost vs state size), which is what `.github/workflows/ci.yml` gates on
@@ -30,35 +31,34 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
 - Execution is step-based. All workers execute all nodes in the same topological order each
   step; exchange nodes rely on this for barrier alignment (`Circuit.RunWorkerStep`).
 - Operator state is sharded per worker and never shared across threads. Any operator whose
-  state is keyed must sit downstream of an exchange on that key (`GroupBy` inserts it;
-  `Distinct` shuffles by value; windowed groupings route by the user key, and
-  window-collapsing regroups — windowed `TopK`, window-sticky `GroupBy` — re-exchange by
-  the window) — adding a stateful operator without this breaks multi-worker correctness
-  silently.
+  state is keyed must sit downstream of an exchange on that key: `GroupBy` inserts one,
+  `Distinct` shuffles by value, windowed groupings route by the user key, and
+  window-collapsing regroups (windowed `TopK`, window-sticky `GroupBy`) re-exchange by the
+  window. Adding a stateful operator without this breaks multi-worker correctness silently.
 - Exchange routing must be process-stable: route by `StableHash` (or a user-supplied
   stable hash), never `GetHashCode` — .NET randomizes string hashes per process, which
   silently breaks cluster routing and multi-worker checkpoint restore.
-- Per-step allocation is the dominant cost at throughput, because the GC's share of process
-  CPU scales with it while a circuit's live set stays large and mostly static. Operators draw
-  their output Z-set from a per-operator `OutputBuffer` (double-buffered, cleared per
-  execution) instead of allocating one, sized from the delta they derive it from. The
-  contract that makes this safe (`OutputBuffer.cs`): nothing an operator returns from `Step`
-  is written after return, nothing retains a delta past one more execution of its producer,
-  and output ports copy — never adopt — worker slots. Operators also keep their
-  flatten/probe/put
-  scratch as cleared-per-step fields rather than rebuilding it, and use the stores' `ApplyAll`
-  / `GetGroupsInto` (batched update with no result array; batched group read into caller-owned
-  buffers) rather than the allocating variants wherever the results are not themselves needed —
-  `AggregateOperator` keeps `GetGroups` because the group is handed to a user aggregate, and
-  `AntiJoinOperator` keeps `UpdateAll` because it reads the updated counts; both say so in a
-  comment, and an operator that needs the results should do the same rather than be "fixed".
-  A new operator that allocates per delta row —
-  or worse, per touched key — is a regression even when its asymptotics are right.
-  The matching startup configuration (server + concurrent GC, DATAS off, GC heap count sized to
-  `CircuitOptions.Workers`) is applied to every example by `examples/Directory.Build.props` plus a
-  `<CircuitWorkers>` property per example csproj — keep that property in step with the worker
-  count the example's `CircuitOptions` actually uses. The torture rig deliberately opts out so
-  its published numbers stay stock-GC.
+- Per-step allocation is the dominant cost at throughput: the GC's share of process CPU
+  scales with it while a circuit's live set stays large and mostly static. A new operator
+  that allocates per delta row — or worse, per touched key — is a regression even when its
+  asymptotics are right. The rules:
+  - Draw the output Z-set from the per-operator `OutputBuffer` (double-buffered, cleared per
+    execution, sized from the delta it derives from) instead of allocating one. The contract
+    that makes this safe (`OutputBuffer.cs`): nothing an operator returns from `Step` is
+    written after return, nothing retains a delta past one more execution of its producer,
+    and output ports copy — never adopt — worker slots.
+  - Keep flatten/probe/put scratch as cleared-per-step fields rather than rebuilding it.
+  - Use the stores' `ApplyAll` / `GetGroupsInto` (batched update with no result array;
+    batched group read into caller-owned buffers) rather than the allocating variants
+    wherever the results are not themselves needed. `AggregateOperator` keeps `GetGroups`
+    because the group is handed to a user aggregate, and `AntiJoinOperator` keeps `UpdateAll`
+    because it reads the updated counts; both say so in a comment. An operator that needs the
+    results should do the same rather than be "fixed".
+  - The matching startup configuration (server + concurrent GC, DATAS off, GC heap count
+    sized to `CircuitOptions.Workers`) is applied to every example by
+    `examples/Directory.Build.props` plus a `<CircuitWorkers>` property per example csproj —
+    keep that property in step with the worker count the example's `CircuitOptions` actually
+    uses. The torture rig deliberately opts out so its published numbers stay stock-GC.
 - The cross-process exchange wire format is the dense codec in `Cluster/ShardCodec.cs`
   (compiled per type from the same structural rules as `StableHash`), with a JSON fallback for
   types it cannot round-trip and a format byte on every frame. Redis state serialization is

@@ -77,8 +77,8 @@ public static class Headless
             Min/Max, custom linear aggregates, distinct counts, grouped and per-window TopK,
             tumbling/hopping/session windows with OnClose finals and watermark eviction, recursive
             fixed points with retraction unwinding, keyed upsert inputs correcting history, crash
-            recovery with exactly-once replay and self-bootstrapping consumers, and (with --cluster)
-            the same code sharded across two OS processes.
+            recovery with exactly-once replay and self-bootstrapping consumers, and (with --nodes 2
+            or more) one declaration sharded across OS processes over TCP.
             """));
 
         if (failures.Count == 0)

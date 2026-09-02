@@ -398,9 +398,9 @@ internal sealed class ExchangeOperator<T>(Func<T, uint> routingHash) : IExchange
     public object Merge(object?[] parts)
     {
         // An exchange cannot be skipped the way a plain operator can — its barrier keeps the
-        // workers aligned — but the worker no key routed to this step still need not allocate
-        // a Z-set to say so. Sizing the merge up front is the point of the counting pass:
-        // the shards are disjoint by key, so their entry counts sum to the merged size
+        // workers aligned — but a worker that was sent nothing this step still need not
+        // allocate a Z-set to say so. Sizing the merge up front is the point of the counting
+        // pass: the shards are disjoint by key, so their entry counts sum to the merged size
         // exactly, and the reused buffer is filled once at its final size.
         var total = 0;
         foreach (var part in parts)

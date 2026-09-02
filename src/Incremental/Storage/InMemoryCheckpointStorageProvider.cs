@@ -7,7 +7,7 @@ namespace Incremental.Storage;
 /// in separate layers, <see cref="Commit"/> promotes the staged layer, and stores are
 /// remembered by name — so a circuit rebuilt against the same provider instance resumes
 /// from the committed state, exactly like the Redis provider across a process restart.
-/// An in-process stand-in for testing checkpoint/restart semantics without a Redis.
+/// An in-process stand-in for testing checkpoint/restart semantics without Redis.
 /// </summary>
 public sealed class InMemoryCheckpointStorageProvider : ICheckpointStorageProvider
 {
@@ -69,7 +69,7 @@ public sealed class InMemoryCheckpointStorageProvider : ICheckpointStorageProvid
         {
             if (_stores.TryGetValue(name, out var existing))
                 return existing as TStore
-                    ?? throw new InvalidOperationException($"Store '{name}' was already created with a different shape.");
+                    ?? throw new InvalidOperationException($"Store '{name}' was already created with different key/value types.");
             var store = factory();
             _stores[name] = store;
             return store;

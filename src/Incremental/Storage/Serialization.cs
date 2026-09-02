@@ -2,7 +2,9 @@ using System.Text.Json;
 
 namespace Incremental.Storage;
 
-/// <summary>Serializes state values for storage providers that persist outside the process (e.g. Redis).</summary>
+/// <summary>Serializes state values for storage providers that persist outside the process
+/// (e.g. Redis). The output is a persisted format — what one run writes, a later run reads
+/// back — so an implementation must keep it stable across versions.</summary>
 public interface IStateSerializer
 {
     string Serialize<T>(T value);
@@ -26,5 +28,6 @@ public sealed class JsonStateSerializer : IStateSerializer
 
     public T Deserialize<T>(string data) =>
         JsonSerializer.Deserialize<T>(data, _options)
-        ?? throw new InvalidOperationException($"Deserializing state of type {typeof(T).Name} produced null.");
+        ?? throw new InvalidOperationException(
+            $"Deserializing state of type {typeof(T).Name} produced null; the stored value is missing or corrupt.");
 }

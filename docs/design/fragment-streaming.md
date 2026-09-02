@@ -1,14 +1,15 @@
 # Linear-segment fragment streaming
 
-Design sketch, August 2026; v1 shipped 2026-08-31, v2 (production at the head, cross-exchange
-forwarding, the emitting join) 2026-09-01 — see "v2" below. Companion to `docs/research/timely-dataflow.md`, which
-motivates the mechanism (findings 1 & 3): after the point-to-point exchange and the
-land/publish staging work, the remaining multi-worker step cost is ~450 µs/worker of
-dependency wait on the *owner chain* — each exchange segment typically has one busy worker
-(key ownership rotates per segment), so the segments' work serializes. Pipelining across
-steps fills that wait but does not shorten a step; the only lever that shortens the chain
-itself is the Timely OnRecv/OnNotify split expressed through DBSP linearity: let work start
-on *partial* data wherever the operator's algebra says partial data is safe.
+Design sketch, August 2026; v1 shipped 2026-08-31, v2 (production at the head,
+cross-exchange forwarding, the emitting join) 2026-09-01 — see "v2" below. Companion to
+`docs/research/timely-dataflow.md`, which motivates the mechanism (findings 1 & 3): after
+the point-to-point exchange and the land/publish staging work, the remaining multi-worker
+step cost is ~450 µs/worker of dependency wait on the *owner chain* — each exchange segment
+typically has one busy worker (key ownership rotates per segment), so the segments' work
+serializes. Pipelining across steps fills that wait but does not shorten a step; the only
+lever that shortens the chain itself is the Timely OnRecv/OnNotify split expressed through
+DBSP linearity: let work start on *partial* data wherever the operator's algebra says
+partial data is safe.
 
 This is the design the handoff asked to sketch before implementing: which operators declare
 linearity, how streamable structure is identified at build time, what "partial merge" means
@@ -30,9 +31,9 @@ Three roles, all per exchange node, all local to the existing sweep:
    under a monotonic per-(node, sender) fragment counter, with the existing per-execution
    sequence publication as the completion marker ("no more fragments from me for this
    execution"). Consumers can start on fragment 1 while the producer partitions fragment 2.
-   Additionally, the maximal chain of *linear* single-consumer operators feeding the
-   exchange is **fused** into the producer loop: the chain runs per chunk, so its work also
-   overlaps consumers' work instead of strictly preceding the publication.
+   The maximal chain of *linear* single-consumer operators feeding the exchange is also
+   **fused** into the producer loop: the chain runs per chunk, so its work overlaps
+   consumers' work instead of strictly preceding the publication.
 
 2. **Arrival-order consumption (consumer side).** A worker at an exchange consumes
    whichever sender's fragments are available (its own included), in arrival order, rather
@@ -73,8 +74,8 @@ any grouping. Declared via `IStepOperator.IsLinear` (default false):
 | `DistinctOperator`, `AggregateOperator`, `ExtremumOperator`, `TopKOperator`, `AntiJoinOperator`, session/window-close, snapshot, loop operators | strict | Non-linear (distinct, extremum, topK), user folds over full groups (aggregate), or presence logic (anti-join). They receive the complete merged delta at their sweep position, exactly as today — the partial merge just has it ready sooner. |
 
 `AggregateOperator` and `AntiJoinOperator` could stream their *store writes* per fragment
-and defer only the group recompute; that is a v2 note, not v1 — their comment about keeping
-the allocating store variants applies to this fence too.
+and defer only the group recompute; that is still open (see the end of this document) —
+their comment about keeping the allocating store variants applies to this fence too.
 
 ## Build-time identification
 
@@ -231,11 +232,11 @@ and output ports copy. Streaming keeps every piece of that argument and adds thr
   then the sink's `Step`), which is safe because nothing reads a slot before its counter is
   published and the counter is published once.
 
-The addendum's warning about **k-step pipelining** stands and is now sharper: with k steps
-in flight, "next execution of the producer" no longer implies "previous step fully
-consumed", so both the rings and the two-buffer `OutputBuffer` would need to deepen to
-k-proportional buffer counts. That is a deliberate cost of that future feature, recorded
-here so it is priced in, not discovered.
+The earlier warning about **k-step pipelining** stands and is now sharper: with k steps in
+flight, "next execution of the producer" no longer implies "previous step fully consumed",
+so both the rings and the two-buffer `OutputBuffer` would need to deepen to k-proportional
+buffer counts. That is a deliberate cost of that future feature, recorded here so it is
+priced in, not discovered.
 
 ## Fault, poison, and the step contracts
 
@@ -291,8 +292,8 @@ overlapping producer tails, so it grows with per-step delta size and vanishes in
 both at trickle deltas (nothing to overlap) and at saturation (throughput is compute-bound
 and pipelined across steps by the input channels anyway). The serialized owner chain's
 dominant term — strict-operator compute between exchanges — is untouched by design in v1;
-shortening it further is the v2 list below, cross-exchange streaming and the early-emitting
-join first. Fragment counts confirm the mechanics engage: ~17 fragments published per
+shortening it was left to v2 (below), cross-exchange streaming and the early-emitting join
+first. Fragment counts confirm the mechanics engage: ~17 fragments published per
 worker-step across 27 exchanges at the 20k rate, sinks fed on every data-bearing step.
 
 ## Measured (v2, 2026-09-01)

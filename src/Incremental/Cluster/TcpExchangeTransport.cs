@@ -22,10 +22,9 @@ namespace Incremental.Cluster;
 /// bare peer index and frames are unencrypted on the socket — anything that can reach the
 /// port can join the mesh and inject data, and every exchanged record crosses the wire
 /// readable (the dense encoding is a compression, not a cipher). Run it only on a trusted,
-/// isolated network segment (or over an encrypted
-/// tunnel the deployment provides); the <c>maxFrameBytes</c> cap bounds what a single
-/// frame can make the receiver allocate, but it is a robustness cap, not an
-/// authentication mechanism.</para>
+/// isolated network segment, or over an encrypted tunnel the deployment provides. The
+/// <c>maxFrameBytes</c> cap bounds what a single frame can make the receiver allocate; it is
+/// a robustness cap, not an authentication mechanism.</para>
 /// </summary>
 public sealed class TcpExchangeTransport : IExchangeTransport, ITransportDiagnostics
 {
@@ -118,14 +117,14 @@ public sealed class TcpExchangeTransport : IExchangeTransport, ITransportDiagnos
         {
             throw new TimeoutException(
                 $"Cluster process {ProcessIndex} could not establish connections to all peers within {_connectTimeout}. " +
-                "Every process of the cluster must be started with the same endpoint list.");
+                "Check that every process is running, reachable, and started with the same endpoint list.");
         }
 
         for (var p = 0; p < ProcessCount; p++)
         {
             if (p == ProcessIndex)
                 continue;
-            var peer = p; // capture per iteration — the loop variable outlives the lambda
+            var peer = p; // for-loop variables are shared across iterations; the lambda needs a copy
             _pumps[peer] = Task.Run(() => PumpSendsAsync(peer, _outbound[peer]!));
         }
     }
@@ -144,7 +143,9 @@ public sealed class TcpExchangeTransport : IExchangeTransport, ITransportDiagnos
             await stream.ReadExactlyAsync(handshake, cancellationToken).ConfigureAwait(false);
             var sender = BinaryPrimitives.ReadInt32LittleEndian(handshake);
             if (sender < 0 || sender >= ProcessCount || sender == ProcessIndex || _inbound[sender] is not null)
-                throw new InvalidOperationException($"Cluster process {ProcessIndex} received an invalid handshake (sender index {sender}).");
+                throw new InvalidOperationException(
+                    $"Cluster process {ProcessIndex} received an invalid handshake (sender index {sender}): " +
+                    "the connection is not from a cluster peer, or a peer has a wrong or duplicate process index.");
             _inbound[sender] = stream;
         }
     }

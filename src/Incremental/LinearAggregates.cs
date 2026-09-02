@@ -21,8 +21,10 @@ public interface ILinearAggregate<TValue, TResult> where TValue : notnull
     TResult Combine(TResult left, TResult right);
 }
 
+/// <summary>Built-in linear aggregates for <c>AggregateLinear</c>.</summary>
 public static class LinearAggregates
 {
+    /// <summary>COUNT: the number of rows in the group (sum of weights — duplicates count).</summary>
     public static ILinearAggregate<TValue, long> Count<TValue>() where TValue : notnull =>
         new CountAggregate<TValue>();
 
@@ -53,8 +55,8 @@ public static class LinearAggregates
     {
         public TNumber Zero => TNumber.Zero;
 
-        // checked binds the generic-math checked operators (op_CheckedMultiply/Add), so
-        // integer accumulators overflow loudly like the Z-set weight arithmetic does;
+        // `checked` binds the generic-math checked operators (op_CheckedMultiply/Add), so
+        // integer accumulators overflow loudly, like Z-set weight arithmetic does;
         // float/double/decimal keep their own semantics (their checked ops are the same).
         public TNumber Map(TValue value, long weight) => checked(selector(value) * TNumber.CreateChecked(weight));
         public TNumber Combine(TNumber left, TNumber right) => checked(left + right);

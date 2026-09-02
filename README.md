@@ -141,7 +141,7 @@ iteration 0 only (δ0), and the loop stops when no delta circulates on any worke
 emits the net change of the new fixed point versus the previous step's, so downstream sees
 ordinary incremental deltas. The stateful operators inside a loop (`Join`, `Distinct`) are
 incremental in *both* time dimensions: their state remembers at which iteration each row's
-weight arrived, which is what makes deletions unwind derivations in well-founded order — 
+weight arrived, which is what makes deletions unwind derivations in well-founded order —
 deleting an edge retracts exactly the paths with no remaining acyclic derivation, even when
 paths "support themselves" around a cycle. Workers iterate in lockstep (the convergence
 decision is a global all-workers reduction on the exchange barrier), so the body's joins
@@ -180,11 +180,13 @@ operator API: the circuit definition is built unchanged on every process — use
 `CircuitOptions.Cluster` declares the process's place in a static topology. Each of the N
 processes hosts a contiguous slice of the global worker set (process p owns global workers
 [p·Workers, (p+1)·Workers)), every exchange hash-partitions by key across all Workers × N
-of them, and shards bound for a remote worker are serialized (the storage serializer's
-JSON — a delta batch is just (value, weight) pairs, retractions included) and shipped as
-length-prefixed frames over a transport: `TcpExchangeTransport` (plain sockets, no
-dependencies; each process gets the shared endpoint list and its own index, connections are
-retried until the mesh is up) or `InMemoryExchangeTransport` for tests.
+of them, and shards bound for a remote worker — a delta batch is just (value, weight)
+pairs, retractions included — are encoded by a dense per-type codec (compiled from the same
+structural rules as `StableHash`, with a JSON fallback for types it cannot round-trip and a
+format byte on every frame) and shipped as length-prefixed frames over a transport:
+`TcpExchangeTransport` (plain sockets, no dependencies; each process gets the shared
+endpoint list and its own index, connections are retried until the mesh is up) or
+`InMemoryExchangeTransport` for tests.
 
 > **Security**: the TCP transport is unauthenticated cleartext — the handshake is a bare
 > process index, and anyone who can reach the port can join the mesh and inject state.
@@ -232,14 +234,15 @@ forever): when set, any single cross-process wait — an exchange's shards, the 
 alignment, space in a peer's bounded send queue — that outlasts it faults the circuit with
 a descriptive `TimeoutException` instead of stalling every process. Size it well above the
 slowest healthy step; a fired timeout is terminal like any fault — rebuild from the last
-committed checkpoint once the cluster is healthy. Checkpointing stays per process: each commits its own shards' state and its own inputs'
-offsets, under keys carrying the process index plus a step marker, so processes sharing one
-physical store never clobber each other; lockstep steps and equal `CheckpointInterval`s
-mean every process commits the same step boundaries, and after a crash all processes must
-resume from the same committed step — compare `Circuit.CommittedStep` across processes
-before feeding data (there is deliberately no distributed commit protocol). `Recurse` is
-not supported in clustered circuits — the per-iteration convergence decision would need a
-cross-process round trip every loop iteration — and is rejected at `Build()`.
+committed checkpoint once the cluster is healthy. Checkpointing stays per process: each
+commits its own shards' state and its own inputs' offsets, under keys carrying the process
+index plus a step marker, so processes sharing one physical store never clobber each other;
+lockstep steps and equal `CheckpointInterval`s mean every process commits the same step
+boundaries, and after a crash all processes must resume from the same committed step —
+compare `Circuit.CommittedStep` across processes before feeding data (there is deliberately
+no distributed commit protocol). `Recurse` is not supported in clustered circuits — the
+per-iteration convergence decision would need a cross-process round trip every loop
+iteration — and is rejected at `Build()`.
 
 **Backpressure.** Everything between producer and consumer is a bounded
 `System.Threading.Channels` channel:
@@ -253,7 +256,7 @@ draining, which fills the input channels, which suspends producers inside `Inser
 No configuration, no dropped data.
 
 **Faults.** When any worker throws mid-step (a user delegate, a storage error), the fault
-propagates cooperatively instead of poisoning the circuit: the faulting worker poisons the
+propagates cooperatively instead of deadlocking the circuit: the faulting worker poisons the
 exchange barrier, so peers blocked mid-shuffle — recursion-loop iterations included — bail
 out of the step rather than deadlock, and the circuit moves to a terminal faulted state
 within that step. The faulting `StepAsync` throws the original exception (an
@@ -263,10 +266,10 @@ a `CircuitFaultedException` (original fault as its inner) instead of hanging, an
 `Circuit.Fault` exposes it; `DisposeAsync` of a faulted circuit completes quietly. A failed
 or cancelled output publish faults the circuit too — by then state has already advanced, so
 dropping the step's merged deltas would silently desynchronize every consumer's integrated
-view. A faulted
-circuit's in-memory state is unusable — the faulting step is half-applied — but that step is
-never committed, so with a checkpointing storage provider the last committed checkpoint is
-intact: rebuild the circuit against the same provider to recover exactly-once (below).
+view. A faulted circuit's in-memory state is unusable — the faulting step is half-applied —
+but that step is never committed, so with a checkpointing storage provider the last
+committed checkpoint is intact: rebuild the circuit against the same provider to recover
+exactly-once (below).
 
 **Observability.** `CircuitOptions.Name` names the circuit in its logs and as the
 `circuit` tag on every metric, so circuits sharing a process stay distinguishable;
@@ -289,6 +292,7 @@ unlistened.
 | `incremental.circuit.checkpoint_commits`, `.checkpoint_commit_duration` | atomic state+offsets commits |
 | `incremental.circuit.input_queue_depth`, `.output_queue_depth` | bounded-channel depths, per port |
 | `incremental.circuit.watermark_lag` | now minus the frozen watermark, seconds |
+| `incremental.circuit.barrier_wait` | cumulative seconds each worker has spent waiting on exchanges (barrier or point-to-point) and loop barriers |
 | `incremental.cluster.frames_sent/received`, `.bytes_sent/received`, `.send_queue_depth` | exchange traffic, per peer |
 
 **Keyed inputs.** `builder.KeyedInput<K,V>(name, keySelector)` declares an input with
@@ -306,12 +310,13 @@ type flowing through a stream needs value equality — records are the natural f
 the insertion it should cancel, and the two coexist at weights +1/−1. With Redis-backed
 state or a cluster, values must additionally round-trip losslessly through the storage
 serializer's JSON (public properties/fields; no polymorphism, no reference cycles, no
-private-only state — a type serializing as `{}` collapses every instance into one). Types
-whose equality diverges from their public structure need the custom stable-hash overloads
-(above). Delegates handed to operators — selectors, predicates, aggregates, eviction
-deadlines — must be pure. `Sum` over integer accumulators is checked (overflow faults the
-circuit instead of wrapping); floating-point sums drift permanently under retraction
-(adding x then −x does not restore the accumulator), so prefer `decimal` or `long`.
+private-only state — a type serializing as `{}` collapses every instance into one); the
+cluster's dense codec follows the same structural rules. Types whose equality diverges
+from their public structure need the custom stable-hash overloads (above). Delegates
+handed to operators — selectors, predicates, aggregates, eviction deadlines — must be pure.
+`Sum` over integer accumulators is checked (overflow faults the circuit instead of
+wrapping); floating-point sums drift permanently under retraction (adding x then −x does
+not restore the accumulator), so prefer `decimal` or `long`.
 
 **Storage.** Stateful operators keep their state behind `IStorageProvider`
 (`IWeightStore`, `IIndexedWeightStore`, `IValueStore`), created per operator *per worker*
@@ -407,11 +412,6 @@ examples/Incremental.TradeEnrichment trades ⋈ reference data, composed interac
                                        amendments, cancellations, and master-data changes (desk
                                        moves, re-ratings) are single UpsertAsync/DeleteAsync calls
                                        that re-attribute historical trades in microseconds
-benchmarks/Incremental.Benchmarks  BenchmarkDotNet suite (Z-set primitives, stateless pipeline,
-                                       join / sum / min / top-k delta cost vs state size), plus
-                                       `-- --assert`: CI performance contracts that check scaling
-                                       ratios (delta cost must not grow with state size) instead of
-                                       wall-clock numbers, so they hold on noisy shared runners
 examples/Incremental.Showcase      the all-features demo: a marketplace payments desk, served as a
                                        local web app (`dotnet run`, then http://localhost:5170) in
                                        five tabs — enrichment joins (inner/left/full/anti) and
@@ -423,19 +423,20 @@ examples/Incremental.Showcase      the all-features demo: a marketplace payments
                                        scaling out: the same declaration measured at 1/2/4 worker
                                        threads (sharding costs latency and buys throughput — the tab
                                        measures both rather than asserting either) and, with
-                                       `--cluster`, re-spawned as a second OS process exchanging
-                                       shards over TCP. Picking a topology relaunches the showcase
-                                       into it and the page reconnects itself. Each tab shows the
-                                       fluent declaration that runs it and buttons that fire its
-                                       scripted moments; a sidebar streams the raw enriched
-                                       changefeed with z-set weights, so retract-then-assert is
-                                       visible rather than described; the footer reads the
-                                       `Incremental` meter. `--workers N` sets the thread count
+                                       `--nodes 2` (alias `--cluster`), re-spawned as a second OS
+                                       process exchanging shards over TCP. Picking a topology
+                                       relaunches the showcase into it and the page reconnects
+                                       itself. Each tab shows the fluent declaration that runs it
+                                       and buttons that fire its scripted moments; a sidebar
+                                       streams the raw enriched changefeed with z-set weights, so
+                                       retract-then-assert is visible rather than described; the
+                                       footer reads the `Incremental` meter. `--workers N` sets the thread count
                                        (default 2, so the other tabs really exercise the exchange
-                                       path). Still no NuGet dependency beyond the
-                                       library: `Microsoft.NET.Sdk.Web` resolves ASP.NET Core from
-                                       the shared framework, the page is one dependency-free HTML
-                                       file, and state reaches it over server-sent events.
+                                       path); `--exchange barrier|p2p|streaming` picks how the live
+                                       pipeline's exchanges synchronize. No NuGet dependency beyond
+                                       the library: `Microsoft.NET.Sdk.Web` resolves ASP.NET Core
+                                       from the shared framework, the page is one dependency-free
+                                       HTML file, and state reaches it over server-sent events.
                                        `--headless` runs every tab and trigger unattended, prints
                                        the panels as text, and exits non-zero if a verified act
                                        (crash recovery, cluster shard merge) fails to verify — that
@@ -450,6 +451,14 @@ examples/Incremental.TaxiAnalytics genuine big data: ~13M real NYC yellow-taxi t
                                        single-row churn with a live view until you press a key —
                                        ~1M rows/s bulk load; single-row updates in ~250 µs,
                                        thousands of × cheaper than a full recompute
+benchmarks/Incremental.Benchmarks  BenchmarkDotNet suite (Z-set primitives, stateless pipeline,
+                                       join / sum / min / top-k delta cost vs state size), plus
+                                       `-- --assert`: CI performance contracts that check scaling
+                                       ratios (delta cost must not grow with state size) instead of
+                                       wall-clock numbers, so they hold on noisy shared runners
+benchmarks/Incremental.Torture     throughput rig: the showcase pipeline flat out over a sliding
+                                       order population — records/s, process CPU split (workers vs
+                                       GC), allocation per record; see Benchmarks below
 ```
 
 ## Benchmarks
@@ -566,6 +575,11 @@ disclosed trade-offs (below), not missing semantics:
       `ILogger` + `Meter` observability, cluster exchange timeouts + frame caps + parking
       barrier, verified Redis commits + required key prefix, checked integer sums, MIT
       license, net8.0/net10.0 NuGet packaging
+- [x] 0.2 consumer API (`docs/intro.md`): LINQ-dialect names, group-then-window typed
+      ladder (windows only on event-timed groupings, eviction derived, per-window `TopK`,
+      `OnClose`), definitions redeemed for typed handles (`circuit.Handle(def)` — outputs
+      unnamed), changefeed-first outputs with automatic table-shaped resync and
+      `MaterializeInMemory` views
 
 ### Known limitations (deliberate, disclosed)
 
@@ -583,12 +597,6 @@ disclosed trade-offs (below), not missing semantics:
 - Changing a persisted value type's shape (renaming/retyping members) invalidates its
   serialized state; there is no schema migration — change the key prefix and rebuild from
   source, or keep state types stable.
-
-- [x] 0.2 consumer API (`docs/intro.md`): LINQ-dialect names, group-then-window typed
-      ladder (windows only on event-timed groupings, eviction derived, per-window `TopK`,
-      `OnClose`), definitions redeemed for typed handles (`circuit.Handle(def)` — outputs
-      unnamed), changefeed-first outputs with automatic table-shaped resync and
-      `MaterializeInMemory` views
 
 ### Headroom
 

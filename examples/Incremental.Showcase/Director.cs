@@ -2,9 +2,9 @@ namespace Incremental.Showcase;
 
 /// <summary>
 /// The deterministic "director": seeded background traffic plus the scripted beats
-/// (re-rating, late events, fraud edges, the crash) fired by the act runner. It owns the
-/// simulated event-time clock and keeps the current master data and offset-stamped source
-/// logs so Act 4 can replay everything after the crash.
+/// (master-data corrections, late events, fraud edges, the crash) fired from the browser.
+/// It owns the simulated event-time clock and keeps the current master data and
+/// offset-stamped source logs so Act 4 can replay everything after the crash.
 /// </summary>
 public sealed class Director
 {
@@ -61,7 +61,7 @@ public sealed class Director
         FeeRates.Add(new FeeRate(1, 0.015m));
         FeeRates.Add(new FeeRate(2, 0.022m));
         FeeRates.Add(new FeeRate(3, 0.031m));
-        // The busiest merchant is onboarded under the wrong category — page 1's
+        // The busiest merchant is onboarded under the wrong category — tab 1's
         // master-data-correction beat fixes it live (a case where retroactive
         // re-attribution is the *correct* behavior, unlike, say, a fee change).
         Merchants[0] = Merchants[0] with { Category = "fashion" };

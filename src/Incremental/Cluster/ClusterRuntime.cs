@@ -60,8 +60,8 @@ internal sealed class ClusterRuntime(
         return channels;
     }
 
-    /// <summary>Connects the transport and starts the demux tasks; called by the coordinator
-    /// before the first step (idempotent, coordinator-only).</summary>
+    /// <summary>Connects the transport and starts the demux tasks. Called by the coordinator
+    /// before the first step; idempotent.</summary>
     public Task EnsureStartedAsync() => _started ??= StartAsync();
 
     private async Task StartAsync()
@@ -102,7 +102,7 @@ internal sealed class ClusterRuntime(
         }
         catch (OperationCanceledException)
         {
-            // Local shutdown or poison: local waiters are released by the same token.
+            // Local shutdown or poison; the local waiters are released by the same token.
             Fail(peer, null);
         }
         catch (Exception ex)
@@ -246,7 +246,7 @@ internal sealed class ClusterRuntime(
     }
 
     /// <summary>Null when no exchange timeout is configured — waits then ride the plain
-    /// poison/shutdown token, exactly as before the timeout existed.</summary>
+    /// poison/shutdown token alone.</summary>
     private CancellationTokenSource? StartDeadline()
     {
         if (exchangeTimeout is not { } timeout)

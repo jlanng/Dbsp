@@ -24,7 +24,7 @@ if (options.Processes > 1)
 }
 
 // Records drained and steps run come from the library's own meter rather than from the
-// harness's bookkeeping: it is the number the circuit actually processed.
+// harness's bookkeeping: those are the counts the circuit actually processed.
 long recordsDrained = 0, stepsRun = 0;
 using var meter = new MeterListener();
 meter.InstrumentPublished = (instrument, listener) =>

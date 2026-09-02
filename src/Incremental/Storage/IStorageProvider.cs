@@ -4,9 +4,9 @@ namespace Incremental.Storage;
 
 /// <summary>
 /// Factory for the state stores that stateful operators (join, aggregate, distinct) use to
-/// hold their integrated state. Stores are created per operator, per worker — the runtime
-/// guarantees a store is only ever touched by the worker thread that owns it, so
-/// implementations do not need to be thread-safe across stores with different names.
+/// hold their integrated state. Stores are created per operator, per worker, and the runtime
+/// guarantees a store is only ever touched by the worker thread that owns it — so a store
+/// need not be thread-safe, though different stores are used concurrently by different workers.
 /// </summary>
 public interface IStorageProvider
 {

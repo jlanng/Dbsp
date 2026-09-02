@@ -139,17 +139,19 @@ public class GroupedZStream<TKey, TValue>
             Eviction);
     }
 
-    /// <summary>Live count per key. A fully-retracted key's row is retracted, never emitted
+    /// <summary>Live count per key. A fully retracted key's row is retracted, never emitted
     /// as zero — weight zero means gone.</summary>
     public KeyedZStream<TKey, long> Count() => AggregateLinear(LinearAggregates.Count<TValue>());
 
+    /// <summary>Live sum of <paramref name="selector"/> per key; see
+    /// <see cref="LinearAggregates.Sum{TValue,TNumber}"/> for the overflow and floating-point caveats.</summary>
     public KeyedZStream<TKey, TNumber> Sum<TNumber>(Func<TValue, TNumber> selector)
         where TNumber : INumber<TNumber> =>
         AggregateLinear(LinearAggregates.Sum(selector));
 
     /// <summary>Grouped MIN maintained by a tournament tree: an update — including deleting
     /// the current minimum — touches a fixed number of small buckets instead of rescanning
-    /// the group, so cost is independent of group size. The general recompute path remains
+    /// the group, so cost is independent of group size. The full-recompute path remains
     /// available as <c>Aggregate(Aggregates.Min(...))</c>.</summary>
     public KeyedZStream<TKey, TProjected> Min<TProjected>(Func<TValue, TProjected> selector)
         where TProjected : notnull
@@ -209,7 +211,7 @@ public class GroupedZStream<TKey, TValue>
     /// <summary>
     /// A stream of window-close notifications: emits each key of this grouping exactly
     /// once, with weight +1, in the first step whose watermark has passed
-    /// <paramref name="closesAt"/>(key). Closed means what it means for eviction: the
+    /// <paramref name="closesAt"/>(key). Closed means the same as for eviction: the
     /// watermark admits no further events for the key, so its results are final —
     /// notifications are never retracted, and a key whose contents were fully retracted
     /// still closes. The value carried is the key's close deadline. The result stays

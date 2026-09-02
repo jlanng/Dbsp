@@ -8,7 +8,7 @@ using Incremental.Cluster;
 namespace Incremental.Showcase;
 
 /// <summary>
-/// Act 5: the same pipeline on several real OS processes (the topology's node count, each
+/// Act 5: one declaration on several real OS processes (the topology's node count, each
 /// with its worker count), exchanging shards over TCP. This binary relaunches itself as
 /// processes 1…N−1 (<c>--cluster-child</c>); every process builds the identical circuit and
 /// calls StepAsync in lockstep — the cluster contract. `Recurse` is rejected in clustered

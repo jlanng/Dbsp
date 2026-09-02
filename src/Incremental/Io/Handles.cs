@@ -38,6 +38,7 @@ public sealed class InputHandle<T> where T : notnull
 
     internal InputHandle(ChannelWriter<InputEntry<T>> writer) => _writer = writer;
 
+    /// <summary>Inserts <paramref name="value"/> (weight +1), unstamped.</summary>
     public ValueTask InsertAsync(T value, CancellationToken cancellationToken = default) =>
         SendAsync(value, 1, cancellationToken);
 
@@ -49,6 +50,7 @@ public sealed class InputHandle<T> where T : notnull
     public ValueTask InsertAsync(T value, int partition, long offset, CancellationToken cancellationToken = default) =>
         SendAsync(value, 1, partition, offset, cancellationToken);
 
+    /// <summary>Retracts <paramref name="value"/> (weight -1), unstamped.</summary>
     public ValueTask RemoveAsync(T value, CancellationToken cancellationToken = default) =>
         SendAsync(value, -1, cancellationToken);
 
@@ -60,6 +62,7 @@ public sealed class InputHandle<T> where T : notnull
     public ValueTask RemoveAsync(T value, int partition, long offset, CancellationToken cancellationToken = default) =>
         SendAsync(value, -1, partition, offset, cancellationToken);
 
+    /// <summary>Sends <paramref name="value"/> with an explicit signed <paramref name="weight"/>, unstamped.</summary>
     public ValueTask SendAsync(T value, long weight, CancellationToken cancellationToken = default)
     {
         LockStamping(stamped: false);
@@ -79,6 +82,8 @@ public sealed class InputHandle<T> where T : notnull
         return WriteAsync(new InputEntry<T>(value, weight, partition, offset), cancellationToken);
     }
 
+    /// <summary>Sends every entry of <paramref name="batch"/>, unstamped, in order. Not atomic:
+    /// a step may drain part of the batch before the rest is written.</summary>
     public async ValueTask SendAsync(IEnumerable<WeightedValue<T>> batch, CancellationToken cancellationToken = default)
     {
         LockStamping(stamped: false);
@@ -97,13 +102,13 @@ public sealed class InputHandle<T> where T : notnull
                 "position (exactly-once dedup). Stamp every record of an input with source offsets, or none of them.");
     }
 
-    /// <summary>The channel write, with the fault path surfaced as what it is: when the
-    /// circuit faults it completes each input's channel with a
-    /// <see cref="CircuitFaultedException"/>, and this unwraps the resulting channel-closed
-    /// error so producers — blocked mid-write on a full channel included — see that
-    /// exception (original fault as its inner) rather than a bare closed-channel error.
-    /// A channel completed normally (via <see cref="Complete"/> or circuit disposal) still
-    /// throws <see cref="ChannelClosedException"/>. The synchronous completion path stays
+    /// <summary>The channel write, with the fault path surfaced as what it is: a faulting
+    /// circuit completes each input's channel with a <see cref="CircuitFaultedException"/>,
+    /// and this unwraps the resulting channel-closed error so producers — including ones
+    /// blocked mid-write on a full channel — see that exception (original fault as its
+    /// inner) rather than a bare closed-channel error. A channel completed normally (via
+    /// <see cref="Complete"/> or circuit disposal) still throws
+    /// <see cref="ChannelClosedException"/>. The synchronous completion path stays
     /// allocation-free.</summary>
     private ValueTask WriteAsync(InputEntry<T> entry, CancellationToken cancellationToken)
     {
@@ -211,6 +216,7 @@ public sealed class KeyedInputHandle<TKey, TValue>
             return _current.TryGetValue(key, out value);
     }
 
+    /// <summary>Signals that no more data will arrive on this input; see <see cref="InputHandle{T}.Complete"/>.</summary>
     public void Complete() => _inner.Complete();
 }
 
@@ -245,15 +251,16 @@ public sealed class OutputHandle<T> where T : notnull
     public ChannelReader<ZSet<T>> Reader => _reader;
 
     /// <summary>
-    /// The output's changefeed: each batch holds every row the step touched, weighted +/−.
-    /// On a bootstrap-enabled output (a keyed or windowed result's <c>ToOutput()</c>, by
-    /// default) the first batch asserts the current integrated state — empty on a fresh
-    /// start — so a consumer that maintains state treats it as a reset; this is what makes
-    /// consumers correct across restarts and mid-run subscription, since batches emitted
-    /// between the last checkpoint and a crash are never replayed. A plain stream output
-    /// starts straight into live batches (at-most-once across a crash). The enumeration
-    /// completes when the circuit disposes and throws <see cref="CircuitFaultedException"/>
-    /// if the circuit faults. One consumer only: a second call throws.
+    /// The output's changefeed: one batch per step that produced changes, holding every row
+    /// the step touched with its signed weight. On a bootstrap-enabled output (a keyed or
+    /// windowed result's <c>ToOutput()</c>, by default) the first batch asserts the current
+    /// integrated state — empty on a fresh start — so a consumer that maintains state treats
+    /// it as a reset; this is what makes consumers correct across restarts and mid-run
+    /// subscription, since batches emitted between the last checkpoint and a crash are never
+    /// replayed. A plain stream output starts straight into live batches (at-most-once
+    /// across a crash). The enumeration completes when the circuit disposes and throws
+    /// <see cref="CircuitFaultedException"/> if the circuit faults. One consumer only: a
+    /// second call throws.
     /// </summary>
     public IAsyncEnumerable<ZSet<T>> Changes(CancellationToken cancellationToken = default)
     {
@@ -278,7 +285,7 @@ public sealed class OutputHandle<T> where T : notnull
     /// <c>ToOutput()</c>) — the automatic resync is what makes the view correct across
     /// restarts and mid-run attachment. The cost is in the name: the view holds the full
     /// live result set on the heap — fine for windowed/evicted results and small
-    /// dimensions, a deliberate decision for anything with an unbounded keyspace.
+    /// dimensions; for an unbounded keyspace, make it a deliberate decision.
     /// </summary>
     public InMemoryView<T> MaterializeInMemory()
     {

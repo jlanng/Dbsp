@@ -5,9 +5,9 @@ namespace Incremental.Torture;
 /// <summary>
 /// Deterministic traffic generator for the torture run. Master data is seeded once; order
 /// traffic is a <em>sliding</em> population — inserting order N retracts order N−Live — so
-/// operator state settles at a fixed size instead of growing without bound for as long as the
-/// run lasts. That is what makes a long run measurable: throughput is not confounded by
-/// dictionaries that keep getting bigger, and the retraction half of every step exercises the
+/// operator state settles at a fixed size instead of growing for as long as the run lasts.
+/// That is what makes a long run measurable: throughput is not confounded by dictionaries
+/// that keep getting bigger, and the retraction half of every step exercises the
 /// negative-weight paths that a pure-insert benchmark never touches.
 /// </summary>
 internal sealed class Feed
@@ -49,7 +49,7 @@ internal sealed class Feed
             FeeRates[i] = new FeeRate(1 + i, 0.010m + i % 20 * 0.001m);
 
         // Linkage evidence, kept to small disjoint rings: the transitive closure is a
-        // fixed-point loop, so a dense graph would make Act 3 the whole benchmark.
+        // fixed-point loop, so a dense graph would make it the whole benchmark.
         var edges = new List<LinkEdge>();
         for (var ring = 0; ring < options.Rings; ring++)
         {

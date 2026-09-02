@@ -39,7 +39,7 @@ public class ZStream<T> where T : notnull
     }
 
     /// <summary>Projects each record. Like LINQ's <c>Select</c>, but over a stream of
-    /// changes: weights pass through unchanged, so retractions of an input record retract
+    /// changes: weights pass through unchanged, so retracting an input record retracts
     /// its projection.</summary>
     public ZStream<TOut> Select<TOut>(Func<T, TOut> selector) where TOut : notnull =>
         new(Builder, Builder.AddNode("select", [NodeId], _ => new MapOperator<T, TOut>(selector)));
@@ -68,7 +68,7 @@ public class ZStream<T> where T : notnull
 
     /// <summary>Z-set subtraction: this stream minus <paramref name="other"/>, pointwise on
     /// weights. Advanced: the result can carry negative weights — deliberately not LINQ's
-    /// <c>Except</c>, whose distinct set-difference semantics are different.</summary>
+    /// <c>Except</c>, which is a distinct set difference.</summary>
     public ZStream<T> Minus(ZStream<T> other) => Concat(other.Negate());
 
     /// <summary>Collapses the multiset to a set: every present value gets weight exactly 1.</summary>
@@ -129,7 +129,7 @@ public class ZStream<T> where T : notnull
     /// <param name="body">The monotone step of the recursion, applied to the recursive stream.</param>
     /// <param name="maxIterations">Iterations allowed per outer step before the circuit
     /// faults with <see cref="InvalidOperationException"/> — a guard against bodies that
-    /// never converge (e.g. non-monotone ones that oscillate).</param>
+    /// never converge (a non-monotone body can oscillate forever).</param>
     public ZStream<T> Recurse(Func<ZStream<T>, ZStream<T>> body, int maxIterations = 10_000)
     {
         ArgumentNullException.ThrowIfNull(body);

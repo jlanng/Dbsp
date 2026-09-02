@@ -22,8 +22,9 @@ var port = Arg("--port") is { } p ? int.Parse(p) : 5170;
 // The topology: --workers N (2 by default, so every other tab really exercises the exchange
 // path), --nodes N (1; above one arms the multi-process cluster act), --exchange
 // barrier|p2p|streaming (how the LIVE pipeline's exchanges synchronize; the cluster act stays
-// barrier-based). --cluster and --p2p remain as aliases. Tab 5 shows what is running,
-// measures the alternatives side by side, and relaunches the showcase into another topology.
+// barrier-based). --cluster, --p2p and --streaming remain as aliases for --nodes 2,
+// --exchange p2p and --exchange streaming. Tab 5 shows what is running, measures the
+// alternatives side by side, and relaunches the showcase into another topology.
 Topology topology;
 try
 {
@@ -69,7 +70,7 @@ if (headless)
 // ── the web host ───────────────────────────────────────────────────────────────
 // Microsoft.NET.Sdk.Web resolves ASP.NET Core from the shared framework, so this example
 // still has no NuGet dependency beyond the library itself. No args are passed to the
-// builder: the showcase's own flags (--redis, --cluster) are not configuration switches.
+// builder: the showcase's own flags (--redis, --workers, …) are not configuration switches.
 
 var builder = WebApplication.CreateBuilder();
 builder.Logging.ClearProviders();                      // circuit logs go to the notice feed

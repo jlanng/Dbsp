@@ -363,7 +363,7 @@ const render = {
           <div class="verdict ${r.matched ? "ok" : "no"}" style="margin-top:10px">${r.matched
             ? `✓ rebuilt state matches the pre-crash snapshot (${r.rows} rows, gross ${n2(r.gross)}) — consumers rebootstrapped themselves`
             : `✗ rebuilt state does NOT match (gross ${n2(r.gross)} vs ${n2(r.expectedGross)}) — that would be a bug`}</div>
-          <div style="color:var(--faint);margin-top:8px">Keyed upserts stay disarmed: the producer-side upsert map is unpersisted (roadmap: keyed-input restart).</div>`);
+          <div style="color:var(--faint);margin-top:8px">Keyed upserts stay disarmed: the producer-side upsert map is not persisted (roadmap: keyed-input restart).</div>`);
 
     return [
       panel("crash & recovery", "CommittedOffset-driven replay", body, true),

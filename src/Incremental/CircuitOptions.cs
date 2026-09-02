@@ -22,13 +22,12 @@ public sealed class CircuitOptions
     public ILoggerFactory? LoggerFactory { get; init; }
 
     /// <summary>Number of worker threads <em>on this process</em>. Keyed operators shard
-    /// their state across workers via exchange operators inserted by
-    /// <c>IndexBy</c>/<c>Distinct</c> — across all processes' workers when
-    /// <see cref="Cluster"/> is set.</summary>
+    /// their state across workers via the exchange operators <c>GroupBy</c>/<c>Distinct</c>
+    /// insert — across all processes' workers when <see cref="Cluster"/> is set.</summary>
     public int Workers { get; init; } = 1;
 
-    /// <summary>Capacity of each input's bounded channel. When full, <c>InsertAsync</c> etc.
-    /// suspend the producer — this is where backpressure originates.</summary>
+    /// <summary>Capacity of each input's bounded channel. When it is full, <c>InsertAsync</c>
+    /// and the other sends suspend the producer — this is where backpressure originates.</summary>
     public int InputChannelCapacity { get; init; } = 8192;
 
     /// <summary>Capacity of each output's bounded channel. A slow output consumer eventually

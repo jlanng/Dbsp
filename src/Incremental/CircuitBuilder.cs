@@ -14,9 +14,9 @@ internal sealed class NodeDefinition
     /// <summary>Explicit state identity from <see cref="ZStream{T}.Named"/>, or null for positional.</summary>
     public string? StateId { get; set; }
 
-    /// <summary>Root of the node's state store names: positional (declaration order) by
-    /// default, so any topology change upstream renumbers it — unless an explicit name pins
-    /// it, letting the node's checkpointed state survive circuit evolution.</summary>
+    /// <summary>Root of the node's state store names. Positional (declaration order) by
+    /// default, so any upstream topology change renumbers it; an explicit name pins it, so
+    /// the node's checkpointed state survives circuit evolution.</summary>
     public string Name => StateId is null ? $"n{Id}.{Kind}" : $"named.{StateId}.{Kind}";
 }
 
@@ -82,7 +82,7 @@ public sealed class CircuitBuilder
 
     public CircuitOptions Options { get; }
 
-    /// <summary>The circuit's shared event-time clock; created by the first <c>WithWatermark</c>.</summary>
+    /// <summary>The circuit's shared event-time clock; created by the first <c>WithEventTime</c>.</summary>
     internal WatermarkClock? WatermarkClock { get; private set; }
 
     internal WatermarkClock GetOrCreateWatermarkClock() => WatermarkClock ??= new WatermarkClock(Options.Workers);

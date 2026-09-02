@@ -8,15 +8,15 @@ namespace Incremental.Showcase;
 /// <summary>
 /// Tab 5, in-process half: the same declaration run at several worker counts, measured.
 /// Sharding is not free — every GroupBy inserts an exchange, and an exchange costs a
-/// barrier per step whether or not there is enough work to amortize it. This act measures
-/// where that trade flips instead of asserting it.
+/// synchronization per step whether or not there is enough work to amortize it. This act
+/// measures where that trade flips instead of asserting it.
 /// </summary>
 public static class ScalingAct
 {
     /// <summary>Per-step latency at the showcase's live batch size, and bulk throughput,
     /// for one topology. The barrier percentages are the share of aggregate worker time
-    /// spent waiting at exchange barriers rather than computing — measured separately for
-    /// the live-batch and bulk sections, because barrier cost amortizes with batch size.</summary>
+    /// spent waiting at exchanges rather than computing — measured separately for the
+    /// live-batch and bulk sections, because exchange cost amortizes with batch size.</summary>
     public record Sample(
         string Label, int Workers, int Processes, ExchangeMode Exchange,
         double LatencyP50, double LatencyP99, double BulkRowsPerSec,

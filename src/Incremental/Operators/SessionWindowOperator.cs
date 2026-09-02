@@ -6,20 +6,24 @@ namespace Incremental.Operators;
 /// Event-time session windows: each key's events are grouped into sessions separated by at
 /// least <c>gap</c> of inactivity. Unlike tumbling/hopping windows this is not a pure
 /// flat-map — session assignment is stateful: an insertion can extend a session or merge two
-/// neighbours (a bridging or late event), and a retraction can shrink or split one. The
-/// operator keeps the integrated events per key; when a step touches a key it re-sessionizes
-/// that key's events (touched keys only — never a full rescan, matching how the non-linear
-/// aggregate recomputes touched groups), retracting the previous session rows and asserting
-/// the new ones — rows whose bounds did not change cancel in the output Z-set, so the net
-/// delta is only what actually moved. A session spans [first event, last event + gap);
-/// consecutive events belong to the same session iff they are strictly less than the gap
-/// apart, so an event exactly at a session's end starts a new one — which keeps sessionization
-/// consistent with eviction: an admitted event is at or above the watermark, so it can never
-/// merge into a key evicted at (last event + gap) &lt;= watermark. When the circuit has a
-/// watermark, a key's state is dropped once the watermark passes its last event + gap. That
-/// deadline moves with the session as events arrive, unlike the static
-/// <see cref="KeyEviction{TKey}"/> policies, so the operator tracks it itself (stale queue
-/// entries are skipped lazily). The input is partitioned by key, so state and eviction
+/// neighbours (a bridging or late event), and a retraction can shrink or split one.
+///
+/// The operator keeps the integrated events per key; when a step touches a key it
+/// re-sessionizes that key's events (touched keys only — never a full rescan, matching how
+/// the non-linear aggregate recomputes touched groups), retracting the previous session rows
+/// and asserting the new ones — rows whose bounds did not change cancel in the output Z-set,
+/// so the net delta is only what actually moved.
+///
+/// A session spans [first event, last event + gap); consecutive events belong to the same
+/// session iff they are strictly less than the gap apart, so an event exactly at a session's
+/// end starts a new one — which keeps sessionization consistent with eviction: an admitted
+/// event is at or above the watermark, so it can never merge into a key evicted at
+/// (last event + gap) &lt;= watermark.
+///
+/// When the circuit has a watermark, a key's state is dropped once the watermark passes its
+/// last event + gap. That deadline moves with the session as events arrive, unlike the
+/// static <see cref="KeyEviction{TKey}"/> policies, so the operator tracks it itself (stale
+/// queue entries are skipped lazily). The input is partitioned by key, so state and eviction
 /// decisions are worker-local and consistent (the watermark is frozen for the whole step).
 /// </summary>
 internal sealed class SessionWindowOperator<TKey, TValue> : IStepOperator

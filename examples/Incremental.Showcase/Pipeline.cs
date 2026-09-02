@@ -34,7 +34,7 @@ public sealed record ShowcaseDefs(
     Output<WindowedValue<int, decimal>> FinalLeaders,
     Output<WindowedValue<string, Acceptance>> AcceptanceRate,
     Output<WindowedValue<int, Spend>> Sessions,
-    // Act 3 — the graph trick
+    // Act 3 — recursion
     Output<KeyedValue<int, long>> RingSizes,
     Output<KeyedValue<int, decimal>> RingExposure,
     Output<KeyedValue<int, int>> RingMembership);
@@ -153,7 +153,7 @@ public static class ShowcasePipeline
             ringSizes, ringExposure, ringMembership);
     }
 
-    // Pure function of the order (equal ItemSale rows collapse to one z-set entry with
+    // Pure function of the order (equal ItemSale rows collapse to one Z-set entry with
     // weight = Items, which is exactly what Count() counts).
     static IEnumerable<ItemSale> SplitItems(Order o)
     {

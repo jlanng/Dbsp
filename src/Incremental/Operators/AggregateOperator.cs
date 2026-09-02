@@ -67,8 +67,8 @@ internal sealed class AggregateOperator<TKey, TValue, TResult> : IStepOperator
         // At most one retraction and one assertion per touched key.
         var output = _output.Next(touched.Count * 2);
 
-        // The group here is handed to a user aggregate, so it stays a plain materialized
-        // list rather than a reused window over shared scratch.
+        // GetGroups rather than GetGroupsInto, deliberately: each group is handed to a user
+        // aggregate, so it must be a plain materialized list, not a window over reused scratch.
         var groups = _groups.GetGroups(touched);
         var lastResults = _lastEmitted.TryGetAll(touched);
         var puts = _puts;

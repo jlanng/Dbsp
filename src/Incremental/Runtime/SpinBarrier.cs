@@ -1,7 +1,7 @@
 namespace Incremental.Runtime;
 
 /// <summary>Thrown to a <see cref="SpinBarrier"/> waiter when the barrier is poisoned: a
-/// peer faulted mid-step and will never arrive, so waiting on would deadlock. Purely an
+/// peer faulted mid-step and will never arrive, so waiting would deadlock. Purely an
 /// unwind signal for the worker loop — the faulting worker records the real exception.</summary>
 internal sealed class BarrierPoisonedException : Exception;
 

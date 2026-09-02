@@ -1,6 +1,6 @@
 namespace Incremental.Showcase;
 
-// Rows that flow through the circuit. Records only: z-set membership needs value equality,
+// Rows that flow through the circuit. Records only: Z-set membership needs value equality,
 // and with --redis every stateful operator round-trips these through JSON. The small ones
 // are record *structs* — a row constructed per delta row (a projection, a fan-out, a
 // recursion edge) allocates nothing that way, living inline in Z-set entries and operator

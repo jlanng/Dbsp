@@ -12,8 +12,8 @@ namespace Incremental.Tests;
 /// point-to-point, and point-to-point with fragment streaming (chunked to one row per
 /// fragment, so multi-fragment publication, partial merges, and the fragment sinks all
 /// engage even on these tiny deltas). CsCheck shrinks failures and prints the seed to
-/// reproduce them; the
-/// op-list → batch folding below is deterministic, so a seed replays the exact circuit run.
+/// reproduce them; the op-list → batch folding below is deterministic, so a seed replays
+/// the exact circuit run.
 /// </summary>
 public class PropertyDifferentialTests
 {

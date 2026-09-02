@@ -37,14 +37,15 @@ internal sealed record Options
     public int StepBatch { get; init; } = 8_192;
     public int InputCapacity { get; init; } = 32_768;
 
-    /// <summary>Emit the summary as a single JSON line (for the ramp driver) as well as text.</summary>
+    /// <summary>Also emit the summary as one JSON line, for scripts that drive repeated runs.</summary>
     public bool Json { get; init; }
 
     /// <summary>Print a byte-weighted allocation histogram by type for the measured window.</summary>
     public bool AllocationTypes { get; init; }
 
     /// <summary>When &gt; 1, run the cluster-mode graph across this many co-hosted processes
-    /// stepped in lockstep, which is what puts the exchange wire format on the measured path.</summary>
+    /// stepped in lockstep — the configuration that puts the exchange wire format on the
+    /// measured path.</summary>
     public int Processes { get; init; } = 1;
 
     public static Options Parse(string[] args)

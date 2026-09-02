@@ -5,8 +5,8 @@ using Microsoft.Extensions.Logging;
 
 namespace Incremental.Diagnostics;
 
-/// <summary>Implemented by transports that can report their internal queue depths; the
-/// send-queue gauge covers transports that opt in and is simply absent for others.</summary>
+/// <summary>Implemented by transports that can report their internal queue depths. The
+/// send-queue gauge covers transports that opt in and is absent for the others.</summary>
 internal interface ITransportDiagnostics
 {
     IEnumerable<(int Peer, int Depth)> SendQueueDepths { get; }
@@ -14,13 +14,13 @@ internal interface ITransportDiagnostics
 
 /// <summary>
 /// The library's observability surface. All instruments hang off one static
-/// <see cref="System.Diagnostics.Metrics.Meter"/> named <c>Incremental</c> — the BCL meter
-/// is effectively free with no listener attached, so instrumentation stays on
-/// unconditionally — and every measurement carries a <c>circuit</c> tag
-/// (<see cref="CircuitOptions.Name"/>) so circuits sharing a process stay distinguishable.
-/// One instance exists per circuit: it holds the circuit's tag, its loggers, and the live
-/// state the observable gauges (queue depths, watermark lag) read on demand; instances
-/// register themselves for the gauges and unregister on dispose.
+/// <see cref="System.Diagnostics.Metrics.Meter"/> named <c>Incremental</c> — a BCL meter
+/// costs nothing with no listener attached, so instrumentation stays on unconditionally —
+/// and every measurement carries a <c>circuit</c> tag (<see cref="CircuitOptions.Name"/>)
+/// so circuits sharing a process stay distinguishable. One instance exists per circuit: it
+/// holds the circuit's tag, its loggers, and the live state the observable gauges (queue
+/// depths, watermark lag) read on demand; instances register themselves for the gauges
+/// and unregister on dispose.
 /// </summary>
 internal sealed class CircuitDiagnostics : IDisposable
 {
@@ -62,7 +62,7 @@ internal sealed class CircuitDiagnostics : IDisposable
         Meter.CreateObservableGauge("incremental.cluster.send_queue_depth",
             ObserveSendQueueDepths, "{frame}", "Frames buffered in each peer's bounded send queue.");
         Meter.CreateObservableGauge("incremental.circuit.barrier_wait",
-            ObserveBarrierWait, "s", "Cumulative time each worker has spent waiting at exchange and loop barriers.");
+            ObserveBarrierWait, "s", "Cumulative time each worker has spent waiting on exchanges (barrier or point-to-point) and loop barriers.");
     }
 
     private readonly KeyValuePair<string, object?> _tag;

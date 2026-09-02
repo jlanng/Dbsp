@@ -1,7 +1,7 @@
 namespace Incremental.Operators;
 
 /// <summary>
-/// The circuit's event-time clock. Each <c>WithWatermark</c> call registers a tracker;
+/// The circuit's event-time clock. Each <c>WithEventTime</c> call registers a tracker;
 /// workers record the max event time they have seen per tracker during a step, and the
 /// coordinator freezes the global watermark between steps as
 /// min over trackers of (max event time seen − allowed lateness), monotonically
@@ -19,7 +19,8 @@ internal sealed class WatermarkClock(int workers)
     private readonly List<Tracker> _trackers = [];
     private long _frozenTicks = long.MinValue;
 
-    /// <summary>Watermark as of the end of the previous step (ticks, UTC); <see cref="long.MinValue"/> until every source has seen data.</summary>
+    /// <summary>Watermark as of the end of the previous step (ticks, UTC);
+    /// <see cref="long.MinValue"/> until every source has seen data.</summary>
     public long FrozenTicks => Volatile.Read(ref _frozenTicks);
 
     public int RegisterTracker(long latenessTicks)

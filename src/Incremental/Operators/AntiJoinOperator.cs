@@ -64,6 +64,8 @@ internal sealed class AntiJoinOperator<TKey, TLeft, TRight> : IStepOperator
             _eviction?.Track(key);
         }
 
+        // UpdateAll rather than ApplyAll, deliberately: the updated counts are read below to
+        // detect keys whose presence flipped.
         var after = _rightRowCount.UpdateAll(countEntries);
         var flipped = _flipped;
         var flipSigns = _flipSigns;

@@ -154,7 +154,7 @@ RenderResults();
 
 // ── 2 · the naive baseline ──────────────────────────────────────────────────────
 
-AnsiConsole.Write(new Rule("[bold]2 · the naive baseline[/]").LeftJustified());
+AnsiConsole.Write(new Rule("[bold]2 · naive baseline[/]").LeftJustified());
 AnsiConsole.MarkupLine(
     "[grey]The same four views computed the way a batch job or dashboard query would: " +
     "one pass over every raw row, rebuilding the dictionaries from scratch. Without " +
@@ -194,7 +194,7 @@ var updateCount = 0L;
 var updateTicks = 0L;
 
 var interactive = !Console.IsInputRedirected;
-AnsiConsole.Write(new Rule("[bold]3 · now change one row at a time[/]").LeftJustified());
+AnsiConsole.Write(new Rule("[bold]3 · continuous churn[/]").LeftJustified());
 AnsiConsole.MarkupLine(
     $"[grey]Single trips now stream in (1 in 4 cancels an earlier one) and every view stays " +
     $"current. Each change makes the join emit one delta, the affected borough's COUNT and " +

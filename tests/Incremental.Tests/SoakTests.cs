@@ -52,8 +52,8 @@ public class SoakTests
             for (var i = 0; i < EventsPerStep; i++)
             {
                 // Time advances ~1.5ms/event with small jitter inside the lateness bound, so
-                // nothing is dropped and the oracle is exact: ~4.5s of event time per step,
-                // so windows keep closing and their state keeps being evicted.
+                // nothing is dropped and the oracle is exact. That is ~4.5s of event time per
+                // step: windows keep closing and their state keeps being evicted.
                 at += TimeSpan.FromMicroseconds(1_000 + rng.Next(1_000));
                 var window = new DateTimeOffset(at.UtcTicks / windowSize.Ticks * windowSize.Ticks, TimeSpan.Zero);
                 expected[window] = expected.GetValueOrDefault(window) + 1;

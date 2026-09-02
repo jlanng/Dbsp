@@ -9,8 +9,8 @@ namespace Incremental.Tests;
 /// faulting <see cref="Circuit.StepAsync"/> throws the original exception, consumers'
 /// reads observe it after the pre-fault deltas, producers are released with a
 /// <see cref="CircuitFaultedException"/>, <see cref="Circuit.Fault"/> exposes it, and
-/// disposal completes quietly. Every wait is fenced with a timeout: a regression here
-/// shows up as a hang, not a wrong value.
+/// disposal completes quietly. Every wait is fenced with a timeout, because a regression
+/// here shows up as a hang, not a wrong value.
 /// </summary>
 public class FaultPropagationTests
 {

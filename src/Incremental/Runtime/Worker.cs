@@ -83,9 +83,9 @@ internal sealed class Worker(
     /// the counters are cheap enough to keep unconditionally).</summary>
     public long FragmentsPublished, FragmentsConsumed;
 
-    // PHASE-STATS (temporary probe instrumentation — revert before committing). Cumulative
-    // ticks per phase of the exchange path, plus per-step span timestamps for launch/land
-    // attribution. Written only by the owning worker thread; read racily at dispose.
+    // PHASE-STATS (diagnostic probe, gated on INCREMENTAL_PHASE_STATS=1; see Circuit).
+    // Cumulative ticks per phase of the exchange path, plus per-step span timestamps for
+    // launch/land attribution. Written only by the owning worker thread; read racily at dispose.
     public long PartitionTicks, MergeTicks, SpanTicks, SlowWaits, ExchangeExecutions, EmptyExchangeSkips;
 
     /// <summary>Point-to-point waits that outlived the spin budget and parked (cumulative;

@@ -13,10 +13,10 @@ namespace Incremental;
 /// A runnable dataflow circuit. Execution is step-based, as in DBSP: each step drains a
 /// batch of records from the inputs, pushes the resulting Z-set deltas through every
 /// operator in topological order on all workers in parallel, and publishes the per-output
-/// deltas. Exchange nodes synchronize the workers on a barrier mid-step to reshuffle data
-/// by key. Backpressure is end-to-end: bounded output channels stall publishing, which
-/// stalls stepping, which stops input draining, which suspends producers on the bounded
-/// input channels.
+/// deltas. Exchange nodes synchronize the workers mid-step (on a barrier by default) to
+/// reshuffle data by key. Backpressure is end-to-end: bounded output channels stall
+/// publishing, which stalls stepping, which stops input draining, which suspends producers
+/// on the bounded input channels.
 /// </summary>
 public sealed class Circuit : IAsyncDisposable
 {
@@ -91,8 +91,9 @@ public sealed class Circuit : IAsyncDisposable
     private long _stepNumber;
     private long _committedStepMarker = -1;
 
-    // PHASE-STATS (temporary probe instrumentation — revert before committing). Env-gated
-    // per-phase step attribution, printed to stderr at dispose.
+    // PHASE-STATS: diagnostic probe, gated on INCREMENTAL_PHASE_STATS=1 — per-phase step
+    // attribution (coordinator and per-worker), printed to stderr at dispose. Every site is
+    // tagged PHASE-STATS; when off, the cost is a static bool check per site.
     private static readonly bool PhaseStats =
         Environment.GetEnvironmentVariable("INCREMENTAL_PHASE_STATS") == "1";
     private long _psDrain, _psWorkerPhase, _psLaunch, _psLand, _psCheckpoint, _psPublish,
@@ -170,7 +171,7 @@ public sealed class Circuit : IAsyncDisposable
         _watermarkClock = watermarkClock;
         _checkpoint = options.Storage as ICheckpointStorageProvider;
         if (options.ExchangeTimeout is { } timeout && timeout <= TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(options), "CircuitOptions.ExchangeTimeout must be positive (or null for no timeout).");
+            throw new ArgumentOutOfRangeException(nameof(options), "CircuitOptions.ExchangeTimeout must be positive, or null to wait forever.");
         Name = options.Name ?? $"circuit-{Interlocked.Increment(ref _autoNames)}";
         _diag = new CircuitDiagnostics(
             Name,
@@ -438,17 +439,20 @@ public sealed class Circuit : IAsyncDisposable
                 _produceAfter[n] = [.. plans];
     }
 
+    /// <summary>Point-to-point waits that outlived the spin budget and parked, summed over
+    /// the workers (a racy read of per-worker counters; for tests and diagnostics).</summary>
+    internal long ExchangeParks => _workers.Sum(w => Volatile.Read(ref w.ExchangeParks));
+
     /// <summary>One line per streamed exchange: production mode, head, fused chain, sink, and
     /// forwarding — the structural decisions <see cref="BuildStreamPlans"/> made, for tests
     /// and the phase-stats report.</summary>
-    /// <summary>Point-to-point waits that outlived the spin budget and parked, summed over
-    /// the workers (racy read of per-worker counters; for tests and diagnostics).</summary>
-    internal long ExchangeParks => _workers.Sum(w => Volatile.Read(ref w.ExchangeParks));
-
     internal IReadOnlyList<string> DescribeStreamPlans() =>
         _streamPlans.Where(p => p is not null).Select(p => p!.ToString()).ToArray();
 
-    /// <summary>Starts the worker threads (and, with <see cref="CircuitOptions.AutoStep"/>, the pump).</summary>
+    /// <summary>Starts the worker threads (and, with <see cref="CircuitOptions.AutoStep"/>,
+    /// the pump). With a checkpointing storage provider it first recovers the committed
+    /// state and input offsets, refusing to start if the checkpoint's state layout no
+    /// longer matches this circuit.</summary>
     public void Start()
     {
         if (_started)
@@ -517,7 +521,7 @@ public sealed class Circuit : IAsyncDisposable
     }
 
     /// <summary>The circuit's current event-time watermark: the frozen value as of the end
-    /// of the last step, or null when no <c>WithWatermark</c> source exists or none has
+    /// of the last step, or null when no <c>WithEventTime</c> source exists or none has
     /// seen data yet.</summary>
     public DateTimeOffset? CurrentWatermark
     {
@@ -566,9 +570,9 @@ public sealed class Circuit : IAsyncDisposable
     }
 
     /// <summary>
-    /// Runs exactly one step: drains currently buffered input, propagates it through the
-    /// circuit, and publishes output deltas. Only valid with <c>AutoStep = false</c>; do not
-    /// call concurrently with itself.
+    /// Runs exactly one step: drains the currently buffered input, propagates it through
+    /// the circuit, and publishes the output deltas (they are published when this returns).
+    /// Only valid with <c>AutoStep = false</c>; do not call concurrently with itself.
     /// </summary>
     public async Task StepAsync(CancellationToken cancellationToken = default)
     {
@@ -821,12 +825,12 @@ public sealed class Circuit : IAsyncDisposable
         }
     }
 
-    /// <summary>The exception that faulted the circuit — the original worker fault, an
-    /// <see cref="AggregateException"/> when several workers faulted in the same step — or
-    /// null while the circuit is healthy. A faulted circuit's in-memory state is unusable
-    /// (the faulting step is half-applied); with a checkpointing storage provider the last
-    /// committed checkpoint is untouched, so rebuild the circuit against the same provider
-    /// to recover.</summary>
+    /// <summary>The exception that faulted the circuit (the original worker fault, or an
+    /// <see cref="AggregateException"/> when several workers faulted in the same step), or
+    /// null while the circuit is healthy. A faulted circuit's in-memory state is unusable —
+    /// the faulting step is half-applied. With a checkpointing storage provider the last
+    /// committed checkpoint is untouched: rebuild the circuit against the same provider to
+    /// recover.</summary>
     public Exception? Fault => Volatile.Read(ref _fault);
 
     /// <summary>Moves the circuit to its terminal faulted state, on the coordinator, once
@@ -1250,7 +1254,7 @@ public sealed class Circuit : IAsyncDisposable
 
     /// <summary>Waits on the exchange barrier, attributing the wait to the worker: the
     /// accumulated ticks feed the barrier-wait gauge, which is what separates
-    /// synchronization cost from compute in a step. Accumulates even on the poison unwind
+    /// synchronization cost from compute in a step. Accumulates on the poison unwind too,
     /// so a faulting step does not under-report.</summary>
     private void BarrierWait(Worker worker)
     {
@@ -1831,7 +1835,7 @@ public sealed class Circuit : IAsyncDisposable
             if (iteration + 1 >= region.MaxIterations)
                 throw new InvalidOperationException(
                     $"Recurse did not reach a fixed point within {region.MaxIterations} iterations. " +
-                    "The loop body may not converge (is it monotone?); otherwise raise maxIterations.");
+                    "Check that the loop body is monotone (a non-monotone body can oscillate forever); if it is, raise maxIterations.");
         }
 
         for (var n = region.Start; n <= region.End; n++)

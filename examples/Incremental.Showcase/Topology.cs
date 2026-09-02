@@ -31,8 +31,9 @@ public sealed record Topology(int Workers, int Nodes, ExchangeMode Exchange)
     public static Topology Normalize(int workers, int nodes, ExchangeMode exchange) =>
         new(Math.Clamp(workers, 1, MaxWorkers), Math.Clamp(nodes, 1, MaxNodes), exchange);
 
-    /// <summary>Parses the process arguments. <c>--cluster</c> and <c>--p2p</c> remain as
-    /// aliases for <c>--nodes 2</c> and <c>--exchange p2p</c>.</summary>
+    /// <summary>Parses the process arguments. <c>--cluster</c>, <c>--p2p</c> and
+    /// <c>--streaming</c> remain as aliases for <c>--nodes 2</c>, <c>--exchange p2p</c> and
+    /// <c>--exchange streaming</c>.</summary>
     public static Topology FromArgs(string[] args)
     {
         string? Arg(string name)

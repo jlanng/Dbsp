@@ -89,10 +89,9 @@ internal static class ClusterRun
             }));
         }
 
-        // Master data goes to every process: keyed inputs are full-replay sources, and the
-        // exchange routes each row to whichever global worker owns its key regardless of
-        // which process fed it — so feeding it once per process would duplicate it. Process 0
-        // feeds it, everyone else feeds nothing.
+        // Master data is fed once, by process 0. The exchange routes each row to whichever
+        // global worker owns its key regardless of which process fed it, so feeding it in
+        // every process would duplicate it.
         var feed = new Feed(options);
         foreach (var m in feed.Merchants) await merchants[0].UpsertAsync(m);
         foreach (var f in feed.FeeRates) await feeRates[0].UpsertAsync(f);

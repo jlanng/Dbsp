@@ -3,7 +3,7 @@ namespace Incremental.Benchmarks.Contracts;
 /// <summary>
 /// One measurable workload for a performance contract: a circuit with preloaded operator
 /// state whose size is the scenario's scale, plus a fixed-size delta that
-/// <see cref="RunCycleAsync"/> asserts and retracts, leaving state at its baseline.
+/// <see cref="RunCycleAsync"/> inserts and retracts, leaving state at its baseline.
 /// Keyed outputs opt out of bootstrap so the contracts measure the operators themselves,
 /// not snapshot maintenance.
 /// </summary>

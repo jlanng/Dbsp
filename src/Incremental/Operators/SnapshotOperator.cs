@@ -3,15 +3,16 @@ using Incremental.Storage;
 namespace Incremental.Operators;
 
 /// <summary>
-/// Backs a snapshot output (<c>Output(name, snapshot: true)</c>): passes its input delta
-/// through unchanged while integrating it into a store, so the current state of the view
-/// can be read back via the bootstrap read of <see cref="OutputHandle{T}.Changes"/>. The store is an
-/// indexed store with a single group rather than a weight store because reading a snapshot
-/// needs enumeration, which only <see cref="IIndexedWeightStore{TKey,TValue}.GetGroup"/>
-/// offers. Integration happens inside the step — before the checkpoint commit — so with a
-/// checkpointing provider the committed snapshot always agrees with the committed input
-/// offsets, which is what lets a consumer bootstrap after a restart without replaying
-/// deltas. State is per worker, as everywhere; the read merges the workers' shards.
+/// Backs a bootstrapping (table-shaped) output — <c>ToOutput(bootstrap: true)</c> on a keyed
+/// or windowed stream: passes its input delta through unchanged while integrating it into a
+/// store, so the current state of the view can be read back as the bootstrap batch of
+/// <see cref="OutputHandle{T}.Changes"/>. The store is an indexed store with a single group
+/// rather than a weight store because reading a snapshot needs enumeration, which only
+/// <see cref="IIndexedWeightStore{TKey,TValue}.GetGroup"/> offers. Integration happens
+/// inside the step — before the checkpoint commit — so with a checkpointing provider the
+/// committed snapshot always agrees with the committed input offsets, which is what lets a
+/// consumer bootstrap after a restart without replaying deltas. State is per worker, as
+/// everywhere; the read merges the workers' shards.
 /// </summary>
 internal sealed class SnapshotOperator<T> : IStepOperator where T : notnull
 {

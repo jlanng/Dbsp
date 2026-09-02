@@ -75,10 +75,12 @@ public sealed class WindowedGroupedZStream<TKey, TValue>
             Eviction);
     }
 
-    /// <summary>Live count per (window, key). A fully-retracted group's row is retracted,
+    /// <summary>Live count per (window, key). A fully retracted group's row is retracted,
     /// never emitted as zero — weight zero means gone.</summary>
     public WindowedZStream<TKey, long> Count() => AggregateLinear(LinearAggregates.Count<TValue>());
 
+    /// <summary>Live sum of <paramref name="selector"/> per (window, key); see
+    /// <see cref="LinearAggregates.Sum{TValue,TNumber}"/> for the overflow and floating-point caveats.</summary>
     public WindowedZStream<TKey, TNumber> Sum<TNumber>(Func<TValue, TNumber> selector)
         where TNumber : INumber<TNumber> =>
         AggregateLinear(LinearAggregates.Sum(selector));
@@ -108,8 +110,9 @@ public sealed class WindowedGroupedZStream<TKey, TValue>
 
 /// <summary>
 /// A windowed result: a stream of (window, key, value) rows in which everything is
-/// per-window by construction. <see cref="GroupBy{TNewKey}(Func{WindowedValue{TKey,TValue},TNewKey})"/> is window-sticky (the new key composes
-/// within the window, eviction re-derived), <see cref="TopK"/> ranks within each window,
+/// per-window by construction.
+/// <see cref="GroupBy{TNewKey}(Func{WindowedValue{TKey,TValue},TNewKey})"/> is window-sticky
+/// (the new key composes within the window, eviction re-derived), <see cref="TopK"/> ranks within each window,
 /// <see cref="OnClose"/> emits each row exactly once when the watermark closes its window,
 /// and <see cref="Rows"/> is the explicit exit that drops window semantics. Live results
 /// flap by design — each update retracts the stale row and asserts the new one; use
