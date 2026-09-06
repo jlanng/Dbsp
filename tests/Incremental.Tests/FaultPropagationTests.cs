@@ -40,19 +40,16 @@ public class FaultPropagationTests
             $"Expected the original fault '{marker}' in: {ex}");
     }
 
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task Fault_between_exchanges_releases_peers_within_the_step(bool pointToPoint)
+    [Fact]
+    public async Task Fault_between_exchanges_releases_peers_within_the_step()
     {
         // Distinct shuffles by value, so exactly one of the four workers owns the poison
         // value and throws in the Select — while its peers sit on the next exchange (GroupBy),
-        // waiting for a participant that will never arrive: at the barrier rendezvous, or —
-        // point-to-point — spinning on a publication the faulted worker will never make.
-        // The poison must release them either way; the timeout is the deadlock detector.
+        // waiting at the barrier for a participant that will never arrive. Poisoning the
+        // barrier must release them; the timeout is the deadlock detector.
         var builder = new CircuitBuilder(new CircuitOptions
         {
-            AutoStep = false, Workers = 4, PointToPointExchange = pointToPoint,
+            AutoStep = false, Workers = 4,
         });
         var numbers = builder.Input<int>("numbers");
         var countsDef = numbers

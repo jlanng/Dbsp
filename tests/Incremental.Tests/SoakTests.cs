@@ -59,7 +59,7 @@ public class SoakTests
                 expected[window] = expected.GetValueOrDefault(window) + 1;
                 await input.InsertAsync((rng.Next(Pages), at));
             }
-            await circuit.StepAsync();
+            await circuit.StepAsync().WaitAsync(TimeSpan.FromSeconds(20));
             while (final.Reader.TryRead(out var delta))
                 foreach (var ((window, count), weight) in delta)
                 {
@@ -83,7 +83,7 @@ public class SoakTests
 
         // The watermark is frozen between steps, so deadlines passed by the final batch's
         // events fire on the next step — run one empty flush step (what AutoStep does).
-        await circuit.StepAsync();
+        await circuit.StepAsync().WaitAsync(TimeSpan.FromSeconds(20));
         while (final.Reader.TryRead(out var delta))
             foreach (var ((window, count), weight) in delta)
             {

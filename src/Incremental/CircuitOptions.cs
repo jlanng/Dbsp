@@ -57,54 +57,6 @@ public sealed class CircuitOptions
     /// exchange operators shuffle across all of them. Null (default) — single process.</summary>
     public ClusterOptions? Cluster { get; init; }
 
-    /// <summary>EXPERIMENTAL. When true, local exchanges synchronize point-to-point instead
-    /// of on a global barrier: each worker release-publishes its fragments under a per-node
-    /// sequence number and waits only for the peers' publications it is about to read. A
-    /// worker never waits for peers to <em>arrive</em> — only for data — so skew at one
-    /// operator no longer convoys every worker at every exchange, which is most of the
-    /// multi-worker step cost on small deltas. A wait spins briefly and then parks until a
-    /// publication wakes it, as the barrier does, so a stalled peer does not keep its
-    /// waiters burning cores. Semantics are unchanged: workers still drift only within a
-    /// step, and steps remain atomic. Local processes only — combining this with
-    /// <see cref="Cluster"/> throws (the cluster shuffle stays barrier-based).</summary>
-    public bool PointToPointExchange { get; init; }
-
-    /// <summary>EXPERIMENTAL. When true, exchanges stream fragments (requires
-    /// <see cref="PointToPointExchange"/>, and is therefore local-only like it): a worker
-    /// publishes its partition of a large delta in chunks as it produces them — with any
-    /// single-consumer chain of linear operators feeding the exchange fused into that loop —
-    /// and consumers process whichever sender's fragments have arrived instead of waiting
-    /// for the slowest producer, merging as data lands; a join or linear aggregate that is
-    /// the exchange's sole consumer integrates the fragments directly. An exchange publishes
-    /// as soon as its input exists — right after the node heading its chain runs, or, when
-    /// that head is an upstream exchange or a join read by nothing else, fragment by
-    /// fragment as the head itself is fed (the join's per-fragment output is final, so it is
-    /// forwarded on the spot). Every operator still sees one complete delta per step and
-    /// outputs, checkpoints, and fault semantics are unchanged — streaming moves work
-    /// earlier inside a step, which is what shortens the serialized chain of busy workers
-    /// that dominates multi-worker step latency. Exchanges inside <c>Recurse</c> regions
-    /// keep the plain point-to-point path. See docs/design/fragment-streaming.md.</summary>
-    public bool FragmentStreaming { get; init; }
-
-    /// <summary>Rows per published fragment on a streamed exchange. A delta at or below this
-    /// publishes as a single fragment (the fast path, mechanically identical to plain
-    /// point-to-point); above it, chunks scale up so one execution never exceeds the
-    /// fragment ring, and forwarded chunks coalesce until they add up to this many rows
-    /// (or the producer is about to idle). Internal so tests can force chunking on tiny
-    /// deltas.</summary>
-    internal int StreamChunkRows { get; init; } = 256;
-
-    /// <summary>Point-to-point exchange waits: <see cref="SpinWait.SpinOnce()"/> iterations
-    /// (a short burst of pure spins, then yields — a millisecond or two in all) a worker
-    /// spends waiting for a peer's publication before it parks on the exchange gate and lets
-    /// a publication wake it — the same escalation the barrier uses, so a stalled peer (a
-    /// long GC pause, a slow user delegate) costs its waiters a core no longer than that.
-    /// The default is where a healthy paced step stops parking at all on the torture rig
-    /// (128, the barrier's budget, parked ~0.4 times per step there; 512 ~0.03; 2048 none —
-    /// with no difference in step time between them). Internal so tests can set it to zero
-    /// and route every slow wait through the park path.</summary>
-    internal int ExchangeSpinBudget { get; init; } = 2048;
-
     /// <summary>Upper bound on any single cross-process wait in a clustered step: receiving
     /// an exchange node's shards from a peer, the end-of-step alignment frames, or space in
     /// a peer's bounded send queue. Null (default) waits forever — a peer that is merely

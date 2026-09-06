@@ -34,7 +34,7 @@ public record RecoveryView(
 
 public record ScalingView(
     ScalingAct.Sample[] Samples, int Cores, int LiveBatch, int BulkBatch, int CurrentWorkers,
-    ExchangeMode CurrentExchange, bool DebugBuild);
+    bool DebugBuild);
 
 public record ClusterProcessRow(string Process, string Workers, string Merchants, string Frames);
 public record ClusterView(

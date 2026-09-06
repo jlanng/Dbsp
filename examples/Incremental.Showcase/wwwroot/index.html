@@ -226,8 +226,7 @@ const us = (micros) => micros >= 10000 ? (micros / 1000).toFixed(1) + " ms" : n0
 // Kept in localStorage because a relaunch is a new process: it is the only place the
 // previous configuration's p50 can survive to be compared with the next one's.
 const HISTORY_KEY = "showcase:topology-history";
-const exchangeName = (e) => ({ barrier: "barrier", pointToPoint: "point-to-point", streaming: "streaming" })[e] || e;
-const topologyKey = (t) => `${t.workers}w·${t.nodes}n·${t.exchange}`;
+const topologyKey = (t) => `${t.workers}w·${t.nodes}n`;
 function loadHistory() {
   try { return JSON.parse(localStorage.getItem(HISTORY_KEY)) || {}; } catch { return {}; }
 }
@@ -238,7 +237,7 @@ function rememberHistory(h) {
   try {
     const history = loadHistory();
     history[topologyKey(h)] = {
-      workers: h.workers, nodes: h.nodes, exchange: h.exchange, build: h.build,
+      workers: h.workers, nodes: h.nodes, build: h.build,
       p50: h.stepP50, p95: h.stepP95, wait: h.workers === 1 ? null : h.syncWaitPct, steps: h.stepWindow, at: Date.now(),
     };
     localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
@@ -250,7 +249,7 @@ function historyPanel(h) {
   const age = (t) => { const s = (Date.now() - t) / 1000; return s < 90 ? "just now" : s < 5400 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`; };
   return panel("configurations tried", "live step time, this machine, this browser", rows.length
     ? table("hist", [
-        { label: "configuration", cls: (r) => (topologyKey(r) === key ? "run" : ""), get: (r) => `${r.workers}w × ${r.nodes}n · ${exchangeName(r.exchange)}${topologyKey(r) === key ? "  ← running" : ""}` },
+        { label: "configuration", cls: (r) => (topologyKey(r) === key ? "run" : ""), get: (r) => `${r.workers}w × ${r.nodes}n · barrier${topologyKey(r) === key ? "  ← running" : ""}` },
         { label: "step p50", num: 1, get: (r) => us(r.p50) },
         { label: "step p95", num: 1, get: (r) => us(r.p95) },
         { label: "exchange wait", num: 1, get: (r) => r.wait == null ? "—" : r.wait.toFixed(0) + "%" },
@@ -380,13 +379,12 @@ const render = {
     const h = s.header, sc = s.scaling, c = s.cluster;
     const out = [];
     rememberHistory(h);
-    const running = { workers: h.workers, nodes: h.nodes, exchange: h.exchange };
+    const running = { workers: h.workers, nodes: h.nodes };
     if (!target) target = { ...running };
-    const exchangeLabel = (e) => ({ barrier: "barrier", pointToPoint: "point-to-point", streaming: "streaming" })[e] || e;
     const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 
     // ── running vs target configuration ──────────────────────────────────
-    const changed = target.workers !== running.workers || target.nodes !== running.nodes || target.exchange !== running.exchange;
+    const changed = target.workers !== running.workers || target.nodes !== running.nodes;
     const sel = (axis, options, value, labelOf) =>
       `<select data-target="${axis}">${options.map((o) =>
         `<option value="${o}"${String(o) === String(value) ? " selected" : ""}>${esc(labelOf(o))}</option>`).join("")}</select>`;
@@ -395,7 +393,7 @@ const render = {
       `<div class="config">
          <div><span class="k">workers per node</span><b>${h.workers}</b></div>
          <div><span class="k">nodes</span><b>${h.nodes}</b><span class="d">${h.nodes === 1 ? "this process only" : `this process + ${plural(h.nodes - 1, "peer")} (cluster act)`}</span></div>
-         <div><span class="k">exchange</span><b>${esc(exchangeLabel(h.exchange))}</b><span class="d">${h.exchange === "barrier" ? "rendezvous at every exchange" : h.exchange === "pointToPoint" ? "wait only for the data about to be read" : "point-to-point + fragments through fused chains"}</span></div>
+         <div><span class="k">exchange</span><b>barrier</b><span class="d">rendezvous at every exchange</span></div>
          <div><span class="k">storage</span><b>${esc(h.storage)}</b></div>
          <div><span class="k">circuit</span><b>${esc(h.circuit)}</b></div>
        </div>
@@ -404,9 +402,7 @@ const render = {
          <div><span class="k">exchange wait</span><b>${h.workers === 1 ? "—" : h.syncWaitPct.toFixed(0) + "% of worker time"}</b><span class="d">${h.workers === 1 ? "no exchanges with one worker" : "blocked at exchanges, not computing (last ~20 s)"}</span></div>
        </div>
        <div style="color:var(--dim);margin-top:10px">What to look for: at this batch size (a handful of orders per tick) a step is mostly
-       exchange synchronization, so the exchange-wait share is the part each mode attacks — <b>barrier</b> makes every worker wait for every
-       worker at each of the pipeline's exchanges; <b>point-to-point</b> waits only for the shards it is about to read, so one slow worker
-       no longer convoys the rest; <b>streaming</b> also starts on partial deltas so downstream work overlaps upstream tails. More workers
+       exchange synchronization: the barrier makes every worker wait for every worker at each of the pipeline's exchanges. More workers
        per node add exchanges: they buy bulk throughput (measured below), not live latency. The history table remembers each
        configuration's numbers so a relaunch can be compared with the one before.</div>`)));
     out.push(historyPanel(h));
@@ -414,18 +410,16 @@ const render = {
       `<div class="config">
          <div><span class="k">workers per node</span>${sel("workers", [1, 2, 4, 8, 16], target.workers, (w) => plural(w, "worker"))}</div>
          <div><span class="k">nodes</span>${sel("nodes", [1, 2, 3, 4], target.nodes, (n) => n === 1 ? "1 node (this process)" : `${n} nodes (OS processes over TCP)`)}</div>
-         <div><span class="k">exchange</span>${sel("exchange", ["barrier", "pointToPoint", "streaming"], target.exchange, exchangeLabel)}</div>
        </div>
        <ul class="diff">${changed
          ? diff("workers per node", running.workers, target.workers, String)
            + diff("nodes", running.nodes, target.nodes, String)
-           + diff("exchange", running.exchange, target.exchange, exchangeLabel)
          : `<li style="color:var(--faint)">change any axis above; all changes apply in one relaunch</li>`}</ul>
        <div class="controls" style="margin:8px 0 0">
          <button class="act${changed ? " trigger" : ""}" data-apply="1"${changed && !relaunching ? "" : " disabled"}>${relaunching ? "relaunching…" : "apply → relaunch"}</button>
          <button class="act" data-reset="1"${changed ? "" : " disabled"}>reset to running</button>
        </div>
-       <div style="color:var(--dim);margin-top:8px">Worker count decides how operator state is sharded, so nothing here can change under a live circuit — the showcase relaunches itself into the target and this page reconnects on its own. Nodes above one arm the multi-process act below (barrier-synchronized over TCP whatever the live exchange mode); the live pipeline stays in this process because Recurse is rejected in clustered circuits.</div>`)));
+       <div style="color:var(--dim);margin-top:8px">Worker count decides how operator state is sharded, so nothing here can change under a live circuit — the showcase relaunches itself into the target and this page reconnects on its own. Nodes above one arm the multi-process act below (barrier-synchronized over TCP); the live pipeline stays in this process because Recurse is rejected in clustered circuits.</div>`)));
 
     // ── threads: measured, not asserted ──────────────────────────────────
     out.push(panel("threads · one process", `live batch ${sc ? sc.liveBatch : 8} rows/step`, sc
@@ -440,16 +434,14 @@ const render = {
             n0(sc.liveBatch)}-row steps, throughput from ${n0(sc.bulkBatch)}-row steps, same declaration throughout.
             Sync wait is the share of worker time spent blocked at exchanges, not computing —
             measured over the live-batch section and the bulk section separately, because it amortizes with batch size.
-            Barrier rows rendezvous every worker at every exchange; point-to-point rows (experimental) wait only for
-            the data they are about to read, so skew stops convoying the whole worker set; streaming rows (experimental)
-            also publish partial deltas in fragments so downstream work overlaps upstream tails.
+            Every multi-worker row rendezvous all workers at each exchange barrier.
             Lowest latency at ${sc.samples.reduce((a, b) => (a.latencyP50 <= b.latencyP50 ? a : b)).label};
             highest throughput at ${sc.samples.reduce((a, b) => (a.bulkRowsPerSec >= b.bulkRowsPerSec ? a : b)).label}.
             The web host is serving this page while it measures, which costs the p99 a little.</div>`
           + (sc.debugBuild
             ? `<div class="verdict no" style="margin-top:8px">Debug build — treat the throughput column as a lower bound. Debug penalises per-row work, which is exactly what extra workers parallelise, so the spread between 1 and 4 workers collapses here. Re-run with <code>dotnet run -c Release</code> for representative numbers.</div>`
             : ""))
-      : `<div class="body" style="color:var(--dim)">Not measured yet. The trigger runs the identical pipeline at 1, 2 and 4 workers in every exchange mode and reports p50/p99 latency at the live batch size next to bulk throughput — the two numbers point in opposite directions, which is the whole point of the tab.</div>`,
+      : `<div class="body" style="color:var(--dim)">Not measured yet. The trigger runs the identical pipeline at 1, 2 and 4 workers and reports p50/p99 latency at the live batch size next to bulk throughput — the two numbers point in opposite directions, which is the whole point of the tab.</div>`,
       true));
 
     // ── processes ────────────────────────────────────────────────────────
@@ -485,8 +477,7 @@ function paint(s) {
     `virtual clock <b>${h.virtualNow}</b>`,
     `watermark <b>${h.watermark ?? "—"}</b>${h.watermarkBehind == null ? "" : ` <span style="color:var(--faint)">(${h.watermarkBehind.toFixed(1)}s behind)</span>`}`,
     `step p50 <b>${us(h.stepP50)}</b> · p95 <b>${us(h.stepP95)}</b>${h.workers > 1 ? ` · exchange wait <b>${h.syncWaitPct.toFixed(0)}%</b>` : ""}`,
-    `${h.storage} · <b>${h.workers}</b> worker${h.workers === 1 ? "" : "s"} × <b>${h.nodes}</b> node${h.nodes === 1 ? "" : "s"} · ${
-      ({ barrier: "barrier", pointToPoint: "point-to-point", streaming: "streaming" })[h.exchange] || h.exchange} · gen <b>${h.generation}</b>`,
+    `${h.storage} · <b>${h.workers}</b> worker${h.workers === 1 ? "" : "s"} × <b>${h.nodes}</b> node${h.nodes === 1 ? "" : "s"} · barrier · gen <b>${h.generation}</b>`,
   ].join(""));
 
   const tab = tabs.find((t) => t.id === active);
@@ -562,7 +553,7 @@ document.addEventListener("click", async (e) => {
   if (apply && target) {
     apply.disabled = true;
     relaunching = true;                 // the reconnect after this one reloads the page
-    const q = new URLSearchParams({ workers: target.workers, nodes: target.nodes, exchange: target.exchange });
+    const q = new URLSearchParams({ workers: target.workers, nodes: target.nodes });
     const res = await fetch(`/api/relaunch?${q}`, { method: "POST" });
     if (!res.ok) { relaunching = false; apply.disabled = false; }
     if (last) paint(last);
@@ -588,7 +579,7 @@ document.addEventListener("change", (e) => {
   const axis = e.target.closest("[data-target]");
   if (!axis || !target) return;
   const v = e.target.value;
-  target = { ...target, [axis.dataset.target]: axis.dataset.target === "exchange" ? v : Number(v) };
+  target = { ...target, [axis.dataset.target]: Number(v) };
   if (last) paint(last);
 });
 

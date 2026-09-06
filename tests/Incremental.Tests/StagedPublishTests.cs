@@ -9,17 +9,14 @@ namespace Incremental.Tests;
 public class StagedPublishTests
 {
     [Theory]
-    [InlineData(1, false)]
-    [InlineData(4, false)]
-    [InlineData(4, true)]
-    public async Task Slow_consumer_receives_every_delta_exactly_once_in_step_order(
-        int workers, bool pointToPoint)
+    [InlineData(1)]
+    [InlineData(4)]
+    public async Task Slow_consumer_receives_every_delta_exactly_once_in_step_order(int workers)
     {
         const int values = 200;
         var builder = new CircuitBuilder(new CircuitOptions
         {
             Workers = workers,
-            PointToPointExchange = pointToPoint,
             // Small enough that the staged flush must actually block on the consumer.
             OutputChannelCapacity = 2,
         });

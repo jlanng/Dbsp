@@ -35,63 +35,10 @@ internal sealed class Worker(
     /// monotonically growing time counter.</summary>
     public long BarrierWaitTicks;
 
-    /// <summary>Point-to-point exchange mode only: how many times this worker has executed
-    /// each exchange node, indexed by node — the sequence number it publishes fragments
-    /// under. Every worker executes every node the same number of times (loop iteration
-    /// counts are a global decision), so a worker's own count is also the sequence it
-    /// expects from every peer. Empty when the circuit synchronizes on the barrier.</summary>
-    public long[] ExchangeSeq { get; set; } = [];
-
-    // Fragment streaming only (all empty otherwise; see docs/design/fragment-streaming.md).
-    // All are written only by the owning worker thread — the cross-thread words are the
-    // circuit's fragment-counter and sequence arrays, not these.
-
-    /// <summary>Cumulative fragments this worker has consumed per (node, sender), indexed
-    /// <c>node * workers + sender</c>. Monotonic across executions, so no per-step reset and
-    /// no ambiguity about which execution a published counter belongs to.</summary>
-    public long[] FragConsumed { get; set; } = [];
-
-    /// <summary>Cumulative fragments this worker has published per exchange node — the value
-    /// it last release-wrote to its fragment-counter slot, kept here so publishing does not
-    /// re-read the shared line.</summary>
-    public long[] FragPublished { get; set; } = [];
-
-    /// <summary>Per streamed exchange node: fragments published in the current execution
-    /// (reset at completion — it bounds an execution to the ring depth) and rows routed into
-    /// the open, not yet published ring slot (forwarded chunks coalesce there).</summary>
-    public int[] FragExecCount { get; set; } = [];
-
-    /// <inheritdoc cref="FragExecCount"/>
-    public int[] FragOpenRows { get; set; } = [];
-
-    /// <summary>Per fragment-sink node: fragments fed to the sink since its last completion,
-    /// so the sink's sweep position knows it must run <c>Step</c> even though the streamed
-    /// input slots are empty. Read and reset by the sink's node execution.</summary>
-    public long[] SinkPending { get; set; } = [];
-
-    /// <summary>Consume-loop scratch: which senders have completed the streamed exchange
-    /// being consumed. One array serves every node — the loop finishes a node before the
-    /// sweep reaches the next.</summary>
-    public bool[] SenderDone { get; set; } = [];
-
-    /// <summary>Per streamed exchange node, the reused chunk Z-sets the producer splits its
-    /// input into (created lazily from the input's own type; only deltas above the chunk
-    /// target ever populate more than the sweep already had).</summary>
-    public IZSet?[]?[] ChunkScratch { get; set; } = [];
-
-    /// <summary>Fragments this worker published/consumed, cumulative (phase-stats reporting;
-    /// the counters are cheap enough to keep unconditionally).</summary>
-    public long FragmentsPublished, FragmentsConsumed;
-
     // PHASE-STATS (diagnostic probe, gated on INCREMENTAL_PHASE_STATS=1; see Circuit).
     // Cumulative ticks per phase of the exchange path, plus per-step span timestamps for
     // launch/land attribution. Written only by the owning worker thread; read racily at dispose.
-    public long PartitionTicks, MergeTicks, SpanTicks, SlowWaits, ExchangeExecutions, EmptyExchangeSkips;
-
-    /// <summary>Point-to-point waits that outlived the spin budget and parked (cumulative;
-    /// cheap enough to keep unconditionally — it says whether parking is ever on a healthy
-    /// step's path).</summary>
-    public long ExchangeParks;
+    public long PartitionTicks, MergeTicks, SpanTicks, ExchangeExecutions, EmptyExchangeSkips;
     public long StepStartTs, StepEndTs;
 
     /// <summary>Released once by the coordinator for every step this worker should run.</summary>

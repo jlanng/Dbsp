@@ -14,11 +14,9 @@ dotnet run -c Release --project benchmarks/Incremental.Torture -- --workers 4 --
 |---|---|
 | `--alloc-types` | byte-weighted allocation histogram by type (an in-process `GCAllocationTick` listener — no external tooling) |
 | `--rate N` | pace at N orders/second instead of running unpaced |
-| `--p2p` | point-to-point exchange synchronization instead of the barrier |
-| `--streaming` | fragment streaming on the exchanges (implies `--p2p`; see docs/design/fragment-streaming.md) |
-| `--spin-budget N` | point-to-point waits spin N iterations before parking (`CircuitOptions.ExchangeSpinBudget`); `parks/step` on the phase-stats line shows how often they park |
 | `--processes N` | cluster mode: N co-hosted processes stepped in lockstep, which puts the exchange wire format on the measured path |
 | `--seconds N`, `--warmup N` | measured window and warm-up, in seconds (defaults 20 and 5) |
+| `--warmup-steps N` | local runs also require this many warm-up steps (default 3000) before measuring |
 | `--workers`, `--batch`, `--input-capacity`, `--live-orders`, `--orders-per-vsec`, `--customers`, `--merchants`, `--categories`, `--fee-tiers`, `--regions`, `--rings`, `--seed`, `--json` | see `Options.cs` |
 
 ## What it does
@@ -31,6 +29,15 @@ negative-weight paths on every step, which a pure-insert benchmark never touches
 
 Each order carries an insert, a retraction, and up to two payment rows, so the record rate
 through the inputs is roughly 3.8x the order rate.
+
+The local rig reports measured-window step duration mean/p50/p95/p99 from the circuit's
+meter, separate from the step interval (which includes idle time in paced runs). The
+bounded histogram has one-microsecond bins, caps at one second, and reports overflows
+in JSON. Exchange wait is the change in the cumulative worker-wait gauge over the
+measurement window, divided by workers and completed steps; it includes recursion
+barriers. The metrics share
+approximate window boundaries: a step in flight at a boundary can contribute a record
+count on one side and a completed duration on the other.
 
 Worker saturation and the CPU split come from `/proc/self/task`: the circuit names its
 threads `circuit-worker-N`, so utime+stime of exactly those threads — against the GC threads

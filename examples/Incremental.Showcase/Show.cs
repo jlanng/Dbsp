@@ -31,7 +31,7 @@ public sealed class Tab
 public record BeatState(string Id, string Label, bool Armed, string? Reason);
 public record HeaderState(
     int Tick, int Generation, string VirtualNow, string? Watermark, double? WatermarkBehind,
-    string Storage, int Workers, int Nodes, ExchangeMode Exchange, string Build,
+    string Storage, int Workers, int Nodes, string Build,
     bool Running, string Circuit, double LastStepMicros, int LastEnrichedDelta,
     double StepP50, double StepP95, int StepWindow, double SyncWaitPct, double SyncWaitSeconds);
 public record Snapshot(
@@ -81,7 +81,7 @@ public sealed class Show : IAsyncDisposable
     ClusterView? cluster;
 
     // Exchange-wait share of the live pipeline over a trailing window of frames: each frame
-    // samples the circuit's summed per-worker barrier/p2p wait (cumulative seconds, from the
+    // samples the circuit's summed per-worker barrier wait (cumulative seconds, from the
     // library's gauge) against its summed step time; the share is Δwait / (workers ×
     // Δstep time) between the oldest and newest sample. Tagged by generation so a crash
     // rebuild (new circuit, new gauge series) starts the window over.
@@ -114,7 +114,7 @@ public sealed class Show : IAsyncDisposable
         StorageLabel = storageLabel;
         Notices = notices;
         Metrics = metrics;
-        live = new ShowcaseCircuit("showcase", storage, loggerFactory, topology.Workers, topology.Exchange);
+        live = new ShowcaseCircuit("showcase", storage, loggerFactory, topology.Workers);
         Tabs = BuildTabs();
     }
 
@@ -229,7 +229,7 @@ public sealed class Show : IAsyncDisposable
         var header = new HeaderState(
             globalTick, generation, director.VirtualNow.ToString("HH:mm:ss"),
             wm?.ToString("HH:mm:ss"), wm is null ? null : (director.VirtualNow - wm.Value).TotalSeconds,
-            StorageLabel, live.Workers, Topology.Nodes, Topology.Exchange, Build,
+            StorageLabel, live.Workers, Topology.Nodes, Build,
             Running, live.Circuit.Name, live.LastStepMicros, live.LastEnrichedDelta,
             p50, p95, windowSteps, waitPct, waitSeconds);
 
@@ -337,7 +337,7 @@ public sealed class Show : IAsyncDisposable
         generation++;
         // The same topology as before the crash — a checkpoint restores into the worker
         // count that wrote it.
-        live = new ShowcaseCircuit($"showcase-g{generation}", storage, loggerFactory, Topology.Workers, Topology.Exchange);
+        live = new ShowcaseCircuit($"showcase-g{generation}", storage, loggerFactory, Topology.Workers);
         var committed = new Dictionary<string, long?>
         {
             ["orders-web"] = live.Circuit.CommittedOffset("orders-web"),
@@ -378,7 +378,7 @@ public sealed class Show : IAsyncDisposable
     async Task MeasureBeat()
     {
         Running = false;         // the measurement must not compete with the live circuit
-        Notices.Push(NoticeLevel.Info, "measuring 1 / 2 / 4 workers — barrier, point-to-point and streaming — on this machine; traffic paused, the view holds for ~40 s");
+        Notices.Push(NoticeLevel.Info, "measuring 1 / 2 / 4 workers on this machine; traffic paused, the view holds briefly");
         scaling = await ScalingAct.MeasureAllAsync(Topology);
         var best = scaling.Samples.MinBy(s => s.LatencyP50)!;
         var fastest = scaling.Samples.MaxBy(s => s.BulkRowsPerSec)!;
@@ -429,7 +429,7 @@ public sealed class Show : IAsyncDisposable
             Unavailable = () => director.Edges.ContainsKey((23, 31)) ? null : "add the bridge first",
         });
         Add(new Beat { Id = "crash", Label = "kill -9 the circuit and rebuild from the checkpoint", Fire = CrashBeat });
-        Add(new Beat { Id = "measure", Label = "measure 1 / 2 / 4 workers × barrier / point-to-point / streaming on this machine (~40 s)", Fire = MeasureBeat });
+        Add(new Beat { Id = "measure", Label = "measure 1 / 2 / 4 workers on this machine", Fire = MeasureBeat });
         Add(new Beat
         {
             Id = "cluster",
@@ -555,8 +555,7 @@ public sealed class Show : IAsyncDisposable
             {
                 Id = "cluster", Title = "scaling out",
                 Explainer = """
-                    One declaration, three knobs: threads in this process, processes, and how the
-                    exchanges between workers synchronize. All three are CircuitOptions — the
+                    One declaration, two knobs: threads in this process and processes. Both are CircuitOptions — the
                     pipeline code never mentions any of them. The running-configuration card shows
                     what this process is running; compose another one and apply it, and the
                     showcase relaunches into it in one go.
@@ -567,13 +566,9 @@ public sealed class Show : IAsyncDisposable
                     the showcase's live batch size — a handful of orders a tick — that overhead is
                     most of the step, so one worker has the lowest latency; feed the same pipeline a
                     bulk batch and the exchange is what lets the extra workers earn their keep. The
-                    trigger measures both on this machine, at 1, 2 and 4 workers in all three
-                    exchange modes, rather than asking you to take the claim on trust. Barrier rows
-                    rendezvous every worker at every exchange; point-to-point rows wait only for the
-                    publications they are about to read; streaming rows also publish partial deltas
-                    in fragments through fused linear chains, so downstream work overlaps upstream
-                    tails (point-to-point and streaming are both experimental). The relaunch is
-                    what gets the GC heap count sized to the new worker count; the rows measured
+                    trigger measures both on this machine, at 1, 2 and 4 workers, rather than asking
+                    you to take the claim on trust. Multi-worker rows rendezvous every worker at each
+                    exchange barrier. The relaunch is what gets the GC heap count sized to the new worker count; the rows measured
                     in one process all share this process's heap count, so treat them as comparing
                     exchange cost, not as tuned per-topology throughput.
 
@@ -582,15 +577,12 @@ public sealed class Show : IAsyncDisposable
                     place. Exchanges then hash-partition by StableHash across the nodes × workers
                     global workers and ship remote shards over TCP (unauthenticated cleartext —
                     loopback only here), with steps in lockstep everywhere. The cluster shuffle is
-                    barrier-based whatever exchange mode the live pipeline runs, and Recurse is
+                    barrier-based, and Recurse is
                     rejected in clustered circuits, so that run uses its own small revenue pipeline.
                     """,
                 Code = """
                     // threads: the only change is a number. No pipeline code moves.
                     new CircuitOptions { Workers = 4 };
-
-                    // exchange mode: how those workers synchronize (both experimental).
-                    new CircuitOptions { Workers = 4, PointToPointExchange = true, FragmentStreaming = true };
 
                     // processes: same declaration on every peer, each told its own index.
                     new CircuitOptions {

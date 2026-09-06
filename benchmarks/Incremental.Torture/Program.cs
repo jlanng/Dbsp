@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
-using System.Globalization;
 using Incremental;
 using Incremental.Showcase;
 using Incremental.Storage;
@@ -26,11 +25,14 @@ if (options.Processes > 1)
 // Records drained and steps run come from the library's own meter rather than from the
 // harness's bookkeeping: those are the counts the circuit actually processed.
 long recordsDrained = 0, stepsRun = 0;
+var latency = new StepLatency();
+double observedWaitSeconds = 0;
 using var meter = new MeterListener();
 meter.InstrumentPublished = (instrument, listener) =>
 {
     if (instrument.Meter.Name == "Incremental" &&
-        instrument.Name is "incremental.circuit.records" or "incremental.circuit.steps")
+        instrument.Name is "incremental.circuit.records" or "incremental.circuit.steps"
+            or "incremental.circuit.step_duration" or "incremental.circuit.barrier_wait")
         listener.EnableMeasurementEvents(instrument);
 };
 meter.SetMeasurementEventCallback<long>((instrument, value, _, _) =>
@@ -40,7 +42,19 @@ meter.SetMeasurementEventCallback<long>((instrument, value, _, _) =>
     else
         Interlocked.Increment(ref stepsRun);
 });
+meter.SetMeasurementEventCallback<double>((instrument, value, _, _) =>
+{
+    if (instrument.Name == "incremental.circuit.step_duration") latency.Record(value);
+    else observedWaitSeconds += value; // gauge callbacks run synchronously on the polling thread
+});
 meter.Start();
+
+double ReadWaitSeconds()
+{
+    observedWaitSeconds = 0;
+    meter.RecordObservableInstruments();
+    return observedWaitSeconds;
+}
 
 var feed = new Feed(options);
 var builder = new CircuitBuilder(new CircuitOptions
@@ -52,9 +66,6 @@ var builder = new CircuitBuilder(new CircuitOptions
     InputChannelCapacity = options.InputCapacity,
     MaxStepItemsPerInput = options.StepBatch,
     OutputChannelCapacity = 1024,
-    PointToPointExchange = options.PointToPoint,
-    FragmentStreaming = options.Streaming,
-    ExchangeSpinBudget = options.SpinBudget ?? new CircuitOptions().ExchangeSpinBudget,
 });
 var defs = ShowcasePipeline.Declare(builder);
 var circuit = builder.Build();
@@ -166,7 +177,17 @@ Console.Error.WriteLine(
     $"seeded {options.LiveOrders:N0} live orders, {options.Merchants:N0} merchants, {options.Customers:N0} customers " +
     $"in {seedElapsed.TotalSeconds:F1}s; working set {Environment.WorkingSet / (1024 * 1024):N0} MB");
 
-await Task.Delay(TimeSpan.FromSeconds(options.WarmupSeconds));
+var warmupStartSteps = Volatile.Read(ref stepsRun);
+var warmup = Stopwatch.StartNew();
+do
+{
+    await Task.Delay(20);
+}
+while (warmup.Elapsed.TotalSeconds < options.WarmupSeconds ||
+       Volatile.Read(ref stepsRun) - warmupStartSteps < options.WarmupSteps);
+warmup.Stop();
+var warmupSteps = Volatile.Read(ref stepsRun) - warmupStartSteps;
+Console.Error.WriteLine($"warmed {warmupSteps:N0} steps in {warmup.Elapsed.TotalSeconds:F1}s");
 
 // ── measured window ────────────────────────────────────────────────────────────
 using var allocations = options.AllocationTypes ? new AllocationProfiler() : null;
@@ -179,11 +200,15 @@ var records0 = Volatile.Read(ref recordsDrained);
 var steps0 = Volatile.Read(ref stepsRun);
 var alloc0 = GC.GetTotalAllocatedBytes(precise: false);
 var gc0 = (GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2));
+var wait0 = ReadWaitSeconds();
+latency.Begin();
 var wall = Stopwatch.StartNew();
 
 await Task.Delay(TimeSpan.FromSeconds(options.Seconds));
 
 wall.Stop();
+var stepLatency = latency.End();
+var waitSeconds = ReadWaitSeconds() - wait0;
 var cpu1 = ThreadCpu.Take();
 var records = Volatile.Read(ref recordsDrained) - records0;
 var steps = Volatile.Read(ref stepsRun) - steps0;
@@ -208,7 +233,10 @@ Console.WriteLine($"workers {options.Workers}   rate {(options.Rate == 0 ? "unpa
                   $"   live orders {options.LiveOrders:N0}   window {seconds:F1}s");
 Console.WriteLine($"  throughput      {records / seconds:N0} records/s   ({records / seconds / 3.8:N0} orders/s equivalent)");
 Console.WriteLine($"  steps           {steps / seconds:N0}/s   {records / (double)Math.Max(1, steps):N0} records/step   " +
-                  $"{seconds / Math.Max(1, steps) * 1e6:N0} us/step");
+                  $"{seconds / Math.Max(1, steps) * 1e6:N0} us/step interval (includes idle)");
+Console.WriteLine($"  step duration   mean {stepLatency.MeanUs:F1} us   p50 {stepLatency.P50Us:F0} us   " +
+                  $"p95 {stepLatency.P95Us:F0} us   p99 {stepLatency.P99Us:F0} us");
+Console.WriteLine($"  barrier wait    {waitSeconds * 1e6 / Math.Max(1, stepLatency.Count) / options.Workers:F1} us/worker-step");
 Console.WriteLine($"  worker CPU      {workerCpu:F2}s over {seconds:F1}s x {options.Workers} = {saturation:P0} saturated");
 Console.WriteLine($"  process CPU     {processCpu:F2}s ({processCpu / seconds:F2} cores)   " +
                   $"= workers {workerCpu:F1}s + GC {gcCpu:F1}s + producer {producerCpu:F1}s + other {processCpu - workerCpu - gcCpu - producerCpu:F1}s");
@@ -235,8 +263,23 @@ if (allocations is not null)
 }
 
 if (options.Json)
-    Console.WriteLine("JSON " + string.Create(CultureInfo.InvariantCulture,
-        $$"""{"workers":{{options.Workers}},"rate":{{options.Rate}},"recordsPerSec":{{records / seconds:F0}},"usPerStep":{{seconds / Math.Max(1, steps) * 1e6:F1}},"saturation":{{saturation:F4}},"cpuPerRecordUs":{{processCpu / records * 1e6:F3}},"workerCpuPerRecordUs":{{workerCpu / records * 1e6:F3}},"bytesPerRecord":{{allocated / (double)records:F1}},"workingSetMB":{{workingSet / (1024 * 1024)}}}"""));
+    Console.WriteLine("JSON " + System.Text.Json.JsonSerializer.Serialize(new
+    {
+        workers = options.Workers, exchange = "Barrier", rate = options.Rate,
+        liveOrders = options.LiveOrders, batch = options.StepBatch, seed = options.Seed,
+        warmupSeconds = warmup.Elapsed.TotalSeconds, warmupSteps,
+        seconds, records, steps, recordsPerSec = records / seconds,
+        recordsPerStep = records / (double)Math.Max(1, steps),
+        usPerStep = seconds / Math.Max(1, steps) * 1e6, // legacy field: interval, not active duration
+        stepSamples = stepLatency.Count, stepMeanUs = stepLatency.MeanUs,
+        stepP50Us = stepLatency.P50Us, stepP95Us = stepLatency.P95Us, stepP99Us = stepLatency.P99Us,
+        stepHistogramOverflows = stepLatency.OverOneSecond,
+        waitUsPerWorkerStep = waitSeconds * 1e6 / Math.Max(1, stepLatency.Count) / options.Workers,
+        saturation, cpuPerRecordUs = processCpu / records * 1e6,
+        workerCpuPerRecordUs = workerCpu / records * 1e6, gcCpuPerRecordUs = gcCpu / records * 1e6,
+        bytesPerRecord = allocated / (double)records, workingSetMB = workingSet / (1024 * 1024),
+        gcPauseSeconds = pause.TotalSeconds,
+    }));
 
 web.Complete(); mobile.Complete(); payments.Complete();
 merchants.Complete(); customers.Complete(); feeRates.Complete(); edges.Complete();

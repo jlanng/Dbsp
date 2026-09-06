@@ -228,14 +228,12 @@ public class WindowCloseTests
         Assert.Equal(1, integrated.DistinctCount); // no close for windows that never saw data
     }
 
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task Window_closes_on_a_step_where_every_exchange_is_empty(bool pointToPoint)
+    [Fact]
+    public async Task Window_closes_on_a_step_where_every_exchange_is_empty()
     {
         var builder = new CircuitBuilder(new CircuitOptions
         {
-            AutoStep = false, Workers = 4, PointToPointExchange = pointToPoint,
+            AutoStep = false, Workers = 4,
         });
         var views = builder.Input<(string Page, DateTimeOffset At)>("views");
         var closesDef = views

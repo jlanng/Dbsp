@@ -9,13 +9,8 @@ namespace Incremental.Operators;
 /// the row count exists only to detect a group vanishing, which the accumulator alone cannot
 /// (a SUM of 0 is not an empty group). Output semantics match
 /// <see cref="AggregateOperator{TKey,TValue,TResult}"/>: stale results are retracted.
-/// <para>
-/// The homomorphism is also what makes this a fragment sink: fragments of the step's delta
-/// fold into the per-key scratch accumulator in any order, and the state
-/// read/compare/emit/write pass runs once, in <see cref="Step"/> — the completion call.
-/// </para>
 /// </summary>
-internal sealed class LinearAggregateOperator<TKey, TValue, TResult> : IFragmentSinkOperator
+internal sealed class LinearAggregateOperator<TKey, TValue, TResult> : IStepOperator
     where TKey : notnull
     where TValue : notnull
     where TResult : notnull
@@ -46,12 +41,7 @@ internal sealed class LinearAggregateOperator<TKey, TValue, TResult> : IFragment
     private readonly List<TKey> _removes = [];
     private readonly OutputBuffer<KeyedValue<TKey, TResult>> _output = new();
 
-    public void OnFragment(int input, object fragment) =>
-        Fold((ZSet<KeyedValue<TKey, TValue>>)fragment);
-
-    /// <summary>Folds a delta (whole or a fragment) into the per-key scratch, which carries
-    /// across fragment calls within a step and is cleared by <see cref="Step"/> on the way
-    /// out — so a skipped step (no fragments, empty input) finds it already clean.</summary>
+    /// <summary>Folds the step's delta into the per-key scratch.</summary>
     private void Fold(ZSet<KeyedValue<TKey, TValue>> delta)
     {
         var perKey = _perKey;
@@ -67,7 +57,6 @@ internal sealed class LinearAggregateOperator<TKey, TValue, TResult> : IFragment
 
     public object Step(object?[] inputs)
     {
-        // When this operator streams, the fragments already folded and the slot is empty.
         Fold((ZSet<KeyedValue<TKey, TValue>>)inputs[0]!);
         var perKey = _perKey;
 

@@ -8,17 +8,13 @@ namespace Incremental.Tests;
 /// integrated input — after every step, under arbitrary insert/retract interleavings.
 /// Inputs are generated over deliberately small domains so values collide, pass through
 /// zero, and retract often, and every property runs the same batches at Workers = 1 and
-/// Workers = 4 — the sharded exchange path, in every synchronization mode: barrier,
-/// point-to-point, and point-to-point with fragment streaming (chunked to one row per
-/// fragment, so multi-fragment publication, partial merges, and the fragment sinks all
-/// engage even on these tiny deltas). CsCheck shrinks failures and prints the seed to
+/// Workers = 4 — the sharded, barrier-synchronized exchange path. CsCheck shrinks failures and prints the seed to
 /// reproduce them; the op-list → batch folding below is deterministic, so a seed replays
 /// the exact circuit run.
 /// </summary>
 public class PropertyDifferentialTests
 {
-    private static readonly (int Workers, bool P2p, bool Streaming)[] Engines =
-        [(1, false, false), (4, false, false), (4, true, false), (4, true, true)];
+    private static readonly int[] WorkerCounts = [1, 4];
 
     // ---------------------------------------------------------------- generators
 
@@ -68,12 +64,11 @@ public class PropertyDifferentialTests
 
         async Task RunAsync()
         {
-            foreach (var (workers, p2p, streaming) in Engines)
+            foreach (var workers in WorkerCounts)
             {
                 var builder = new CircuitBuilder(new CircuitOptions
                 {
-                    AutoStep = false, Workers = workers, PointToPointExchange = p2p,
-                    FragmentStreaming = streaming, StreamChunkRows = streaming ? 1 : 256,
+                    AutoStep = false, Workers = workers,
                 });
                 var inputDef = builder.Input<TIn>("in");
                 var outputDef = query(inputDef).ToOutput();
@@ -93,7 +88,7 @@ public class PropertyDifferentialTests
                         integratedOut.AddAll(delta);
                     foreach (var (v, w) in batches[step])
                         integratedIn.Add(v, w);
-                    AssertZSetsEqual(oracle(integratedIn), integratedOut, workers, p2p, streaming, step);
+                    AssertZSetsEqual(oracle(integratedIn), integratedOut, workers, step);
                 }
             }
         }
@@ -112,12 +107,11 @@ public class PropertyDifferentialTests
 
         async Task RunAsync()
         {
-            foreach (var (workers, p2p, streaming) in Engines)
+            foreach (var workers in WorkerCounts)
             {
                 var builder = new CircuitBuilder(new CircuitOptions
                 {
-                    AutoStep = false, Workers = workers, PointToPointExchange = p2p,
-                    FragmentStreaming = streaming, StreamChunkRows = streaming ? 1 : 256,
+                    AutoStep = false, Workers = workers,
                 });
                 var leftDef = builder.Input<TIn>("left");
                 var rightDef = builder.Input<TIn>("right");
@@ -140,14 +134,14 @@ public class PropertyDifferentialTests
                         integratedOut.AddAll(delta);
                     foreach (var (isLeft, entry) in batches[step])
                         (isLeft ? integratedL : integratedR).Add(entry.Value, entry.Weight);
-                    AssertZSetsEqual(oracle(integratedL, integratedR), integratedOut, workers, p2p, streaming, step);
+                    AssertZSetsEqual(oracle(integratedL, integratedR), integratedOut, workers, step);
                 }
             }
         }
     }
 
     private static void AssertZSetsEqual<T>(
-        IEnumerable<WeightedValue<T>> expectedEntries, ZSet<T> actual, int workers, bool p2p, bool streaming, int step)
+        IEnumerable<WeightedValue<T>> expectedEntries, ZSet<T> actual, int workers, int step)
         where T : notnull
     {
         var expected = new ZSet<T>(expectedEntries);
@@ -155,8 +149,7 @@ public class PropertyDifferentialTests
             && expected.All(e => actual.WeightOf(e.Value) == e.Weight);
         if (!equal)
             throw new Exception(
-                $"differential mismatch (workers={workers}, " +
-                $"{(streaming ? "fragment-streaming" : p2p ? "point-to-point" : "barrier")}, after step {step}): " +
+                $"differential mismatch (workers={workers}, barrier, after step {step}): " +
                 $"expected {expected} but integrated deltas give {actual}");
     }
 

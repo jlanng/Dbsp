@@ -21,9 +21,7 @@ var headless = args.Contains("--headless");
 var port = Arg("--port") is { } p ? int.Parse(p) : 5170;
 // The topology: --workers N (2 by default, so every other tab really exercises the exchange
 // path), --nodes N (1; above one arms the multi-process cluster act), --exchange
-// barrier|p2p|streaming (how the LIVE pipeline's exchanges synchronize; the cluster act stays
-// barrier-based). --cluster, --p2p and --streaming remain as aliases for --nodes 2,
-// --exchange p2p and --exchange streaming. Tab 5 shows what is running, measures the
+// barrier-synchronized. --cluster remains an alias for --nodes 2. Tab 5 shows what is running, measures the
 // alternatives side by side, and relaunches the showcase into another topology.
 Topology topology;
 try
@@ -85,7 +83,7 @@ var hub = new Hub();
 app.MapGet("/api/tabs", () => Results.Json(new
 {
     tabs = show.Tabs.Select(t => new { t.Id, t.Title, t.Explainer, t.Code }),
-    topology = new { topology.Workers, topology.Nodes, topology.Exchange, maxWorkers = Topology.MaxWorkers, maxNodes = Topology.MaxNodes },
+    topology = new { topology.Workers, topology.Nodes, maxWorkers = Topology.MaxWorkers, maxNodes = Topology.MaxNodes },
 }, json));
 
 // One SSE stream per browser. Every client gets its own single-slot channel that drops
@@ -137,22 +135,20 @@ app.MapPost("/api/trigger/{id}", async (string id) =>
     }
 });
 
-// Relaunch the showcase into a different topology — any combination of workers, nodes and
-// exchange mode in one go. Worker count changes how state is sharded, so it cannot be
+// Relaunch the showcase into a different topology — any combination of workers and nodes.
+// Worker count changes how state is sharded, so it cannot be
 // swapped under a running circuit — the process restarts instead. Kestrel has released the
 // port by the time RunAsync returns, so the successor binds the same one and the browser's
 // EventSource reconnects to it on its own. Axes left out of the request keep their current
 // value.
 string[]? relaunchArgs = null;
 var relaunchTopology = topology;
-app.MapPost("/api/relaunch", (int? workers, int? nodes, string? exchange, IHostApplicationLifetime lifetime) =>
+app.MapPost("/api/relaunch", (int? workers, int? nodes, IHostApplicationLifetime lifetime) =>
 {
     Topology target;
     try
     {
-        target = Topology.Normalize(
-            workers ?? topology.Workers, nodes ?? topology.Nodes,
-            exchange is null ? topology.Exchange : Topology.ParseExchange(exchange));
+        target = Topology.Normalize(workers ?? topology.Workers, nodes ?? topology.Nodes);
     }
     catch (ArgumentException ex)
     {
@@ -171,7 +167,7 @@ app.MapPost("/api/relaunch", (int? workers, int? nodes, string? exchange, IHostA
     relaunchArgs = [.. next];
     notices.Push(NoticeLevel.Info, $"relaunching into {target.Label}: {string.Join(' ', next)}");
     lifetime.StopApplication();
-    return Results.Json(new { target.Workers, target.Nodes, target.Exchange }, json);
+    return Results.Json(new { target.Workers, target.Nodes }, json);
 });
 
 app.MapPost("/api/run/{state}", async (string state) =>

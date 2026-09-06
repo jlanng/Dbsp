@@ -62,7 +62,7 @@ internal sealed class CircuitDiagnostics : IDisposable
         Meter.CreateObservableGauge("incremental.cluster.send_queue_depth",
             ObserveSendQueueDepths, "{frame}", "Frames buffered in each peer's bounded send queue.");
         Meter.CreateObservableGauge("incremental.circuit.barrier_wait",
-            ObserveBarrierWait, "s", "Cumulative time each worker has spent waiting on exchanges (barrier or point-to-point) and loop barriers.");
+            ObserveBarrierWait, "s", "Cumulative time each worker has spent waiting on exchange and loop barriers.");
     }
 
     private readonly KeyValuePair<string, object?> _tag;

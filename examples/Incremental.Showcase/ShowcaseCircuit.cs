@@ -83,13 +83,10 @@ public sealed class ShowcaseCircuit
     }
 
     public readonly int Workers;
-    public readonly ExchangeMode Exchange;
-
     public ShowcaseCircuit(string name, IStorageProvider storage, ILoggerFactory loggerFactory, int workers = 2,
-        ExchangeMode exchange = ExchangeMode.Barrier, bool autoStep = false)
+        bool autoStep = false)
     {
         Workers = workers;
-        Exchange = exchange;
         var builder = new CircuitBuilder(new CircuitOptions
         {
             Name = name,
@@ -100,9 +97,6 @@ public sealed class ShowcaseCircuit
             Storage = storage,
             CheckpointInterval = 4,      // a crash loses up to 3 steps — replay covers the gap
             LoggerFactory = loggerFactory,
-            // --exchange: barrier (default), point-to-point, or point-to-point with fragment streaming.
-            PointToPointExchange = exchange != ExchangeMode.Barrier,
-            FragmentStreaming = exchange == ExchangeMode.Streaming,
         });
         Defs = ShowcasePipeline.Declare(builder);
         Circuit = builder.Build();

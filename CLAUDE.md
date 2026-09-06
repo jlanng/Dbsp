@@ -10,8 +10,7 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   `dotnet run --project examples/Incremental.LogAnalytics [-- --redis]`
 - Showcase (the all-features demo): `dotnet run --project examples/Incremental.Showcase`
   serves a web app on http://localhost:5170. Flags: `--port`, `--no-open`, `--redis`,
-  `--workers N`, `--nodes N`, `--exchange barrier|p2p|streaming` (`--cluster`, `--p2p` and
-  `--streaming` are aliases for `--nodes 2`, `--exchange p2p` and `--exchange streaming`).
+  `--workers N`, `--nodes N` (`--cluster` is an alias for `--nodes 2`).
   `-- --headless` runs every tab unattended and exits non-zero if a verified act fails —
   that is the smoke test. `Microsoft.NET.Sdk.Web` alone; no NuGet packages needed. Tab 5
   measures worker-count scaling and can relaunch the process into another topology; run it

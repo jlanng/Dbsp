@@ -292,7 +292,7 @@ unlistened.
 | `incremental.circuit.checkpoint_commits`, `.checkpoint_commit_duration` | atomic state+offsets commits |
 | `incremental.circuit.input_queue_depth`, `.output_queue_depth` | bounded-channel depths, per port |
 | `incremental.circuit.watermark_lag` | now minus the frozen watermark, seconds |
-| `incremental.circuit.barrier_wait` | cumulative seconds each worker has spent waiting on exchanges (barrier or point-to-point) and loop barriers |
+| `incremental.circuit.barrier_wait` | cumulative seconds each worker has spent waiting on exchange and loop barriers |
 | `incremental.cluster.frames_sent/received`, `.bytes_sent/received`, `.send_queue_depth` | exchange traffic, per peer |
 
 **Keyed inputs.** `builder.KeyedInput<K,V>(name, keySelector)` declares an input with
@@ -432,8 +432,7 @@ examples/Incremental.Showcase      the all-features demo: a marketplace payments
                                        retract-then-assert is visible rather than described; the
                                        footer reads the `Incremental` meter. `--workers N` sets the thread count
                                        (default 2, so the other tabs really exercise the exchange
-                                       path); `--exchange barrier|p2p|streaming` picks how the live
-                                       pipeline's exchanges synchronize. No NuGet dependency beyond
+                                       path). No NuGet dependency beyond
                                        the library: `Microsoft.NET.Sdk.Web` resolves ASP.NET Core
                                        from the shared framework, the page is one dependency-free
                                        HTML file, and state reaches it over server-sent events.

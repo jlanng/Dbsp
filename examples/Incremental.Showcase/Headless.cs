@@ -174,9 +174,9 @@ public static class Headless
                     var fastest = sc.Samples.MaxBy(x => x.BulkRowsPerSec)!;
                     Line("verified", $"lowest latency at {quickest.Workers} worker(s), highest throughput at {fastest.Workers}");
                     if (quickest.LatencyP50 <= 0) failures.Add("scaling: measured a non-positive latency");
-                    foreach (var mode in Enum.GetValues<ExchangeMode>())
-                        if (!sc.Samples.Any(x => x.Exchange == mode && x.Workers > 1))
-                            failures.Add($"scaling: no {Topology.ExchangeLabel(mode)} row was measured");
+                    foreach (var workers in new[] { 2, 4 })
+                        if (!sc.Samples.Any(x => x.Workers == workers))
+                            failures.Add($"scaling: no {workers}-worker row was measured");
                     if (sc.Samples.Count(x => x.Highlight) != 1)
                         failures.Add("scaling: exactly one row should be marked as the running topology");
                 }

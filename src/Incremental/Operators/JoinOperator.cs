@@ -8,18 +8,8 @@ namespace Incremental.Operators;
 /// indexed store, and each step only probes the state with the new deltas — no
 /// recomputation over historical data. Both inputs must be co-partitioned by key, which
 /// <c>GroupBy</c> guarantees via its exchange.
-/// <para>
-/// Bilinearity is also what makes this a fragment sink: applying a fragment of either
-/// side's delta means probing the other side's <em>current</em> state and then integrating
-/// into its own, and under that discipline every ΔL×ΔR pair is counted exactly once no
-/// matter how the deltas are cut into fragments or interleaved — the whole-delta
-/// <see cref="Step"/> is just the two-fragment special case. And because a fragment's
-/// probe results are its final contribution (no later fragment revises them), the join is
-/// also an <em>emitting</em> sink: the runtime may forward each fragment's output onward
-/// the moment it is produced.
-/// </para>
 /// </summary>
-internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IEmittingFragmentSinkOperator
+internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IStepOperator
     where TKey : notnull
     where TLeft : notnull
     where TRight : notnull
@@ -58,35 +48,12 @@ internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IEmittingFragmen
     private readonly List<WeightedValue<TRight>> _rightRows = [];
     private readonly OutputBuffer<TOut> _output = new();
 
-    // The output delta under construction: opened by the first fragment (or by Step) from
-    // the shared double-buffered OutputBuffer, grown per applied delta, handed out once by
-    // Step. Streaming fills it earlier, never keeps it longer.
+    // The output delta under construction, shared by the left and right applications within
+    // one step and handed out once at the end.
     private ZSet<TOut>? _current;
-
-    public void OnFragment(int input, object fragment)
-    {
-        if (input == 0)
-            ApplyLeft((ZSet<KeyedValue<TKey, TLeft>>)fragment);
-        else
-            ApplyRight((ZSet<KeyedValue<TKey, TRight>>)fragment);
-    }
-
-    /// <summary>Emitting mode: the fragment's probe results, handed out immediately rather
-    /// than accumulated — nothing carries across calls, so <see cref="Step"/> later opens a
-    /// fresh buffer for what its non-streamed inputs produce.</summary>
-    public object OnFragmentEmitting(int input, object fragment)
-    {
-        OnFragment(input, fragment);
-        var output = _current ?? _empty;
-        _current = null;
-        return output;
-    }
 
     public object Step(object?[] inputs)
     {
-        // When this operator streams, its exchanged inputs arrived via OnFragment and the
-        // slots hold empty deltas — Step is then just the completion call (cross terms were
-        // covered as the fragments integrated) plus the eviction drain.
         if ((ZSet<KeyedValue<TKey, TLeft>>)inputs[0]! is { IsEmpty: false } deltaLeft)
             ApplyLeft(deltaLeft);
         if ((ZSet<KeyedValue<TKey, TRight>>)inputs[1]! is { IsEmpty: false } deltaRight)
@@ -105,8 +72,8 @@ internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IEmittingFragmen
         return output;
     }
 
-    /// <summary>ΔL ⋈ R with R's current state, then ΔL integrated — so later right-side
-    /// deltas (fragments or Step's) cover their ΔL ⋈ ΔR cross terms by probing L.</summary>
+    /// <summary>ΔL ⋈ R with R's current state, then ΔL integrated — so the right-side
+    /// delta covers the ΔL ⋈ ΔR cross term by probing the updated L.</summary>
     private void ApplyLeft(ZSet<KeyedValue<TKey, TLeft>> delta)
     {
         var output = _current ??= _output.Next(delta.DistinctCount);
@@ -129,7 +96,7 @@ internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IEmittingFragmen
         _left.ApplyAll(_leftEntries);
     }
 
-    /// <summary>The mirror image: ΔR ⋈ L (ΔL applied so far included), then ΔR integrated.</summary>
+    /// <summary>The mirror image: ΔR ⋈ L (ΔL applied first), then ΔR integrated.</summary>
     private void ApplyRight(ZSet<KeyedValue<TKey, TRight>> delta)
     {
         var output = _current ??= _output.Next(delta.DistinctCount);

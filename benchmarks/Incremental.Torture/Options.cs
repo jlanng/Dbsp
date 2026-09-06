@@ -26,14 +26,9 @@ internal sealed record Options
 
     public double Seconds { get; init; } = 20;
     public double WarmupSeconds { get; init; } = 5;
+    /// <summary>Local-run warm-up also waits for this many completed steps to let tiered JIT settle.</summary>
+    public int WarmupSteps { get; init; } = 3_000;
     public int Seed { get; init; } = 42;
-    public bool PointToPoint { get; init; }
-
-    /// <summary>Fragment streaming (implies point-to-point, which it builds on).</summary>
-    public bool Streaming { get; init; }
-
-    /// <summary>Point-to-point spin budget before a wait parks (CircuitOptions.ExchangeSpinBudget); null keeps the default.</summary>
-    public int? SpinBudget { get; init; }
     public int StepBatch { get; init; } = 8_192;
     public int InputCapacity { get; init; } = 32_768;
 
@@ -57,8 +52,6 @@ internal sealed record Options
             if (!arg.StartsWith("--", StringComparison.Ordinal))
                 throw new ArgumentException($"Unexpected argument '{arg}'.");
             var name = arg[2..];
-            if (name == "p2p") { options = options with { PointToPoint = true }; continue; }
-            if (name == "streaming") { options = options with { Streaming = true, PointToPoint = true }; continue; }
             if (name == "json") { options = options with { Json = true }; continue; }
             if (name == "alloc-types") { options = options with { AllocationTypes = true }; continue; }
 
@@ -68,7 +61,6 @@ internal sealed record Options
             options = name switch
             {
                 "workers" => options with { Workers = Int() },
-                "spin-budget" => options with { SpinBudget = Int() },
                 "merchants" => options with { Merchants = Int() },
                 "customers" => options with { Customers = Int() },
                 "categories" => options with { Categories = Int() },
@@ -80,6 +72,7 @@ internal sealed record Options
                 "rate" => options with { Rate = Int() },
                 "seconds" => options with { Seconds = Real() },
                 "warmup" => options with { WarmupSeconds = Real() },
+                "warmup-steps" => options with { WarmupSteps = Int() },
                 "seed" => options with { Seed = Int() },
                 "batch" => options with { StepBatch = Int() },
                 "input-capacity" => options with { InputCapacity = Int() },
