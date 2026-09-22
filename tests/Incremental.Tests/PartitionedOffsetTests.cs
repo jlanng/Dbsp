@@ -177,7 +177,7 @@ public class PartitionedOffsetTests
         Assert.Equal(2L, resumed.CommittedOffset("orders"));
     }
 
-    [SkippableFact]
+    [Fact]
     public async Task Multi_partition_checkpoint_round_trips_through_redis()
     {
         using var redis = ConnectOrSkip();
@@ -219,7 +219,7 @@ public class PartitionedOffsetTests
         }
         catch (RedisConnectionException)
         {
-            throw new SkipException("Redis is not reachable on localhost:6379 — run `docker compose up -d`.");
+            throw Xunit.Sdk.SkipException.ForSkip("Redis is not reachable on localhost:6379 — run `docker compose up -d`.");
         }
     }
 }

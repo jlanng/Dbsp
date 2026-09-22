@@ -5,7 +5,8 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
 
 ## Commands
 - Build: `dotnet build`
-- Test: `dotnet test tests/Incremental.Tests` (Redis tests skip unless `docker compose up -d` has run)
+- Test: `dotnet test --project tests/Incremental.Tests` (xunit v3 on Microsoft.Testing.Platform,
+  opted in by `global.json` — hence `--project`; Redis tests skip unless `docker compose up -d` has run)
 - Examples: `dotnet run --project examples/Incremental.Example`,
   `dotnet run --project examples/Incremental.LogAnalytics [-- --redis]`
 - Showcase (the all-features demo): `dotnet run --project examples/Incremental.Showcase`

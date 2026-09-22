@@ -18,11 +18,11 @@ public class RedisStorageTests
         }
         catch (RedisConnectionException)
         {
-            throw new SkipException("Redis is not reachable on localhost:6379 — run `docker compose up -d`.");
+            throw Xunit.Sdk.SkipException.ForSkip("Redis is not reachable on localhost:6379 — run `docker compose up -d`.");
         }
     }
 
-    [SkippableFact]
+    [Fact]
     public async Task Join_and_count_with_redis_state()
     {
         using var redis = ConnectOrSkip();
@@ -57,7 +57,7 @@ public class RedisStorageTests
         Assert.Equal(1, delta.WeightOf(new KeyedValue<string, long>("emea", 1)));
     }
 
-    [SkippableFact]
+    [Fact]
     public async Task TopK_with_tuple_rows_round_trips_through_redis()
     {
         using var redis = ConnectOrSkip();
@@ -90,7 +90,7 @@ public class RedisStorageTests
         Assert.Equal(1, delta.WeightOf(new KeyedValue<string, (string, string, int)>("g", ("g", "b", 2))));
     }
 
-    [SkippableFact]
+    [Fact]
     public async Task Min_tournament_tree_round_trips_through_redis()
     {
         using var redis = ConnectOrSkip();
@@ -128,7 +128,7 @@ public class RedisStorageTests
     private static RedisStorageProvider FreshProvider(ConnectionMultiplexer redis) =>
         new(redis, new RedisStorageOptions { KeyPrefix = $"sp-test:{Guid.NewGuid():N}" });
 
-    [SkippableFact]
+    [Fact]
     public void Weight_store_batches_pipeline_and_drop_zeroed_entries()
     {
         using var redis = ConnectOrSkip();
@@ -150,7 +150,7 @@ public class RedisStorageTests
         Assert.Equal([0, 7, 0], store.WeightOfAll(["a", "b", "c"]));
     }
 
-    [SkippableFact]
+    [Fact]
     public void Indexed_store_batches_span_groups()
     {
         using var redis = ConnectOrSkip();
@@ -170,7 +170,7 @@ public class RedisStorageTests
         Assert.All(store.GetGroups(["g1", "g2"]), g => Assert.Empty(g));
     }
 
-    [SkippableFact]
+    [Fact]
     public async Task Recursive_closure_with_redis_state()
     {
         // The loop operators' state is iteration-profiled — (row, iteration) tuple members
@@ -206,7 +206,7 @@ public class RedisStorageTests
         Assert.Equal(2, delta.DistinctCount);
     }
 
-    [SkippableFact]
+    [Fact]
     public void Value_store_batches_round_trip()
     {
         using var redis = ConnectOrSkip();

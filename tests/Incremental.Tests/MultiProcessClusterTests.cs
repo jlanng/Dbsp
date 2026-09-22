@@ -38,7 +38,7 @@ public class MultiProcessClusterTests
         AssertSameZSet(await ReferenceRevenue(), Merge(results));
     }
 
-    [SkippableFact]
+    [Fact]
     public async Task Checkpoint_restart_across_real_processes_is_exactly_once()
     {
         using var redis = ConnectOrSkip();
@@ -198,7 +198,7 @@ public class MultiProcessClusterTests
         }
         catch (RedisConnectionException)
         {
-            throw new SkipException("Redis is not reachable on localhost:6379 — run `docker compose up -d`.");
+            throw Xunit.Sdk.SkipException.ForSkip("Redis is not reachable on localhost:6379 — run `docker compose up -d`.");
         }
     }
 

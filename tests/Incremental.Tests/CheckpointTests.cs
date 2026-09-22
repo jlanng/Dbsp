@@ -192,7 +192,7 @@ public class CheckpointTests
         }
         catch (RedisConnectionException)
         {
-            throw new SkipException("Redis is not reachable on localhost:6379 — run `docker compose up -d`.");
+            throw Xunit.Sdk.SkipException.ForSkip("Redis is not reachable on localhost:6379 — run `docker compose up -d`.");
         }
     }
 
@@ -205,7 +205,7 @@ public class CheckpointTests
             Assert.Equal(weight, actual.WeightOf(row));
     }
 
-    [SkippableFact]
+    [Fact]
     public async Task Crashed_circuit_resumes_exactly_once_from_redis()
     {
         using var redis = ConnectOrSkip();
@@ -269,7 +269,7 @@ public class CheckpointTests
         AssertSameZSet(reference, integrated);
     }
 
-    [SkippableFact]
+    [Fact]
     public async Task Multi_worker_crash_and_resume_is_exactly_once()
     {
         using var redis = ConnectOrSkip();
@@ -317,7 +317,7 @@ public class CheckpointTests
             Assert.Equal(1, integrated.WeightOf(Row(region, count)));
     }
 
-    [SkippableFact]
+    [Fact]
     public void Uncommitted_redis_writes_are_invisible_until_commit()
     {
         using var redis = ConnectOrSkip();

@@ -7,7 +7,7 @@ namespace Incremental.Tests;
 /// hold state roughly constant while event time advances, so heap growth after warm-up is
 /// capped. Run with:
 ///
-///     INCREMENTAL_SOAK=1 dotnet test tests/Incremental.Tests --filter SoakTests
+///     INCREMENTAL_SOAK=1 dotnet test --project tests/Incremental.Tests --filter SoakTests
 ///
 /// (takes on the order of a minute; the RNG is fixed-seed, so a failure reproduces exactly).
 /// </summary>
@@ -17,10 +17,10 @@ public class SoakTests
     private const int EventsPerStep = 3_000; // 3M events total
     private const int Pages = 16;
 
-    [SkippableFact]
+    [Fact]
     public async Task Windowed_evicting_pipeline_is_correct_and_memory_bounded_over_millions_of_events()
     {
-        Skip.If(Environment.GetEnvironmentVariable("INCREMENTAL_SOAK") != "1",
+        Assert.SkipUnless(Environment.GetEnvironmentVariable("INCREMENTAL_SOAK") == "1",
             "Soak test is opt-in: set INCREMENTAL_SOAK=1 to run it (~1 minute).");
 
         var windowSize = TimeSpan.FromSeconds(5);

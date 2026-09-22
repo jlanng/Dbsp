@@ -148,7 +148,7 @@ public class StateManifestTests
         Assert.Throws<InvalidOperationException>(() => counts.Named("renamed")); // identity already pinned
     }
 
-    [SkippableFact]
+    [Fact]
     public async Task Redis_restore_with_changed_topology_is_refused()
     {
         using var redis = ConnectOrSkip();
@@ -189,7 +189,7 @@ public class StateManifestTests
         }
         catch (RedisConnectionException)
         {
-            throw new SkipException("Redis is not reachable on localhost:6379 — run `docker compose up -d`.");
+            throw Xunit.Sdk.SkipException.ForSkip("Redis is not reachable on localhost:6379 — run `docker compose up -d`.");
         }
     }
 }
