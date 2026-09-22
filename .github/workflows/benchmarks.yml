@@ -18,7 +18,7 @@ jobs:
         run: >
           dotnet run -c Release --project benchmarks/Incremental.Benchmarks --
           --filter '*' --job short --exporters json github
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: benchmark-results
