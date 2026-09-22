@@ -450,24 +450,23 @@ async Task DownloadAsync(HttpClient http, string url, string path)
 // are never even read off disk.
 async Task ReadTripsParquetAsync(string path)
 {
-    using var reader = await ParquetReader.CreateAsync(path);
-    var zoneField = reader.Schema.DataFields.First(f => f.Name == "PULocationID");
-    var totalField = reader.Schema.DataFields.First(f => f.Name == "total_amount");
+    await using var reader = await ParquetReader.CreateAsync(path);
+    var zoneField = reader.Schema.DataFields.First(f => f.Name == "PULocationID");   // INT32, optional
+    var totalField = reader.Schema.DataFields.First(f => f.Name == "total_amount");  // DOUBLE, optional
     for (var g = 0; g < reader.RowGroupCount; g++)
     {
-        using var rowGroup = reader.OpenRowGroupReader(g);
-        var zoneData = (await rowGroup.ReadColumnAsync(zoneField)).Data;
-        var totalData = (await rowGroup.ReadColumnAsync(totalField)).Data;
-        var count = zoneData.Length;
+        var rowGroup = reader.OpenRowGroupReader(g);
+        var count = (int)rowGroup.RowCount;
+        var zones = new int?[count];
+        var totals = new double?[count];
+        await rowGroup.ReadAsync<int>(zoneField, zones);
+        await rowGroup.ReadAsync<double>(totalField, totals);
         for (var i = 0; i < count; i++)
         {
-            tripZones.Add(ToInt(zoneData.GetValue(i)));
-            tripTotals.Add(ToDouble(totalData.GetValue(i)));
+            tripZones.Add(zones[i] ?? 0);
+            tripTotals.Add(totals[i] ?? 0);
         }
     }
-
-    static int ToInt(object? v) => v switch { int i => i, long l => (int)l, short s => s, null => 0, _ => Convert.ToInt32(v) };
-    static double ToDouble(object? v) => v switch { double d => d, float f => f, decimal m => (double)m, null => 0, _ => Convert.ToDouble(v) };
 }
 
 void GenerateSyntheticData()
