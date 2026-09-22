@@ -86,6 +86,9 @@ public sealed class Circuit : IAsyncDisposable
     private Exception? _flushFault;
     private bool _stopping;
     private bool _started;
+
+    // True once Start has finished recovering; false if the circuit was disposed unstarted.
+    private readonly TaskCompletionSource<bool> _startSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private bool _disposed;
     private Task? _pump;
 
@@ -109,6 +112,10 @@ public sealed class Circuit : IAsyncDisposable
     // state — _fault is the first (or aggregated) exception, null while healthy.
     private readonly List<Exception> _stepFaults = [];
     private Exception? _fault;
+
+    // Backs Completion. Continuations run off the coordinator: a fault is published from
+    // inside the step path, and whoever awaits it must not run there.
+    private readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     // Observability: per-circuit tag + loggers + gauge state (metrics ride the static
     // "Incremental" meter). Everything here is step-granular — never per record.
@@ -282,6 +289,7 @@ public sealed class Circuit : IAsyncDisposable
         if (_options.AutoStep)
             _pump = Task.Run(PumpAsync);
 
+        _startSignal.TrySetResult(true);
         _log.LogInformation("Circuit {Circuit} started ({Stepping})",
             Name, _options.AutoStep ? "auto-stepping" : "manual stepping");
     }
@@ -549,8 +557,12 @@ public sealed class Circuit : IAsyncDisposable
     internal async Task<ZSet<T>> ReadOutputSnapshotAsync<T>(
         int nodeId, Action discardPending, CancellationToken cancellationToken) where T : notnull
     {
-        if (!_started)
-            throw new InvalidOperationException("Start the circuit before reading a snapshot.");
+        // A subscription may precede Start — under a host, services resolve in construction
+        // order, not start order — and then waits for it, as early input records wait in
+        // their channel. A circuit disposed unstarted has no state: its snapshot is empty,
+        // and the completed channel ends the feed right after.
+        if (!await _startSignal.Task.WaitAsync(cancellationToken).ConfigureAwait(false))
+            return new ZSet<T>();
 
         while (true)
         {
@@ -599,6 +611,14 @@ public sealed class Circuit : IAsyncDisposable
     /// recover.</summary>
     public Exception? Fault => Volatile.Read(ref _fault);
 
+    /// <summary>Completes when the circuit reaches a terminal state: successfully once
+    /// <see cref="DisposeAsync"/> has finished a clean shutdown, or faulted with
+    /// <see cref="Fault"/> the moment the circuit faults. It is the push-shaped twin of
+    /// <see cref="Fault"/>, for supervisors (a host, a health monitor) that feed no input
+    /// and read no output and so would otherwise never observe a fault. Leaving it
+    /// unawaited is fine — a fault here never surfaces as an unobserved task exception.</summary>
+    public Task Completion => _completion.Task;
+
     /// <summary>Moves the circuit to its terminal faulted state, on the coordinator, once
     /// every worker has left the faulting step: the step's half-staged effects will never be
     /// committed (see the fault check in <see cref="CommitCheckpoint"/> callers and
@@ -633,6 +653,10 @@ public sealed class Circuit : IAsyncDisposable
         Volatile.Write(ref _stopping, true);
         foreach (var worker in _workers)
             worker.Go.Release();
+
+        // Last, so whoever Completion wakes finds the handles already failed.
+        if (_completion.TrySetException(fault))
+            _ = _completion.Task.Exception; // observed: Completion is optional to await
     }
 
     /// <summary>Atomically persists everything the steps since the last commit staged,
@@ -1162,6 +1186,7 @@ public sealed class Circuit : IAsyncDisposable
         if (_disposed)
             return;
         _disposed = true;
+        _startSignal.TrySetResult(false);
 
         foreach (var input in _inputs)
             input.CompleteWriter();
@@ -1252,5 +1277,6 @@ public sealed class Circuit : IAsyncDisposable
         _shutdown.Dispose();
         _diag.Dispose();
         _log.LogInformation("Circuit {Circuit} disposed after {Steps} steps", Name, _stepNumber);
+        _completion.TrySetResult();
     }
 }

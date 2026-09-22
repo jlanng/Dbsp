@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
   <ItemGroup>
     <ProjectReference Include="..\..\src\Incremental\Incremental.csproj" />
+    <ProjectReference Include="..\..\src\Incremental.Hosting\Incremental.Hosting.csproj" />
     <ProjectReference Include="..\..\src\Incremental.Storage.Redis\Incremental.Storage.Redis.csproj" />
   </ItemGroup>
   <PropertyGroup>

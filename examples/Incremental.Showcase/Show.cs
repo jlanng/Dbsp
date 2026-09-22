@@ -105,8 +105,13 @@ public sealed class Show : IAsyncDisposable
         return stepSeconds <= 0 ? (0, 0) : (100 * waitSeconds / (live.Workers * stepSeconds), waitSeconds);
     }
 
-    public Show(IStorageProvider storage, string storageLabel, Topology topology,
-        NoticeLog notices, IncrementalMetrics metrics, ILoggerFactory loggerFactory)
+    public static async Task<Show> StartAsync(IStorageProvider storage, string storageLabel, Topology topology,
+        NoticeLog notices, IncrementalMetrics metrics, ILoggerFactory loggerFactory) =>
+        new(storage, storageLabel, topology, notices, metrics, loggerFactory,
+            await ShowcaseCircuit.StartAsync("showcase", storage, loggerFactory, topology.Workers));
+
+    Show(IStorageProvider storage, string storageLabel, Topology topology,
+        NoticeLog notices, IncrementalMetrics metrics, ILoggerFactory loggerFactory, ShowcaseCircuit first)
     {
         this.storage = storage;
         this.loggerFactory = loggerFactory;
@@ -114,7 +119,7 @@ public sealed class Show : IAsyncDisposable
         StorageLabel = storageLabel;
         Notices = notices;
         Metrics = metrics;
-        live = new ShowcaseCircuit("showcase", storage, loggerFactory, topology.Workers);
+        live = first;
         Tabs = BuildTabs();
     }
 
@@ -333,11 +338,11 @@ public sealed class Show : IAsyncDisposable
         var before = Views.Snapshot(live.CategoryStats);
         var beforeGross = before.Values.Sum(s => s.Gross);
         // The crash itself: every reference dropped, nothing disposed, nothing flushed.
-        Notices.Push(NoticeLevel.Bad, "💥 crash: circuit abandoned without dispose — views and consumers died with it; rebuilding from the last committed checkpoint");
+        Notices.Push(NoticeLevel.Bad, "💥 crash: the circuit's host abandoned without a stop — views and consumers died with it; rebuilding from the last committed checkpoint");
         generation++;
         // The same topology as before the crash — a checkpoint restores into the worker
         // count that wrote it.
-        live = new ShowcaseCircuit($"showcase-g{generation}", storage, loggerFactory, Topology.Workers);
+        live = await ShowcaseCircuit.StartAsync($"showcase-g{generation}", storage, loggerFactory, Topology.Workers);
         var committed = new Dictionary<string, long?>
         {
             ["orders-web"] = live.Circuit.CommittedOffset("orders-web"),
@@ -543,9 +548,9 @@ public sealed class Show : IAsyncDisposable
                     as you like — each crash starts a new generation.
                     """,
                 Code = """
-                    new CircuitOptions { Storage = provider, CheckpointInterval = 4, … };
-                    var circuit = builder.Build();
-                    circuit.Start();                                        // restores the latest checkpoint
+                    services.AddIncremental<ShowcaseDefs>()
+                        .Configure(o => { o.Storage = provider; o.CheckpointInterval = 4; … });
+                    await host.StartAsync();                                // restores the latest checkpoint
                     var committed = circuit.CommittedOffset("orders-web");
                     await web.InsertAsync(order, offset: o.Offset);         // ≤ committed ⇒ dropped on arrival
                     """,

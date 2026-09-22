@@ -1,19 +1,25 @@
 using System.Diagnostics;
 using Incremental;
+using Incremental.Hosting;
 using Incremental.Storage;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
 namespace Incremental.Showcase;
 
 /// <summary>
-/// One live generation of the showcase circuit: the built circuit, every redeemed handle,
-/// the materialized views, and the synchronously drained readers. Act 4 abandons one
-/// instance (the crash) and constructs the next against the same storage provider.
+/// One live generation of the showcase circuit: a generic host around
+/// <c>AddIncremental&lt;ShowcaseDefs&gt;()</c>, every redeemed handle, the host's shared views,
+/// and the synchronously drained readers. A generation is a host of its own, rather than a
+/// service of the web app's, because act 4 kills it: the crash abandons one host without
+/// stopping it and starts the next against the same storage provider — which is also why
+/// the headless run, with no web app at all, hosts the circuit exactly the same way.
 /// </summary>
 public sealed class ShowcaseCircuit
 {
+    readonly IHost host;
     public readonly Circuit Circuit;
-    public readonly ShowcaseDefs Defs;
 
     public readonly InputHandle<Order> Web;
     public readonly InputHandle<Order> Mobile;
@@ -83,53 +89,64 @@ public sealed class ShowcaseCircuit
     }
 
     public readonly int Workers;
-    public ShowcaseCircuit(string name, IStorageProvider storage, ILoggerFactory loggerFactory, int workers = 2,
-        bool autoStep = false)
+
+    public static async Task<ShowcaseCircuit> StartAsync(
+        string name, IStorageProvider storage, ILoggerFactory loggerFactory, int workers = 2)
     {
+        var builder = Host.CreateEmptyApplicationBuilder(new HostApplicationBuilderSettings());
+        // A guest of this process: the web host (or the headless run) owns Ctrl-C.
+        builder.Services.AddSingleton<IHostLifetime, GuestLifetime>();
+        builder.Services
+            .AddIncremental<ShowcaseDefs>()
+            .Configure(o =>
+            {
+                o.Name = name;
+                o.Workers = workers;         // >1: exchanges really shuffle, state is sharded per worker
+                o.AutoStep = false;          // the app steps explicitly: exact boundaries for timing and beats
+                o.Storage = storage;
+                o.CheckpointInterval = 4;    // a crash loses up to 3 steps — replay covers the gap
+                o.LoggerFactory = loggerFactory;   // circuit logs go to the notice feed
+            });
+        var host = builder.Build();
+        await host.StartAsync();             // restores from the latest checkpoint if one exists
+        return new ShowcaseCircuit(host, workers);
+    }
+
+    ShowcaseCircuit(IHost host, int workers)
+    {
+        this.host = host;
         Workers = workers;
-        var builder = new CircuitBuilder(new CircuitOptions
-        {
-            Name = name,
-            Workers = workers,           // >1: exchanges really shuffle, state is sharded per worker
-            // The app steps explicitly: exact boundaries for timing and beats. autoStep is
-            // for pump-driven measurement harnesses — StepTimedAsync must not be called then.
-            AutoStep = autoStep,
-            Storage = storage,
-            CheckpointInterval = 4,      // a crash loses up to 3 steps — replay covers the gap
-            LoggerFactory = loggerFactory,
-        });
-        Defs = ShowcasePipeline.Declare(builder);
-        Circuit = builder.Build();
-        Circuit.Start();                 // restores from the latest checkpoint if one exists
+        var circuit = host.Services.GetRequiredService<CircuitHost<ShowcaseDefs>>();
+        Circuit = circuit.Circuit;
 
-        Web = Circuit.Handle(Defs.WebOrders);
-        Mobile = Circuit.Handle(Defs.MobileOrders);
-        Payments = Circuit.Handle(Defs.Payments);
-        Merchants = Circuit.Handle(Defs.Merchants);
-        Customers = Circuit.Handle(Defs.Customers);
-        FeeRates = Circuit.Handle(Defs.FeeRates);
-        Edges = Circuit.Handle(Defs.Edges);
+        Web = circuit.Handle(d => d.WebOrders);
+        Mobile = circuit.Handle(d => d.MobileOrders);
+        Payments = circuit.Handle(d => d.Payments);
+        Merchants = circuit.Handle(d => d.Merchants);
+        Customers = circuit.Handle(d => d.Customers);
+        FeeRates = circuit.Handle(d => d.FeeRates);
+        Edges = circuit.Handle(d => d.Edges);
 
-        CategoryStats = Circuit.Handle(Defs.CategoryStats).MaterializeInMemory();
-        CategoryMin = Circuit.Handle(Defs.CategoryMin).MaterializeInMemory();
-        CategoryMax = Circuit.Handle(Defs.CategoryMax).MaterializeInMemory();
-        TopOrders = Circuit.Handle(Defs.TopOrders).MaterializeInMemory();
-        MerchantOrders = Circuit.Handle(Defs.MerchantOrders).MaterializeInMemory();
-        MerchantRevenue = Circuit.Handle(Defs.MerchantRevenue).MaterializeInMemory();
-        MerchantBuyers = Circuit.Handle(Defs.MerchantBuyers).MaterializeInMemory();
-        MerchantItems = Circuit.Handle(Defs.MerchantItems).MaterializeInMemory();
-        RegionRevenue = Circuit.Handle(Defs.RegionRevenue).MaterializeInMemory();
-        Compliance = Circuit.Handle(Defs.Compliance).MaterializeInMemory();
-        Recon = Circuit.Handle(Defs.Recon).MaterializeInMemory();
-        LiveLeaders = Circuit.Handle(Defs.LiveLeaders).MaterializeInMemory();
-        AcceptanceRate = Circuit.Handle(Defs.AcceptanceRate).MaterializeInMemory();
-        Sessions = Circuit.Handle(Defs.Sessions).MaterializeInMemory();
-        RingSizes = Circuit.Handle(Defs.RingSizes).MaterializeInMemory();
-        RingExposure = Circuit.Handle(Defs.RingExposure).MaterializeInMemory();
+        CategoryStats = circuit.View(d => d.CategoryStats);
+        CategoryMin = circuit.View(d => d.CategoryMin);
+        CategoryMax = circuit.View(d => d.CategoryMax);
+        TopOrders = circuit.View(d => d.TopOrders);
+        MerchantOrders = circuit.View(d => d.MerchantOrders);
+        MerchantRevenue = circuit.View(d => d.MerchantRevenue);
+        MerchantBuyers = circuit.View(d => d.MerchantBuyers);
+        MerchantItems = circuit.View(d => d.MerchantItems);
+        RegionRevenue = circuit.View(d => d.RegionRevenue);
+        Compliance = circuit.View(d => d.Compliance);
+        Recon = circuit.View(d => d.Recon);
+        LiveLeaders = circuit.View(d => d.LiveLeaders);
+        AcceptanceRate = circuit.View(d => d.AcceptanceRate);
+        Sessions = circuit.View(d => d.Sessions);
+        RingSizes = circuit.View(d => d.RingSizes);
+        RingExposure = circuit.View(d => d.RingExposure);
 
-        EnrichedFeed = Circuit.Handle(Defs.EnrichedFeed);
-        FinalLeaders = Circuit.Handle(Defs.FinalLeaders);
-        RingMembership = Circuit.Handle(Defs.RingMembership);
+        EnrichedFeed = circuit.Handle(d => d.EnrichedFeed);
+        FinalLeaders = circuit.Handle(d => d.FinalLeaders);
+        RingMembership = circuit.Handle(d => d.RingMembership);
     }
 
     public async ValueTask FeedAsync(IEnumerable<StampedOrder> orders, IEnumerable<StampedPayment> payments)
@@ -196,28 +213,18 @@ public sealed class ShowcaseCircuit
         return (LastStepMicros, enrichedDelta);
     }
 
-    public void CompleteInputs()
-    {
-        Web.Complete();
-        Mobile.Complete();
-        Payments.Complete();
-        Merchants.Complete();
-        Customers.Complete();
-        FeeRates.Complete();
-        Edges.Complete();
-    }
-
-    /// <summary>Graceful shutdown — the crash path never calls this.</summary>
+    /// <summary>Graceful shutdown — the crash path never calls this. Stopping the host
+    /// completes the inputs, drains the circuit while the views keep reading, then disposes
+    /// them.</summary>
     public async ValueTask ShutdownAsync()
     {
-        CompleteInputs();
-        await Circuit.DisposeAsync();
-        foreach (var view in new IAsyncDisposable[]
-        {
-            CategoryStats, CategoryMin, CategoryMax, TopOrders, MerchantOrders, MerchantRevenue,
-            MerchantBuyers, MerchantItems, RegionRevenue, Compliance, Recon, LiveLeaders,
-            AcceptanceRate, Sessions, RingSizes, RingExposure,
-        })
-            await view.DisposeAsync();
+        await host.StopAsync();
+        host.Dispose();
+    }
+
+    sealed class GuestLifetime : IHostLifetime
+    {
+        public Task WaitForStartAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
     }
 }

@@ -67,7 +67,7 @@ var builder = new CircuitBuilder(new CircuitOptions
     MaxStepItemsPerInput = options.StepBatch,
     OutputChannelCapacity = 1024,
 });
-var defs = ShowcasePipeline.Declare(builder);
+var defs = new ShowcaseDefs(builder);
 var circuit = builder.Build();
 circuit.Start();
 
@@ -177,14 +177,29 @@ Console.Error.WriteLine(
     $"seeded {options.LiveOrders:N0} live orders, {options.Merchants:N0} merchants, {options.Customers:N0} customers " +
     $"in {seedElapsed.TotalSeconds:F1}s; working set {Environment.WorkingSet / (1024 * 1024):N0} MB");
 
+// The step floor is there so tiered JIT has settled, and it is sized for paced runs, where
+// steps are small and 3,000 of them pass in seconds. Unpaced, a step carries thousands of
+// records and takes tens of milliseconds: the hot paths are long since compiled while the
+// floor is still minutes away, so past WarmupStepsCapSeconds the clock wins. The wait
+// reports itself either way — a silent minute reads as a hang.
+const double WarmupStepsCapSeconds = 60;
 var warmupStartSteps = Volatile.Read(ref stepsRun);
 var warmup = Stopwatch.StartNew();
-do
+var nextWarmupReport = 10.0;
+while (true)
 {
     await Task.Delay(20);
+    var elapsed = warmup.Elapsed.TotalSeconds;
+    var done = Volatile.Read(ref stepsRun) - warmupStartSteps;
+    if (elapsed >= options.WarmupSeconds &&
+        (done >= options.WarmupSteps || elapsed >= Math.Max(options.WarmupSeconds, WarmupStepsCapSeconds)))
+        break;
+    if (elapsed >= nextWarmupReport)
+    {
+        Console.Error.WriteLine($"warming up: {done:N0} of {options.WarmupSteps:N0} steps after {elapsed:F0}s");
+        nextWarmupReport += 10;
+    }
 }
-while (warmup.Elapsed.TotalSeconds < options.WarmupSeconds ||
-       Volatile.Read(ref stepsRun) - warmupStartSteps < options.WarmupSteps);
 warmup.Stop();
 var warmupSteps = Volatile.Read(ref stepsRun) - warmupStartSteps;
 Console.Error.WriteLine($"warmed {warmupSteps:N0} steps in {warmup.Elapsed.TotalSeconds:F1}s");

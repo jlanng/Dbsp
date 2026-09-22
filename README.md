@@ -403,7 +403,8 @@ examples/Incremental.Example       joined + aggregated order analytics with live
 examples/Incremental.LogAnalytics  simulated clickstream → 5s tumbling windows → counts → live top-3
                                        per window, rendered as an in-place Spectre.Console dashboard
                                        (bar gauges per window, watermark in the header);
-                                       `--redis` keeps operator state in Redis
+                                       `--redis` keeps operator state in Redis. The hosted
+                                       example: a worker service on `Incremental.Hosting`
 examples/Incremental.TradeEnrichment trades ⋈ reference data, composed interactively: pick which
                                        enrichment columns to join (grouped by table: instrument;
                                        trader → desk, a two-hop join; counterparty) and which
@@ -507,8 +508,9 @@ its own project; `docs/intro.md` has them under *Running it fast*.
 
 ## Packaging
 
-MIT-licensed (see `LICENSE`). The two shipped libraries (`Incremental`,
-`Incremental.Storage.Redis`) multi-target **net8.0 and net10.0** and carry full NuGet
+MIT-licensed (see `LICENSE`). The three shipped libraries (`Incremental`,
+`Incremental.Storage.Redis`, and `Incremental.Hosting` — generic-host and DI integration,
+see *Hosting it* in `docs/intro.md`) multi-target **net8.0 and net10.0** and carry full NuGet
 metadata — `dotnet pack` produces consumable packages with XML docs, SourceLink, and
 symbol packages (not yet published to nuget.org; consume by project reference or a local
 feed). The only runtime dependency of the core library is
@@ -580,7 +582,15 @@ disclosed trade-offs (below), not missing semantics:
       unnamed), changefeed-first outputs with automatic table-shaped resync and
       `MaterializeInMemory` views
 
+- [x] Generic-host and DI integration (`Incremental.Hosting`: `AddIncremental<TDefinition>()`
+      keys a circuit by its definition class; the host owns start/recovery, a draining
+      shutdown that outlives the circuit with its consumers, fault policy — stop the
+      application by default — configuration binding, shared in-memory views and a health
+      check; `Circuit.Completion` is the fault signal it supervises on)
+
 ### Known limitations (deliberate, disclosed)
+
+- `Incremental.Hosting` does not host clustered circuits yet (no host-side lockstep stepping).
 
 - The TCP cluster transport is **unauthenticated cleartext** — trusted, isolated networks
   only; TLS/authentication is deferred.

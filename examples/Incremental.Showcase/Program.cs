@@ -54,7 +54,7 @@ else
     storageLabel = "in-memory checkpoints";
 }
 
-var show = new Show(storage, storageLabel, topology, notices, metrics, loggerFactory);
+var show = await Show.StartAsync(storage, storageLabel, topology, notices, metrics, loggerFactory);
 var json = new JsonSerializerOptions
 {
     PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -67,7 +67,9 @@ if (headless)
 
 // ── the web host ───────────────────────────────────────────────────────────────
 // Microsoft.NET.Sdk.Web resolves ASP.NET Core from the shared framework, so this example
-// still has no NuGet dependency beyond the library itself. No args are passed to the
+// still has no NuGet dependency beyond the library itself. The circuit is not one of this
+// host's services: each generation has a host of its own (see ShowcaseCircuit), because
+// act 4 kills it and the headless run has no web host at all. No args are passed to the
 // builder: the showcase's own flags (--redis, --workers, …) are not configuration switches.
 
 var builder = WebApplication.CreateBuilder();

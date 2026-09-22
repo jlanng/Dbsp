@@ -258,7 +258,8 @@ public sealed class OutputHandle<T> where T : notnull
     /// it as a reset; this is what makes consumers correct across restarts and mid-run
     /// subscription, since batches emitted between the last checkpoint and a crash are never
     /// replayed. A plain stream output starts straight into live batches (at-most-once
-    /// across a crash). The enumeration completes when the circuit disposes and throws
+    /// across a crash). Subscribing before <see cref="Circuit.Start"/> is fine: the bootstrap
+    /// read waits for it. The enumeration completes when the circuit disposes and throws
     /// <see cref="CircuitFaultedException"/> if the circuit faults. One consumer only: a
     /// second call throws.
     /// </summary>

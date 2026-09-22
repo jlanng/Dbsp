@@ -11,6 +11,7 @@
     <Project Path="examples/Incremental.TradeEnrichment/Incremental.TradeEnrichment.csproj" />
   </Folder>
   <Folder Name="/src/">
+    <Project Path="src/Incremental.Hosting/Incremental.Hosting.csproj" />
     <Project Path="src/Incremental.Storage.Redis/Incremental.Storage.Redis.csproj" />
     <Project Path="src/Incremental/Incremental.csproj" />
   </Folder>

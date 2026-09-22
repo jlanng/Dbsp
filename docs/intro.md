@@ -395,8 +395,83 @@ hexadecimal**, so twelve heaps is `DOTNET_GCHeapCount=c`.
 Every example in this repo ships with this applied; see `examples/Directory.Build.props` and
 the `<CircuitWorkers>` property in each example's `.csproj`.
 
-> **TODO:** hosting & DI integration (`services.AddIncremental(…)`, `IHostedService`) — planned,
-> not yet designed.
+### Hosting it
+
+Under the generic host — a worker service, an ASP.NET Core app — the `Incremental.Hosting`
+package owns the lifecycle. Put the dataflow in a **definition class**: its constructor takes
+the `CircuitBuilder` (any further parameters come from the container), and the inputs and
+outputs you want reachable are its members.
+
+```csharp
+public sealed class PageAnalytics
+{
+    public InputStream<PageView> Views { get; }
+    public Output<WindowedValue<string, long>> TopPages { get; }
+
+    public PageAnalytics(CircuitBuilder builder)
+    {
+        Views = builder.Input<PageView>("views");
+        TopPages = Views
+            .WithEventTime(v => v.At, lateness: TimeSpan.FromSeconds(2))
+            .GroupBy(v => v.Page)
+            .TumblingWindow(TimeSpan.FromSeconds(5))
+            .Count()
+            .TopK(3, r => r.Value)
+            .ToOutput();
+    }
+}
+
+builder.Services
+    .AddIncremental<PageAnalytics>()
+    .BindConfiguration("Incremental:PageAnalytics")          // Workers, capacities, CheckpointInterval, …
+    .Configure((o, sp) => o.Storage = new RedisStorageProvider(
+        sp.GetRequiredService<IConnectionMultiplexer>(), "page-analytics"))
+    .AddOutputConsumer<LeaderboardPublisher, WindowedValue<string, long>>(d => d.TopPages)
+    .AddHealthCheck();
+```
+
+The class is the circuit's key in the container — still no strings, and as many circuits as
+you have definition classes. Anything that feeds or reads the circuit injects
+`CircuitHost<PageAnalytics>` and redeems members for handles, exactly as `circuit.Handle`
+does:
+
+```csharp
+app.MapPost("/views", (PageView view, CircuitHost<PageAnalytics> analytics) =>
+    analytics.Handle(d => d.Views).InsertAsync(view));
+
+app.MapGet("/top", (CircuitHost<PageAnalytics> analytics) =>
+    analytics.View(d => d.TopPages).Current());      // a shared MaterializeInMemory view
+```
+
+What the host does for you:
+
+- **Start.** The circuit is built when `CircuitHost<T>` is first resolved (so handles are
+  valid in any constructor; early records wait in the input channel, and an output
+  subscribed early waits for the start) and started — checkpoint
+  recovery included — before the host reports started, so nothing serves traffic against a
+  circuit that has not resumed.
+- **Shutdown, in the right order.** The host completes the inputs and drains the circuit
+  *while registered consumers and views keep reading*, then stops them: `AddOutputConsumer`
+  and `View` see every batch, including what the drain produces. A consumer you write by
+  hand must follow the same rule — read the output to completion rather than cancelling on
+  the stopping token — or the drain blocks on the unread output until the host's shutdown
+  timeout abandons it (with a warning; state up to the last checkpoint is safe).
+- **Faults.** A fault is terminal and recovery is a rebuild from the checkpoint, which under
+  a host means a restart: by default the host logs at Critical, sets a non-zero exit code and
+  stops the application (`CircuitFaultBehavior.StopHost`). `Ignore` leaves the host running;
+  pair it with the health check. A registered consumer that throws is treated the same way,
+  and the rest of its output is discarded so shutdown can still drain.
+- **Wiring.** The container's `ILoggerFactory` is used unless you set one; the circuit's
+  name defaults to the definition class's name, so logs and the `circuit` metric tag read as
+  the thing you wrote. Options are read once, at build — configuration reloads are not
+  observed, because a circuit's shape cannot change under it.
+
+`examples/Incremental.LogAnalytics` is this section as a runnable worker service: a producer
+`BackgroundService`, a dashboard reading a `View`, and registration order doing the shutdown
+ordering. The definition class is plain: `new PageAnalytics(builder)` works just as well in a test or
+a console app with no container in sight. Clustered circuits are not hostable yet — they
+step in explicit lockstep across processes, which needs a host-side stepping protocol.
+
 > **TODO:** cluster deployment (multi-process exchange over a transport), checkpoint
 > operations guide, observability/metrics reference. The engine supports all three today;
 > consumer-facing docs pending.

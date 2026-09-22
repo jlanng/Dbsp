@@ -24,21 +24,25 @@ public static class ScalingAct
 
     // The showcase's enrichment shape, minus the parts that would dominate the timing:
     // two exchanges (group by merchant to join, group by category to aggregate).
-    static (CircuitBuilder Builder, InputStream<Order> Orders, KeyedInputStream<int, Merchant> Merchants,
-        Output<KeyedValue<string, FeeStats>> Stats) Declare(CircuitOptions options)
+    sealed class ScalingDefs
     {
-        var builder = new CircuitBuilder(options);
-        var orders = builder.Input<Order>("orders");
-        var merchants = builder.KeyedInput<int, Merchant>("merchants", m => m.Id);
-        var stats = orders
-            .GroupBy(o => o.MerchantId)
-            .Join(merchants.GroupBy(m => m.Id),
-                (_, o, m) => new EnrichedOrder(o.Id, o.MerchantId, m.Name, m.Category, o.CustomerId,
-                    "guest", o.Amount, Math.Round(o.Amount * 0.02m, 2)))
-            .GroupBy(e => e.Category)
-            .AggregateLinear(new FeeTakeAggregate())
-            .ToOutput(bootstrap: false);
-        return (builder, orders, merchants, stats);
+        public InputStream<Order> Orders { get; }
+        public KeyedInputStream<int, Merchant> Merchants { get; }
+        public Output<KeyedValue<string, FeeStats>> Stats { get; }
+
+        public ScalingDefs(CircuitBuilder builder)
+        {
+            Orders = builder.Input<Order>("orders");
+            Merchants = builder.KeyedInput<int, Merchant>("merchants", m => m.Id);
+            Stats = Orders
+                .GroupBy(o => o.MerchantId)
+                .Join(Merchants.GroupBy(m => m.Id),
+                    (_, o, m) => new EnrichedOrder(o.Id, o.MerchantId, m.Name, m.Category, o.CustomerId,
+                        "guest", o.Amount, Math.Round(o.Amount * 0.02m, 2)))
+                .GroupBy(e => e.Category)
+                .AggregateLinear(new FeeTakeAggregate())
+                .ToOutput(bootstrap: false);
+        }
     }
 
     public const int LiveBatch = 8;         // ~ what one showcase tick feeds
@@ -117,12 +121,15 @@ public static class ScalingAct
             return barrierSeconds;
         }
 
-        var (builder, ordersDef, merchantsDef, statsDef) = Declare(options);
+        // Not hosted: a throwaway circuit per measurement, stepped by hand. The definition
+        // class is the same shape either way.
+        var builder = new CircuitBuilder(options);
+        var defs = new ScalingDefs(builder);
         await using var circuit = builder.Build();
         circuit.Start();
-        var orders = circuit.Handle(ordersDef);
-        var merchantInput = circuit.Handle(merchantsDef);
-        var stats = circuit.Handle(statsDef);
+        var orders = circuit.Handle(defs.Orders);
+        var merchantInput = circuit.Handle(defs.Merchants);
+        var stats = circuit.Handle(defs.Stats);
 
         foreach (var m in merchants) await merchantInput.UpsertAsync(m);
         await circuit.StepAsync();
@@ -186,7 +193,7 @@ public static class ScalingAct
         int workers, Incremental.Storage.IStorageProvider storage, ILoggerFactory loggerFactory)
     {
         var director = new Director(DateTimeOffset.UtcNow);
-        var circuit = new ShowcaseCircuit($"measure-w{workers}", storage, loggerFactory, workers);
+        var circuit = await ShowcaseCircuit.StartAsync($"measure-w{workers}", storage, loggerFactory, workers);
         try
         {
             await circuit.ReplayMasterDataAsync(director);

@@ -3,45 +3,49 @@ using Incremental;
 namespace Incremental.Showcase;
 
 /// <summary>
-/// The whole dataflow, declared once. Act 4 rebuilds the circuit by calling
-/// <see cref="Declare"/> again on a fresh builder — declaration order is identity for
+/// The whole dataflow, declared once, as a definition class: the constructor declares the
+/// graph on the builder it is given and the members are the inputs and outputs the app
+/// redeems for handles. <c>AddIncremental&lt;ShowcaseDefs&gt;()</c> hosts it; act 4 rebuilds the
+/// circuit by hosting it again over the same storage — declaration order is identity for
 /// checkpointed state (store names are positional unless pinned with .Named), so this
-/// function is the single source of truth for the graph.
+/// constructor is the single source of truth for the graph.
 /// </summary>
-public sealed record ShowcaseDefs(
-    InputStream<Order> WebOrders,
-    InputStream<Order> MobileOrders,
-    InputStream<Payment> Payments,
-    KeyedInputStream<int, Merchant> Merchants,
-    KeyedInputStream<int, Customer> Customers,
-    KeyedInputStream<int, FeeRate> FeeRates,
-    KeyedInputStream<(int A, int B), LinkEdge> Edges,
-    // Act 1 — living data
-    Output<KeyedValue<string, FeeStats>> CategoryStats,
-    Output<KeyedValue<string, decimal>> CategoryMin,
-    Output<KeyedValue<string, decimal>> CategoryMax,
-    Output<KeyedValue<string, EnrichedOrder>> TopOrders,
-    Output<KeyedValue<int, long>> MerchantOrders,
-    Output<KeyedValue<int, decimal>> MerchantRevenue,
-    Output<KeyedValue<int, long>> MerchantBuyers,
-    Output<KeyedValue<int, long>> MerchantItems,
-    Output<KeyedValue<string, decimal>> RegionRevenue,
-    Output<KeyedValue<int, Order>> Compliance,
-    Output<KeyedValue<string, long>> Recon,
-    Output<EnrichedOrder> EnrichedFeed,
-    // Act 2 — time
-    Output<WindowedValue<int, decimal>> LiveLeaders,
-    Output<WindowedValue<int, decimal>> FinalLeaders,
-    Output<WindowedValue<string, Acceptance>> AcceptanceRate,
-    Output<WindowedValue<int, Spend>> Sessions,
-    // Act 3 — recursion
-    Output<KeyedValue<int, long>> RingSizes,
-    Output<KeyedValue<int, decimal>> RingExposure,
-    Output<KeyedValue<int, int>> RingMembership);
-
-public static class ShowcasePipeline
+public sealed class ShowcaseDefs
 {
-    public static ShowcaseDefs Declare(CircuitBuilder builder)
+    public InputStream<Order> WebOrders { get; }
+    public InputStream<Order> MobileOrders { get; }
+    public InputStream<Payment> Payments { get; }
+    public KeyedInputStream<int, Merchant> Merchants { get; }
+    public KeyedInputStream<int, Customer> Customers { get; }
+    public KeyedInputStream<int, FeeRate> FeeRates { get; }
+    public KeyedInputStream<(int A, int B), LinkEdge> Edges { get; }
+
+    // Act 1 — living data
+    public Output<KeyedValue<string, FeeStats>> CategoryStats { get; }
+    public Output<KeyedValue<string, decimal>> CategoryMin { get; }
+    public Output<KeyedValue<string, decimal>> CategoryMax { get; }
+    public Output<KeyedValue<string, EnrichedOrder>> TopOrders { get; }
+    public Output<KeyedValue<int, long>> MerchantOrders { get; }
+    public Output<KeyedValue<int, decimal>> MerchantRevenue { get; }
+    public Output<KeyedValue<int, long>> MerchantBuyers { get; }
+    public Output<KeyedValue<int, long>> MerchantItems { get; }
+    public Output<KeyedValue<string, decimal>> RegionRevenue { get; }
+    public Output<KeyedValue<int, Order>> Compliance { get; }
+    public Output<KeyedValue<string, long>> Recon { get; }
+    public Output<EnrichedOrder> EnrichedFeed { get; }
+
+    // Act 2 — time
+    public Output<WindowedValue<int, decimal>> LiveLeaders { get; }
+    public Output<WindowedValue<int, decimal>> FinalLeaders { get; }
+    public Output<WindowedValue<string, Acceptance>> AcceptanceRate { get; }
+    public Output<WindowedValue<int, Spend>> Sessions { get; }
+
+    // Act 3 — recursion
+    public Output<KeyedValue<int, long>> RingSizes { get; }
+    public Output<KeyedValue<int, decimal>> RingExposure { get; }
+    public Output<KeyedValue<int, int>> RingMembership { get; }
+
+    public ShowcaseDefs(CircuitBuilder builder)
     {
         var web = builder.Input<Order>("orders-web");
         var mobile = builder.Input<Order>("orders-mobile");
@@ -144,13 +148,32 @@ public static class ShowcasePipeline
             .ToOutput();
         var ringMembership = membership.ToOutput(bootstrap: false);    // drained for beat notices
 
-        return new ShowcaseDefs(
-            web, mobile, payments, merchants, customers, feeRates, edges,
-            categoryStats, categoryMin, categoryMax, topOrders,
-            merchantOrders, merchantRevenue, merchantBuyers, merchantItems, regionRevenue,
-            compliance, recon, enrichedFeed,
-            liveLeaders, finalLeaders, acceptanceRate, sessions,
-            ringSizes, ringExposure, ringMembership);
+        WebOrders = web;
+        MobileOrders = mobile;
+        Payments = payments;
+        Merchants = merchants;
+        Customers = customers;
+        FeeRates = feeRates;
+        Edges = edges;
+        CategoryStats = categoryStats;
+        CategoryMin = categoryMin;
+        CategoryMax = categoryMax;
+        TopOrders = topOrders;
+        MerchantOrders = merchantOrders;
+        MerchantRevenue = merchantRevenue;
+        MerchantBuyers = merchantBuyers;
+        MerchantItems = merchantItems;
+        RegionRevenue = regionRevenue;
+        Compliance = compliance;
+        Recon = recon;
+        EnrichedFeed = enrichedFeed;
+        LiveLeaders = liveLeaders;
+        FinalLeaders = finalLeaders;
+        AcceptanceRate = acceptanceRate;
+        Sessions = sessions;
+        RingSizes = ringSizes;
+        RingExposure = ringExposure;
+        RingMembership = ringMembership;
     }
 
     // Pure function of the order (equal ItemSale rows collapse to one Z-set entry with

@@ -21,14 +21,19 @@ public static class ClusterAct
 
     public record ShardRow(int MerchantId, decimal Revenue, long Weight);
 
-    static (CircuitBuilder Builder, InputStream<Order> Orders, Output<KeyedValue<int, decimal>> Revenue)
-        Declare(CircuitOptions options)
+    // Identical on every process; only CircuitOptions.Cluster differs (its process index).
+    // Built by hand rather than hosted: clustered circuits step in explicit lockstep, which
+    // Incremental.Hosting does not drive yet.
+    sealed class ClusterDefs
     {
-        // Identical on every process; only CircuitOptions.Cluster differs (its process index).
-        var builder = new CircuitBuilder(options);
-        var orders = builder.Input<Order>("orders");
-        var revenue = orders.GroupBy(o => o.MerchantId).Sum(o => o.Amount).ToOutput(bootstrap: false);
-        return (builder, orders, revenue);
+        public InputStream<Order> Orders { get; }
+        public Output<KeyedValue<int, decimal>> Revenue { get; }
+
+        public ClusterDefs(CircuitBuilder builder)
+        {
+            Orders = builder.Input<Order>("orders");
+            Revenue = Orders.GroupBy(o => o.MerchantId).Sum(o => o.Amount).ToOutput(bootstrap: false);
+        }
     }
 
     static CircuitOptions Options(int processIndex, string[] endpoints, int workers) => new()
@@ -71,10 +76,11 @@ public static class ClusterAct
         var resultPath = arguments["--result"];
         var workers = int.Parse(arguments["--workers"]);
 
-        var (builder, _, revenueDef) = Declare(Options(index, endpoints, workers));
+        var builder = new CircuitBuilder(Options(index, endpoints, workers));
+        var defs = new ClusterDefs(builder);
         await using var circuit = builder.Build();
         circuit.Start();
-        var revenue = circuit.Handle(revenueDef);
+        var revenue = circuit.Handle(defs.Revenue);
 
         var shard = new ZSet<KeyedValue<int, decimal>>();
         for (var step = 0; step < Steps; step++)
@@ -123,11 +129,12 @@ public static class ClusterAct
         var stepMicros = new double[Steps];
         try
         {
-            var (builder, ordersDef, revenueDef) = Declare(Options(0, endpoints, workers));
+            var builder = new CircuitBuilder(Options(0, endpoints, workers));
+            var defs = new ClusterDefs(builder);
             await using var circuit = builder.Build();
             circuit.Start();               // TCP mesh comes up here; peers retry until connected
-            var input = circuit.Handle(ordersDef);
-            var revenue = circuit.Handle(revenueDef);
+            var input = circuit.Handle(defs.Orders);
+            var revenue = circuit.Handle(defs.Revenue);
 
             foreach (var order in orders)
                 await input.InsertAsync(order);

@@ -16,7 +16,7 @@ dotnet run -c Release --project benchmarks/Incremental.Torture -- --workers 4 --
 | `--rate N` | pace at N orders/second instead of running unpaced |
 | `--processes N` | cluster mode: N co-hosted processes stepped in lockstep, which puts the exchange wire format on the measured path |
 | `--seconds N`, `--warmup N` | measured window and warm-up, in seconds (defaults 20 and 5) |
-| `--warmup-steps N` | local runs also require this many warm-up steps (default 3000) before measuring |
+| `--warmup-steps N` | local runs also require this many warm-up steps (default 3000) before measuring — until 60 s of warm-up have passed, after which the clock wins: unpaced steps are large and slow, and the hot paths are compiled long before 3000 of them |
 | `--workers`, `--batch`, `--input-capacity`, `--live-orders`, `--orders-per-vsec`, `--customers`, `--merchants`, `--categories`, `--fee-tiers`, `--regions`, `--rings`, `--seed`, `--json` | see `Options.cs` |
 
 ## What it does

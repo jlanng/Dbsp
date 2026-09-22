@@ -12,7 +12,9 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   serves a web app on http://localhost:5170. Flags: `--port`, `--no-open`, `--redis`,
   `--workers N`, `--nodes N` (`--cluster` is an alias for `--nodes 2`).
   `-- --headless` runs every tab unattended and exits non-zero if a verified act fails —
-  that is the smoke test. `Microsoft.NET.Sdk.Web` alone; no NuGet packages needed. Tab 5
+  that is the smoke test. `Microsoft.NET.Sdk.Web` plus the library projects; no NuGet packages of its own. The live
+  circuit runs under `Incremental.Hosting` — one generic host per generation, because the
+  crash act kills it; the scaling and cluster acts build theirs by hand (throwaway / not hostable). Tab 5
   measures worker-count scaling and can relaunch the process into another topology; run it
   `-c Release` if the throughput column is the point (Debug flattens it).
 - Benchmarks: `dotnet run -c Release --project benchmarks/Incremental.Benchmarks -- --filter '*'`
@@ -68,6 +70,11 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
 - Backpressure comes only from bounded channels (inputs, outputs). Never buffer unboundedly.
   This includes outputs: stream-shaped outputs never maintain integrated (snapshot) state —
   only table-shaped (keyed/windowed) outputs may, and theirs is bounded by eviction.
+- `Incremental.Hosting` (generic host + DI) is a separate package so the core keeps its one
+  dependency. A hosted circuit is keyed by its definition class (`CircuitHost<TDefinition>`);
+  the host supervises on `Circuit.Completion`. Shutdown order is the invariant: drain the
+  circuit first, with consumers and views still reading, and stop those after — an unread
+  output blocks the drain. Clustered circuits are not hostable yet.
 - Public API is fluent delegates with LINQ-dialect names (`Select`/`Where`/`GroupBy`),
   intentionally not LINQ/expression trees. The 0.2 surface is specced in `docs/intro.md`:
   windows exist only on groupings of an `EventTimeStream`; grouping types are staging types
