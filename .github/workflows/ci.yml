@@ -27,6 +27,7 @@ jobs:
         run: |
           dotnet pack src/Incremental -c Release --no-build -o artifacts/packages
           dotnet pack src/Incremental.Storage.Redis -c Release --no-build -o artifacts/packages
+          dotnet pack src/Incremental.Hosting -c Release --no-build -o artifacts/packages
       - name: Upload packages
         uses: actions/upload-artifact@v7
         with:
