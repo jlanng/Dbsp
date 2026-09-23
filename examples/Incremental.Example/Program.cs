@@ -3,7 +3,7 @@ using Incremental;
 // Live order analytics: join orders to customers, then keep per-region revenue and
 // per-region max order size incrementally up to date. Both inputs are keyed: cancelling an
 // order is DeleteAsync(id), and moving a customer to another region is one UpsertAsync —
-// the handle retracts the old row itself, and every joined and aggregated result follows.
+// the circuit retracts the old row itself, and every joined and aggregated result follows.
 
 var builder = new CircuitBuilder(new CircuitOptions { Workers = 2 });
 

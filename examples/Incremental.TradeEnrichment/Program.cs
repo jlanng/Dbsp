@@ -10,7 +10,7 @@ using Incremental;
 //   trades ⋈ instruments ⋈ traders ⋈ desks ⋈ counterparties ─▶ group by <your dims> ─▶ top N
 //
 // The part most streaming systems get wrong: reference data is a stream too. Every input
-// here is a keyed input — UpsertAsync replaces a row and the handle retracts the old
+// here is a keyed input — UpsertAsync replaces a row and the circuit retracts the old
 // version automatically. When a trader moves desks mid-run, one upsert re-attributes all
 // of their historical trades; trade amendments are just upserts on the trade stream.
 
@@ -29,7 +29,7 @@ var forceBlotter = args.Contains("--blotter");
 
 AnsiConsole.Write(new Panel(new Rows(
         new Markup("A live trade stream is enriched by joining the reference [bold]columns[/] you choose, then grouped by dimensions you choose — the circuit is composed from your selections."),
-        new Markup("[green]▪[/] Every input is a keyed input: amendments and reference changes are [bold]UpsertAsync[/] calls, and the handle emits the retraction of the old row itself."),
+        new Markup("[green]▪[/] Every input is a keyed input: amendments and reference changes are [bold]UpsertAsync[/] calls, and the circuit emits the retraction of the old row itself."),
         new Markup("[green]▪[/] Reference data is a stream too: desk moves and rating changes re-attribute [italic]historical[/] trades instantly — watch the notices."),
         new Markup("[green]▪[/] With no dimensions selected you get a live top-trades blotter instead.")))
     .Header("[bold] trade enrichment [/]")
@@ -289,6 +289,9 @@ AnsiConsole.MarkupLine(interactive
 var rng = new Random(11);
 long nextTradeId = 1;
 var liveIds = new List<long>();
+// The trade source's own book: the circuit keeps each key's current row for retraction,
+// but a producer that amends or tallies trades tracks what it sent itself.
+var liveTrades = new Dictionary<long, Trade>();
 // Live-trade counts per trader/counterparty, so master-data notices can report how many
 // historical trades one upsert re-attributed (the group-level delta count hides this).
 var tradesByTrader = new Dictionary<int, int>();
@@ -348,6 +351,7 @@ await AnsiConsole.Live(BuildLiveView()).AutoClear(false).StartAsync(async ctx =>
         {
             var trade = RandomTrade();
             liveIds.Add(trade.Id);
+            liveTrades[trade.Id] = trade;
             tradesByTrader[trade.TraderId] = tradesByTrader.GetValueOrDefault(trade.TraderId) + 1;
             tradesByCpty[trade.CounterpartyId] = tradesByCpty.GetValueOrDefault(trade.CounterpartyId) + 1;
             tradesInserted++;
@@ -359,7 +363,7 @@ await AnsiConsole.Live(BuildLiveView()).AutoClear(false).StartAsync(async ctx =>
             var victimId = liveIds[victimIndex];
             if (rng.NextDouble() < 0.5)
             {
-                if (tradeInput.TryGetCurrent(victimId, out var cancelled))
+                if (liveTrades.Remove(victimId, out var cancelled))
                 {
                     tradesByTrader[cancelled.TraderId]--;
                     tradesByCpty[cancelled.CounterpartyId]--;
@@ -370,9 +374,11 @@ await AnsiConsole.Live(BuildLiveView()).AutoClear(false).StartAsync(async ctx =>
                 liveIds.RemoveAt(liveIds.Count - 1);
                 tradesCancelled++;
             }
-            else if (tradeInput.TryGetCurrent(victimId, out var victim))
+            else if (liveTrades.TryGetValue(victimId, out var victim))
             {
-                await tradeInput.UpsertAsync(victim with { Quantity = Math.Max(1, victim.Quantity / 2) });
+                var amended = victim with { Quantity = Math.Max(1, victim.Quantity / 2) };
+                liveTrades[victimId] = amended;
+                await tradeInput.UpsertAsync(amended);
                 tradesAmended++;
             }
         }
@@ -436,7 +442,7 @@ IRenderable BuildLiveView()
     var renderables = new List<IRenderable>
     {
         new Markup(
-            $"[grey]trades[/] [bold]{tradesInserted,8:N0}[/]   [grey]live[/] {tradeInput.Count,7:N0}   " +
+            $"[grey]trades[/] [bold]{tradesInserted,8:N0}[/]   [grey]live[/] {liveTrades.Count,7:N0}   " +
             $"[grey]amended[/] {tradesAmended,5:N0}   [grey]cancelled[/] {tradesCancelled,5:N0}   " +
             $"[grey]step p50[/] [bold green]{StepPercentile(0.50),7:N0} µs[/]   [grey]p99[/] {StepPercentile(0.99),7:N0} µs   [grey]avg[/] {avgMicros,7:N0} µs"),
     };

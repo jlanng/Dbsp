@@ -7,6 +7,14 @@ namespace Incremental;
 /// records as it consumes them (partition is ignored).</summary>
 internal readonly record struct InputEntry<T>(T Value, long Weight, int Partition, long Offset) where T : notnull;
 
+/// <summary>One queued keyed-input command: an upsert of <see cref="Value"/> under
+/// <see cref="Key"/>, or a delete of the key (<see cref="Value"/> default), stamped as
+/// <see cref="InputEntry{T}"/> is.</summary>
+internal readonly record struct KeyedInputEntry<TKey, TValue>(
+    TKey Key, bool IsDelete, TValue? Value, int Partition, long Offset)
+    where TKey : notnull
+    where TValue : notnull;
+
 /// <summary>
 /// Producer-side handle to a circuit input. Writes go through a bounded channel: when the
 /// circuit cannot keep up, the returned <see cref="ValueTask"/>s suspend until capacity
@@ -30,11 +38,7 @@ internal readonly record struct InputEntry<T>(T Value, long Weight, int Partitio
 public sealed class InputHandle<T> where T : notnull
 {
     private readonly ChannelWriter<InputEntry<T>> _writer;
-
-    // 0 = no record sent yet, 1 = unstamped, 2 = stamped. Locked by the first send so a
-    // producer that mixes the two kinds fails on the spot instead of corrupting the
-    // input's replay position.
-    private int _stamping;
+    private StampingLock _stamping;
 
     internal InputHandle(ChannelWriter<InputEntry<T>> writer) => _writer = writer;
 
@@ -65,8 +69,8 @@ public sealed class InputHandle<T> where T : notnull
     /// <summary>Sends <paramref name="value"/> with an explicit signed <paramref name="weight"/>, unstamped.</summary>
     public ValueTask SendAsync(T value, long weight, CancellationToken cancellationToken = default)
     {
-        LockStamping(stamped: false);
-        return WriteAsync(new InputEntry<T>(value, weight, -1, -1), cancellationToken);
+        _stamping.Lock(stamped: false);
+        return InputWrites.WriteAsync(_writer, new InputEntry<T>(value, weight, -1, -1), cancellationToken);
     }
 
     /// <summary>Sends a weighted record stamped with its source offset (partition 0).</summary>
@@ -78,41 +82,145 @@ public sealed class InputHandle<T> where T : notnull
     {
         ArgumentOutOfRangeException.ThrowIfNegative(partition);
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
-        LockStamping(stamped: true);
-        return WriteAsync(new InputEntry<T>(value, weight, partition, offset), cancellationToken);
+        _stamping.Lock(stamped: true);
+        return InputWrites.WriteAsync(_writer, new InputEntry<T>(value, weight, partition, offset), cancellationToken);
     }
 
     /// <summary>Sends every entry of <paramref name="batch"/>, unstamped, in order. Not atomic:
     /// a step may drain part of the batch before the rest is written.</summary>
     public async ValueTask SendAsync(IEnumerable<WeightedValue<T>> batch, CancellationToken cancellationToken = default)
     {
-        LockStamping(stamped: false);
+        _stamping.Lock(stamped: false);
         foreach (var entry in batch)
-            await WriteAsync(new InputEntry<T>(entry.Value, entry.Weight, -1, -1), cancellationToken).ConfigureAwait(false);
+            await InputWrites.WriteAsync(_writer, new InputEntry<T>(entry.Value, entry.Weight, -1, -1), cancellationToken)
+                .ConfigureAwait(false);
     }
 
-    private void LockStamping(bool stamped)
+    /// <summary>Signals that no more data will arrive on this input. Once every input of a
+    /// circuit is complete and drained, its outputs complete too.</summary>
+    public void Complete() => _writer.TryComplete();
+}
+
+/// <summary>
+/// Producer-side handle to a keyed circuit input: upsert/delete-by-key semantics on top of
+/// the Z-set delta stream. The circuit keeps the current row per key as checkpointed
+/// operator state, so <see cref="UpsertAsync(TValue, CancellationToken)"/> retracts the
+/// previous version of the row before asserting the new one — the natural way to feed
+/// reference/master data and any stream whose rows are amended in place. Upserting the
+/// current row is a no-op, and so is deleting an absent key.
+///
+/// Because the current rows live in the circuit's state, a keyed input is safe to re-feed
+/// after a restart: re-upserting rows the recovered state already holds changes nothing, so
+/// a producer may replay its whole table (a keyed input fed that way converges on the
+/// replayed rows, though a key deleted at the source while the circuit was down is only
+/// retracted if the replay includes its delete). The offset-stamped overloads work as on
+/// <see cref="InputHandle{T}"/>: replay a partition from <see cref="Circuit.CommittedOffsets"/>
+/// and commands at or below the checkpoint are dropped, so nothing is even re-applied.
+///
+/// Commands for one key take effect in the order they were sent, the last one within a step
+/// winning — so a key needs one logical producer. In a clustered circuit that holds per
+/// process: if two processes send commands for the same key within one step, which one wins
+/// is unspecified.
+/// </summary>
+public sealed class KeyedInputHandle<TKey, TValue>
+    where TKey : notnull
+    where TValue : notnull
+{
+    private readonly ChannelWriter<KeyedInputEntry<TKey, TValue>> _writer;
+    private readonly Func<TValue, TKey> _keySelector;
+    private StampingLock _stamping;
+
+    internal KeyedInputHandle(ChannelWriter<KeyedInputEntry<TKey, TValue>> writer, Func<TValue, TKey> keySelector)
+    {
+        _writer = writer;
+        _keySelector = keySelector;
+    }
+
+    /// <summary>Inserts the row, or replaces the current row with its key (retraction +
+    /// assertion), unstamped.</summary>
+    public ValueTask UpsertAsync(TValue value, CancellationToken cancellationToken = default)
+    {
+        _stamping.Lock(stamped: false);
+        return Write(new KeyedInputEntry<TKey, TValue>(_keySelector(value), false, value, -1, -1), cancellationToken);
+    }
+
+    /// <summary>Upserts the row, stamped with its source offset (partition 0).</summary>
+    public ValueTask UpsertAsync(TValue value, long offset, CancellationToken cancellationToken = default) =>
+        UpsertAsync(value, 0, offset, cancellationToken);
+
+    /// <summary>Upserts the row, stamped with its source partition and offset.</summary>
+    public ValueTask UpsertAsync(TValue value, int partition, long offset, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(partition);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        _stamping.Lock(stamped: true);
+        return Write(new KeyedInputEntry<TKey, TValue>(_keySelector(value), false, value, partition, offset), cancellationToken);
+    }
+
+    /// <summary>Retracts the current row for <paramref name="key"/>, if any, unstamped.</summary>
+    public ValueTask DeleteAsync(TKey key, CancellationToken cancellationToken = default)
+    {
+        _stamping.Lock(stamped: false);
+        return Write(new KeyedInputEntry<TKey, TValue>(key, true, default, -1, -1), cancellationToken);
+    }
+
+    /// <summary>Deletes <paramref name="key"/>, stamped with its source offset (partition 0).</summary>
+    public ValueTask DeleteAsync(TKey key, long offset, CancellationToken cancellationToken = default) =>
+        DeleteAsync(key, 0, offset, cancellationToken);
+
+    /// <summary>Deletes <paramref name="key"/>, stamped with its source partition and offset.</summary>
+    public ValueTask DeleteAsync(TKey key, int partition, long offset, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(partition);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        _stamping.Lock(stamped: true);
+        return Write(new KeyedInputEntry<TKey, TValue>(key, true, default, partition, offset), cancellationToken);
+    }
+
+    private ValueTask Write(KeyedInputEntry<TKey, TValue> entry, CancellationToken cancellationToken)
+    {
+        if (entry.Key is null)
+            throw new ArgumentNullException("key", "A keyed input's key cannot be null.");
+        return InputWrites.WriteAsync(_writer, entry, cancellationToken);
+    }
+
+    /// <summary>Signals that no more data will arrive on this input; see <see cref="InputHandle{T}.Complete"/>.</summary>
+    public void Complete() => _writer.TryComplete();
+}
+
+/// <summary>An input handle's stamped/unstamped lock: 0 = no record sent yet, 1 = unstamped,
+/// 2 = stamped. Locked by the first send so a producer that mixes the two kinds fails on the
+/// spot instead of corrupting the input's replay position. A mutable struct held in a field
+/// of its handle — never copied.</summary>
+internal struct StampingLock
+{
+    private int _mode;
+
+    public void Lock(bool stamped)
     {
         var mode = stamped ? 2 : 1;
-        var seen = Interlocked.CompareExchange(ref _stamping, mode, 0);
+        var seen = Interlocked.CompareExchange(ref _mode, mode, 0);
         if (seen != 0 && seen != mode)
             throw new InvalidOperationException(
                 $"This input already carries {(stamped ? "unstamped" : "offset-stamped")} records, so it cannot accept " +
                 $"{(stamped ? "an offset-stamped" : "an unstamped")} one: mixing the two would corrupt the input's replay " +
                 "position (exactly-once dedup). Stamp every record of an input with source offsets, or none of them.");
     }
+}
 
+internal static class InputWrites
+{
     /// <summary>The channel write, with the fault path surfaced as what it is: a faulting
     /// circuit completes each input's channel with a <see cref="CircuitFaultedException"/>,
     /// and this unwraps the resulting channel-closed error so producers — including ones
     /// blocked mid-write on a full channel — see that exception (original fault as its
     /// inner) rather than a bare closed-channel error. A channel completed normally (via
-    /// <see cref="Complete"/> or circuit disposal) still throws
+    /// <c>Complete</c> or circuit disposal) still throws
     /// <see cref="ChannelClosedException"/>. The synchronous completion path stays
     /// allocation-free.</summary>
-    private ValueTask WriteAsync(InputEntry<T> entry, CancellationToken cancellationToken)
+    public static ValueTask WriteAsync<TEntry>(ChannelWriter<TEntry> writer, TEntry entry, CancellationToken cancellationToken)
     {
-        var write = _writer.WriteAsync(entry, cancellationToken);
+        var write = writer.WriteAsync(entry, cancellationToken);
         return write.IsCompletedSuccessfully ? write : Awaited(write);
 
         static async ValueTask Awaited(ValueTask write)
@@ -127,97 +235,6 @@ public sealed class InputHandle<T> where T : notnull
             }
         }
     }
-
-    /// <summary>Signals that no more data will arrive on this input. Once every input of a
-    /// circuit is complete and drained, its outputs complete too.</summary>
-    public void Complete() => _writer.TryComplete();
-}
-
-/// <summary>
-/// Producer-side handle to a keyed circuit input: upsert/delete-by-key semantics on top of
-/// the Z-set delta stream. The handle tracks the current row per key, so
-/// <see cref="UpsertAsync"/> automatically retracts the previous version of the row before
-/// asserting the new one — the natural way to feed reference/master data (and any stream
-/// where rows are amended in place). Calls are serialized internally; state lives on the
-/// producer side, so a keyed input should have a single logical producer.
-/// </summary>
-public sealed class KeyedInputHandle<TKey, TValue>
-    where TKey : notnull
-    where TValue : notnull
-{
-    private readonly InputHandle<TValue> _inner;
-    private readonly Func<TValue, TKey> _keySelector;
-    private readonly Dictionary<TKey, TValue> _current = new();
-    private readonly SemaphoreSlim _gate = new(1, 1);
-
-    internal KeyedInputHandle(InputHandle<TValue> inner, Func<TValue, TKey> keySelector)
-    {
-        _inner = inner;
-        _keySelector = keySelector;
-    }
-
-    /// <summary>Number of keys currently present.</summary>
-    public int Count
-    {
-        get { lock (_current) return _current.Count; }
-    }
-
-    /// <summary>Inserts the row, or replaces the existing row with its key (retraction +
-    /// assertion). Upserting an identical row is a no-op.</summary>
-    public async ValueTask UpsertAsync(TValue value, CancellationToken cancellationToken = default)
-    {
-        var key = _keySelector(value);
-        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            bool had;
-            TValue? existing;
-            lock (_current)
-                had = _current.TryGetValue(key, out existing);
-            if (had)
-            {
-                if (EqualityComparer<TValue>.Default.Equals(existing, value))
-                    return;
-                await _inner.SendAsync(existing!, -1, cancellationToken).ConfigureAwait(false);
-            }
-            await _inner.SendAsync(value, 1, cancellationToken).ConfigureAwait(false);
-            lock (_current)
-                _current[key] = value;
-        }
-        finally
-        {
-            _gate.Release();
-        }
-    }
-
-    /// <summary>Retracts the current row for <paramref name="key"/>, if any.</summary>
-    public async ValueTask DeleteAsync(TKey key, CancellationToken cancellationToken = default)
-    {
-        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            bool removed;
-            TValue? existing;
-            lock (_current)
-                removed = _current.Remove(key, out existing);
-            if (removed)
-                await _inner.SendAsync(existing!, -1, cancellationToken).ConfigureAwait(false);
-        }
-        finally
-        {
-            _gate.Release();
-        }
-    }
-
-    /// <summary>The current row for <paramref name="key"/>, as this handle last sent it.</summary>
-    public bool TryGetCurrent(TKey key, [System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out TValue value)
-    {
-        lock (_current)
-            return _current.TryGetValue(key, out value);
-    }
-
-    /// <summary>Signals that no more data will arrive on this input; see <see cref="InputHandle{T}.Complete"/>.</summary>
-    public void Complete() => _inner.Complete();
 }
 
 /// <summary>

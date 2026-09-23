@@ -296,13 +296,21 @@ unlistened.
 | `incremental.cluster.frames_sent/received`, `.bytes_sent/received`, `.send_queue_depth` | exchange traffic, per peer |
 
 **Keyed inputs.** `builder.KeyedInput<K,V>(name, keySelector)` declares an input with
-upsert/delete-by-key semantics: the handle tracks the current row per key, so
+upsert/delete-by-key semantics: the circuit keeps the current row per key, so
 `UpsertAsync(row)` emits the retraction of the previous version automatically and
 `DeleteAsync(key)` retracts the current one. This is the natural way to feed reference /
 master data (and any stream whose rows are amended in place) — one upsert to a reference
-row re-attributes everything joined against it. Caveat (design in progress): the upsert
-map lives on the producer side and is not checkpointed, and keyed inputs carry no source
-offsets — treat a keyed input as a full-replay source after a restart.
+row re-attributes everything joined against it. The current rows are checkpointed operator
+state (stored under the input's name, so topology edits leave them alone), which makes a
+keyed input safe to re-feed after a restart: re-upserting a row the recovered state already
+holds is a no-op, so a producer can simply send its whole table again. A key deleted at the
+source while the circuit was down is only retracted if the re-feed includes its delete. The
+offset-stamped overloads (`UpsertAsync(row, offset)`, `DeleteAsync(key, partition, offset)`)
+replay exactly-once from `CommittedOffsets`, as on plain inputs. Several commands for one
+key within a step resolve last-write-wins, so a key needs one logical producer — in a
+cluster, if two processes write the same key in the same step, which one wins is
+unspecified. The cost is memory: the table is held once more in the input's state, beside
+whatever copy a downstream join keeps.
 
 **What your types must satisfy.** Values are Z-set members and dictionary keys, so every
 type flowing through a stream needs value equality — records are the natural fit. A
@@ -611,9 +619,10 @@ disclosed trade-offs (below), not missing semantics:
 
 - [x] All-singing, all-dancing demo showing every feature together
       (`examples/Incremental.Showcase` — see Project layout)
-- [ ] Keyed-input restart story (checkpoint the upsert map, or derive retractions from
-      operator state; the Showcase's Act 4 demonstrates the current behavior honestly —
-      after a restore it does *not* re-feed keyed inputs, because replaying upserts on top
-      of checkpointed state double-counts)
+- [x] Keyed-input restart story: the current row per key is checkpointed circuit state,
+      so keyed inputs re-feed safely after a restore (the Showcase's Act 4 re-feeds every
+      reference table and verifies nothing double-counts) and take source offsets
+- [ ] Keyed-input snapshot sync (`ReplaceAllAsync`: retract every key a full-table
+      snapshot omits — needs a key scan on value stores)
 - [ ] Investigate off-heap in-process storage to reduce GC (RocksDB, SQLite candidates)
 - [ ] Cluster transport TLS/authentication

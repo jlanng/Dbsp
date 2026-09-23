@@ -34,7 +34,8 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   step; exchange nodes rely on this for barrier alignment (`Circuit.RunWorkerStep`).
 - Operator state is sharded per worker and never shared across threads. Any operator whose
   state is keyed must sit downstream of an exchange on that key: `GroupBy` inserts one,
-  `Distinct` shuffles by value, windowed groupings route by the user key, and
+  `Distinct` shuffles by value, keyed inputs place commands by key at drain (plus an exchange
+  across processes), windowed groupings route by the user key, and
   window-collapsing regroups (windowed `TopK`, window-sticky `GroupBy`) re-exchange by the
   window. Adding a stateful operator without this breaks multi-worker correctness silently.
 - Exchange routing must be process-stable: route by `StableHash` (or a user-supplied

@@ -11,7 +11,6 @@ public sealed class Beat
     public required string Label;
     public required Func<Task> Fire;
     public bool Once;                    // fires at most once (e.g. onboarding)
-    public bool NeedsKeyedInputs;        // disarmed after a crash-rebuild (disclosed limitation)
     /// <summary>Extra guard: returns why the trigger cannot fire, or null when it can.</summary>
     public Func<string?>? Unavailable;
     public bool Fired;
@@ -75,7 +74,6 @@ public sealed class Show : IAsyncDisposable
     ShowcaseCircuit live;
     int globalTick;
     int generation = 1;
-    bool keyedInputsArmed = true;        // a crash-rebuild disarms keyed upserts (disclosed limitation)
     RecoveryView? recovery;
     ScalingView? scaling;
     ClusterView? cluster;
@@ -202,8 +200,6 @@ public sealed class Show : IAsyncDisposable
     /// disabled button, so a greyed-out trigger always explains itself.</summary>
     string? Blocked(Beat beat) =>
         beat.Once && beat.Fired ? "already fired — this one only happens once"
-        : beat.NeedsKeyedInputs && !keyedInputsArmed
-            ? "disarmed by the crash: the producer-side upsert map is not persisted, so re-feeding reference data would double-count (roadmap item)"
         : beat.Unavailable?.Invoke();
 
     async Task TrafficTickAsync()
@@ -360,6 +356,9 @@ public sealed class Show : IAsyncDisposable
             total++;
             if (p.Offset <= committed["payments"]) deduped++;
         }
+        // Reference data first: the keyed inputs re-feed their whole tables, unstamped —
+        // the recovered upsert state absorbs every row it already holds.
+        var referenceRows = await live.ReplayMasterDataAsync(director);
         await live.FeedAsync(director.OrderLog, director.PaymentLog);   // full replay, from offset 0
         await live.StepTimedAsync();
         await live.StepTimedAsync();
@@ -371,13 +370,11 @@ public sealed class Show : IAsyncDisposable
             after = Views.Snapshot(live.CategoryStats);
         }
         var recovered = SnapshotsEqual(before, after);
-        recovery = new RecoveryView(generation, committed, total, deduped, recovered,
+        recovery = new RecoveryView(generation, committed, total, deduped, referenceRows, recovered,
             after.Count, after.Values.Sum(s => s.Gross), beforeGross);
-        keyedInputsArmed = false;
         Notices.Push(recovered ? NoticeLevel.Good : NoticeLevel.Bad, recovered
-            ? "recovered exactly-once: state + offsets from the checkpoint, replay deduplicated, consumers bootstrapped"
+            ? $"recovered exactly-once: state + offsets from the checkpoint, replay deduplicated, {referenceRows:N0} reference rows re-fed without double-counting, consumers bootstrapped"
             : "recovery verification FAILED");
-        Notices.Push(NoticeLevel.Info, "keyed upsert triggers disarmed: the producer-side upsert map is not persisted (roadmap item) — re-feeding or amending reference data would double-count");
     }
 
     async Task MeasureBeat()
@@ -409,18 +406,17 @@ public sealed class Show : IAsyncDisposable
     {
         void Add(Beat beat) => beats[beat.Id] = beat;
 
-        Add(new Beat { Id = "correct", Label = "correct the miscategorized merchant (again toggles it back)", Fire = CorrectionBeat, NeedsKeyedInputs = true });
+        Add(new Beat { Id = "correct", Label = "correct the miscategorized merchant (again toggles it back)", Fire = CorrectionBeat });
         Add(new Beat { Id = "orphan", Label = "post an orphan payment", Fire = OrphanBeat });
-        Add(new Beat { Id = "onboard", Label = "onboard the unknown merchant", Fire = OnboardBeat, Once = true, NeedsKeyedInputs = true });
+        Add(new Beat { Id = "onboard", Label = "onboard the unknown merchant", Fire = OnboardBeat, Once = true });
         Add(new Beat { Id = "late", Label = "send an order 4 s late — inside lateness, corrects its window", Fire = LateBeat });
         Add(new Beat { Id = "flash", Label = "start a flash sale (12 ticks of 3× volume)", Fire = FlashBeat });
         Add(new Beat { Id = "drop", Label = "send an order 45 s late — beyond lateness, dropped", Fire = DropBeat });
-        Add(new Beat { Id = "link-a", Label = "link accounts 21·22·23 (ring A)", Fire = LinkABeat, Once = true, NeedsKeyedInputs = true });
-        Add(new Beat { Id = "link-b", Label = "link accounts 31·32·33 (ring B)", Fire = LinkBBeat, Once = true, NeedsKeyedInputs = true });
+        Add(new Beat { Id = "link-a", Label = "link accounts 21·22·23 (ring A)", Fire = LinkABeat, Once = true });
+        Add(new Beat { Id = "link-b", Label = "link accounts 31·32·33 (ring B)", Fire = LinkBBeat, Once = true });
         Add(new Beat
         {
             Id = "bridge", Label = "add the bridge edge 23↔31 — the rings merge", Fire = BridgeBeat,
-            NeedsKeyedInputs = true,
             // Both rings must exist first, and the bridge must not already be there.
             Unavailable = () =>
                 !director.Edges.ContainsKey((22, 23)) || !director.Edges.ContainsKey((32, 33))
@@ -430,7 +426,6 @@ public sealed class Show : IAsyncDisposable
         Add(new Beat
         {
             Id = "withdraw", Label = "withdraw the bridge — the closure unwinds", Fire = WithdrawBeat,
-            NeedsKeyedInputs = true,
             Unavailable = () => director.Edges.ContainsKey((23, 31)) ? null : "add the bridge first",
         });
         Add(new Beat { Id = "crash", Label = "kill -9 the circuit and rebuild from the checkpoint", Fire = CrashBeat });
@@ -543,9 +538,11 @@ public sealed class Show : IAsyncDisposable
                     simulated kill -9. Its checkpoints (every 4 steps: all operator state + consumed
                     input offsets, one atomic commit) live in {StorageLabel}. The rebuild starts
                     against the same provider, the source logs replay from the beginning, and the
-                    circuit drops everything at-or-below the committed offsets on arrival. The panel
-                    below verifies the rebuilt state against a pre-crash snapshot. Fire it as often
-                    as you like — each crash starts a new generation.
+                    circuit drops everything at-or-below the committed offsets on arrival. The keyed
+                    reference inputs are simply re-fed whole: their current rows are checkpointed
+                    state too, so re-upserting a row the circuit already holds changes nothing. The
+                    panel below verifies the rebuilt state against a pre-crash snapshot. Fire it as
+                    often as you like — each crash starts a new generation.
                     """,
                 Code = """
                     services.AddIncremental<ShowcaseDefs>()
@@ -553,6 +550,7 @@ public sealed class Show : IAsyncDisposable
                     await host.StartAsync();                                // restores the latest checkpoint
                     var committed = circuit.CommittedOffset("orders-web");
                     await web.InsertAsync(order, offset: o.Offset);         // ≤ committed ⇒ dropped on arrival
+                    await merchants.UpsertAsync(merchant);                  // already held ⇒ no-op
                     """,
                 Beats = ["crash"],
             },

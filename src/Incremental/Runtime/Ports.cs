@@ -21,9 +21,11 @@ internal sealed class KeyedInputRegistration<TKey, TValue> : InputRegistration
 {
     public required Func<TValue, TKey> KeySelector { get; init; }
 
+    /// <summary>Null on an unsharded circuit, where every command goes to the one worker.</summary>
+    public required Func<TKey, uint>? RoutingHash { get; init; }
+
     public override IInputPort CreatePort(CircuitOptions options) =>
-        new InputPort<TValue>(Name, NodeId, options,
-            writer => new KeyedInputHandle<TKey, TValue>(new InputHandle<TValue>(writer), KeySelector));
+        new KeyedInputPort<TKey, TValue>(Name, NodeId, options, KeySelector, RoutingHash);
 }
 
 /// <summary>Encodes the checkpoint entry keys the committed-offsets marker uses: an
@@ -87,44 +89,18 @@ internal interface IInputPort
     void Fail(Exception error);
 }
 
-internal sealed class InputPort<T> : IInputPort where T : notnull
+/// <summary>
+/// An input's replay position — the consuming side of offset stamping, shared by plain and
+/// keyed inputs. Stamping mode mirrors the handle's lock, but from the side that survives a
+/// restart: a recovered checkpoint seeds the mode, so a producer that switches kinds across
+/// a restart (committed positions of the other kind) faults the step instead of
+/// deduplicating against a meaningless position.
+/// </summary>
+internal sealed class InputPosition(string inputName)
 {
-    private readonly Channel<InputEntry<T>> _channel;
-    private readonly int _nodeId;
-
-    // Stamping mode mirrors the handle's lock, but from the consuming side — which is the
-    // side that survives a restart: a recovered checkpoint seeds the mode, so a producer
-    // that switches kinds across a restart (committed positions of the other kind) faults
-    // the step instead of deduplicating against a meaningless position.
     private byte _mode; // 0 = nothing consumed or seeded, 1 = unstamped, 2 = stamped
     private long _unstamped = -1;                // running count (unstamped mode)
     private Dictionary<int, long>? _partitions;  // partition → highest consumed offset (stamped mode)
-
-    public InputPort(string name, int nodeId, CircuitOptions options,
-        Func<ChannelWriter<InputEntry<T>>, object>? handleFactory = null)
-    {
-        if (name.Contains('#'))
-            throw new ArgumentException(
-                $"Input name '{name}' contains '#', which is reserved for the checkpoint offset keys ({nameof(OffsetKeys)}).",
-                nameof(name));
-        Name = name;
-        _nodeId = nodeId;
-        _channel = Channel.CreateBounded<InputEntry<T>>(new BoundedChannelOptions(options.InputChannelCapacity)
-        {
-            SingleReader = true,
-            FullMode = BoundedChannelFullMode.Wait,
-        });
-        Handle = handleFactory?.Invoke(_channel.Writer) ?? new InputHandle<T>(_channel.Writer);
-    }
-
-    public string Name { get; }
-    public object Handle { get; }
-    public bool HasPending => _channel.Reader.TryPeek(out _);
-    public bool IsCompleted => _channel.Reader.Completion.IsCompleted;
-    public int BufferedCount => _channel.Reader.Count;
-
-    public Task<bool> WaitToReadAsync(CancellationToken cancellationToken) =>
-        _channel.Reader.WaitToReadAsync(cancellationToken).AsTask();
 
     public void SeedUnstamped(long offset)
     {
@@ -141,11 +117,77 @@ internal sealed class InputPort<T> : IInputPort where T : notnull
     public void AppendConsumedOffsets(Dictionary<string, long> into)
     {
         if (_mode == 1 && _unstamped >= 0)
-            into[Name] = _unstamped;
+            into[inputName] = _unstamped;
         else if (_mode == 2)
             foreach (var (partition, offset) in _partitions!)
-                into[OffsetKeys.Encode(Name, partition)] = offset;
+                into[OffsetKeys.Encode(inputName, partition)] = offset;
     }
+
+    /// <summary>Advances the position past one consumed record (offset -1 = unstamped) and
+    /// says whether the record is new. A stamped record must advance its partition's
+    /// position: one at or below it — in particular one replayed after a restart, when the
+    /// position starts at the committed checkpoint — is a duplicate, to be dropped.
+    /// Unstamped records are numbered as they are consumed and always admitted.</summary>
+    public bool Admit(int partition, long offset)
+    {
+        if (offset >= 0)
+        {
+            if (_mode == 1)
+                throw MixedStamping(stamped: true);
+            _mode = 2;
+            _partitions ??= new Dictionary<int, long>();
+            if (_partitions.TryGetValue(partition, out var position) && offset <= position)
+                return false;
+            _partitions[partition] = offset;
+            return true;
+        }
+
+        if (_mode == 2)
+            throw MixedStamping(stamped: false);
+        _mode = 1;
+        _unstamped++;
+        return true;
+    }
+
+    /// <summary>The handle already refuses mixing within one run, so reaching this means the
+    /// producer switched kinds across a restart: the recovered checkpoint committed positions
+    /// of the other kind, and deduplicating against them would be meaningless.</summary>
+    private InvalidOperationException MixedStamping(bool stamped) => new(
+        $"Input '{inputName}' has consumed (or recovered a committed checkpoint of) " +
+        $"{(stamped ? "unstamped" : "offset-stamped")} records, but received {(stamped ? "an offset-stamped" : "an unstamped")} " +
+        "one. Mixing the two would corrupt the input's replay position (exactly-once dedup); stamp every record of an " +
+        "input with source offsets, or none of them — across restarts too.");
+}
+
+internal sealed class InputPort<T> : IInputPort where T : notnull
+{
+    private readonly Channel<InputEntry<T>> _channel;
+    private readonly int _nodeId;
+    private readonly InputPosition _position;
+
+    public InputPort(string name, int nodeId, CircuitOptions options)
+    {
+        Name = InputPorts.ValidateName(name);
+        _nodeId = nodeId;
+        _position = new InputPosition(name);
+        _channel = InputPorts.CreateChannel<InputEntry<T>>(options);
+        Handle = new InputHandle<T>(_channel.Writer);
+    }
+
+    public string Name { get; }
+    public object Handle { get; }
+    public bool HasPending => _channel.Reader.TryPeek(out _);
+    public bool IsCompleted => _channel.Reader.Completion.IsCompleted;
+    public int BufferedCount => _channel.Reader.Count;
+
+    public Task<bool> WaitToReadAsync(CancellationToken cancellationToken) =>
+        _channel.Reader.WaitToReadAsync(cancellationToken).AsTask();
+
+    public void SeedUnstamped(long offset) => _position.SeedUnstamped(offset);
+
+    public void SeedPartition(int partition, long offset) => _position.SeedPartition(partition, offset);
+
+    public void AppendConsumedOffsets(Dictionary<string, long> into) => _position.AppendConsumedOffsets(into);
 
     // The staging targets — each worker's input operator's current pending buffer — fetched
     // per drain (which of an operator's two buffers is current changes as steps run); only
@@ -163,27 +205,8 @@ internal sealed class InputPort<T> : IInputPort where T : notnull
         while (drained < maxItems && _channel.Reader.TryRead(out var entry))
         {
             drained++;
-            if (entry.Offset >= 0)
-            {
-                if (_mode == 1)
-                    throw MixedStamping(stamped: true);
-                _mode = 2;
-
-                // Stamped records must advance their partition's position: one at or below
-                // it — in particular one replayed after a restart, when the position starts
-                // at the committed checkpoint — is a duplicate and is dropped.
-                _partitions ??= new Dictionary<int, long>();
-                if (_partitions.TryGetValue(entry.Partition, out var position) && entry.Offset <= position)
-                    continue;
-                _partitions[entry.Partition] = entry.Offset;
-            }
-            else
-            {
-                if (_mode == 2)
-                    throw MixedStamping(stamped: false);
-                _mode = 1;
-                _unstamped++; // unstamped records are numbered as they are consumed
-            }
+            if (!_position.Admit(entry.Partition, entry.Offset))
+                continue;
 
             if (staging is null)
             {
@@ -202,15 +225,90 @@ internal sealed class InputPort<T> : IInputPort where T : notnull
     public void CompleteWriter() => _channel.Writer.TryComplete();
 
     public void Fail(Exception error) => _channel.Writer.TryComplete(error);
+}
 
-    /// <summary>The handle already refuses mixing within one run, so reaching this means the
-    /// producer switched kinds across a restart: the recovered checkpoint committed positions
-    /// of the other kind, and deduplicating against them would be meaningless.</summary>
-    private InvalidOperationException MixedStamping(bool stamped) => new(
-        $"Input '{Name}' has consumed (or recovered a committed checkpoint of) " +
-        $"{(stamped ? "unstamped" : "offset-stamped")} records, but received {(stamped ? "an offset-stamped" : "an unstamped")} " +
-        "one. Mixing the two would corrupt the input's replay position (exactly-once dedup); stamp every record of an " +
-        "input with source offsets, or none of them — across restarts too.");
+/// <summary>
+/// The port of a keyed input: carries upsert/delete commands rather than weighted rows, and
+/// places each on a worker chosen by its key — so every command for a key reaches the same
+/// worker, in channel order, and that worker's <see cref="KeyedInputOperator{TKey,TValue}"/>
+/// can resolve several commands for one key within a step as last-write-wins. On a single
+/// process that worker also owns the key's upsert state; in a cluster the collapsed commands
+/// then cross an exchange to the owning process.
+/// </summary>
+internal sealed class KeyedInputPort<TKey, TValue> : IInputPort
+    where TKey : notnull
+    where TValue : notnull
+{
+    private readonly Channel<KeyedInputEntry<TKey, TValue>> _channel;
+    private readonly int _nodeId;
+    private readonly InputPosition _position;
+    private readonly Func<TKey, uint>? _routingHash;
+
+    public KeyedInputPort(string name, int nodeId, CircuitOptions options,
+        Func<TValue, TKey> keySelector, Func<TKey, uint>? routingHash)
+    {
+        Name = InputPorts.ValidateName(name);
+        _nodeId = nodeId;
+        _position = new InputPosition(name);
+        _routingHash = routingHash;
+        _channel = InputPorts.CreateChannel<KeyedInputEntry<TKey, TValue>>(options);
+        Handle = new KeyedInputHandle<TKey, TValue>(_channel.Writer, keySelector);
+    }
+
+    public string Name { get; }
+    public object Handle { get; }
+    public bool HasPending => _channel.Reader.TryPeek(out _);
+    public bool IsCompleted => _channel.Reader.Completion.IsCompleted;
+    public int BufferedCount => _channel.Reader.Count;
+
+    public Task<bool> WaitToReadAsync(CancellationToken cancellationToken) =>
+        _channel.Reader.WaitToReadAsync(cancellationToken).AsTask();
+
+    public void SeedUnstamped(long offset) => _position.SeedUnstamped(offset);
+
+    public void SeedPartition(int partition, long offset) => _position.SeedPartition(partition, offset);
+
+    public void AppendConsumedOffsets(Dictionary<string, long> into) => _position.AppendConsumedOffsets(into);
+
+    /// <summary>Moves up to <paramref name="maxItems"/> buffered commands onto the workers'
+    /// pending lists, each on the worker its key hashes to (the same placement the exchange
+    /// uses on a single process, which is why none is needed there).</summary>
+    public int DrainInto(Worker[] workers, int maxItems)
+    {
+        var drained = 0;
+        while (drained < maxItems && _channel.Reader.TryRead(out var entry))
+        {
+            drained++;
+            if (!_position.Admit(entry.Partition, entry.Offset))
+                continue;
+
+            var target = _routingHash is null ? 0 : (int)(_routingHash(entry.Key) % (uint)workers.Length);
+            ((KeyedInputOperator<TKey, TValue>)workers[target].Operators[_nodeId]).Pending
+                .Add(new KeyedCommand<TKey, TValue>(entry.Key, entry.IsDelete, entry.Value));
+        }
+        return drained;
+    }
+
+    public void CompleteWriter() => _channel.Writer.TryComplete();
+
+    public void Fail(Exception error) => _channel.Writer.TryComplete(error);
+}
+
+internal static class InputPorts
+{
+    public static string ValidateName(string name) =>
+        name.Contains('#')
+            ? throw new ArgumentException(
+                $"Input name '{name}' contains '#', which is reserved for the checkpoint offset keys ({nameof(OffsetKeys)}).",
+                nameof(name))
+            : name;
+
+    public static Channel<TEntry> CreateChannel<TEntry>(CircuitOptions options) =>
+        Channel.CreateBounded<TEntry>(new BoundedChannelOptions(options.InputChannelCapacity)
+        {
+            SingleReader = true,
+            FullMode = BoundedChannelFullMode.Wait,
+        });
 }
 
 internal abstract class OutputRegistration

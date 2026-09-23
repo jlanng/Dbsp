@@ -359,10 +359,11 @@ const render = {
           <div class="kv"><span>replayed</span><span>${n0(r.replayed)}</span></div>
           <div class="kv"><span>deduplicated on arrival</span><span>${n0(r.deduped)}</span></div>
           <div class="kv"><span>reapplied (uncommitted tail)</span><span>${n0(r.replayed - r.deduped)}</span></div>
+          <div class="kv"><span>reference rows re-fed (keyed upserts)</span><span>${n0(r.referenceRows)}</span></div>
           <div class="verdict ${r.matched ? "ok" : "no"}" style="margin-top:10px">${r.matched
             ? `✓ rebuilt state matches the pre-crash snapshot (${r.rows} rows, gross ${n2(r.gross)}) — consumers rebootstrapped themselves`
             : `✗ rebuilt state does NOT match (gross ${n2(r.gross)} vs ${n2(r.expectedGross)}) — that would be a bug`}</div>
-          <div style="color:var(--faint);margin-top:8px">Keyed upserts stay disarmed: the producer-side upsert map is not persisted (roadmap: keyed-input restart).</div>`);
+          <div style="color:var(--faint);margin-top:8px">Keyed inputs were re-fed whole (${n0(r.referenceRows)} reference rows): their current rows are checkpointed state, so only what the lost tail swallowed was reapplied.</div>`);
 
     return [
       panel("crash & recovery", "CommittedOffset-driven replay", body, true),

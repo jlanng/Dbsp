@@ -1,3 +1,4 @@
+using Incremental.Operators;
 using Incremental.Cluster;
 
 namespace Incremental.Tests;
@@ -102,6 +103,12 @@ public class ShardCodecTests
 
         var windowed = new WindowedValue<int, decimal>(window.WindowStart, window.WindowEnd, 7, 12.34m);
         Assert.Equal(windowed, RoundTrip(windowed));
+
+        // A clustered keyed input ships its resolved commands; a delete carries no row.
+        var upsert = new KeyedCommand<int, Point>(5, false, new Point(1, 2));
+        Assert.Equal(upsert, RoundTrip(upsert));
+        var delete = new KeyedCommand<int, string>(5, true, null);
+        Assert.Equal(delete, RoundTrip(delete));
     }
 
     [Fact]

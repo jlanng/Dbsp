@@ -29,7 +29,7 @@ public record Act3View(RingRow[] Rings, EdgeRow[] Edges);
 public record FeedRow(long Seq, long OrderId, string Merchant, string Category, decimal Amount, decimal Fee, long Weight);
 
 public record RecoveryView(
-    int Generation, Dictionary<string, long?> Committed, long Replayed, long Deduped,
+    int Generation, Dictionary<string, long?> Committed, long Replayed, long Deduped, long ReferenceRows,
     bool Matched, int Rows, decimal Gross, decimal ExpectedGross);
 
 public record ScalingView(

@@ -149,7 +149,8 @@ public static class Headless
                 if (s.Recovery is not { } r) { failures.Add("kill: the crash trigger never ran"); break; }
                 Line("generation", $"{r.Generation}");
                 Line("committed offsets", string.Join("  ", r.Committed.Select(kv => $"{kv.Key} {kv.Value?.ToString("N0") ?? "—"}")));
-                Line("replay", $"{r.Replayed:N0} records → {r.Deduped:N0} deduplicated, {r.Replayed - r.Deduped:N0} reapplied");
+                Line("replay", $"{r.Replayed:N0} records → {r.Deduped:N0} deduplicated, {r.Replayed - r.Deduped:N0} reapplied; " +
+                    $"{r.ReferenceRows:N0} reference rows re-fed");
                 Line("verified", r.Matched
                     ? $"rebuilt state matches the pre-crash snapshot ({r.Rows} rows, gross {r.Gross:N2})"
                     : $"MISMATCH: gross {r.Gross:N2} vs expected {r.ExpectedGross:N2}");

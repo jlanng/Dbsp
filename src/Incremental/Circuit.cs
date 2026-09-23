@@ -712,12 +712,15 @@ public sealed class Circuit : IAsyncDisposable
     private string BuildStateManifest(IEnumerable<string> storeNames)
     {
         var manifest = new System.Text.StringBuilder();
-        // format 3: the 0.2 API surface rewrite — operator kinds and node layouts changed
+        // format 4: keyed inputs keep their current rows as circuit state (an input-named
+        // upsert store) instead of in the producer's handle; a format-3 checkpoint of a
+        // circuit with keyed inputs has no rows to retract against, so it must not resume.
+        // (format 3: the 0.2 API surface rewrite — operator kinds and node layouts changed
         // (groupBy/select naming, windowed groupings' composite WindowKey state, snapshot
         // nodes on table-shaped outputs), so store names moved wholesale. No deployed
-        // format-2 checkpoints existed; the bump is hygiene.
+        // format-2 checkpoints existed; the bump is hygiene.)
         // (format 2: the committed-offsets marker became per-partition — see OffsetKeys.)
-        manifest.Append("format=3\n");
+        manifest.Append("format=4\n");
         manifest.Append($"workers={_options.Workers}\n");
         manifest.Append($"processes={_cluster?.ProcessCount ?? 1}\n");
         foreach (var store in storeNames)

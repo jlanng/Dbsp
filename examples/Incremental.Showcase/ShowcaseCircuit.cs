@@ -157,12 +157,19 @@ public sealed class ShowcaseCircuit
             await Payments.InsertAsync(p.Payment, offset: p.Offset);
     }
 
-    public async ValueTask ReplayMasterDataAsync(Director director)
+    /// <summary>Feeds the reference tables whole: the initial load, and the re-feed after a
+    /// crash. Keyed inputs keep their current rows in checkpointed state, so re-upserting
+    /// rows the recovered state already holds is a no-op and only what the lost tail
+    /// swallowed is re-applied. Returns the number of commands sent.</summary>
+    public async ValueTask<int> ReplayMasterDataAsync(Director director)
     {
-        foreach (var m in director.Merchants) await Merchants.UpsertAsync(m);
-        foreach (var c in director.Customers) await Customers.UpsertAsync(c);
-        foreach (var f in director.FeeRates) await FeeRates.UpsertAsync(f);
-        foreach (var e in director.Edges.Values) await Edges.UpsertAsync(e);
+        var sent = 0;
+        foreach (var m in director.Merchants) { await Merchants.UpsertAsync(m); sent++; }
+        foreach (var c in director.Customers) { await Customers.UpsertAsync(c); sent++; }
+        foreach (var f in director.FeeRates) { await FeeRates.UpsertAsync(f); sent++; }
+        foreach (var e in director.Edges.Values) { await Edges.UpsertAsync(e); sent++; }
+        foreach (var key in director.WithdrawnEdges) { await Edges.DeleteAsync(key); sent++; }
+        return sent;
     }
 
     /// <summary>One step, timed, with all step-level readers drained.</summary>

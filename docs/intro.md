@@ -251,15 +251,14 @@ required on inputs: they anchor durable identity for checkpointed source offsets
 (`InsertAsync(value, offset)` for exactly-once resumption from replayable sources).
 
 `builder.KeyedInput<TKey, TValue>(name, keySelector)` gives upsert semantics — `UpsertAsync`
-replaces the current row for a key (emitting the retraction of the old row itself) and
-`DeleteAsync` removes it.
-
-> **Keyed-input caveat (design in progress):** the upsert map that generates retractions is
-> producer-side and not yet checkpointed, and keyed inputs don't carry source offsets. For
-> now, treat keyed inputs as full-replay sources: after a restart, replay the reference data
-> from scratch rather than resuming mid-stream. Fixing this properly (checkpointing the
-> upsert map, or deriving retractions from operator state) is an open engine decision — see
-> the appendix.
+replaces the current row for a key (the circuit emits the retraction of the old row itself)
+and `DeleteAsync` removes it. The current row per key is circuit state, checkpointed under
+the input's name, so a keyed input restarts cleanly: re-upserting rows the recovered state
+already holds changes nothing (re-feed the whole table), and the offset-stamped overloads
+replay exactly-once from `CommittedOffsets`. Several commands for one key within a step
+resolve last-write-wins; a key needs one logical producer. A key deleted at the source while
+the circuit was down is only retracted if the re-feed sends its delete — a snapshot-sync
+`ReplaceAllAsync` is not designed yet.
 
 **Outputs.** `.ToOutput()` marks any stream (or table-shaped result) as an output. Outputs
 are not named: they carry no durable state, so the definition reference is their identity.
@@ -558,8 +557,8 @@ Implementation notes (not consumer-facing):
   (continue with `.Grouped()` for a distinct count).
 - Still open: the spelling for collapsing a windowed result to the window alone
   (aggregate-of-aggregates — window-sticky `GroupBy` to a unit key works but is ugly;
-  `TopK` doesn't need it, it ranks per window natively); the keyed-input restart mechanism
-  (checkpoint the upsert map vs. derive retractions from operator state); watermark
+  `TopK` doesn't need it, it ranks per window natively); keyed-input snapshot sync (retract
+  keys a full-table re-feed omits); watermark
   idleness handling; whether required input names can go too — today they are the durable
   key for checkpointed source offsets (a reference dies with the process, positional
   identity would re-bind offsets across topology edits), but a derived-with-optional-pin

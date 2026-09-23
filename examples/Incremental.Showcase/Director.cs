@@ -173,6 +173,7 @@ public sealed class Director
     {
         var edge = new LinkEdge(a, b, reason);
         Edges[(a, b)] = edge;
+        WithdrawnEdges.Remove((a, b));
         return edge;
     }
 
@@ -180,8 +181,14 @@ public sealed class Director
     {
         var edge = Edges[(a, b)];
         Edges.Remove((a, b));
+        WithdrawnEdges.Add((a, b));
         return edge;
     }
+
+    /// <summary>Edges deleted and not re-added. A re-feed after a crash re-sends their
+    /// deletes: a delete the lost tail swallowed must be replayed like any other command,
+    /// and deleting a key the recovered state no longer holds is a no-op.</summary>
+    public HashSet<(int A, int B)> WithdrawnEdges { get; } = [];
 
     /// <summary>An order from a specific customer (used to give ring accounts live exposure).</summary>
     public StampedOrder EmitOrderFor(int tick, int customerId) => MakeOrder(tick, customerId, PickMerchant());
