@@ -676,8 +676,8 @@ await using var storage = await ChangelogStorage.OpenAsync(changelog);   // rest
 var builder = new CircuitBuilder(new CircuitOptions { Storage = storage.Pipeline("orders-by-region") });
 ```
 
-`changelog` is an `IStateChangelog` — in production a compacted Kafka topic (not built
-yet), in tests `InMemoryStateChangelog`. A commit writes the entries the steps touched, not
+`changelog` is an `IStateChangelog` — in production a compacted Kafka topic (`log.State`
+of a `KafkaLog`, below), in tests `InMemoryStateChangelog`. A commit writes the entries the steps touched, not
 the state, plus one commit record with the offsets. The standby runs the same code with two
 differences: it follows instead of opening, and it does not start its circuits.
 
@@ -702,6 +702,63 @@ commit: its next checkpoint throws `ChangelogFencedException`, its circuits faul
 `provider.StartNewIncarnationAsync()` discards a pipeline's state durably, for the cases
 where a circuit is told to "start against an empty state store". Clustered circuits cannot
 use this provider.
+
+**On Kafka.** The `Incremental.Kafka` package supplies both logs. One `KafkaLog` per
+process owns the one transactional producer everything durable is written through:
+
+```csharp
+await using var log = await KafkaLog.ConnectAsync(new KafkaLogOptions
+{
+    BootstrapServers = "b-1.example:9098,b-2.example:9098",
+    TopicPrefix = "enrichment",                    // {prefix}.state, {prefix}.leader, {prefix}.table.{name}.*
+    ClientConfig = new Dictionary<string, string>  // any librdkafka setting, for every client
+    {
+        ["security.protocol"] = "SASL_SSL",
+        ["sasl.mechanism"] = "OAUTHBEARER",
+    },
+});
+
+// The active.
+await log.AcquireWriterAsync();                    // fences whoever wrote before
+var instruments = await SharedTable<int, Instrument>.OpenAsync(
+    "instruments", i => i.Id, await log.OpenTableLogAsync<int, Instrument>("instruments"));
+await using var storage = await ChangelogStorage.OpenAsync(log.State);
+
+// The standby: no AcquireWriterAsync, FollowAsync and Follow instead of the two opens.
+// At takeover it is the first call:
+await log.AcquireWriterAsync();
+await instruments.PromoteAsync();
+await storage.PromoteAsync();
+circuit.Start();
+```
+
+- `ConnectAsync` creates the topics it needs and checks the ones that exist. The state
+  topic has a fixed partition count (`StatePartitions`, 12 by default) that can never
+  change; a topic with another count is refused. Set `ReplicationFactor` to 1 for a single
+  local broker.
+- Checkpoints and table versions from every circuit and table in the process queue for one
+  writer thread, which commits whatever is waiting as one Kafka transaction. A commit
+  completes when its transaction has. It fails in two ways only: `KafkaLogException` — the
+  transaction was aborted, nothing of it is readable, the writer carries on — or fenced.
+- Fencing is Kafka's: `AcquireWriterAsync` initialises the shared `transactional.id`
+  (`{prefix}.writer` unless set), after which the previous holder cannot commit. Its next
+  checkpoint throws `ChangelogFencedException`, its next table version
+  `TableLogFencedException`, and `log.WhenFenced` completes. A broker that times a
+  transaction out (`TransactionTimeout`, 60 s) looks the same to the client, so an outage
+  longer than that also ends the active.
+- A table's key type must serialize equal values to the same text — integers, strings,
+  `Guid`s, enums, and tuples or records of them. `decimal`, `double` and `DateTimeOffset`
+  keys are refused when the log is opened: Kafka compacts by key bytes.
+- A standby can open a table's log only after the active has opened it once; until then
+  `OpenTableLogAsync` waits.
+- `table.Writer` over a Kafka log publishes a version once its transaction has committed,
+  so a commit costs a round trip. Batch what arrived meanwhile into the next commit.
+- `tableLog.TrimBeforeAsync(version)` deletes change history below a version. Nothing calls
+  it for you yet; the floor is the lowest `CommittedVersion(table)` of any pipeline that
+  must still be able to restart.
+
+Leader election (who calls `AcquireWriterAsync`, and when) is not built yet; nor is a Kafka
+source adapter.
 
 A commit is due at the end of the step that reaches `CheckpointInterval`, or — with
 `CheckpointMaxDelay` set — of the first step that ends after the oldest uncommitted step has

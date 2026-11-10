@@ -22,12 +22,17 @@ jobs:
         run: dotnet build -c Release
       - name: Test
         run: dotnet test --project tests/Incremental.Tests -c Release --no-build
+      # No broker in CI: the integration tests skip, and the ones that need none
+      # (SnapshotCutTests) run.
+      - name: Test Kafka
+        run: dotnet test --project tests/Incremental.Kafka.Tests -c Release --no-build
       # Validates the NuGet packaging (metadata, XML docs, SourceLink, symbols) on every build.
       - name: Pack
         run: |
           dotnet pack src/Incremental -c Release --no-build -o artifacts/packages
           dotnet pack src/Incremental.Storage.Redis -c Release --no-build -o artifacts/packages
           dotnet pack src/Incremental.Hosting -c Release --no-build -o artifacts/packages
+          dotnet pack src/Incremental.Kafka -c Release --no-build -o artifacts/packages
       - name: Upload packages
         uses: actions/upload-artifact@v7
         with:

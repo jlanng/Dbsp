@@ -408,9 +408,34 @@ so implementations never see cross-thread access to one store.
   takes its writer; `Follow` keeps a standby's copy warm, and `PromoteAsync` turns it into
   the active — it fences the previous one, whose next commit throws
   `ChangelogFencedException`. `SharedTable.FollowAsync` / `PromoteAsync` do the same for a
-  table over its log. `InMemoryStateChangelog` is the in-process log for tests; the Kafka
-  one is not built. Design and what was built:
+  table over its log. `InMemoryStateChangelog` is the in-process log for tests. Design and
+  what was built:
   [docs/design/durability-and-standby.md](docs/design/durability-and-standby.md).
+
+- `Incremental.Kafka` puts both logs on Kafka. One `KafkaLog` per process owns one
+  transactional producer; `log.State` is the `IStateChangelog` over the compacted topic
+  `{prefix}.state`, and `log.OpenTableLogAsync<TKey, TRow>(name)` is a table's `ITableLog`
+  over `{prefix}.table.{name}.changes` and `.rows`. Concurrent commits from every circuit
+  and table share Kafka transactions (group commit). `AcquireWriterAsync` initialises the
+  shared `transactional.id`, which fences the previous active:
+
+  ```csharp
+  await using var log = await KafkaLog.ConnectAsync(new KafkaLogOptions
+  {
+      BootstrapServers = "localhost:9092",
+      TopicPrefix = "enrichment",
+      ReplicationFactor = 1,                       // 3 by default, for a real cluster
+  });
+  await log.AcquireWriterAsync();                  // the active; a standby does not call this until takeover
+  var instruments = await SharedTable<int, Instrument>.OpenAsync(
+      "instruments", i => i.Id, await log.OpenTableLogAsync<int, Instrument>("instruments"));
+  await using var storage = await ChangelogStorage.OpenAsync(log.State);
+  var options = new CircuitOptions { Storage = storage.Pipeline("orders-by-region") };
+  ```
+
+  `KafkaLogOptions.ClientConfig` passes any librdkafka setting to every client (TLS and
+  SASL for MSK). Not built yet: the leader heartbeat and election, the Kafka source
+  adapter, hosting roles.
 
 - Candidates that make sense next: RocksDB (large state, embedded, fast scans), SQLite.
 
@@ -516,8 +541,13 @@ deterministic step boundaries for tests and batch jobs.
 src/Incremental                    core: Z-sets, builder API, operators, windows, runtime, in-memory
                                        storage, cluster transports (TCP + in-memory)
 src/Incremental.Storage.Redis      Redis-backed IStorageProvider
+src/Incremental.Kafka              Kafka-backed state changelog and shared-table logs, written
+                                       through one transactional producer per process
 tests/Incremental.Tests            xunit: Z-set algebra, per-step delta semantics, multi-worker runs,
                                        Redis integration (auto-skipped when Redis is down)
+tests/Incremental.Kafka.Tests      xunit, against the local broker (`docker compose --profile
+                                       connectors up -d`; auto-skipped when it is down): the log
+                                       writer, fencing, restore, compaction, failover end to end
 examples/Incremental.Example       joined + aggregated order analytics with live retraction
 examples/Incremental.LogAnalytics  simulated clickstream → 5s tumbling windows → counts → live top-3
                                        per window, rendered as an in-place Spectre.Console dashboard
@@ -627,9 +657,9 @@ its own project; `docs/intro.md` has them under *Running it fast*.
 
 ## Packaging
 
-MIT-licensed (see `LICENSE`). The three shipped libraries (`Incremental`,
-`Incremental.Storage.Redis`, and `Incremental.Hosting` — generic-host and DI integration,
-see *Hosting it* in `docs/intro.md`) multi-target **net8.0 and net10.0** and carry full NuGet
+MIT-licensed (see `LICENSE`). The four shipped libraries (`Incremental`,
+`Incremental.Storage.Redis`, `Incremental.Kafka`, and `Incremental.Hosting` — generic-host
+and DI integration, see *Hosting it* in `docs/intro.md`) multi-target **net8.0 and net10.0** and carry full NuGet
 metadata — `dotnet pack` produces consumable packages with XML docs, SourceLink, and
 symbol packages (not yet published to nuget.org; consume by project reference or a local
 feed). The only runtime dependency of the core library is
@@ -757,12 +787,14 @@ disclosed trade-offs (below), not missing semantics:
       snapshot omits — needs a key scan on value stores; shared tables have it)
 - [ ] Shared tables (`docs/design/shared-tables.md`): built so far — the table, its
       writer and change log seam, retroactive `Join`/`LeftJoin`, `Lookup`, secondary
-      indexes, `ReplaceAllAsync`, `Changes()`, derived tables (`ToTable`); to come — a
-      durable log, registration in `Incremental.Hosting`
+      indexes, `ReplaceAllAsync`, `Changes()`, derived tables (`ToTable`), a Kafka log
+      (`KafkaTableLog` in `Incremental.Kafka`); to come — registration in
+      `Incremental.Hosting`
 - [ ] Durability and warm standby (`docs/design/durability-and-standby.md`): built so
       far — commit after delivery, acknowledged outputs and sinks, the state changelog seam
       (`IStateChangelog`), `ChangelogStorage` with follower mode and promotion, table
-      followers, all against in-memory logs; to come — the Kafka changelog and table log,
-      the leader protocol, source adapters, active/standby roles in `Incremental.Hosting`
+      followers, and both logs on Kafka through one transactional producer with group
+      commit and `transactional.id` fencing (`Incremental.Kafka`); to come — the leader
+      heartbeat and election, source adapters, active/standby roles in `Incremental.Hosting`
 - [ ] Investigate off-heap in-process storage to reduce GC (RocksDB, SQLite candidates)
 - [ ] Cluster transport TLS/authentication

@@ -7,8 +7,10 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
 - Build: `dotnet build`
 - Test: `dotnet test --project tests/Incremental.Tests` (xunit v3 on Microsoft.Testing.Platform,
   opted in by `global.json` — hence `--project`; Redis tests skip unless `docker compose up -d` has run)
-- Connector stack for development (nothing tests against it yet):
-  `docker compose --profile connectors up -d` adds Kafka (`localhost:9092`), Postgres with
+- Kafka tests: `dotnet test --project tests/Incremental.Kafka.Tests` — integration tests of
+  `Incremental.Kafka` against the local broker; they skip unless the connector stack is up.
+  Each test uses its own topic prefix. About a minute.
+- Connector stack: `docker compose --profile connectors up -d` adds Kafka (`localhost:9092`), Postgres with
   logical decoding (`localhost:5432`, user/password/db `incremental`) and Debezium's Kafka
   Connect (`localhost:8083`). Plain `docker compose up -d` stays Redis-only.
 - Examples: `dotnet run --project examples/Incremental.Example`,
@@ -24,7 +26,9 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   `-c Release` if the throughput column is the point (Debug flattens it).
 - Benchmarks: `dotnet run -c Release --project benchmarks/Incremental.Benchmarks -- --filter '*'`
   (BenchmarkDotNet); `-- --assert` runs the CI performance contracts — scaling-ratio
-  assertions (delta cost vs state size), which is what `.github/workflows/ci.yml` gates on
+  assertions (delta cost vs state size), which is what `.github/workflows/ci.yml` gates on;
+  `-- --log-sizes` prints bytes per row of the Kafka logs' record format (JSON vs the dense
+  codec, raw and compressed)
 - Throughput rig: `dotnet run -c Release --project benchmarks/Incremental.Torture -- --workers 4`
   runs the showcase pipeline flat out over a sliding order population and reports records/s,
   the process CPU split (workers vs GC), and allocation per record (`--alloc-types` for a
@@ -87,6 +91,14 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   (compiled per type from the same structural rules as `StableHash`), with a JSON fallback for
   types it cannot round-trip and a format byte on every frame. Redis state serialization is
   still JSON and must stay so — it is a persisted format.
+- Durable logs on Kafka (`src/Incremental.Kafka`, docs/design/durability-and-standby.md).
+  Everything durable goes through the one transactional producer a `KafkaLog` owns —
+  never produce outside it, or fencing no longer covers the write. A commit fails only as
+  fenced (`KafkaLogFencedException`: the writer is finished) or as aborted
+  (`KafkaLogException`: nothing readable, writer usable); an unknown outcome is resolved
+  inside the writer loop, never reported. Readers are `read_committed`; "the end" is the
+  last stable offset, and positions must pass transaction markers. Record values start
+  with a format byte; keys must be byte-stable because compaction compares bytes.
 - Checkpointed state identity is covered by the state manifest (committed with every
   checkpoint, validated at `Start()`); store names are positional unless pinned with
   `.Named()` — changing store naming or the manifest format needs a format-version bump.

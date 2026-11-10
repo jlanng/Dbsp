@@ -390,26 +390,14 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
         return new TableHead(head.Version, head.Offsets);
     }
 
-    /// <summary>
-    /// Reads the rows topic into a consistent snapshot. Each partition is read on its own
-    /// clock, so "to the end of each" could mix versions when the writer is busy. Instead:
-    /// every version ends with its head in every partition. A partition is first read to
-    /// <paramref name="ends"/>, the end of its committed data when the restore began; from
-    /// then on it is stopped (paused) whenever it stands right after a head at the highest
-    /// version seen anywhere, and let run again if another partition shows a higher one.
-    /// The snapshot is done when every partition has passed its end and stands right after
-    /// the head of the same version.
-    /// </summary>
+    /// <summary>Reads the rows topic into a consistent snapshot: every partition from its
+    /// start, stopped where <see cref="SnapshotCut"/> says they all stand at one version.</summary>
     private (Dictionary<TKey, TRow> Rows, Head Head) ReadSnapshot(long[] ends, CancellationToken cancellationToken)
     {
         var rows = new Dictionary<TKey, TRow>();
-        var versions = new long[_rows.Length];
-        var atHead = new bool[_rows.Length];
+        var cut = new SnapshotCut(ends);
         var paused = new bool[_rows.Length];
-        var reachedEnd = new bool[_rows.Length];
-        Array.Fill(versions, -1);
         Head? head = null;
-        var target = -1L;
 
         using var consumer = _log.CreateConsumer();
         consumer.Assign(_rows.Select(partition => new TopicPartitionOffset(partition, Offset.Beginning)));
@@ -422,22 +410,15 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
             {
                 if (Environment.TickCount64 - idleSince > (long)_log.Options.OperationTimeout.TotalMilliseconds)
                     throw new TimeoutException(
-                        $"Restoring table '{_name}' stalled: no partition of '{RowsTopic}' produced a record or reached version {target}.");
+                        $"Restoring table '{_name}' stalled: no partition of '{RowsTopic}' produced a record or reached version {cut.Target}.");
                 continue;
             }
             idleSince = Environment.TickCount64;
-            var p = result.Partition.Value;
 
-            // "Has read everything committed below ends[p]". The offset just below an end
-            // is always a transaction marker (every write here is transactional), so the
-            // last record that can be seen is two below it. When that one belongs to an
-            // aborted transaction it is never seen, and a later record or the end-of-
-            // partition event settles it instead. The event alone would not do: a busy
-            // writer keeps every fetch non-empty, and the client reports the end only on
-            // an empty one.
-            reachedEnd[p] |= result.IsPartitionEOF || result.Offset.Value >= ends[p] - 2;
+            var p = result.Partition.Value;
             if (result.IsPartitionEOF)
             {
+                cut.End(p);
             }
             else if (result.Message.Key.AsSpan().SequenceEqual(HeadKey))
             {
@@ -445,52 +426,32 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
                     continue;
                 var read = ParseHead(headValue);
                 CheckEpoch(read.Epoch);
-                versions[p] = read.Version;
-                atHead[p] = true;
                 if (head is null || read.Version >= head.Version)
                     head = read;
-                if (read.Version > target)
-                {
-                    target = read.Version;
-                    for (var other = 0; other < paused.Length; other++)
-                    {
-                        if (paused[other] && versions[other] < target)
-                        {
-                            consumer.Resume([_rows[other]]);
-                            paused[other] = false;
-                        }
-                    }
-                }
+                cut.Head(p, result.Offset.Value, read.Version);
             }
             else
             {
-                // A row. If it arrived on a paused partition it was already fetched, and it
-                // belongs to a version past the head this partition stopped at: read on to
-                // that version's head.
-                atHead[p] = false;
-                if (paused[p])
-                {
-                    consumer.Resume([_rows[p]]);
-                    paused[p] = false;
-                }
                 var rowKey = _codec.KeyFromBytes<TKey>(result.Message.Key);
                 if (result.Message.Value is { } value)
                     rows[rowKey] = ParseRow(value);
                 else
                     rows.Remove(rowKey);
-                continue;
+                cut.Row(p, result.Offset.Value);
             }
 
-            if (reachedEnd[p] && atHead[p] && versions[p] >= target && !paused[p])
-            {
-                consumer.Pause([_rows[p]]);
-                paused[p] = true;
-            }
-            var done = head is not null;
-            for (var other = 0; other < versions.Length; other++)
-                done &= reachedEnd[other] && atHead[other] && versions[other] == target;
-            if (done)
+            if (cut.Done)
                 return (rows, head!);
+            for (var partition = 0; partition < paused.Length; partition++)
+            {
+                if (cut.ShouldPause(partition) == paused[partition])
+                    continue;
+                paused[partition] = !paused[partition];
+                if (paused[partition])
+                    consumer.Pause([_rows[partition]]);
+                else
+                    consumer.Resume([_rows[partition]]);
+            }
         }
     }
 

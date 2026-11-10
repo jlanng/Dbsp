@@ -17,6 +17,8 @@
     <!-- The Kafka logs write the default serializer's JSON straight to UTF-8 (its options)
          and ask whether a table's key type serializes equal values alike. -->
     <InternalsVisibleTo Include="Incremental.Kafka" />
+    <!-- LogSerializationBenchmarks compares the logs' JSON with the dense exchange codec. -->
+    <InternalsVisibleTo Include="Incremental.Benchmarks" />
   </ItemGroup>
 
 </Project>

@@ -403,6 +403,13 @@ no longer holds the version it needs next) cannot be promoted and must be reopen
 `SharedTable` is `IAsyncDisposable` for one reason: to stop a follower that is dropped
 without being promoted.
 
+**The Kafka log** (built with durability steps 3 and 4) is `KafkaTableLog` in
+`Incremental.Kafka`: `await kafkaLog.OpenTableLogAsync<TKey, TRow>(name)`. It is the
+durable log this section keeps referring to; what it adds and where it departs from the
+durability design is recorded there (*As built: `Incremental.Kafka`*). Two things a table
+owner must know: the key type must serialize equal values alike (it is refused
+otherwise), and nothing trims the log unless the host calls `TrimBeforeAsync`.
+
 `InMemoryTableLog` now models fencing. An instance is one connection to the log;
 `Connect()` returns another to the same log (the standby's), `TakeOver()` makes a
 connection the writer, and an append through any other connection throws

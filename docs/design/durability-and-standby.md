@@ -1,10 +1,13 @@
 # Design: durability and warm standby
 
-> **Status:** agreed design, 2026-11-09. Build-order steps 1 and 2 are built: commit after
+> **Status:** agreed design, 2026-11-09. Build-order steps 1 to 4 are built: commit after
 > delivery (with the sink side of keyed upsert delivery and the per-record error policy; see
-> the two *As built* sections under *Commit after delivery*), and the state changelog seam,
+> the two *As built* sections under *Commit after delivery*); the state changelog seam,
 > the changelog provider, the in-memory changelog and follower mode for stores and tables
-> (see *As built (step 2)* under *Warm standby*). Nothing that needs Kafka is.
+> (see *As built (step 2)* under *Warm standby*); and, in `Incremental.Kafka`, the log
+> writer, the state changelog and the table log on Kafka (see *As built:
+> `Incremental.Kafka`*). The leader protocol, the source adapter and the hosting roles are
+> not.
 > Sibling of [shared-tables.md](shared-tables.md); it fills the `ITableLog` seam that
 > design leaves open. Blocks marked **Decided** record a choice James made.
 > Kafka and MSK facts were checked against the sources in *References*; anything not
@@ -86,6 +89,9 @@ UTF-8 `segment NUL segment …` with the user key serialized last.
 > persisted format; the format byte lets it be introduced per topic without rewriting
 > history. Either way record *keys* must be byte-stable for a given value, because
 > compaction compares bytes. The Redis provider already depends on that property.
+
+The benchmark has been run; the numbers, and what they suggest, are under *As built:
+`Incremental.Kafka`*. The decision itself is still open.
 
 ## Kafka-backed table log
 
@@ -202,6 +208,259 @@ on read and tombstoned by a background sweep. Deleting a pipeline is the same sw
 > `P` can never change. A topic per pipeline was rejected: at replication factor 3 about
 > a thousand pipelines reaches MSK's recommended 1,000 partitions per broker, and MSK
 > Serverless allows only 120 compacted partitions per cluster.
+
+## As built: `Incremental.Kafka` (steps 3 and 4)
+
+Code: `src/Incremental.Kafka` — `KafkaLog.cs` (the connection, the log writer, topic
+set-up, the readers), `KafkaLogOptions.cs`, `KafkaStateChangelog.cs`, `KafkaTableLog.cs`.
+Tests: `tests/Incremental.Kafka.Tests` (`KafkaLogTests.cs`, `KafkaTableLogTests.cs`,
+`KafkaEndToEndTests.cs`), all against the local broker and skipped when `localhost:9092`
+is unreachable. Benchmark: `benchmarks/Incremental.Benchmarks/LogSerializationBenchmarks.cs`.
+Built against Confluent.Kafka 2.16.0 and tested against Apache Kafka 3.9.0 (KRaft, one
+broker).
+
+```csharp
+await using var log = await KafkaLog.ConnectAsync(new KafkaLogOptions
+{
+    BootstrapServers = "…", TopicPrefix = "enrichment",       // transactional.id defaults to "{prefix}.writer"
+    ClientConfig = { /* MSK: security.protocol, sasl.mechanism, … */ },
+});
+
+// The active.
+await log.AcquireWriterAsync();                                // InitTransactions: fences; commits the next term
+var instruments = await SharedTable<int, Instrument>.OpenAsync(
+    "instruments", i => i.Id, await log.OpenTableLogAsync<int, Instrument>("instruments"));
+await using var storage = await ChangelogStorage.OpenAsync(log.State);
+
+// The standby: the same, with FollowAsync / Follow and no AcquireWriterAsync. Takeover:
+await log.AcquireWriterAsync();
+await instruments.PromoteAsync();
+await storage.PromoteAsync();
+circuit.Start();
+```
+
+**One object per process.** `KafkaLog` owns the one transactional producer, the admin
+client and the topic names. `log.State` is the `IStateChangelog`; `log.OpenTableLogAsync`
+returns an `ITableLog`. A log is a reader until `AcquireWriterAsync`, which
+`ChangelogStorage.OpenAsync` and `PromoteAsync` also reach through
+`IStateChangelog.AcquireWriterAsync`; it runs once, and later calls return the first
+result. The `IStateChangelogWriter` handed to the storage does not own the producer —
+disposing it does nothing — because tables write through the same one. `KafkaLog.DisposeAsync`
+closes everything.
+
+**The log writer.** A dedicated thread, because every librdkafka transaction call blocks.
+A commit (a checkpoint, or a table version) is a list of records and a completion. The
+thread takes everything queued, runs one Kafka transaction over it, and completes the
+commits. `GroupCommitLinger` defaults to zero: commits that arrive while a transaction is
+in flight ride in the next one, which is where the batching comes from. In the test, 300
+concurrent committers doing three rounds each — 900 commits — took 6 Kafka transactions
+(it asserts at most a quarter as many transactions as commits). `MaxTransactionRecords` (default 100,000) bounds how much
+one transaction carries; a single larger commit is never split. Outcomes:
+
+| What the client says | What the writer does |
+|---|---|
+| `CommitTransaction` succeeds | completes every commit in the batch |
+| `KafkaRetriableException` from commit or abort | calls again; the call resumes, the outcome is still open |
+| `KafkaTxnRequiresAbortException`, or any other non-fatal error from commit | aborts, then runs the same batch again, up to `MaxAbortRetries` (5) with a short backoff; then gives each commit a transaction of its own; a commit that still aborts fails with `KafkaLogException` |
+| `Produce` refuses one record (too large, say) | aborts; that commit alone fails with `KafkaLogException`; the rest of the batch runs again |
+| fatal, `Local_Fenced`, or an abort that fails | the writer is finished: every waiting and later commit fails with `KafkaLogFencedException`, `WhenFenced` completes |
+
+That is the seam's two failure meanings. `KafkaStateChangelog` rethrows the second as
+`ChangelogFencedException` and `KafkaTableLog` as `TableLogFencedException`, each with the
+`KafkaLogFencedException` inside. A commit is not cancellable once queued. A transaction
+the broker times out (`transaction.timeout.ms`, default 60 s) comes back as a fence, so a
+Kafka outage longer than that ends the active even with no standby taking over; that is a
+departure from *Failure modes* ("Both recover when Kafka does") and is kept, because the
+client cannot tell the two apart.
+
+**Fencing, verified** (resolves the item under *Not verified*). With client 2.16.0
+against Kafka 3.9.0, a producer whose `transactional.id` has been initialised elsewhere
+gets `ErrorCode.Local_Fenced` ("This instance has been fenced by a newer instance"):
+
+- from `CommitTransaction`, `AbortTransaction` and `BeginTransaction` as a `KafkaException`
+  with `Error.IsFatal == true`, and on the error handler, also fatal;
+- from a later `Produce` as a `ProduceException` with the same code but `IsFatal == false`.
+  The writer therefore checks the code as well as the flag;
+- a producer fenced while idle does not find out until it writes again. Its next
+  `BeginTransaction` and `Produce` succeed locally; the fatal error reaches the error
+  handler when that transaction first talks to the coordinator, and the commit then
+  fails. So `WhenFenced` completes on a zombie's next write, not before. Telling an idle
+  zombie it has been deposed is the heartbeat topic's job (step 5).
+
+`InitTransactions` took about 0.5 s every time against the local broker, with or without
+an open transaction to abort. That is the floor of a takeover here; its cause was not
+investigated.
+
+**Terms.** `AcquireWriterAsync` reads `{p}.leader` (one partition, compacted) for the last
+term and commits the next under the key `term`, before it returns. Reading after
+`InitTransactions` makes the last term final; committing through the transactional
+producer makes the new one unique. This is the "write the new term" of takeover step 4,
+brought forward because `IStateChangelogWriter.Term` needs it. Heartbeats, the election
+and the delivery lease are still step 5.
+
+**Reading to the end.** Two facts about Kafka shaped the readers:
+
+- *A commit is not readable the moment it returns.* The broker writes a transaction's
+  markers after it answers the commit, so the last stable offset trails by a few
+  milliseconds. `EndOffsetAsync` asked right after one's own commit can therefore be the
+  offset before it — the in-memory changelog never does this. Asked after
+  `AcquireWriterAsync` it is exact, because `InitTransactions` waits for the previous
+  writer's markers, and that is the case a takeover depends on. Nothing in the core relies
+  on the other case; tests that read back their own writes either take over first or poll.
+- *The client reports the end of a partition only on an empty fetch,* which costs
+  `fetch.wait.max.ms` (0.5 s), and never while a busy writer keeps fetches full. So a
+  reader does not wait for it. The offset just below a last stable offset is always a
+  marker (every write is transactional and one producer's transactions do not overlap), so
+  having read the record two below the end is having read everything. A follower reports
+  `NextOffset` at the end as soon as the fetch that brought the last record says the end
+  is one offset further; the end-of-partition event still covers the case where the tail
+  is an aborted transaction. This took a caught-up standby's takeover from 2.0 s to
+  0.55 s, and a follower now stands at the end 1 to 3 ms after the commit returns.
+
+Each `ReadAsync` and each table `FollowAsync` runs its own consumer on its own thread, with
+a bounded channel of two batches to the caller. A storage therefore holds `P` consumers
+while it follows. One consumer for all partitions is the obvious saving and is not built.
+Consumers use `auto.offset.reset=error`, belong to no group and commit no offsets.
+
+**Topics.** `ConnectAsync` creates `{p}.state` (`StatePartitions`, default 12,
+`cleanup.policy=compact`, `delete.retention.ms` from `DeleteRetention`, default 24 h) and
+`{p}.leader`; `OpenTableLogAsync` creates `{p}.table.{name}.changes` (one partition,
+`cleanup.policy=delete`, `retention.ms=-1`, `retention.bytes=-1`) and
+`{p}.table.{name}.rows` (`TableRowPartitions`, default 4, compacted). An existing topic is
+checked: a state topic with another partition count, or any topic with the wrong
+`cleanup.policy`, is refused with `KafkaLogException`. A rows topic keeps the partition
+count it was created with, which the head record also carries; if the two ever differ the
+table is refused. `ReplicationFactor` defaults to 3. `StateTopicConfig`,
+`TableRowsTopicConfig` and `TableChangesTopicConfig` add or override topic settings at
+creation (`min.insync.replicas`; small segments in the compaction tests). Topic and table
+names are limited to letters, digits, `.`, `_` and `-`.
+
+**Record format.** Every value starts with format byte `1`: JSON, UTF-8. Compression is the
+producer's (`Compression`, default zstd), not the record's. State records are passed
+through as the changelog provider built them. Table records:
+
+```
+changes  key: version, 8 bytes big-endian
+         value: 1 {"epoch":"…","version":7,"chunk":0,"changes":[{"k":K,"o":OLD,"n":NEW},…],"last":true,"offsets":{"0":41}}
+rows     key: K's serialized bytes          value: 1 {"v":7,"r":ROW}      (null value: deleted)
+         key: NUL "$head"                   value: 1 {"epoch":"…","version":7,"partitions":4,"offsets":{"0":41}}
+```
+
+`o` and `n` are omitted when null. A row is serialized once and written into both records.
+The serializer seam is `KafkaLogOptions.Serializer`, an `IStateSerializer`: the default
+JSON serializer's output is written and read directly as UTF-8; any other goes through its
+strings, embedded as JSON strings. Departures from *Kafka-backed table log*:
+
+- **Chunks say "last", not "i of n".** A version is cut into another record whenever it
+  reaches `MaxRecordBytes` (default 900,000), so the count is not known when the first
+  chunk is written. Offsets ride on the last chunk as specified.
+- **Table keys must serialize equal values alike.** The rows topic finds a key by its
+  bytes. A key type for which that can fail (`decimal`, `double`, `DateTimeOffset`, a
+  hand-written `Equals`; the changelog provider's `ByteStableEquality` test) is refused at
+  `OpenTableLogAsync` rather than handled by remembering instances as the provider does.
+- **The epoch is written by the writer, the first time it opens the table,** as a version-0
+  head in every rows partition. A reader that opens a table nobody has created waits until
+  the active has. So the active must open a new table before the standby can.
+- **The head is found by reading the tail of rows partition 0,** not by reading the
+  partition: every version ends with its head, so one short read gives the epoch and the
+  last version. `LastVersionAsync` is that read (on a writer that has appended or looked
+  since it took over, it is the number in memory).
+- **Restore is consistent across partitions.** Reading each rows partition "to its end"
+  could mix versions while the writer is busy. `RestoreAsync` first reads every partition
+  to the end it had when the restore began, then pauses a partition whenever it stands
+  right after a head at the highest version seen anywhere and resumes it if another
+  partition shows a higher one; it is done when all stand after the head of the same
+  version. A test restores twelve times under a writer that rewrites every key each
+  version and checks each snapshot is one version. Rows are collected in a dictionary
+  first, because `RestoreAsync` can only hand rows over, not take one back.
+- **The offset index is filled as records pass, not at restore.** The design has restore
+  read the changes topic to fill the in-memory tail and the index. Neither happens:
+  `SharedTable.OpenAsync` starts with an empty tail (a lagging circuit reads the log), and
+  the index gains an entry when the writer appends a version (from the delivery report) or
+  a reader passes one. A range read seeks to the nearest entry at or below the version it
+  wants, or to the start of the topic when there is none, and skips forward. The index is
+  bounded (8,192 entries, thinned by half when full).
+- **Retention is `TrimBeforeAsync` and nothing else.** It finds the first offset of the
+  version and calls `DeleteRecords`. Computing the floor from the pipelines' commit
+  records, and the cap, are the host's and are not built.
+  `OldestRetainedVersion` is what this process last saw: at open, after its own trim, on a
+  reader's `LastVersionAsync`, and when a read runs into missing history.
+- **No `Old` in memory.** A followed version's `Old` and `New` rows are fresh instances
+  deserialized from the record, so rows must have value equality (records do), as
+  retraction already requires.
+
+**Core changes.** One: `InternalsVisibleTo` for `Incremental.Kafka` and
+`Incremental.Benchmarks` in `Incremental.csproj`, for `JsonStateSerializer.Options`,
+`ByteStableEquality` and (the benchmark) the dense codec. No seam changed.
+
+**Measured** (one machine, one local broker, Debug build unless said; indicative only):
+
+- Takeover by a caught-up standby, in process: about 0.55 s — 0.52 s to fence and commit
+  the term, 20 ms to promote two tables, 1 to 2 ms to promote the storage, under 1 ms to
+  start the circuit.
+- A 200,000-row table of wide reference rows (19 fields, about 410 bytes of JSON), four
+  rows partitions: loaded in 2.0 s as 40 versions of 5,000 rows; restored by a new process
+  in 2.5 s (80,000 rows/s).
+- Compaction: a rows topic of 3,072 records over 50 keys came down to 53, and a state
+  partition at end offset 3,428 to 775 records, within 15 s of small segments rolling;
+  restores before and after agree, and a circuit cold-started from the compacted state
+  topic carries on to the same sinks.
+
+**The serialization benchmark Decided (1) asked for.** `LogSerializationBenchmarks`
+(`dotnet run -c Release --project benchmarks/Incremental.Benchmarks -- --filter
+'*LogSerialization*'` for cost, `-- --log-sizes` for bytes), on two shapes: a trade (12
+fields: ids, a quantity, a `decimal` price, an instant, a few short strings) and a wide
+reference row (an instrument, 19 fields, mostly short strings). JSON is the format as
+built; dense is the cluster's `ShardCodec` holding the same row in the same record.
+One run, i7-13700H, .NET 10, Release; BenchmarkDotNet short job for the times.
+
+| Shape | Encoding | Raw B/row | zstd B/row | lz4 B/row | Encode ns/row | Decode ns/row | Decode alloc B/row |
+|---|---|---:|---:|---:|---:|---:|---:|
+| trade | JSON | 279 | 19 | 59 | 313 | 840 | 552 |
+| trade | dense | 99 | 26 | 41 | 105 | 160 | 312 |
+| instrument | JSON | 414 | 29 | 72 | 446 | 1,220 | 946 |
+| instrument | dense | 208 | 31 | 51 | 195 | 282 | 671 |
+
+Bytes are a row record's key and value; compressed figures are 1,000 records compressed
+as one batch (zstd level 3, lz4 fast — the client's defaults), without Kafka's per-record
+framing. Encoding allocates nothing in either format. Compressing cost 1.1 to 1.5 µs a
+row for JSON under zstd and 0.3 to 0.6 µs under lz4, with managed ports of the
+compressors, so those are a guide only. The rows are synthetic and regular — sequential
+ids, a handful of repeated strings — which flatters every compressed number; real rows
+will compress less well in both formats.
+
+What the numbers say:
+
+- **Bytes.** Uncompressed, JSON is two to three times the dense size. Under zstd the
+  difference disappears (JSON is slightly *smaller*: field names are the most
+  compressible thing in the batch). Under lz4 JSON is about 40% larger. With zstd, the
+  dense codec buys nothing on disk or on the wire.
+- **CPU.** JSON costs about 0.2 to 0.25 µs more per row to encode and 0.7 to 0.9 µs more
+  to decode. Encoding is on the commit path, where a Kafka round trip of milliseconds
+  dwarfs it. Decoding is the restore path: 200,000 wide rows are about 0.25 s of JSON
+  decoding against 0.06 s dense, inside a restore that took 2.5 s.
+
+On these numbers the dense codec is not worth making a persisted format: it would save a
+fraction of a second per few hundred thousand rows restored and no storage, at the price
+of a second format whose stability becomes a compatibility promise. **Kept open for
+James**, as Decided (1) reserves the decision; the default stays JSON with zstd, and the
+format byte leaves the door open per topic. The case that would change the answer is a
+table of tens of millions of rows whose cold restore must be fast.
+
+**Not built, or left open.**
+
+- Heartbeats, election, the leader term on deliveries, the delivery lease (step 5). The
+  writer commits nothing when idle.
+- Metrics: none yet (transactions, commits per transaction, commit latency, follower lag).
+  `KafkaLog` exposes counters (`TransactionsCommitted`, `TransactionsAborted`,
+  `CommitsCompleted`, `RecordsWritten`) but publishes nothing.
+- The producer pool and the single multiplexed consumer.
+- MSK: `ClientConfig` passes any librdkafka setting through and `ConfigureProducer` /
+  `ConfigureConsumer` / `ConfigureAdmin` expose the builders for an OAUTHBEARER refresh
+  handler, but nothing has been run against MSK, IAM or TLS.
+- A commit larger than the client's queue (`queue.buffering.max.messages`, 100,000 by
+  default) is handled by waiting for the queue to drain; one larger than the broker's
+  transaction can sensibly hold has no guard beyond `transaction.timeout.ms`.
 
 ## Warm standby
 
@@ -832,9 +1091,18 @@ Against the local stack (`docker compose --profile connectors up -d`; tests skip
 `localhost:9092` is unreachable, as the Redis tests do):
 
 - **Fencing.** Two log writers on one `transactional.id`: after the second initialises,
-  the first's next commit fails and a reader never sees its open transaction.
+  the first's next commit fails and a reader never sees its open transaction. *Built*
+  (`KafkaLogTests`), for a checkpoint commit and a table version.
 - **Restore after compaction**, with the cleaner forced by small segments and a low dirty
-  ratio, equals restore before it.
+  ratio, equals restore before it. *Built* for the rows topic (`KafkaTableLogTests`) and,
+  through a circuit, for the state topic (`KafkaEndToEndTests`); both skip if the
+  broker's cleaner has not run within 90 s.
+- **Built beyond this list:** group commit (transactions counted), an aborted commit
+  isolated from its neighbours, a snapshot restore under a busy writer, range reads and
+  trimming, a 200,000-row restore, and the in-process failover: a circuit with a stream
+  join, a table join, a lookup, aggregates, a distinct, a keyed input, a derived table and
+  four upsert sinks is dropped three times — replaced by its standby, by a cold start, by
+  a standby again — and the sinks and the derived table equal an in-memory run.
 - **Kill -9 failover**, in the style of `MultiProcessClusterTests`: a host executable run
   twice as real processes, active and standby, with a Kafka source, a shared table, a
   retroactive join and a keyed upsert sink written to a topic. The test kills the active
@@ -865,9 +1133,20 @@ soak run on a real cluster before the failover number is believed.
    `StableHash(pipeline id) mod P`; that `Append` copies its spans, so the writer owns the
    batching; and that a storage reads every partition from offset 0 whichever role it
    starts in.
-3. `Incremental.Kafka`: the log writer, the changelog over `{p}.state`, restore.
-4. Kafka `ITableLog`: both topics, restore, durable range reads, retention.
-5. Leader topic, terms, the takeover sequence; the kill -9 test.
+3. **Done.** `Incremental.Kafka`: the log writer, the changelog over `{p}.state`, restore.
+   See *As built: `Incremental.Kafka`*.
+4. **Done.** Kafka `ITableLog`: both topics, restore, durable range reads, retention by
+   `TrimBeforeAsync`. Same section. Step 5 should know: `{p}.leader` exists (one
+   partition, compacted) and already holds the term under the key `term`, written by
+   `KafkaLog.AcquireWriterAsync`; heartbeats belong in the writer loop (`WriterLoop` in
+   `KafkaLog.cs`), one per transaction plus an idle timer, under another key; a fenced
+   idle producer learns nothing until it writes, so the heartbeat is also what tells a
+   zombie; `InitTransactions` costs about half a second locally; a transaction the broker
+   times out is reported as a fence; the standby must not open a table before the active
+   has created it (`OpenTableLogAsync` waits); and the takeover order that is tested is
+   `log.AcquireWriterAsync()`, each `table.PromoteAsync()`, `storage.PromoteAsync()`, each
+   `circuit.Start()`.
+5. Leader topic heartbeats, the election, the takeover sequence; the kill -9 test.
 6. Kafka source adapter; resumption contracts for gRPC, files and CDC adapters.
 7. Active and standby roles in `Incremental.Hosting`.
 8. A soak on MSK to replace the estimates above with measurements.
@@ -895,9 +1174,21 @@ soak run on a real cluster before the failover number is believed.
 - The exact conditions under which `InitProducerId` returns `CONCURRENT_TRANSACTIONS`,
   and so the worst-case duration of takeover step 2. KIP-98 states the abort-or-await
   behaviour; the timing is unmeasured.
-- How `Confluent.Kafka` surfaces fencing (which error code, and that it is always
-  flagged fatal). The transactional API and `DeleteRecordsAsync` exist; the fencing error
-  path needs a test, which is the first Kafka test above.
+- ~~How `Confluent.Kafka` surfaces fencing.~~ Verified against the local broker:
+  `Local_Fenced`, fatal from the transaction calls, not flagged fatal on a later
+  `Produce`. See *Fencing, verified* under *As built: `Incremental.Kafka`*. Still not
+  verified: that MSK's broker version reports it the same way, and what a producer sees
+  when the broker itself aborts a timed-out transaction (the code treats any fatal error
+  as a fence, which is safe either way).
+- Why `InitTransactions` takes about half a second against an idle local broker, and
+  whether it is shorter or longer on MSK. It is the largest part of a takeover measured
+  so far.
+- That the offset just below a last stable offset is always a transaction marker on MSK
+  as it is on Kafka 3.9 (the readers finish a read to the end on that basis). If it were
+  not, a read would fall back to the end-of-partition event and be slower, not wrong.
+- Behaviour of the group commit under a slow or failing broker: abort-and-retry, the
+  split into single-commit transactions and the retriable-commit loop are exercised only
+  by an oversized record. A fault-injection run (a proxy that drops or delays) is needed.
 - Which Kafka version MSK must run to include the KIP-890 broker-side checks against
   writes from a stale epoch. The design does not rely on them for a well-behaved client.
 - KAFKA-13727 (cleaner removing abort markers too early) should be confirmed fixed in the

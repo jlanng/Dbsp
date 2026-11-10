@@ -10,7 +10,7 @@ namespace Incremental.Kafka.Tests;
 /// The log writer and the state changelog against a real broker: topic set-up, the
 /// changelog's read contract, group commit, an aborted commit, and fencing.
 /// </summary>
-public class KafkaLogTests
+public class KafkaLogTests(ITestOutputHelper output)
 {
     private static readonly TimeSpan Timeout = KafkaEnv.Timeout;
 
@@ -187,6 +187,7 @@ public class KafkaLogTests
         Assert.True(transactions * 4 <= commits,
             $"{commits} commits took {transactions} Kafka transactions: they were not batched.");
         Assert.Equal(0, log.TransactionsAborted);
+        KafkaEnv.Measured(output, $"group commit: {commits} commits from {Committers} concurrent committers in {transactions} Kafka transactions");
 
         // Every commit landed whole, and a committer's rounds kept their order.
         var successor = await env.ConnectWriterAsync();
@@ -230,9 +231,87 @@ public class KafkaLogTests
 
         // Aborted means nothing of it is readable — not even the record that was fine.
         await CommitAsync(writer, 0, ("later", "3"));
+
         var successor = await env.ConnectWriterAsync();
         var keys = (await KafkaEnv.ReadToEndAsync(successor.State, 0)).Select(r => Text(r.Key)).ToList();
         Assert.Equal(["after", "before", "later"], keys.Order());
+    }
+
+    [Fact]
+    public async Task A_read_to_the_end_gets_past_an_aborted_transaction_at_the_tail()
+    {
+        await using var env = KafkaEnv.Create();
+        var log = await env.ConnectWriterAsync();
+        var writer = await log.State.AcquireWriterAsync();
+        await CommitAsync(writer, 0, ("kept", "1"));
+
+        // Records that reached the broker and were then aborted, as the last thing in the
+        // partition. (Written with a producer of the test's own, under another
+        // transactional id, because the log writer aborts before anything is sent whenever
+        // it can.) The end of committed data is now past records no reader is ever handed.
+        using (var other = new ProducerBuilder<byte[], byte[]>(new ProducerConfig
+        {
+            BootstrapServers = KafkaEnv.Bootstrap, TransactionalId = env.Prefix + ".other",
+        }).Build())
+        {
+            other.InitTransactions(Timeout);
+            other.BeginTransaction();
+            for (var i = 0; i < 3; i++)
+                other.Produce(new TopicPartition(log.State.Topic, 0), new Message<byte[], byte[]> { Key = Bytes($"aborted{i}"), Value = Bytes("x") });
+            other.Flush(Timeout);
+            other.AbortTransaction(Timeout);
+        }
+
+        var successor = await env.ConnectWriterAsync();
+        var end = await successor.State.EndOffsetAsync(0);
+        var records = await KafkaEnv.ReadToEndAsync(successor.State, 0); // returns only when the position reaches the end
+        Assert.Equal(["kept"], records.Select(r => Text(r.Key)));
+        Assert.Equal(records[0].Offset + 6, end);                         // marker, three aborted records, marker
+
+        // The leader term is read the same way, across the same kind of tail.
+        Assert.Equal(2, successor.Term);
+    }
+
+    [Fact]
+    public async Task A_follower_at_the_end_knows_it_without_waiting_for_an_empty_fetch()
+    {
+        // After a commit the follower holds the last record, but its position is "at the
+        // end" only once it is past the transaction's marker. The client says so on an
+        // empty fetch — fetch.wait.max.ms, half a second, later. A takeover waits on
+        // exactly this, so the reader works it out from the record's own fetch.
+        await using var env = KafkaEnv.Create();
+        var active = await env.ConnectWriterAsync();
+        var writer = await active.State.AcquireWriterAsync();
+        var standby = await env.ConnectAsync();
+
+        using var stop = new CancellationTokenSource(Timeout);
+        var position = 0L;
+        var following = Task.Run(async () =>
+        {
+            await foreach (var batch in standby.State.ReadAsync(0, 0, stop.Token))
+                Volatile.Write(ref position, batch.NextOffset);
+        });
+        await CommitAsync(writer, 0, ("warm-up", "v"));
+        await KafkaEnv.EventuallyAsync(() => Task.FromResult(Volatile.Read(ref position) >= 2), "the follower is at the end");
+        await Task.Delay(700); // let the follower settle into a long poll
+
+        var waits = new List<double>();
+        for (var i = 0; i < 7; i++)
+        {
+            await CommitAsync(writer, 0, ($"k{i}", "v"));
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            var end = 2 * (i + 2);                    // each transaction: one record, one marker
+            while (Volatile.Read(ref position) < end && clock.Elapsed < Timeout)
+                await Task.Delay(1);
+            waits.Add(clock.Elapsed.TotalMilliseconds);
+            await Task.Delay(50);
+        }
+        waits.Sort();
+        KafkaEnv.Measured(output, $"follower reaches the end after a commit returns: median {waits[3]:F0} ms, worst {waits[^1]:F0} ms");
+        Assert.True(waits[3] < 250, $"the follower took {waits[3]:F0} ms (median) to stand at the end; an empty fetch takes 500");
+
+        stop.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => following).WaitAsync(Timeout);
     }
 
     [Fact]
