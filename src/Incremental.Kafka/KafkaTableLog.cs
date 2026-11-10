@@ -18,7 +18,8 @@ namespace Incremental.Kafka;
 /// makes the chunks atomic.</item>
 /// <item><c>{prefix}.table.{name}.rows</c> — compacted: one record per live key, a null
 /// value for a deleted one, and a <c>$head</c> record per partition rewritten by every
-/// version (epoch, version, source offsets). Restoring reads this topic only, so it is
+/// version (epoch, version, source offsets, and where the changes topic's recent history
+/// starts). Restoring reads this topic only, so it is
 /// bounded by the table's size.</item>
 /// </list>
 /// <para>
@@ -152,7 +153,20 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
 
     // ── the head ───────────────────────────────────────────────────────────────────────
 
-    private sealed record Head(string Epoch, long Version, int Partitions, Dictionary<int, long> Offsets);
+    /// <summary>The head record. <c>IndexVersion</c> and <c>IndexOffset</c> are a version at
+    /// or below this one and the changes-topic offset of its first record, as the writer
+    /// knew it — normally the version before. They let a process that has only read the
+    /// head seek near the end of the changes topic instead of reading its history.
+    /// <c>IndexVersion</c> 0: none.</summary>
+    private sealed record Head(
+        string Epoch, long Version, int Partitions, Dictionary<int, long> Offsets, long IndexVersion = 0, long IndexOffset = -1);
+
+    private Head Seed(Head head)
+    {
+        if (head.IndexVersion > 0 && head.IndexOffset >= 0)
+            _index.Add(head.IndexVersion, head.IndexOffset);
+        return head;
+    }
 
     private void AddHeads(LogCommit commit, Head head)
     {
@@ -199,7 +213,7 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
                         head = ParseHead(value);
                 }, cancellationToken);
                 if (head is not null || from == start)
-                    return head;
+                    return head is null ? null : Seed(head);
             }
         }, cancellationToken).ConfigureAwait(false);
     }
@@ -364,7 +378,9 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
         EndChunk(last: true);
 
         commit.Records.AddRange(rows);
-        AddHeads(commit, new Head(_epoch, version.Version, _rows.Length, new Dictionary<int, long>(version.Offsets)));
+        var (indexVersion, indexOffset) = _index.Last ?? (0, -1);
+        AddHeads(commit, new Head(
+            _epoch, version.Version, _rows.Length, new Dictionary<int, long>(version.Offsets), indexVersion, indexOffset));
         return commit;
     }
 
@@ -441,7 +457,7 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
             }
 
             if (cut.Done)
-                return (rows, head!);
+                return (rows, Seed(head!));
             for (var partition = 0; partition < paused.Length; partition++)
             {
                 if (cut.ShouldPause(partition) == paused[partition])
@@ -495,9 +511,7 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
                 throw LostHistory(next, OldestRetainedVersion);
         }
 
-        // The nearest offset known to be at or before the version; failing that, the start
-        // of what the topic still holds.
-        var start = _index.Floor(next) is { } known ? new Offset(known) : Offset.Beginning;
+        var start = await StartNearAsync(next, cancellationToken).ConfigureAwait(false);
         List<TableChange<TKey, TRow>>? changes = null;
         var expectedChunk = 0;
         await foreach (var batch in _log.ReadBatchesAsync(_changes, start, cancellationToken).ConfigureAwait(false))
@@ -541,6 +555,22 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
             }
         }
     }
+
+    /// <summary>Where to start reading for <paramref name="version"/>: the nearest offset
+    /// known to be at or before its first record, or failing that the start of what the
+    /// topic still holds. A known offset may since have been trimmed away — by this process
+    /// or another — so it is never taken below the topic's start.</summary>
+    private async Task<Offset> StartNearAsync(long version, CancellationToken cancellationToken)
+    {
+        if (_index.Floor(version) is not { } known)
+            return Offset.Beginning;
+        var low = await _log.StartOffsetAsync(_changes, cancellationToken).ConfigureAwait(false);
+        return new Offset(Math.Max(known, low));
+    }
+
+    /// <summary>The offset the index would start a read for <paramref name="version"/> at,
+    /// or null when it knows none. For tests.</summary>
+    internal long? KnownOffsetAtOrBelow(long version) => _index.Floor(version);
 
     private InvalidOperationException LostHistory(long wanted, long oldest) => new(
         $"Table log '{_name}' no longer retains version {wanted}: its history starts at version {oldest}.");
@@ -667,7 +697,7 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
         if (_index.Exact(version) is { } exact)
             return exact;
 
-        var start = _index.Floor(version) is { } known ? new Offset(known) : Offset.Beginning;
+        var start = await StartNearAsync(version, cancellationToken).ConfigureAwait(false);
         await foreach (var batch in _log.ReadBatchesAsync(_changes, start, cancellationToken).ConfigureAwait(false))
         {
             foreach (var record in batch.Records)
@@ -725,6 +755,16 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
                     _entries.RemoveRange(kept, _entries.Count - kept);
                 }
                 _entries.Add((version, offset));
+            }
+        }
+
+        /// <summary>The newest entry, or null when there is none.</summary>
+        public (long Version, long Offset)? Last
+        {
+            get
+            {
+                lock (_entries)
+                    return _entries.Count > 0 ? _entries[^1] : null;
             }
         }
 

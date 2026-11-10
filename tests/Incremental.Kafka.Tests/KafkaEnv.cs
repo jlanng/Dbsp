@@ -7,11 +7,14 @@ namespace Incremental.Kafka.Tests;
 /// <summary>
 /// One test's corner of the local broker (<c>docker compose --profile connectors up -d</c>):
 /// a topic prefix nobody else has used, the logs opened under it, and the clean-up. A test
-/// that cannot reach <c>localhost:9092</c> is skipped, as the Redis tests are.
+/// that cannot reach the broker is skipped, as the Redis tests are.
 /// </summary>
 internal sealed class KafkaEnv : IAsyncDisposable
 {
-    public const string Bootstrap = "localhost:9092";
+    /// <summary>The broker under test: the local stack's, unless
+    /// <c>INCREMENTAL_KAFKA_BOOTSTRAP</c> names another (<c>host:port</c>).</summary>
+    public static readonly string Bootstrap =
+        Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_BOOTSTRAP") is { Length: > 0 } configured ? configured : "localhost:9092";
     public static readonly TimeSpan Timeout = TimeSpan.FromSeconds(60);
 
     private readonly List<KafkaLog> _logs = [];
@@ -27,13 +30,15 @@ internal sealed class KafkaEnv : IAsyncDisposable
     {
         try
         {
+            var first = Bootstrap.Split(',')[0];
+            var colon = first.LastIndexOf(':');
             using var probe = new TcpClient();
-            if (!probe.ConnectAsync("localhost", 9092).Wait(TimeSpan.FromSeconds(2)))
+            if (!probe.ConnectAsync(first[..colon], int.Parse(first[(colon + 1)..])).Wait(TimeSpan.FromSeconds(2)))
                 throw new SocketException();
         }
         catch (Exception ex) when (ex is SocketException or AggregateException)
         {
-            Assert.Skip("Kafka is not reachable on localhost:9092 — run `docker compose --profile connectors up -d`.");
+            Assert.Skip($"Kafka is not reachable on {Bootstrap} — run `docker compose --profile connectors up -d`.");
         }
         return new KafkaEnv();
     }

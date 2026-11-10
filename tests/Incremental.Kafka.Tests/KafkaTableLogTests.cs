@@ -235,11 +235,65 @@ public class KafkaTableLogTests(ITestOutputHelper output)
         Assert.Equal(7, rows.Count);
         Assert.Equal(new Row(0, "v6"), rows[0]);
 
-        // Past the end: everything goes, and the next version is still readable.
+        // Past the end: everything goes.
         await reopened.TrimBeforeAsync(100).AsTask().WaitAsync(Timeout);
         Assert.Equal(7, reopened.OldestRetainedVersion);
+
+        // A process that starts now is told by the head where recent history began — at an
+        // offset the trim has just deleted. Its reads must start from what is left, not
+        // fail on a position that no longer exists.
+        var late = await env.ConnectAsync();
+        var afterTrim = await late.OpenTableLogAsync<int, Row>("rows").WaitAsync(Timeout);
+        Assert.Equal(7, afterTrim.OldestRetainedVersion);
+        Assert.NotNull(afterTrim.KnownOffsetAtOrBelow(7));
+        using var following = new CancellationTokenSource(Timeout);
+        var next = Task.Run(async () =>
+        {
+            await foreach (var version in afterTrim.FollowAsync(6, following.Token))
+                return version.Version;
+            return -1;
+        });
+
+        // The next version is appended and read as usual.
         await reopened.AppendAsync(Version(7, null, Put(7, "row7")));
         Assert.Equal([7L], (await ReadAsync(reopened, 6, 7)).Select(v => v.Version));
+        Assert.Equal(7, await next.WaitAsync(Timeout));
+    }
+
+    [Fact]
+    public async Task A_new_process_follows_from_the_head_without_reading_the_history()
+    {
+        await using var env = KafkaEnv.Create();
+        var active = await env.ConnectWriterAsync();
+        var log = await active.OpenTableLogAsync<int, Row>("rows").WaitAsync(Timeout);
+        const int Versions = 60;
+        for (var v = 1; v <= Versions; v++)
+            await log.AppendAsync(Version(v, null, Put(v % 7, $"v{v}", old: v > 7 ? $"v{v - 7}" : null)));
+
+        // The standby restores the rows, and with them learns from the head where the
+        // version before the last starts in the changes topic: its follower seeks there
+        // instead of reading sixty versions to skip them. (One record and one marker per
+        // version: version v starts at offset 2(v - 1).)
+        var standby = await env.ConnectAsync();
+        var followed = await standby.OpenTableLogAsync<int, Row>("rows").WaitAsync(Timeout);
+        TableHead head = null!;
+        await KafkaEnv.EventuallyAsync(async () => (head = (await RestoreAsync(followed)).Head).Version == Versions, "the restore sees the last version");
+        Assert.Equal(2 * (Versions - 2), followed.KnownOffsetAtOrBelow(head.Version + 1));
+
+        using var stop = new CancellationTokenSource(Timeout);
+        var next = Task.Run(async () =>
+        {
+            await foreach (var version in followed.FollowAsync(head.Version, stop.Token))
+                return version;
+            throw new InvalidOperationException("the log ended");
+        });
+        await log.AppendAsync(Version(Versions + 1, null, Put(100, "new")));
+        var seen = await next.WaitAsync(Timeout);
+        Assert.Equal(Versions + 1, seen.Version);
+        Assert.Equal([Put(100, "new")], seen.Changes);
+
+        // A range read below the known offset still works: it starts from the beginning.
+        Assert.Equal([3L, 4L, 5L], (await ReadAsync(followed, 2, 5)).Select(v => v.Version));
     }
 
     [Fact]

@@ -343,7 +343,8 @@ through as the changelog provider built them. Table records:
 changes  key: version, 8 bytes big-endian
          value: 1 {"epoch":"…","version":7,"chunk":0,"changes":[{"k":K,"o":OLD,"n":NEW},…],"last":true,"offsets":{"0":41}}
 rows     key: K's serialized bytes          value: 1 {"v":7,"r":ROW}      (null value: deleted)
-         key: NUL "$head"                   value: 1 {"epoch":"…","version":7,"partitions":4,"offsets":{"0":41}}
+         key: NUL "$head"                   value: 1 {"epoch":"…","version":7,"partitions":4,"offsets":{"0":41},
+                                                       "indexVersion":6,"indexOffset":10}
 ```
 
 `o` and `n` are omitted when null. A row is serialized once and written into both records.
@@ -379,7 +380,13 @@ strings, embedded as JSON strings. Departures from *Kafka-backed table log*:
   the index gains an entry when the writer appends a version (from the delivery report) or
   a reader passes one. A range read seeks to the nearest entry at or below the version it
   wants, or to the start of the topic when there is none, and skips forward. The index is
-  bounded (8,192 entries, thinned by half when full).
+  bounded (8,192 entries, thinned by half when full). So that a process which has only
+  restored does not read the whole history to follow from the head, each head record
+  also carries the writer's newest index entry — normally the version before and the
+  offset it starts at (`indexVersion`, `indexOffset`) — and reading a head seeds the
+  index with it. A standby's follower therefore starts one version back from the end.
+  Because that offset may have been trimmed since, a read never starts below the topic's
+  current start.
 - **Retention is `TrimBeforeAsync` and nothing else.** It finds the first offset of the
   version and calls `DeleteRecords`. Computing the floor from the pipelines' commit
   records, and the cap, are the host's and are not built.
@@ -1098,8 +1105,10 @@ Against the local stack (`docker compose --profile connectors up -d`; tests skip
   through a circuit, for the state topic (`KafkaEndToEndTests`); both skip if the
   broker's cleaner has not run within 90 s.
 - **Built beyond this list:** group commit (transactions counted), an aborted commit
-  isolated from its neighbours, a snapshot restore under a busy writer, range reads and
-  trimming, a 200,000-row restore, and the in-process failover: a circuit with a stream
+  isolated from its neighbours, a read to the end across an aborted tail, a follower's
+  position after a commit, a snapshot restore under a busy writer (and the rule behind it
+  against 20,000 simulated interleavings, with no broker), range reads and trimming, a
+  200,000-row restore, and the in-process failover: a circuit with a stream
   join, a table join, a lookup, aggregates, a distinct, a keyed input, a derived table and
   four upsert sinks is dropped three times — replaced by its standby, by a cold start, by
   a standby again — and the sinks and the derived table equal an in-memory run.
