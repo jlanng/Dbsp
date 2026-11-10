@@ -126,8 +126,95 @@ internal sealed class KafkaEnv : IAsyncDisposable
             File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "measurements.log"), $"{DateTime.UtcNow:O} {line}{Environment.NewLine}");
     }
 
+    // ── plain topics, for the sources and sinks ────────────────────────────────────────
+
+    /// <summary>Creates <c>{prefix}.{name}</c> and returns its full name.</summary>
+    public async Task<string> CreateTopicAsync(
+        string name, int partitions = 1, bool compacted = false, IReadOnlyDictionary<string, string>? config = null)
+    {
+        var topic = $"{Prefix}.{name}";
+        var settings = new Dictionary<string, string>(config ?? new Dictionary<string, string>());
+        if (compacted)
+            settings["cleanup.policy"] = "compact";
+        using var admin = new AdminClientBuilder(new AdminClientConfig { BootstrapServers = Bootstrap }).Build();
+        await admin.CreateTopicsAsync(
+            [new Confluent.Kafka.Admin.TopicSpecification { Name = topic, NumPartitions = partitions, ReplicationFactor = 1, Configs = settings }]);
+        return topic;
+    }
+
+    public KafkaSourceOptions Source(string topic) => new() { BootstrapServers = Bootstrap, Topic = topic };
+
+    private IProducer<byte[], byte[]>? _producer;
+
+    /// <summary>A plain producer, as some other system writing a source topic would be.</summary>
+    public IProducer<byte[], byte[]> Producer =>
+        _producer ??= new ProducerBuilder<byte[], byte[]>(new ProducerConfig { BootstrapServers = Bootstrap, LingerMs = 2 }).Build();
+
+    /// <summary>Queues one record; <see cref="FlushAsync"/> makes them durable.</summary>
+    public void Produce(string topic, int partition, byte[]? key, byte[]? value) =>
+        Producer.Produce(new TopicPartition(topic, partition), new Message<byte[], byte[]> { Key = key!, Value = value! });
+
+    public void ProduceJson<TKey, TValue>(string topic, int partition, TKey key, TValue? value) where TValue : class =>
+        Produce(topic, partition, Json(key), value is null ? null : Json(value));
+
+    public static byte[] Json<T>(T value) => System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(value, System.Text.Json.JsonSerializerOptions.Web);
+
+    public Task FlushAsync() => Task.Run(() => Producer.Flush(Timeout));
+
+    /// <summary>Every record a topic holds when asked, in offset order within a partition.</summary>
+    public static List<ConsumeResult<byte[], byte[]>> ReadTopic(string topic, IsolationLevel isolation = IsolationLevel.ReadCommitted)
+    {
+        using var consumer = new ConsumerBuilder<byte[], byte[]>(new ConsumerConfig
+        {
+            BootstrapServers = Bootstrap,
+            GroupId = "test-reader",
+            EnableAutoCommit = false,
+            IsolationLevel = isolation,
+            EnablePartitionEof = true,
+        }).Build();
+        using var admin = new DependentAdminClientBuilder(consumer.Handle).Build();
+        var partitions = admin.GetMetadata(topic, TimeSpan.FromSeconds(10)).Topics[0].Partitions.Count;
+        consumer.Assign(Enumerable.Range(0, partitions).Select(p => new TopicPartitionOffset(topic, p, Offset.Beginning)));
+        var records = new List<ConsumeResult<byte[], byte[]>>();
+        var open = partitions;
+        var deadline = DateTime.UtcNow + Timeout;
+        while (open > 0 && DateTime.UtcNow < deadline)
+        {
+            var result = consumer.Consume(TimeSpan.FromMilliseconds(200));
+            if (result is null)
+                continue;
+            if (result.IsPartitionEOF)
+            {
+                open--;
+                consumer.Pause([result.TopicPartition]);
+            }
+            else
+                records.Add(result);
+        }
+        Assert.Equal(0, open);
+        return records;
+    }
+
+    /// <summary>A keyed topic read as the table it describes: the last value per key,
+    /// tombstoned keys gone.</summary>
+    public static Dictionary<TKey, TValue> ReadTable<TKey, TValue>(string topic) where TKey : notnull
+    {
+        var table = new Dictionary<TKey, TValue>();
+        foreach (var partition in ReadTopic(topic).GroupBy(r => r.Partition.Value))
+            foreach (var record in partition)
+            {
+                var key = System.Text.Json.JsonSerializer.Deserialize<TKey>(record.Message.Key, System.Text.Json.JsonSerializerOptions.Web)!;
+                if (record.Message.Value is null)
+                    table.Remove(key);
+                else
+                    table[key] = System.Text.Json.JsonSerializer.Deserialize<TValue>(record.Message.Value, System.Text.Json.JsonSerializerOptions.Web)!;
+            }
+        return table;
+    }
+
     public async ValueTask DisposeAsync()
     {
+        _producer?.Dispose();
         foreach (var log in _logs)
             await log.DisposeAsync();
 

@@ -211,8 +211,12 @@ internal sealed class InputPosition(string inputName)
         "input with source offsets, or none of them — across restarts too.");
 }
 
-internal sealed class InputPort<T> : IInputPort where T : notnull
+internal sealed class InputPort<T> : IInputPort, IDeadLetteringInput where T : notnull
 {
+    private RecordErrors? _errors;
+
+    public void DeadLetterInto(RecordErrors errors) => _errors = errors;
+
     private readonly Channel<InputEntry<T>> _channel;
     private readonly int _nodeId;
     private readonly InputPosition _position;
@@ -259,6 +263,16 @@ internal sealed class InputPort<T> : IInputPort where T : notnull
             drained++;
             if (!_position.Admit(entry.Partition, entry.Offset))
                 continue;
+
+            // A record the source could not read (InputHandle.RejectAsync): admitted, so
+            // its offset is consumed and a replay drops it; reported, or a fault.
+            if (entry.Rejection is { } rejection)
+            {
+                if (_errors is null)
+                    throw rejection.Fault(Name, entry.Partition, entry.Offset);
+                _errors.Add(rejection.Record, 1, rejection.Error);
+                continue;
+            }
 
             if (staging is null)
             {
@@ -345,6 +359,13 @@ internal sealed class KeyedInputPort<TKey, TValue> : IInputPort, IDeadLetteringI
             // An upsert whose key could not be derived (see KeyedInputHandle): it was
             // admitted, so its offset is consumed and a replay drops it, and it goes to the
             // dead letters instead of a worker.
+            if (entry.Rejection is { } rejection)
+            {
+                if (_errors is null)
+                    throw rejection.Fault(Name, entry.Partition, entry.Offset);
+                _errors.Add(rejection.Record, 1, rejection.Error);
+                continue;
+            }
             if (entry.Error is not null)
             {
                 _errors!.Add(entry.Value, 1, entry.Error);

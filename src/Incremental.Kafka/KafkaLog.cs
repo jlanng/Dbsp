@@ -676,7 +676,7 @@ public sealed class KafkaLog : IAsyncDisposable
     private void Produce(LogCommit commit, int index)
     {
         var record = commit.Records[index];
-        var message = new Message<byte[], byte[]> { Key = record.Key, Value = record.Value! };
+        var message = new Message<byte[], byte[]> { Key = record.Key!, Value = record.Value!, Headers = record.Headers };
         var handler = index == commit.TrackIndex ? commit.OnDelivered : null;
         while (true)
         {
@@ -817,6 +817,16 @@ public sealed class KafkaLog : IAsyncDisposable
                 "It was not created by this library, or was altered since.");
         return actual;
     }
+
+    /// <summary>The partition count of a topic this log does not own (a sink's).</summary>
+    internal Task<int> PartitionCountAsync(string topic, CancellationToken cancellationToken) =>
+        RetryAsync(async () =>
+        {
+            var described = await _admin.DescribeTopicsAsync(
+                TopicCollection.OfTopicNames([topic]), new DescribeTopicsOptions { RequestTimeout = _options.OperationTimeout })
+                .ConfigureAwait(false);
+            return described.TopicDescriptions[0].Partitions.Count;
+        }, cancellationToken);
 
     // ── reading ────────────────────────────────────────────────────────────────────────
 
@@ -1152,7 +1162,8 @@ internal sealed class LogCommit
 
     public Action<DeliveryReport<byte[], byte[]>>? OnDelivered;
 
-    public void Add(TopicPartition target, byte[] key, byte[]? value) => Records.Add(new LogRecord(target, key, value));
+    public void Add(TopicPartition target, byte[]? key, byte[]? value, Headers? headers = null) =>
+        Records.Add(new LogRecord(target, key, value, headers));
 
     /// <summary>Asks for the offset of the record added next.</summary>
     public void TrackNext()
@@ -1166,8 +1177,10 @@ internal sealed class LogCommit
     }
 }
 
-/// <summary>A record to write. A null value is a tombstone.</summary>
-internal readonly record struct LogRecord(TopicPartition Target, byte[] Key, byte[]? Value);
+/// <summary>A record to write. A null value is a tombstone. The log's own records always
+/// have a key and no headers; a sink's records (<see cref="KafkaSinkOptions.Log"/>) may
+/// have either.</summary>
+internal readonly record struct LogRecord(TopicPartition Target, byte[]? Key, byte[]? Value, Headers? Headers = null);
 
 /// <summary>Records read from one partition, and the reader's position after them.</summary>
 internal readonly record struct LogBatch(List<ConsumeResult<byte[], byte[]>> Records, long NextOffset);

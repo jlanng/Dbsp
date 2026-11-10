@@ -5,14 +5,33 @@ namespace Incremental;
 /// <summary>One queued input record: a weighted value plus the source (partition, offset)
 /// the producer stamped it with, or offset -1 when unstamped — the input then numbers
 /// records as it consumes them (partition is ignored).</summary>
-internal readonly record struct InputEntry<T>(T Value, long Weight, int Partition, long Offset) where T : notnull;
+/// With <see cref="Rejection"/> set it is a record the source could not turn into a value:
+/// it has no value and is on its way to the dead letters (or to fault the circuit).
+internal readonly record struct InputEntry<T>(T Value, long Weight, int Partition, long Offset, InputRejection? Rejection = null)
+    where T : notnull;
+
+/// <summary>A source record that never became an input value — it would not deserialize,
+/// say — with the exception that says why. It travels through the input's channel in the
+/// record's place, so that its offset is consumed in order like any other.</summary>
+internal sealed class InputRejection(object? record, Exception error)
+{
+    public object? Record { get; } = record;
+    public Exception Error { get; } = error;
+
+    /// <summary>What the drain throws under <see cref="RecordErrorPolicy.Fault"/>.</summary>
+    public InvalidOperationException Fault(string inputName, int partition, long offset) => new(
+        $"Input '{inputName}' was handed a record its source could not read (partition {partition}, offset {offset}): " +
+        $"{Error.Message} Under RecordErrorPolicy.DeadLetter the record is reported on Circuit.DeadLetters and skipped instead.",
+        Error);
+}
 
 /// <summary>One queued keyed-input command: an upsert of <see cref="Value"/> under
 /// <see cref="Key"/>, or a delete of the key (<see cref="Value"/> default), stamped as
 /// <see cref="InputEntry{T}"/> is. With <see cref="Error"/> set it is an upsert whose key
 /// could not be derived, on its way to the dead letters: it has no key.</summary>
 internal readonly record struct KeyedInputEntry<TKey, TValue>(
-    TKey Key, bool IsDelete, TValue? Value, int Partition, long Offset, Exception? Error = null)
+    TKey Key, bool IsDelete, TValue? Value, int Partition, long Offset, Exception? Error = null,
+    InputRejection? Rejection = null)
     where TKey : notnull
     where TValue : notnull;
 
@@ -95,6 +114,25 @@ public sealed class InputHandle<T> where T : notnull
         foreach (var entry in batch)
             await InputWrites.WriteAsync(_writer, new InputEntry<T>(entry.Value, entry.Weight, -1, -1), cancellationToken)
                 .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Reports a source record that could not be turned into a value — one that does not
+    /// deserialize, say — in the record's place in the feed. Its position is consumed like
+    /// any record's, so the checkpoint covers it and a replay drops it. Under
+    /// <see cref="RecordErrorPolicy.DeadLetter"/> it appears on
+    /// <see cref="Circuit.DeadLetters"/> with <paramref name="record"/> (whatever the source
+    /// has to identify it: topic, partition, offset, the raw bytes) and
+    /// <paramref name="error"/>; under <see cref="RecordErrorPolicy.Fault"/> it faults the
+    /// circuit, as a record that throws inside an operator does.
+    /// </summary>
+    public ValueTask RejectAsync(object? record, Exception error, int partition, long offset, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(error);
+        ArgumentOutOfRangeException.ThrowIfNegative(partition);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        _stamping.Lock(stamped: true);
+        return InputWrites.WriteAsync(_writer, new InputEntry<T>(default!, 0, partition, offset, new InputRejection(record, error)), cancellationToken);
     }
 
     /// <summary>Signals that no more data will arrive on this input. Once every input of a
@@ -208,6 +246,17 @@ public sealed class KeyedInputHandle<TKey, TValue>
         if (entry.Key is null)
             throw new ArgumentNullException("key", "A keyed input's key cannot be null.");
         return InputWrites.WriteAsync(_writer, entry, cancellationToken);
+    }
+
+    /// <inheritdoc cref="InputHandle{T}.RejectAsync"/>
+    public ValueTask RejectAsync(object? record, Exception error, int partition, long offset, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(error);
+        ArgumentOutOfRangeException.ThrowIfNegative(partition);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        _stamping.Lock(stamped: true);
+        return InputWrites.WriteAsync(_writer,
+            new KeyedInputEntry<TKey, TValue>(default!, false, default, partition, offset, null, new InputRejection(record, error)), cancellationToken);
     }
 
     /// <summary>Signals that no more data will arrive on this input; see <see cref="InputHandle{T}.Complete"/>.</summary>

@@ -1207,4 +1207,80 @@ public class RecordErrorPolicyTests
         await Assert.ThrowsAsync<Bad>(() => circuit.StepAsync()).WaitAsync(Timeout);
         _ = joinedDef;
     }
+
+    // ---- a record the source could not read (InputHandle.RejectAsync) ----
+
+    [Fact]
+    public async Task ARejectedSourceRecord_IsDeadLettered_AndItsOffsetIsConsumed()
+    {
+        var storage = new InMemoryCheckpointStorageProvider();
+        Circuit Build(out InputStream<int> numbers, out KeyedInputStream<int, string> names, out Output<int> output)
+        {
+            var builder = Builder(storage: storage, name: "rejects");
+            numbers = builder.Input<int>("numbers");
+            names = builder.KeyedInput<int, string>("names", s => s.Length);
+            output = numbers.Concat(names.Select(s => s.Length)).ToOutput();
+            return builder.Build();
+        }
+
+        var circuit = Build(out var numbers, out var names, out var output);
+        circuit.Start();
+        var input = circuit.Handle(numbers);
+        var keyed = circuit.Handle(names);
+        await input.InsertAsync(1, 0, 10);
+        await input.RejectAsync("raw-11", new Bad("unreadable"), 0, 11);
+        await input.InsertAsync(3, 0, 12);
+        await keyed.UpsertAsync("ab", 1, 5);
+        await keyed.RejectAsync("raw-6", new Bad("unreadable too"), 1, 6);
+        await circuit.StepAsync();
+
+        var state = new ZSet<int>();
+        Integrate(circuit.Handle(output), state);
+        AssertState(state, (1, 1), (3, 1), (2, 1));
+        var letters = Letters(circuit);
+        Assert.Equal(2, letters.Count);
+        Assert.Equal(("input[numbers]", "raw-11", "unreadable"), (letters[0].Operator, letters[0].Record, letters[0].Exception.Message));
+        Assert.Equal(("input[names]", "raw-6", "unreadable too"), (letters[1].Operator, letters[1].Record, letters[1].Exception.Message));
+
+        // The rejected records' offsets are the committed positions: nothing came after them
+        // on the keyed input, so only a consumed rejection can have put 6 there.
+        Assert.Equal(12, circuit.CommittedOffsets("numbers")[0]);
+        Assert.Equal(6, circuit.CommittedOffsets("names")[1]);
+        await circuit.DisposeAsync();
+
+        // Replayed after a restart, the rejection is dropped as any duplicate is.
+        var restarted = Build(out numbers, out names, out output);
+        restarted.Start();
+        await restarted.Handle(numbers).RejectAsync("raw-11", new Bad("unreadable"), 0, 11);
+        await restarted.Handle(names).RejectAsync("raw-6", new Bad("unreadable too"), 1, 6);
+        await restarted.Handle(numbers).InsertAsync(4, 0, 13);
+        await restarted.StepAsync();
+        Assert.Empty(Letters(restarted));
+        await restarted.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task ARejectedSourceRecord_FaultsTheCircuit_UnderTheDefaultPolicy()
+    {
+        var builder = Builder(RecordErrorPolicy.Fault);
+        var numbers = builder.Input<int>("numbers");
+        var names = builder.KeyedInput<int, string>("names", s => s.Length);
+        numbers.Concat(names.Select(s => s.Length)).ToOutput();
+        await using var circuit = builder.Build();
+        circuit.Start();
+        await circuit.Handle(numbers).RejectAsync("raw", new Bad("unreadable"), 2, 7);
+        var fault = await Assert.ThrowsAnyAsync<Exception>(() => circuit.StepAsync());
+        var cause = fault as InvalidOperationException ?? fault.InnerException as InvalidOperationException;
+        Assert.NotNull(cause);
+        Assert.Contains("partition 2, offset 7", cause.Message);
+        Assert.IsType<Bad>(cause.InnerException);
+
+        var keyedBuilder = Builder(RecordErrorPolicy.Fault);
+        var keyedNames = keyedBuilder.KeyedInput<int, string>("names", s => s.Length);
+        keyedNames.ToOutput();
+        await using var keyedCircuit = keyedBuilder.Build();
+        keyedCircuit.Start();
+        await keyedCircuit.Handle(keyedNames).RejectAsync("raw", new Bad("unreadable"), 0, 1);
+        await Assert.ThrowsAnyAsync<Exception>(() => keyedCircuit.StepAsync());
+    }
 }
