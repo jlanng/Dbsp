@@ -77,12 +77,16 @@ public sealed class KafkaConnectClient : IDisposable
     /// For Debezium's Postgres connector this includes whether the database can be reached
     /// with the credentials given.
     /// </summary>
-    public async Task<IReadOnlyList<string>> ValidateAsync(IReadOnlyDictionary<string, string> config, CancellationToken cancellationToken = default)
+    public async Task<IReadOnlyList<string>> ValidateAsync(
+        string name, IReadOnlyDictionary<string, string> config, CancellationToken cancellationToken = default)
     {
+        ArgumentException.ThrowIfNullOrEmpty(name);
         if (!config.TryGetValue("connector.class", out var connectorClass))
             throw new ArgumentException("The configuration has no 'connector.class'.", nameof(config));
+        // Validation wants the name inside the configuration; registration takes it in the path.
+        var named = new Dictionary<string, string>(config) { ["name"] = name };
         using var response = await _http.PutAsJsonAsync(
-            new Uri(BaseAddress, $"connector-plugins/{Uri.EscapeDataString(connectorClass)}/config/validate"), config, cancellationToken)
+            new Uri(BaseAddress, $"connector-plugins/{Uri.EscapeDataString(connectorClass)}/config/validate"), named, cancellationToken)
             .ConfigureAwait(false);
         await EnsureAsync(response, "validating a connector configuration", cancellationToken).ConfigureAwait(false);
         using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false));
