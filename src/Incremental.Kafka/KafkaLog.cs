@@ -993,9 +993,15 @@ public sealed class KafkaLog : IAsyncDisposable
 
     /// <summary>Runs an admin call, retrying the failures a cluster produces while a topic
     /// is new or a partition's leader is moving, for up to the operation timeout.</summary>
-    private async Task<T> RetryAsync<T>(Func<Task<T>> call, CancellationToken cancellationToken)
+    private Task<T> RetryAsync<T>(Func<Task<T>> call, CancellationToken cancellationToken) =>
+        RetryTransientAsync(call, _options.OperationTimeout, cancellationToken);
+
+    /// <summary>Runs <paramref name="call"/>, and again every 100 ms while it fails in a way
+    /// that passes (<see cref="IsTransient"/>), until <paramref name="timeout"/> has gone
+    /// by; then the failure is the caller's.</summary>
+    internal static async Task<T> RetryTransientAsync<T>(Func<Task<T>> call, TimeSpan timeout, CancellationToken cancellationToken)
     {
-        var deadline = Environment.TickCount64 + (long)_options.OperationTimeout.TotalMilliseconds;
+        var deadline = Environment.TickCount64 + (long)timeout.TotalMilliseconds;
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();

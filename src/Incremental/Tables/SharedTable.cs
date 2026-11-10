@@ -898,11 +898,16 @@ public sealed class TableWriter<TKey, TRow>
         public readonly List<KeyValuePair<TKey, TRow?>> Changes = [];
         public readonly Dictionary<int, long> Offsets = [];
 
+        /// <summary>The offsets are to be recorded even if nothing changes
+        /// (<see cref="AdvanceAsync"/>).</summary>
+        public bool RecordOffsets;
+
         public void Clear()
         {
             Index.Clear();
             Changes.Clear();
             Offsets.Clear();
+            RecordOffsets = false;
         }
     }
 
@@ -952,6 +957,34 @@ public sealed class TableWriter<TKey, TRow>
         return default;
     }
 
+    /// <summary>
+    /// Records that the source has been read up to and including <paramref name="offset"/>
+    /// of <paramref name="partition"/>, whether or not anything read there changed the
+    /// table. Offsets normally ride with the versions that change something, so a tail of
+    /// records that changed nothing — or of offsets with no record behind them, such as a
+    /// Kafka transaction's marker — is read again after a restart. That is harmless until
+    /// the source no longer holds those offsets. After this call the next
+    /// <see cref="CommitAsync"/> records the position even if it has no change to publish:
+    /// it then mints a version with no changes, which is the one case in which that
+    /// happens. An offset below the partition's position changes nothing.
+    /// </summary>
+    public ValueTask AdvanceAsync(int partition, long offset)
+    {
+        ThrowIfOwned();
+        ArgumentOutOfRangeException.ThrowIfNegative(partition);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ThrowIfFaulted();
+        lock (_stageLock)
+        {
+            if (_positions.TryGetValue(partition, out var position) && offset < position)
+                return default;
+            _positions[partition] = offset;
+            _staging.Offsets[partition] = offset;
+            _staging.RecordOffsets = true;
+        }
+        return default;
+    }
+
     /// <summary>Stages a delete from a source with no offsets to resume from.</summary>
     public ValueTask DeleteAsync(TKey key)
     {
@@ -988,7 +1021,8 @@ public sealed class TableWriter<TKey, TRow>
     /// <summary>
     /// Publishes everything staged as one version and returns the table's latest version —
     /// unchanged when the batch altered nothing (re-upserting a row that is already current
-    /// and deleting an absent key are no-ops, and a version with no changes is never minted).
+    /// and deleting an absent key are no-ops, and a version with no changes is never minted,
+    /// unless <see cref="AdvanceAsync"/> asked for a position to be recorded).
     /// <para>
     /// Visible means durable: with a log, the version is appended first and readers see it
     /// only once the append completes. Changes staged meanwhile go into the next version.
@@ -1031,7 +1065,7 @@ public sealed class TableWriter<TKey, TRow>
         ThrowIfFaulted();
         lock (_stageLock)
         {
-            if (_staging.Changes.Count == 0)
+            if (_staging.Changes.Count == 0 && !_staging.RecordOffsets)
                 return _table.LatestVersion;
         }
 
@@ -1058,7 +1092,18 @@ public sealed class TableWriter<TKey, TRow>
                 countDelta += (row is null ? 0 : 1) - (current is null ? 0 : 1);
             }
 
-            if (_changes.Count == 0)
+            var offsets = _table.CommittedOffsets;
+            if (_changes.Count == 0 && batch.RecordOffsets)
+            {
+                // Asked to record the position (AdvanceAsync). If it is already recorded
+                // there is still nothing to publish.
+                var ahead = false;
+                foreach (var (partition, offset) in batch.Offsets)
+                    ahead |= !offsets.TryGetValue(partition, out var committed) || offset > committed;
+                if (!ahead)
+                    return _table.LatestVersion;
+            }
+            else if (_changes.Count == 0)
             {
                 // Nothing to publish, so nothing to record the offsets in: they ride with
                 // the next version that changes something. Replaying these records after
@@ -1072,7 +1117,6 @@ public sealed class TableWriter<TKey, TRow>
                 return _table.LatestVersion;
             }
 
-            var offsets = _table.CommittedOffsets;
             if (batch.Offsets.Count > 0)
             {
                 var advanced = new Dictionary<int, long>(offsets);
@@ -1289,6 +1333,10 @@ public sealed class TableWriter<TKey, TRow>
                     continue;
                 _positions[partition] = offset;
                 _staging.Offsets[partition] = offset;
+
+                // A snapshot's position is recorded even when the snapshot changed nothing:
+                // it was taken because the old position was no good.
+                _staging.RecordOffsets = true;
             }
         }
     }

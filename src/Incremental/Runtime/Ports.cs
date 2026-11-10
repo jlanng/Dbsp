@@ -268,6 +268,9 @@ internal sealed class InputPort<T> : IInputPort, IDeadLetteringInput where T : n
             // its offset is consumed and a replay drops it; reported, or a fault.
             if (entry.Rejection is { } rejection)
             {
+                // A position with no record (AdvanceAsync): admitted above, nothing more.
+                if (ReferenceEquals(rejection, InputRejection.Advance))
+                    continue;
                 if (_errors is null)
                     throw rejection.Fault(Name, entry.Partition, entry.Offset);
                 _errors.Add(rejection.Record, 1, rejection.Error);
@@ -361,6 +364,9 @@ internal sealed class KeyedInputPort<TKey, TValue> : IInputPort, IDeadLetteringI
             // dead letters instead of a worker.
             if (entry.Rejection is { } rejection)
             {
+                // A position with no record (AdvanceAsync): admitted above, nothing more.
+                if (ReferenceEquals(rejection, InputRejection.Advance))
+                    continue;
                 if (_errors is null)
                     throw rejection.Fault(Name, entry.Partition, entry.Offset);
                 _errors.Add(rejection.Record, 1, rejection.Error);

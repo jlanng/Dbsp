@@ -171,6 +171,28 @@ internal sealed class KafkaEnv : IAsyncDisposable
 
     public Task FlushAsync() => Task.Run(() => Producer.Flush(Timeout));
 
+    /// <summary>A transactional producer of its own, initialised: some other system that
+    /// writes a source topic in transactions (Debezium with exactly-once, a sink on a log).
+    /// Each transaction leaves a marker behind its records — an offset with no record.</summary>
+    public IProducer<byte[], byte[]> TransactionalProducer()
+    {
+        var producer = new ProducerBuilder<byte[], byte[]>(new ProducerConfig
+        {
+            BootstrapServers = Bootstrap,
+            TransactionalId = Prefix + ".tx." + Guid.NewGuid().ToString("N")[..8],
+            LingerMs = 2,
+        }).Build();
+        producer.InitTransactions(Timeout);
+        return producer;
+    }
+
+    /// <summary>Moves a partition's start, as time retention does to an idle topic.</summary>
+    public static async Task DeleteRecordsBeforeAsync(string topic, int partition, long offset)
+    {
+        using var admin = new AdminClientBuilder(new AdminClientConfig { BootstrapServers = Bootstrap }).Build();
+        await admin.DeleteRecordsAsync([new TopicPartitionOffset(topic, partition, offset)]);
+    }
+
     /// <summary>Every record a topic holds when asked, in offset order within a partition.</summary>
     public static List<ConsumeResult<byte[], byte[]>> ReadTopic(string topic, IsolationLevel isolation = IsolationLevel.ReadCommitted)
     {

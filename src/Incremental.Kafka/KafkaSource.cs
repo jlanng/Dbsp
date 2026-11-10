@@ -6,13 +6,17 @@ using Microsoft.Extensions.Logging;
 
 namespace Incremental.Kafka;
 
-/// <summary>Where a partition that has no committed position starts.</summary>
+/// <summary>Where a source starts reading a topic it has never read.</summary>
 public enum KafkaSourceStart
 {
-    /// <summary>At the first record the partition still holds.</summary>
+    /// <summary>At the first record each partition still holds.</summary>
     Earliest,
 
-    /// <summary>At the end: only records produced from now on.</summary>
+    /// <summary>At the end: only records produced after the source first started. "First"
+    /// is the start at which nothing was committed for any partition. The ends found then
+    /// are recorded as positions, so a later start resumes from them like any other; and a
+    /// partition that still has no position at a later start — it was empty at the first,
+    /// or was added since — is read from its beginning, because everything in it is new.</summary>
     Latest,
 }
 
@@ -27,8 +31,9 @@ public sealed class KafkaSourceOptions
     /// partitions added later are picked up at the next start.</summary>
     public required string Topic { get; init; }
 
-    /// <summary>Where a partition starts when nothing has been committed for it yet. A
-    /// partition with a committed position always resumes just after it.</summary>
+    /// <summary>Where the source starts in a topic it has never read: see
+    /// <see cref="KafkaSourceStart"/>. A partition with a committed position always resumes
+    /// just after it.</summary>
     public KafkaSourceStart StartFrom { get; init; } = KafkaSourceStart.Earliest;
 
     /// <summary><c>isolation.level</c>. The default reads committed records only, which is
@@ -69,7 +74,19 @@ public sealed class KafkaSourceOptions
     /// which is right for a compacted reference topic and wrong for anything else.</summary>
     public bool ReloadTableWhenPositionLost { get; init; }
 
-    /// <summary>How long start-up requests (metadata, offsets) may take.</summary>
+    /// <summary>Table loader only: how long the loader may stand past the table's committed
+    /// position, with nothing more to read, before it records where it stands
+    /// (<see cref="TableWriter{TKey,TRow}.AdvanceAsync"/>, which costs a version with no
+    /// changes). A table's offsets ride with the versions that change something, so
+    /// offsets that changed nothing — a transaction's marker, a record passed over, an
+    /// upsert of the row already there — are otherwise not recorded, and once retention
+    /// has removed them a restart would find the committed position gone. A circuit input
+    /// needs no such delay: its position is recorded as soon as the source reaches the end.
+    /// Default 30 s.</summary>
+    public TimeSpan CommitIdlePositionAfter { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>How long start-up requests (metadata, offsets) may take, retries of a
+    /// partition without a leader included.</summary>
     public TimeSpan OperationTimeout { get; init; } = TimeSpan.FromSeconds(30);
 
     /// <summary>Extra librdkafka settings for the consumer, applied last: MSK's
@@ -89,6 +106,7 @@ public sealed class KafkaSourceOptions
         ArgumentOutOfRangeException.ThrowIfLessThan(FetchBufferKilobytes, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(MaxTableBatch, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(PauseAfter, TimeSpan.Zero);
+        ArgumentOutOfRangeException.ThrowIfLessThan(CommitIdlePositionAfter, TimeSpan.Zero);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(OperationTimeout, TimeSpan.Zero);
     }
 }
@@ -126,7 +144,11 @@ public sealed record KafkaSourceLag(IReadOnlyDictionary<int, long> Positions, IR
 /// so a restart or a takeover re-reads exactly what the checkpoint does not cover, and
 /// anything re-read below it would be dropped anyway. The consumer joins no group and
 /// commits no offsets, and a position that is no longer in the topic is an error
-/// (<see cref="KafkaSourcePositionLostException"/>), never a silent jump.
+/// (<see cref="KafkaSourcePositionLostException"/>), never a silent jump. Offsets that
+/// yield nothing — a transaction's marker, a tombstone on a stream of facts, a record the
+/// decoder passes over — are recorded as read too
+/// (<see cref="InputHandle{T}.AdvanceAsync"/>), so that the committed position follows
+/// the source to the end of an idle topic and retention cannot overtake it there.
 /// </para>
 /// <para>
 /// <b>Backpressure.</b> Records are written into the input's bounded channel one by one;
@@ -293,7 +315,7 @@ public sealed class KafkaSource : IAsyncDisposable
         lock (_clientGate)
             admin = _admin ?? throw new ObjectDisposedException(nameof(KafkaSource), "The source has stopped.");
         var count = Volatile.Read(ref _next).Length;
-        var ends = await ListOffsetsAsync(admin, count, OffsetSpec.Latest()).WaitAsync(cancellationToken).ConfigureAwait(false);
+        var ends = await ListOffsetsAsync(admin, count, OffsetSpec.Latest(), cancellationToken).ConfigureAwait(false);
         return new KafkaSourceLag(Positions, Enumerable.Range(0, count).ToDictionary(p => p, p => ends[p]));
     }
 
@@ -341,8 +363,16 @@ public sealed class KafkaSource : IAsyncDisposable
             var admin = new DependentAdminClientBuilder(consumer.Handle).Build();
             lock (_clientGate)
                 _admin = admin;
-            Assign(consumer, admin);
+            var pins = Assign(consumer, admin);
+
+            // A table records where a first start at the end began before the loader says
+            // it has started; an input takes the same through its channel, which may have
+            // to wait for the circuit.
+            if (_target.Batches)
+                Pin(consumer, pins);
             _started.TrySetResult();
+            if (!_target.Batches)
+                Pin(consumer, pins);
             Loop(consumer);
             _completion.TrySetResult();
         }
@@ -416,12 +446,13 @@ public sealed class KafkaSource : IAsyncDisposable
     /// <summary>Works out where each partition starts and assigns them all. Every start is
     /// a number: a consumer assigned at a logical offset waits half a second before it
     /// resolves it (durability-and-standby.md, <i>A logical start offset costs half a
-    /// second</i>).</summary>
-    private void Assign(IConsumer<byte[], byte[]> consumer, IAdminClient admin)
+    /// second</i>). Returns the positions a first start at the end begins from, which are
+    /// to be recorded.</summary>
+    private List<(int Partition, long Offset)> Assign(IConsumer<byte[], byte[]> consumer, IAdminClient admin)
     {
-        var count = PartitionCount(admin);
-        var starts = ListOffsetsAsync(admin, count, OffsetSpec.Earliest()).WaitAsync(_stop.Token).GetAwaiter().GetResult();
-        var ends = ListOffsetsAsync(admin, count, OffsetSpec.Latest()).WaitAsync(_stop.Token).GetAwaiter().GetResult();
+        var count = PartitionCount(consumer, admin);
+        var starts = Pump(consumer, ListOffsetsAsync(admin, count, OffsetSpec.Earliest(), _stop.Token));
+        var ends = Pump(consumer, ListOffsetsAsync(admin, count, OffsetSpec.Latest(), _stop.Token));
         var committed = _target.CommittedOffsets();
 
         foreach (var partition in committed.Keys)
@@ -430,13 +461,20 @@ public sealed class KafkaSource : IAsyncDisposable
                     $"A position is committed for partition {partition} of topic '{_options.Topic}', which has only {count} " +
                     "partition(s): this is not the topic the position was committed against.");
 
+        // "The end" is taken once: at the start that finds nothing committed at all. Taken
+        // again at every start it would skip whatever a quiet partition received while the
+        // source was down, and whatever had been read and not yet checkpointed.
+        var atEnd = _options.StartFrom == KafkaSourceStart.Latest && committed.Count == 0;
+        var pins = new List<(int Partition, long Offset)>();
         var next = new long[count];
         var lost = new List<string>();
         for (var p = 0; p < count; p++)
         {
             if (!committed.TryGetValue(p, out var position))
             {
-                next[p] = _options.StartFrom == KafkaSourceStart.Earliest ? starts[p] : ends[p];
+                next[p] = atEnd ? ends[p] : starts[p];
+                if (atEnd && ends[p] > 0)
+                    pins.Add((p, ends[p] - 1));
                 continue;
             }
             next[p] = position + 1;
@@ -464,9 +502,31 @@ public sealed class KafkaSource : IAsyncDisposable
 
         Volatile.Write(ref _next, next);
         consumer.Assign(next.Select((offset, p) => new TopicPartitionOffset(_options.Topic, p, offset)).ToList());
+        return pins;
     }
 
-    private int PartitionCount(IAdminClient admin)
+    private void Pin(IConsumer<byte[], byte[]> consumer, List<(int Partition, long Offset)> pins)
+    {
+        if (pins.Count > 0)
+            Await(consumer, _target.AdvanceAsync(pins, _stop.Token));
+    }
+
+    /// <summary>Waits for a start-up request on the source's thread while polling the
+    /// consumer, which has nothing assigned yet and so returns nothing. The polling is the
+    /// point: a consumer serves its callbacks only when polled, an OAUTHBEARER token
+    /// refresh among them, and without a token (MSK with IAM) no request on its
+    /// connections — these included — is ever answered.</summary>
+    private T Pump<T>(IConsumer<byte[], byte[]> consumer, Task<T> request)
+    {
+        while (!request.IsCompleted)
+        {
+            _stop.Token.ThrowIfCancellationRequested();
+            consumer.Consume(TimeSpan.FromMilliseconds(20));
+        }
+        return request.GetAwaiter().GetResult();
+    }
+
+    private int PartitionCount(IConsumer<byte[], byte[]> consumer, IAdminClient admin)
     {
         // A topic created a moment ago can be unknown to the broker asked, so an unknown
         // topic is asked about again for a few seconds; one that stays unknown does not
@@ -476,7 +536,8 @@ public sealed class KafkaSource : IAsyncDisposable
         while (true)
         {
             _stop.Token.ThrowIfCancellationRequested();
-            var topic = admin.GetMetadata(_options.Topic, _options.OperationTimeout).Topics.FirstOrDefault(t => t.Topic == _options.Topic);
+            var metadata = Pump(consumer, Task.Run(() => admin.GetMetadata(_options.Topic, _options.OperationTimeout)));
+            var topic = metadata.Topics.FirstOrDefault(t => t.Topic == _options.Topic);
             if (topic is { Partitions.Count: > 0 } && !topic.Error.IsError)
                 return topic.Partitions.Count;
             var unknown = topic is null || topic.Error.Code is ErrorCode.UnknownTopicOrPart or ErrorCode.LeaderNotAvailable or ErrorCode.NoError;
@@ -487,20 +548,26 @@ public sealed class KafkaSource : IAsyncDisposable
         }
     }
 
-    private async Task<long[]> ListOffsetsAsync(IAdminClient admin, int partitions, OffsetSpec spec)
-    {
-        var result = await admin.ListOffsetsAsync(
-            Enumerable.Range(0, partitions).Select(p => new TopicPartitionOffsetSpec
-            {
-                TopicPartition = new TopicPartition(_options.Topic, p),
-                OffsetSpec = spec,
-            }),
-            new ListOffsetsOptions { IsolationLevel = _options.IsolationLevel, RequestTimeout = _options.OperationTimeout }).ConfigureAwait(false);
-        var offsets = new long[partitions];
-        foreach (var info in result.ResultInfos)
-            offsets[info.TopicPartitionOffsetError.Partition.Value] = info.TopicPartitionOffsetError.Offset.Value;
-        return offsets;
-    }
+    /// <summary>One offset per partition, asked of the cluster. A partition between
+    /// leaders, or one whose leader the client does not know yet, is asked about again for
+    /// up to the operation timeout: that passes, and a source that gave up on it would
+    /// fail a start — or a takeover — over nothing.</summary>
+    private Task<long[]> ListOffsetsAsync(IAdminClient admin, int partitions, OffsetSpec spec, CancellationToken cancellationToken) =>
+        KafkaLog.RetryTransientAsync(async () =>
+        {
+            var result = await admin.ListOffsetsAsync(
+                Enumerable.Range(0, partitions).Select(p => new TopicPartitionOffsetSpec
+                {
+                    TopicPartition = new TopicPartition(_options.Topic, p),
+                    OffsetSpec = spec,
+                }),
+                new ListOffsetsOptions { IsolationLevel = _options.IsolationLevel, RequestTimeout = _options.OperationTimeout })
+                .ConfigureAwait(false);
+            var offsets = new long[partitions];
+            foreach (var info in result.ResultInfos)
+                offsets[info.TopicPartitionOffsetError.Partition.Value] = info.TopicPartitionOffsetError.Offset.Value;
+            return offsets;
+        }, _options.OperationTimeout, cancellationToken);
 
     /// <summary>Reads the whole topic as it stands and replaces the table's rows with what
     /// it says, recording the ends as the table's position.</summary>
@@ -540,6 +607,14 @@ public sealed class KafkaSource : IAsyncDisposable
         var token = _stop.Token;
         var next = _next;
         var staged = (long[])next.Clone(); // where each partition stands once what is staged commits
+
+        // The last offset of each partition whose position the target has been given, and
+        // since when the source has stood past what the target has recorded.
+        var handed = new long[next.Length];
+        for (var p = 0; p < handed.Length; p++)
+            handed[p] = next[p] - 1;
+        var aheadSince = new long[next.Length];
+
         while (!token.IsCancellationRequested)
         {
             // With changes staged, do not wait for more: commit them as soon as the client
@@ -547,9 +622,12 @@ public sealed class KafkaSource : IAsyncDisposable
             var result = consumer.Consume(_target.Staged > 0 ? TimeSpan.Zero : TimeSpan.FromMilliseconds(100));
             if (result is null || result.IsPartitionEOF)
             {
+                // The end-of-partition event carries the position past whatever follows
+                // the last record: its transaction's marker, say.
                 if (result is not null)
                     staged[result.Partition.Value] = Math.Max(staged[result.Partition.Value], result.Offset.Value);
                 Flush(consumer, next, staged);
+                RecordIdlePositions(consumer, staged, handed, aheadSince);
                 continue;
             }
 
@@ -557,6 +635,7 @@ public sealed class KafkaSource : IAsyncDisposable
             Await(consumer, _target.HandleAsync(in record, ref _unreadable, token));
             Interlocked.Increment(ref _read);
             staged[record.Partition] = record.Offset + 1;
+            handed[record.Partition] = record.Offset;
             if (!_target.Batches)
                 Volatile.Write(ref next[record.Partition], record.Offset + 1);
             else if (_target.Staged >= _options.MaxTableBatch)
@@ -571,6 +650,45 @@ public sealed class KafkaSource : IAsyncDisposable
             Await(consumer, _target.FlushAsync(_stop.Token));
         for (var p = 0; p < next.Length; p++)
             Volatile.Write(ref next[p], staged[p]);
+    }
+
+    /// <summary>With nothing left to read, tells the target how far each partition has been
+    /// read wherever that is past what the target has recorded: offsets that held no
+    /// record, or records that came to nothing. Without it the committed position would
+    /// stay behind at the last record that counted, and once retention had removed the
+    /// offsets after it a restart would report the position lost though nothing was.</summary>
+    private void RecordIdlePositions(IConsumer<byte[], byte[]> consumer, long[] staged, long[] handed, long[] aheadSince)
+    {
+        List<(int Partition, long Offset)>? due = null;
+        for (var p = 0; p < staged.Length; p++)
+        {
+            if (staged[p] - 1 <= _target.Recorded(p, handed[p]))
+            {
+                aheadSince[p] = 0;
+                continue;
+            }
+
+            // A table pays for this with a version, so it waits to see that the topic has
+            // really gone quiet; an input pays with a channel entry and does not wait.
+            if (_target.Batches)
+            {
+                var now = Environment.TickCount64;
+                if (aheadSince[p] == 0)
+                    aheadSince[p] = now;
+                if (now - aheadSince[p] < (long)_options.CommitIdlePositionAfter.TotalMilliseconds)
+                    continue;
+            }
+            (due ??= []).Add((p, staged[p] - 1));
+        }
+        if (due is null)
+            return;
+
+        Await(consumer, _target.AdvanceAsync(due, _stop.Token));
+        foreach (var (partition, offset) in due)
+        {
+            handed[partition] = offset;
+            aheadSince[partition] = 0;
+        }
     }
 
     /// <summary>Waits for a write on the source's thread. One that takes longer than
@@ -617,6 +735,14 @@ public sealed class KafkaSource : IAsyncDisposable
         /// counted in <paramref name="unreadable"/> and dealt with as the target does.</summary>
         public abstract ValueTask HandleAsync(in KafkaRecord record, ref long unreadable, CancellationToken cancellationToken);
 
+        /// <summary>Records that the source has read up to and including each offset, with
+        /// nothing (more) to hand on for it.</summary>
+        public abstract ValueTask AdvanceAsync(IReadOnlyList<(int Partition, long Offset)> positions, CancellationToken cancellationToken);
+
+        /// <summary>The last offset of <paramref name="partition"/> the target has on
+        /// record, given the last one the source handed it (<paramref name="handed"/>).</summary>
+        public virtual long Recorded(int partition, long handed) => handed;
+
         /// <summary>True for a target that stages records and commits them in batches.</summary>
         public virtual bool Batches => false;
 
@@ -645,9 +771,9 @@ public sealed class KafkaSource : IAsyncDisposable
 
         public override ValueTask HandleAsync(in KafkaRecord record, ref long unreadable, CancellationToken cancellationToken)
         {
-            // A tombstone means nothing on a stream of facts.
+            // A tombstone means nothing on a stream of facts — but it has been read.
             if (record.Value is not { } bytes)
-                return default;
+                return handle.AdvanceAsync(record.Partition, record.Offset, cancellationToken);
 
             T value;
             try
@@ -662,6 +788,12 @@ public sealed class KafkaSource : IAsyncDisposable
                 return handle.RejectAsync(record, ex, record.Partition, record.Offset, cancellationToken);
             }
             return handle.InsertAsync(value, record.Partition, record.Offset, cancellationToken);
+        }
+
+        public override async ValueTask AdvanceAsync(IReadOnlyList<(int Partition, long Offset)> positions, CancellationToken cancellationToken)
+        {
+            foreach (var (partition, offset) in positions)
+                await handle.AdvanceAsync(partition, offset, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -679,7 +811,7 @@ public sealed class KafkaSource : IAsyncDisposable
             {
                 var change = decoder(in record);
                 if (change.IsSkip)
-                    return default;
+                    return handle.AdvanceAsync(record.Partition, record.Offset, cancellationToken);
                 if (change.IsDelete)
                 {
                     if (RecordErrors.IsNull(change.Key))
@@ -697,6 +829,12 @@ public sealed class KafkaSource : IAsyncDisposable
                 return handle.RejectAsync(record, ex, record.Partition, record.Offset, cancellationToken);
             }
         }
+
+        public override async ValueTask AdvanceAsync(IReadOnlyList<(int Partition, long Offset)> positions, CancellationToken cancellationToken)
+        {
+            foreach (var (partition, offset) in positions)
+                await handle.AdvanceAsync(partition, offset, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private sealed class TableTarget<TKey, TRow>(
@@ -712,6 +850,18 @@ public sealed class KafkaSource : IAsyncDisposable
         public override bool Batches => true;
 
         public override int Staged => _staged;
+
+        // What the table has committed, not what it was handed: an upsert of the row
+        // already there is handed over and recorded nowhere.
+        public override long Recorded(int partition, long handed) => table.CommittedOffsets.GetValueOrDefault(partition, -1);
+
+        public override async ValueTask AdvanceAsync(IReadOnlyList<(int Partition, long Offset)> positions, CancellationToken cancellationToken)
+        {
+            foreach (var (partition, offset) in positions)
+                await table.Writer.AdvanceAsync(partition, offset).ConfigureAwait(false);
+            await table.Writer.CommitAsync(cancellationToken).ConfigureAwait(false);
+            _staged = 0;
+        }
 
         public override ValueTask HandleAsync(in KafkaRecord record, ref long unreadable, CancellationToken cancellationToken)
         {

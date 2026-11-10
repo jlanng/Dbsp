@@ -33,6 +33,56 @@ public class TableFollowerTests
         return rows;
     }
 
+    /// <summary>Offsets ride with the versions that change something — unless the source
+    /// asks for its position to be recorded, which costs one version with no changes and
+    /// reaches the log, a follower and a restart like any other.</summary>
+    [Fact]
+    public async Task An_advance_records_the_position_in_a_version_with_no_changes()
+    {
+        var log = new InMemoryTableLog<int, Instrument>();
+        var active = await SharedTable<int, Instrument>.OpenAsync("instruments", i => i.Id, log);
+        await active.Writer.UpsertAsync(new Instrument(1, "ACME"), partition: 0, offset: 10);
+        Assert.Equal(1, await active.Writer.CommitAsync());
+        await using var standby = await SharedTable<int, Instrument>.FollowAsync("instruments", i => i.Id, log.Connect());
+
+        // A record that changes nothing leaves the committed position where it was …
+        await active.Writer.UpsertAsync(new Instrument(1, "ACME"), partition: 0, offset: 11);
+        Assert.Equal(1, await active.Writer.CommitAsync());
+        Assert.Equal(10, active.CommittedOffsets[0]);
+
+        // … until the source says how far it has read: past that record, and past two
+        // offsets that held no record at all; and to the end of a partition it started at.
+        await active.Writer.AdvanceAsync(0, 13);
+        await active.Writer.AdvanceAsync(4, 70);
+        Assert.Equal(2, await active.Writer.CommitAsync());
+        Assert.Equal(new Dictionary<int, long> { [0] = 13, [4] = 70 }, active.CommittedOffsets);
+        Assert.Equal(1, active.Count);
+        Assert.Equal(new Instrument(1, "ACME"), Rows(active)[1]);
+
+        // Asking again for a position already recorded mints nothing, and neither does an
+        // advance to an earlier offset.
+        await active.Writer.AdvanceAsync(0, 13);
+        await active.Writer.AdvanceAsync(0, 12);
+        Assert.Equal(2, await active.Writer.CommitAsync());
+
+        // Records at or below the position are replays; the next one applies.
+        await active.Writer.UpsertAsync(new Instrument(1, "STALE"), partition: 0, offset: 13);
+        await active.Writer.UpsertAsync(new Instrument(2, "BOLT"), partition: 0, offset: 14);
+        Assert.Equal(3, await active.Writer.CommitAsync());
+        Assert.Equal("ACME", Rows(active)[1].Symbol);
+        Assert.Equal(14, active.CommittedOffsets[0]);
+
+        // The follower saw the empty version as a version, with its offsets.
+        await Eventually(() => standby.LatestVersion == 3);
+        Assert.Equal(active.CommittedOffsets, standby.CommittedOffsets);
+        Assert.Equal(Rows(active), Rows(standby));
+
+        // And so does a process that starts from the log alone.
+        var restored = await SharedTable<int, Instrument>.OpenAsync("instruments", i => i.Id, log.Connect());
+        Assert.Equal(new Dictionary<int, long> { [0] = 14, [4] = 70 }, restored.CommittedOffsets);
+        Assert.Equal(3, restored.LatestVersion);
+    }
+
     [Fact]
     public async Task Follower_restores_then_mirrors_every_version_and_refuses_writes()
     {

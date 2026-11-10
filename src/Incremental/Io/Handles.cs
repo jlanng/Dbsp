@@ -15,6 +15,11 @@ internal readonly record struct InputEntry<T>(T Value, long Weight, int Partitio
 /// record's place, so that its offset is consumed in order like any other.</summary>
 internal sealed class InputRejection(object? record, Exception error)
 {
+    /// <summary>Not a rejection at all: the entry carries a position and nothing else
+    /// (<see cref="InputHandle{T}.AdvanceAsync"/>). The drain admits its offset and passes
+    /// on. It shares the rejection's slot so that an ordinary entry stays the size it was.</summary>
+    public static readonly InputRejection Advance = new(null, new InvalidOperationException("An input position with no record."));
+
     public object? Record { get; } = record;
     public Exception Error { get; } = error;
 
@@ -133,6 +138,24 @@ public sealed class InputHandle<T> where T : notnull
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
         _stamping.Lock(stamped: true);
         return InputWrites.WriteAsync(_writer, new InputEntry<T>(default!, 0, partition, offset, new InputRejection(record, error)), cancellationToken);
+    }
+
+    /// <summary>
+    /// Records that the source has been read up to and including <paramref name="offset"/>
+    /// of <paramref name="partition"/> with nothing to hand on for it: an offset with no
+    /// record behind it (a Kafka transaction marker), a record that means nothing to this
+    /// input, or the place a source chose to start. It travels through the channel like a
+    /// record, so the position is consumed in order and committed with the next
+    /// checkpoint — and a source that resumes from <see cref="Circuit.CommittedOffsets"/>
+    /// does not come back to offsets it had already passed, which may no longer exist. An
+    /// offset at or below the partition's position changes nothing.
+    /// </summary>
+    public ValueTask AdvanceAsync(int partition, long offset, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(partition);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        _stamping.Lock(stamped: true);
+        return InputWrites.WriteAsync(_writer, new InputEntry<T>(default!, 0, partition, offset, InputRejection.Advance), cancellationToken);
     }
 
     /// <summary>Signals that no more data will arrive on this input. Once every input of a
@@ -257,6 +280,16 @@ public sealed class KeyedInputHandle<TKey, TValue>
         _stamping.Lock(stamped: true);
         return InputWrites.WriteAsync(_writer,
             new KeyedInputEntry<TKey, TValue>(default!, false, default, partition, offset, null, new InputRejection(record, error)), cancellationToken);
+    }
+
+    /// <inheritdoc cref="InputHandle{T}.AdvanceAsync"/>
+    public ValueTask AdvanceAsync(int partition, long offset, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(partition);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        _stamping.Lock(stamped: true);
+        return InputWrites.WriteAsync(_writer,
+            new KeyedInputEntry<TKey, TValue>(default!, false, default, partition, offset, null, InputRejection.Advance), cancellationToken);
     }
 
     /// <summary>Signals that no more data will arrive on this input; see <see cref="InputHandle{T}.Complete"/>.</summary>
