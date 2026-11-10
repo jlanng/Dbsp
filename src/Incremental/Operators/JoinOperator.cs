@@ -26,7 +26,12 @@ internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IStepOperator
         _right = context.Storage.CreateIndexedWeightStore<TKey, TRight>(context.StateName("right"));
         _resultSelector = resultSelector;
         _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
+        _errors = context.Errors;
     }
+
+    // Null under the default policy. Each application reads it into a local once and
+    // branches on that per pair, which is all the default path pays for the other policy.
+    private readonly RecordErrors? _errors;
 
     private readonly ZSet<TOut> _empty = new();
 
@@ -82,6 +87,7 @@ internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IStepOperator
         _rightRows.Clear();
         _bounds.Clear();
         _right.GetGroupsInto(_probeKeys, _rightRows, _bounds);
+        var errors = _errors;
         for (var i = 0; i < _leftEntries.Count; i++)
         {
             var (key, left, leftWeight) = _leftEntries[i];
@@ -89,7 +95,11 @@ internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IStepOperator
             for (var r = group == 0 ? 0 : _bounds[group - 1]; r < _bounds[group]; r++)
             {
                 var (right, rightWeight) = _rightRows[r];
-                output.Add(_resultSelector(key, left, right), checked(leftWeight * rightWeight));
+                if (errors is null)
+                    output.Add(_resultSelector(key, left, right), checked(leftWeight * rightWeight));
+                else
+                    errors.Emit(output, _resultSelector, key, left, right, checked(leftWeight * rightWeight),
+                        new KeyedValue<TKey, TLeft>(key, left));
             }
             _eviction?.Track(key);
         }
@@ -105,6 +115,7 @@ internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IStepOperator
         _leftRows.Clear();
         _bounds.Clear();
         _left.GetGroupsInto(_probeKeys, _leftRows, _bounds);
+        var errors = _errors;
         for (var i = 0; i < _rightEntries.Count; i++)
         {
             var (key, right, rightWeight) = _rightEntries[i];
@@ -112,7 +123,11 @@ internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IStepOperator
             for (var l = group == 0 ? 0 : _bounds[group - 1]; l < _bounds[group]; l++)
             {
                 var (left, leftWeight) = _leftRows[l];
-                output.Add(_resultSelector(key, left, right), checked(leftWeight * rightWeight));
+                if (errors is null)
+                    output.Add(_resultSelector(key, left, right), checked(leftWeight * rightWeight));
+                else
+                    errors.Emit(output, _resultSelector, key, left, right, checked(leftWeight * rightWeight),
+                        new KeyedValue<TKey, TRight>(key, right));
             }
             _eviction?.Track(key);
         }

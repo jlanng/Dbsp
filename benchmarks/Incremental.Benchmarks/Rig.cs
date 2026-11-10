@@ -16,11 +16,12 @@ internal sealed class Rig : IAsyncDisposable
     public Circuit Circuit { get; }
 
     /// <summary>Options sized so a whole measured delta always fits in one step.</summary>
-    public static CircuitOptions Options(int stepCapacity = 1 << 15) => new()
+    public static CircuitOptions Options(int stepCapacity = 1 << 15, Incremental.Storage.IStorageProvider? storage = null) => new()
     {
         AutoStep = false,
         InputChannelCapacity = stepCapacity,
         MaxStepItemsPerInput = stepCapacity,
+        Storage = storage ?? new Incremental.Storage.InMemoryStorageProvider(),
     };
 
     /// <summary>Redeems <paramref name="output"/> and discards its changefeed for the life

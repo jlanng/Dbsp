@@ -151,8 +151,8 @@ public sealed class WindowedZStream<TKey, TValue> : ZStream<WindowedValue<TKey, 
         new(Builder, Builder.AddNode(
                 "mapValues",
                 [_keyedNodeId],
-                _ => new MapOperator<KeyedValue<WindowKey<TKey>, TValue>, KeyedValue<WindowKey<TKey>, TOut>>(
-                    kv => new KeyedValue<WindowKey<TKey>, TOut>(kv.Key, selector(kv.Value)))),
+                ctx => new MapOperator<KeyedValue<WindowKey<TKey>, TValue>, KeyedValue<WindowKey<TKey>, TOut>>(
+                    KeySelectors.MapValues<WindowKey<TKey>, TValue, TOut>(selector, guarded: ctx.Errors is not null), ctx.Errors)),
             _eviction);
 
     /// <summary>Keeps the rows matching <paramref name="predicate"/>, staying windowed.</summary>
@@ -160,7 +160,7 @@ public sealed class WindowedZStream<TKey, TValue> : ZStream<WindowedValue<TKey, 
         new(Builder, Builder.AddNode(
                 "where",
                 [_keyedNodeId],
-                _ => new FilterOperator<KeyedValue<WindowKey<TKey>, TValue>>(kv => predicate(Row(kv)))),
+                ctx => new FilterOperator<KeyedValue<WindowKey<TKey>, TValue>>(kv => predicate(Row(kv)), ctx.Errors)),
             _eviction);
 
     /// <summary>
@@ -194,13 +194,24 @@ public sealed class WindowedZStream<TKey, TValue> : ZStream<WindowedValue<TKey, 
         var keyed = Builder.AddNode(
             "groupBy",
             [_keyedNodeId],
-            _ => new MapOperator<KeyedValue<WindowKey<TKey>, TValue>, KeyedValue<WindowKey<TNewKey>, WindowedValue<TKey, TValue>>>(
-                kv =>
-                {
-                    var row = Row(kv);
-                    return new KeyedValue<WindowKey<TNewKey>, WindowedValue<TKey, TValue>>(
-                        new WindowKey<TNewKey>(row.WindowStart, row.WindowEnd, keySelector(row)), row);
-                }));
+            ctx => new MapOperator<KeyedValue<WindowKey<TKey>, TValue>, KeyedValue<WindowKey<TNewKey>, WindowedValue<TKey, TValue>>>(
+                ctx.Errors is null
+                    ? kv =>
+                    {
+                        var row = Row(kv);
+                        return new KeyedValue<WindowKey<TNewKey>, WindowedValue<TKey, TValue>>(
+                            new WindowKey<TNewKey>(row.WindowStart, row.WindowEnd, keySelector(row)), row);
+                    }
+                    : kv =>
+                    {
+                        // As KeySelectors.Keyed: a null key becomes an exception the
+                        // dead-letter policy catches.
+                        var row = Row(kv);
+                        var key = RecordErrors.Key(keySelector(row));
+                        return new KeyedValue<WindowKey<TNewKey>, WindowedValue<TKey, TValue>>(
+                            new WindowKey<TNewKey>(row.WindowStart, row.WindowEnd, key), row);
+                    },
+                ctx.Errors));
 
         var node = keyed;
         if (Builder.Options.IsSharded)

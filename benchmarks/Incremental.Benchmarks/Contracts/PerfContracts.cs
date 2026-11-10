@@ -20,11 +20,29 @@ internal static class PerfContracts
     private const int MeasuredTrials = 9;
     private const int CyclesPerTrial = 40;
 
-    private sealed record Contract(string Name, int SmallScale, int LargeScale, Func<int, Task<IDeltaScenario>> Create);
+    /// <param name="AllocLimitKb">An absolute ceiling on a trial's allocation, for a
+    /// contract whose claim is about bytes per record rather than about scaling: a cost per
+    /// delta row is flat across state sizes however large it is, so the ratio cannot see
+    /// it. Allocation is deterministic enough to assert on where wall-clock time is not.</param>
+    private sealed record Contract(
+        string Name, int SmallScale, int LargeScale, Func<int, Task<IDeltaScenario>> Create, double? AllocLimitKb = null);
+
+    // A trial of the lookup cycle is 40 × (256 facts in + 256 out). The same cycle through
+    // a stream join allocates about 660 KB, and a remembered lookup has no reason to
+    // allocate more: what it keeps per fact lives inline in its store. A structure per
+    // remembered fact shows up as several times this.
+    private const double LookupTrialAllocLimitKb = 1_000;
 
     private static readonly Contract[] Contracts =
     [
         new("join: delta cost vs indexed state size", 1_000, 64_000, Scenarios.JoinAsync),
+        new("table join: delta cost vs table size and fact state size", 1_000, 64_000, Scenarios.TableJoinAsync),
+        new("table index join: delta cost vs table size and fact state size", 1_000, 64_000, Scenarios.TableIndexJoinAsync),
+        new("table lookup: delta cost vs table size and remembered state size", 1_000, 64_000, Scenarios.TableLookupAsync,
+            LookupTrialAllocLimitKb),
+        new("table changes: delta cost after bootstrap vs table size", 1_000, 1_000_000, Scenarios.TableChangesAsync),
+        new("derived table: delta cost after bootstrap vs table size", 1_000, 1_000_000, Scenarios.DerivedTableAsync),
+        new("changelog provider: commit cost vs state size", 1_000, 64_000, Scenarios.ChangelogCommitAsync),
         new("sum (linear aggregate): delta cost vs group count", 1_000, 64_000, Scenarios.SumAsync),
         new("min (tournament tree): delta cost vs group size", 100, 6_400, Scenarios.MinAsync),
         new("keyed distinct: delta cost vs values per key", 100, 6_400, Scenarios.KeyedDistinctAsync),
@@ -81,10 +99,14 @@ internal static class PerfContracts
         }
 
         var timeRatio = Report("time ", Median(smallSamples, s => s.Milliseconds), Median(largeSamples, s => s.Milliseconds), "ms");
-        var allocRatio = Report("alloc", Median(smallSamples, s => s.Bytes / 1024.0), Median(largeSamples, s => s.Bytes / 1024.0), "KB");
+        var largeAllocKb = Median(largeSamples, s => s.Bytes / 1024.0);
+        var allocRatio = Report("alloc", Median(smallSamples, s => s.Bytes / 1024.0), largeAllocKb, "KB");
 
-        var holds = timeRatio <= TimeRatioLimit && allocRatio <= AllocRatioLimit;
-        Console.WriteLine($"  {(holds ? "PASS" : "FAIL")}  (limits: time {TimeRatioLimit:0.0}x, alloc {AllocRatioLimit:0.0}x)");
+        var holds = timeRatio <= TimeRatioLimit && allocRatio <= AllocRatioLimit
+            && (contract.AllocLimitKb is not { } ceiling || largeAllocKb <= ceiling);
+        var limits = $"time {TimeRatioLimit:0.0}x, alloc {AllocRatioLimit:0.0}x"
+            + (contract.AllocLimitKb is { } limit ? $", alloc per trial {limit:N0} KB" : "");
+        Console.WriteLine($"  {(holds ? "PASS" : "FAIL")}  (limits: {limits})");
         return holds;
     }
 

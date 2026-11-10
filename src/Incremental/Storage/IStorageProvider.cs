@@ -28,8 +28,9 @@ public interface IStorageProvider
 /// staged since the previous commit atomically together with the input offsets whose records
 /// produced it — so durable state and offsets always agree. A circuit whose
 /// <see cref="CircuitOptions.Storage"/> implements this interface commits automatically every
-/// <see cref="CircuitOptions.CheckpointInterval"/> steps, after all workers' shards for those
-/// steps are complete: one commit point for the whole circuit. After a crash, rebuild the
+/// <see cref="CircuitOptions.CheckpointInterval"/> steps (through <see cref="CommitAsync"/>),
+/// after all workers' shards for those steps are complete: one commit point for the whole
+/// circuit. After a crash, rebuild the
 /// circuit against the same provider — <see cref="Circuit.Start"/> recovers the checkpoint,
 /// <see cref="Circuit.CommittedOffset"/> tells the producer where to resume each source, and
 /// replayed records stamped at or below the checkpoint are dropped, making the restart
@@ -50,6 +51,20 @@ public interface ICheckpointStorageProvider : IStorageProvider
     /// <paramref name="inputOffsets"/>: either the new checkpoint lands in full, or the
     /// previous one remains intact.</summary>
     void Commit(IReadOnlyDictionary<string, long> inputOffsets);
+
+    /// <summary><see cref="Commit"/>, awaited: this is what the circuit calls. A provider
+    /// whose commit waits on I/O (a network round trip, a log transaction) overrides it so
+    /// that a process running many circuits does not hold a thread per commit in flight.
+    /// The default runs <see cref="Commit"/> synchronously. The contract is the same: when
+    /// the returned task completes the checkpoint has landed in full, and a failure leaves
+    /// the previous one intact. The circuit runs one commit at a time and no step while it
+    /// is pending, so an implementation need not guard against stores changing under it.</summary>
+    ValueTask CommitAsync(IReadOnlyDictionary<string, long> inputOffsets, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Commit(inputOffsets);
+        return default;
+    }
 
     /// <summary>The state manifest committed with the last checkpoint under
     /// <paramref name="scope"/> (one scope per process sharing the physical store), or null

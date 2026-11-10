@@ -24,7 +24,10 @@ internal sealed class LinearAggregateOperator<TKey, TValue, TResult> : IStepOper
         _state = context.Storage.CreateValueStore<TKey, (long, TResult)>(context.StateName("state"));
         _aggregate = aggregate;
         _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
+        _errors = context.Errors;
     }
+
+    private readonly RecordErrors? _errors;
 
     private readonly ZSet<KeyedValue<TKey, TResult>> _empty = new();
 
@@ -45,6 +48,11 @@ internal sealed class LinearAggregateOperator<TKey, TValue, TResult> : IStepOper
     private void Fold(ZSet<KeyedValue<TKey, TValue>> delta)
     {
         var perKey = _perKey;
+        if (_errors is not null)
+        {
+            FoldGuarded(delta, _errors);
+            return;
+        }
         foreach (var ((key, value), weight) in delta)
         {
             ref var entry = ref System.Runtime.InteropServices.CollectionsMarshal
@@ -52,6 +60,32 @@ internal sealed class LinearAggregateOperator<TKey, TValue, TResult> : IStepOper
             if (!seen)
                 entry = (0L, _aggregate.Zero);
             entry = (entry.Rows + weight, _aggregate.Combine(entry.Acc, _aggregate.Map(value, weight)));
+        }
+    }
+
+    // The dead-letter policy's fold. Map is where the user's selector runs (SUM's), once per
+    // row and before anything is accumulated, so a row it throws for is left out of both the
+    // sum and the row count — and, the selector being deterministic, so is its retraction.
+    private void FoldGuarded(ZSet<KeyedValue<TKey, TValue>> delta, RecordErrors errors)
+    {
+        var perKey = _perKey;
+        foreach (var (row, weight) in delta)
+        {
+            TResult mapped;
+            try
+            {
+                mapped = _aggregate.Map(row.Value, weight);
+            }
+            catch (Exception ex)
+            {
+                errors.Add(row, weight, ex);
+                continue;
+            }
+            ref var entry = ref System.Runtime.InteropServices.CollectionsMarshal
+                .GetValueRefOrAddDefault(perKey, row.Key, out var seen);
+            if (!seen)
+                entry = (0L, _aggregate.Zero);
+            entry = (entry.Rows + weight, _aggregate.Combine(entry.Acc, mapped));
         }
     }
 

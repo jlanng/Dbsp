@@ -51,6 +51,7 @@ internal sealed class ExtremumOperator<TKey, TValue, TProjected> : IStepOperator
         _selector = selector;
         _sign = sign;
         _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
+        _errors = context.Errors;
         try
         {
             // Tree slots are derived from the hash and may live in persistent storage a
@@ -123,6 +124,32 @@ internal sealed class ExtremumOperator<TKey, TValue, TProjected> : IStepOperator
     private readonly List<(ExtremumSlot<TKey>, TProjected, long)> _updates = [];
     private readonly OutputBuffer<KeyedValue<TKey, TProjected>> _output = new();
 
+    private readonly RecordErrors? _errors; // null under the default policy
+
+    // The dead-letter policy's projection. The selector runs once per row, before the row
+    // touches the tree, so a row it throws for (or projects to null) never enters the
+    // group — nor, the selector being deterministic, does its retraction.
+    private void ProjectGuarded(ZSet<KeyedValue<TKey, TValue>> delta, Level current, RecordErrors errors)
+    {
+        foreach (var (row, weight) in delta)
+        {
+            TProjected projected;
+            uint slot;
+            try
+            {
+                projected = RecordErrors.Result(_selector(row.Value));
+                slot = (uint)_slotHash(projected) & LeafMask;
+            }
+            catch (Exception ex)
+            {
+                errors.Add(row, weight, ex);
+                continue;
+            }
+            current.Add(row.Key, slot, projected, weight);
+            _eviction?.Track(row.Key);
+        }
+    }
+
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
@@ -135,12 +162,15 @@ internal sealed class ExtremumOperator<TKey, TValue, TProjected> : IStepOperator
         var current = _levelA;
         var next = _levelB;
         current.Clear();
-        foreach (var ((key, value), weight) in delta)
-        {
-            var projected = _selector(value);
-            current.Add(key, (uint)_slotHash(projected) & LeafMask, projected, weight);
-            _eviction?.Track(key);
-        }
+        if (_errors is not null)
+            ProjectGuarded(delta, current, _errors);
+        else
+            foreach (var ((key, value), weight) in delta)
+            {
+                var projected = _selector(value);
+                current.Add(key, (uint)_slotHash(projected) & LeafMask, projected, weight);
+                _eviction?.Track(key);
+            }
 
         var comparer = Comparer<TProjected>.Default;
         for (byte level = 0; level <= RootLevel && current.Count > 0; level++)

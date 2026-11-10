@@ -90,12 +90,17 @@ one that compiles.
 ZStream<T>                                   deltas of T
   │  Select · Where · SelectMany · Distinct · Concat
   │
+  │  Lookup(table, key, …) · LookupAppendOnly(table, key, …)   enrich from a shared table
+  │  ToTable(table)                                            write a shared table (rows are records)
+  │
   ├─ GroupBy(keySelector) ──▶ GroupedZStream<TKey, T>          a staging type
   │     │  aggregates: Count · Sum · Min · Max · TopK · Aggregate(…)
   │     │  joins:      Join · LeftJoin · FullJoin · AntiJoin   (on the shared key)
+  │     │  tables:     Join · LeftJoin · Lookup                (against builder.Table(…))
   │     ▼
   │  aggregate result: KeyedZStream<TKey, TValue>              rows (Key, Value)
   │     │  MapValues · Values · Grouped() — continue on the same key, no reshuffle
+  │     │  ToTable(table, (key, value) => row) — write a shared table
   │
   └─ WithEventTime(sel, lateness) ──▶ EventTimeStream<T>
         │  Where and Distinct keep event time; Select returns a plain ZStream
@@ -243,6 +248,140 @@ retracted and new ones asserted automatically — historical results re-attribut
 > **TODO:** windowed / interval joins (stream-stream within a time bound) — not yet designed;
 > today this is manual via the escape hatches.
 
+### Joining shared tables
+
+A reference stream joined this way is stored by every join that reads it, in every circuit.
+When the same reference data serves many circuits — or is simply large — hold it once per
+process in a `SharedTable` instead and attach it wherever it is needed:
+
+```csharp
+// Once per process. One writer; a commit publishes everything staged as one version.
+var instruments = new SharedTable<int, Instrument>("instruments", i => i.Id);
+await instruments.Writer.UpsertAsync(new Instrument(7, "ACME", "USD"));
+await instruments.Writer.CommitAsync();
+
+// In each circuit.
+var inst = builder.Table(instruments);                 // TableRef<int, Instrument>
+
+var enriched = trades
+    .GroupBy(t => t.InstrumentId)
+    .Join(inst, (_, trade, instrument) => new EnrichedTrade(trade, instrument.Symbol, instrument.Currency));
+```
+
+A table is a staging type like a grouping: you join against it, and it is not itself a
+stream. The join above behaves exactly like the stream join — change the instrument and
+every trade joined to it is retracted and re-asserted — but the circuit stores only the
+trades. `LeftJoin(inst, matched, unmatched)` is the outer form. Each step reads one
+*version* of the table, the latest when the step began, so a step never sees half a commit;
+that version is checkpointed with the input offsets, and a restarted circuit picks up the
+changes it missed. A circuit built after the table was loaded needs nothing special: its
+first trades find the rows already there.
+
+**Enrich once instead.** Retroactive correction has a price — when a hot row changes, every
+trade ever joined to it is re-emitted. `Lookup` enriches each record as it arrives and
+leaves it alone afterwards:
+
+```csharp
+var enriched = trades.Lookup(
+    inst,
+    t => t.InstrumentId,
+    (trade, instrument) => new EnrichedTrade(trade, instrument.Symbol, instrument.Currency),
+    missing: trade => new EnrichedTrade(trade, "?", "?"));   // omit to drop unmatched records
+```
+
+"As it arrives" means as of the step that processed it; it is not event time. Retractions
+still work, because the lookup remembers what it emitted for each record: amend or cancel a
+trade and exactly the row it produced is taken back, whatever the table says by then, and
+the amended trade is enriched afresh. That memory is one entry per live record. Bound it
+the usual way — `trades.GroupBy(t => t.InstrumentId).EvictWhen(…).Lookup(inst, …)` is the
+same operator on a grouping you control — or, for a stream that only ever inserts (ticks,
+events, log lines), use `LookupAppendOnly`, which keeps nothing and faults the circuit if a
+retraction ever reaches it.
+
+**Other columns.** To join on something that is not the table's key, ask the table for an
+index. It is maintained with the rows, shared by every circuit that asks for the same name,
+and may hold several rows per value — a join then yields one result per row, and a left
+join's unmatched row appears only while there are none:
+
+```csharp
+var byIsin = inst.By("isin", i => i.Isin);            // null from the selector = not indexed
+quotes.GroupBy(q => q.Isin).Join(byIsin, (isin, quote, instrument) => …);
+quotes.Lookup(byIsin, q => q.Isin, (quote, instrument) => …);
+```
+
+**The table as a stream.** `inst.Changes()` is the table's own rows as a `ZStream` — the
+old row retracted and the new one asserted on every change — for aggregating or re-keying
+reference data. In a new circuit it begins with every row the table already holds; a
+circuit restored from a checkpoint resumes where it left off.
+
+A table never completes. An auto-stepping circuit ends, as always, once its inputs have
+completed and been drained — the tables it reads are not waited for — and a circuit whose
+only inputs are tables runs until it is disposed.
+
+**Derived tables.** A circuit can write a table as well as read one: `ToTable` makes a
+table-shaped result the contents of a shared table, for other circuits to join. A chain of
+dependent joins then costs each pipeline one hop — `traders ⋈ desks` is computed once,
+and every pipeline joins trades to the result:
+
+```csharp
+var traderDesks = new SharedTable<int, TraderDesk>("trader-desks", td => td.TraderId);
+
+// A small circuit of its own, not part of any pipeline.
+derive.Table(traders).Changes()
+      .GroupBy(t => t.DeskId)
+      .Join(derive.Table(desks), (deskId, trader, desk) => new TraderDesk(trader.Id, trader.Name, desk.Region))
+      .ToTable(traderDesks);                               // keyed by the table's own key
+
+// An aggregate's result, one row per key.
+orders.GroupBy(o => o.CustomerId).Count()
+      .ToTable(orderCounts, (customerId, count) => new OrderCount(customerId, count));
+
+// Any pipeline, as with any table.
+trades.GroupBy(t => t.TraderId).Join(pipeline.Table(traderDesks), (id, trade, td) => …);
+```
+
+- **One row per key.** Each step's changes are collapsed to one upsert or delete per key
+  and committed as one table version; a step that changes nothing publishes nothing. The
+  stream must be table-shaped — a key's old row retracted in the step that asserts its new
+  one. A second row for a key, in the same step or a later one, or a retraction of a row
+  the table does not hold, faults the circuit.
+- **The circuit is the table's only writer** from `Build()` until it is disposed or faults;
+  `table.Writer` throws meanwhile. The table holds what the circuit computes and nothing
+  else: the first step of a circuit that starts with no checkpoint removes any row it does
+  not produce itself. Because `Changes()` begins with a table's current rows, a derived
+  table can be added while its sources are already loaded.
+- **Crash consistency.** The table version is committed before the circuit's checkpoint
+  (commit after delivery, below), and the checkpoint records which version it covers. A
+  restarted circuit first takes back what it wrote after that version, then writes the
+  replayed steps — in one version, so a replay that repeats the lost step changes nothing.
+  The table always equals what the circuit's state describes. Readers may see a row step
+  back and forward again: a `Join` against the table corrects itself, a `Lookup` does not.
+  `circuit.CommittedVersion(table)` is the version the checkpoint covers; a table's log
+  must keep its history back to there.
+- **Restarts need the table and the circuit to agree.** A table opened over a log
+  (`SharedTable.OpenAsync`) and a checkpointed circuit resume together. A table made with
+  `new SharedTable(…)` is new every process start, so its circuit must start from empty
+  state too and recompute it; a circuit resuming a checkpoint against a recreated table
+  refuses to start, as does one given `ToTable` after its first checkpoint.
+- **Backpressure.** A table with no log makes its writer wait for a reader that has fallen
+  a full tail behind. For a derived table the writer is a circuit, so that circuit stops,
+  and its inputs fill, until the reader steps.
+- **Not allowed** (`Build()` throws): reading a table the circuit writes, directly or
+  through other derived tables; a second circuit writing the same table; a clustered
+  circuit. Nor inside `Recurse`.
+
+**Feeding a table.** `UpsertAsync`/`DeleteAsync` stage, `CommitAsync` publishes; a commit
+that changes nothing publishes nothing. The offset-stamped overloads and
+`table.CommittedOffsets` give a replayable source the same exactly-once resume as a circuit
+input. `ReplaceAllAsync(rows)` is snapshot sync: it upserts the snapshot in chunks and then
+deletes every key the snapshot did not mention. Rows must be immutable (records with
+init-only members): every circuit in the process is handed the same objects.
+
+Limits today: a table lives in one process, so a clustered circuit cannot attach one;
+table joins and lookups are not available inside `Recurse`; and a table built with
+`new SharedTable(…)` starts empty with every process — `SharedTable.OpenAsync(…, log)`
+restores from a change log, of which only the in-memory one exists so far.
+
 ## Inputs and outputs
 
 **Inputs.** `builder.Input<T>(name)` gives an insert/retract stream. Awaiting `InsertAsync`
@@ -257,8 +396,8 @@ the input's name, so a keyed input restarts cleanly: re-upserting rows the recov
 already holds changes nothing (re-feed the whole table), and the offset-stamped overloads
 replay exactly-once from `CommittedOffsets`. Several commands for one key within a step
 resolve last-write-wins; a key needs one logical producer. A key deleted at the source while
-the circuit was down is only retracted if the re-feed sends its delete — a snapshot-sync
-`ReplaceAllAsync` is not designed yet.
+the circuit was down is only retracted if the re-feed sends its delete — keyed inputs have
+no snapshot-sync `ReplaceAllAsync`; shared tables (under *Joins*) do.
 
 **Outputs.** `.ToOutput()` marks any stream (or table-shaped result) as an output. Outputs
 are not named: they carry no durable state, so the definition reference is their identity.
@@ -301,6 +440,121 @@ The contract:
   one would be unbounded durable state. Across a crash these are at-most-once; exactly-once
   delivery is the downstream consumer's offset/idempotency concern.
 
+### Acknowledged outputs: at-least-once to a sink
+
+A changefeed that loses the batches between a checkpoint and a crash is the wrong tool for
+writing to a sink that must not miss anything. For that, declare the output acknowledged:
+
+```csharp
+var enriched = trades.Join(…).ToAcknowledgedOutput();          // AcknowledgedOutput<Row>
+// …
+await circuit.Handle(enriched).ConsumeAsync(async (batch, ct) =>
+{
+    await sink.UpsertAsync(batch.Sequence, batch.Changes, ct);  // return = delivered
+});
+```
+
+Each `OutputBatch<T>` carries the step's `Changes` and its `Sequence`. `ConsumeAsync`
+acknowledges a batch when your delegate returns; if you would rather drive it yourself, read
+`Batches()` and call `batch.Acknowledge()` (or `handle.Acknowledge(sequence)` — an
+acknowledgement covers every earlier batch too, so a sink that confirms in groups
+acknowledges the last one).
+
+What changes in the circuit is the order of two things. Normally a step commits its
+checkpoint and then publishes. With an acknowledged output — and a checkpointing storage
+provider — it publishes first and **commits only once every batch published so far has been
+acknowledged**. The checkpoint therefore never runs ahead of what the sink holds, and a
+crash loses nothing: the restarted circuit re-runs the steps since its last checkpoint and
+delivers their batches again. The contract:
+
+- **At-least-once.** After a crash a sink sees some batches twice. Apply them idempotently
+  (upserts by key do), or use the sequence: sequences are step numbers, committed with every
+  checkpoint and continued after a restart, so a batch whose `Sequence` is not above the
+  highest one already applied is a redelivery. `Circuit.CommittedStep` is the sequence the
+  last checkpoint reflects; everything above it is what a restart delivers again.
+- **Redelivery repeats sequences, not necessarily contents.** An auto-stepping circuit may
+  cut the replayed input into different steps, so a redelivered batch can differ from the
+  one that first carried its sequence. The replayed batches still add up to the same
+  change, which is why keyed upserts converge. With manual stepping and the same step
+  boundaries, the batches are identical.
+- **The circuit waits for the sink at each commit point** — every `CheckpointInterval`
+  steps — and runs no step while it waits; inputs back up behind it, bounded as ever. At
+  `CheckpointInterval = 1` that is one sink round trip per step. To let steps flow between
+  commits, raise the interval and set `CheckpointMaxDelay` (below): the replay window is
+  then bounded in time. `incremental.circuit.sink_ack_wait` measures what the waiting
+  costs. With manual stepping, a `StepAsync` that commits returns only after the
+  acknowledgement, so the consumer must be running concurrently.
+- **A consumer that goes away faults the circuit.** Ending `Batches()` early — cancelling
+  it, breaking out, throwing from the loop or from the `ConsumeAsync` delegate — means the
+  remaining batches can never be confirmed, so the circuit faults instead of waiting for
+  ever, without committing past the unconfirmed batch. A sink that is merely slow or down
+  and retrying stalls its circuit and faults nothing.
+- **No state, no bootstrap, one consumer.** An acknowledged output keeps no snapshot and
+  has no "batch zero"; redelivery is what makes it correct across restarts. It works on any
+  stream, keyed and windowed results included.
+- **Every output of that circuit is published before the commit.** A plain `ToOutput()`
+  beside an acknowledged one holds no commit up, but after a crash its consumer can also
+  see the replayed steps' batches again (as it already can with `CheckpointInterval > 1`).
+  Table-shaped outputs resync on their bootstrap batch regardless.
+- Not available on clustered circuits, which must commit on the same steps on every process.
+
+### Sinks: keyed upserts and appends
+
+Most sinks want one of two shapes, and both are built on the acknowledged output, so you
+write the sink and not the loop around it:
+
+```csharp
+var totals = orders.GroupBy(o => o.Region).Sum(o => o.Amount).ToAcknowledgedOutput();
+// …
+await circuit.Handle(totals).DeliverToAsync(new RegionTotalsSink(db));
+
+sealed class RegionTotalsSink(Db db) : IUpsertSink<string, long>
+{
+    public async ValueTask WriteAsync(UpsertBatch<string, long> batch, CancellationToken ct)
+    {
+        // batch.Upserts: key → row as of this step.  batch.Deletes: keys with no row now.
+        await db.ApplyAsync(batch.Upserts, batch.Deletes, ct);   // return = durable
+    }
+}
+```
+
+- **`IUpsertSink<TKey, TRow>`** is for table-shaped results. Each step's delta is collapsed
+  to at most one upsert or delete per key — a row that changed arrives as one upsert of the
+  new row, not a delete and an insert — and the step is acknowledged when `WriteAsync`
+  returns. A keyed result (`KeyedValue<TKey, TRow>`) is keyed by its key; for any other
+  stream pass a key selector: `DeliverToAsync(sink, row => row.Id)`. The stream must hold
+  one row per key at a time: a step that leaves a key with two live rows faults the circuit
+  rather than let the sink keep one of them at random.
+- **`IAppendSink<T>`** is for insert-only streams (events, enriched facts). `AppendBatch<T>`
+  carries the step's records and its `Sequence`; a retraction on the stream faults the
+  circuit, because an append sink cannot take a record back.
+- **Failures.** A write that throws is retried with a doubling backoff
+  (`SinkDeliveryOptions`: `MaxRetries` 5, `InitialBackoff` 100 ms, `MaxBackoff` 5 s,
+  `OnFailedAttempt` to log). When the retries run out the circuit faults without committing
+  past the batch, and a restart delivers it again. `MaxRetries = null` retries for ever: the
+  pipeline stalls behind a sink that is down and resumes when it is back.
+- **Backpressure.** One batch is with the sink at a time and nothing is buffered beyond the
+  output's bounded channel, so a slow sink slows the circuit and, through it, the producers.
+- **`InMemoryUpsertSink<TKey, TRow>` and `InMemoryAppendSink<T>`** are the reference
+  implementations, for tests.
+
+What at-least-once means for each, precisely:
+
+- *Upserts.* After a crash the steps since the checkpoint are delivered again. With the same
+  step boundaries (manual stepping) the batches repeat exactly and applying them twice
+  changes nothing. An auto-stepping circuit may cut the replay into different steps; a key
+  can then step back to an older row and forward again, which converges. One case does not:
+  a key whose row was delivered before the crash and is gone again by the end of a merged
+  replay step nets out to no change, so nothing tells the sink to delete it, and the row
+  stays until that key next changes. Where a transient key left behind matters, step
+  manually, or reconcile the sink against a table-shaped `ToOutput()` snapshot.
+- *Appends.* A redelivered batch repeats its sequence, so with the same step boundaries the
+  sink skips (or replaces) a sequence it already has. Under auto-stepping a replayed record
+  can come back under a different sequence. The rule that is always exact: on restart,
+  before delivery resumes, drop what the sink holds above `circuit.CommittedStep`
+  (`InMemoryAppendSink.TruncateAfter`). A sink that cannot drop — a topic — should carry
+  the sequence on its records and leave deduplication to its readers.
+
 When you want a live table in memory, opt in — the name says what you are buying:
 
 ```csharp
@@ -320,6 +574,66 @@ duplicating multi-weight rows.
 > **TODO:** point-lookup views (query a key's current value without materializing the whole
 > result) — design pending.
 
+## Records that cannot be processed
+
+By default a delegate that throws — a `Select`, a `Where`, a key selector, an aggregate —
+faults the circuit, and so does a null key. That is the safe default: nothing is dropped
+silently. It also means one malformed record stops the pipeline. The alternative is to set
+the record aside and carry on:
+
+```csharp
+var builder = new CircuitBuilder(new CircuitOptions { ErrorPolicy = RecordErrorPolicy.DeadLetter });
+// …
+await foreach (var letter in circuit.DeadLetters.ReadAllAsync())
+    log.LogWarning(letter.Exception, "{Operator} dropped {Record} ({Weight})",
+        letter.Operator, letter.Record, letter.Weight);
+```
+
+A `DeadLetter` carries the record, its signed weight, the operator that dropped it (its
+state name: `n3.select`, or `named.enrich.join` if you named it), the exception, and the
+step. `incremental.circuit.dead_letters` counts them, tagged by operator. Override the
+policy for one operator with `.OnError(…)` on the stream it returns:
+`orders.Select(Parse).OnError(RecordErrorPolicy.DeadLetter)` in a circuit that otherwise
+faults, or `.OnError(RecordErrorPolicy.Fault)` on the one operator that must never drop.
+
+The rules:
+
+- **A dropped record's retraction must be dropped too**, or it would take away something
+  that was never added. For stateless operators that follows from the delegate being
+  deterministic: what threw for the insertion throws for the retraction, and both are
+  reported, each with its own weight — so an operator's dead letters are themselves a
+  stream of changes, and integrating them gives the bad records present right now. A
+  delegate that throws for a record at one time and not at another breaks retraction just
+  as a non-deterministic `Select` already does, and a stateless operator cannot detect it.
+  Operators with state do not rely on it: an aggregate whose function throws leaves the key
+  with no result (retracting the one it had) until a later change mends the group, and a
+  remembered `Lookup` remembers that it dropped a fact, so the retraction takes nothing away.
+- **What can dead-letter:** `Select`, `Where`, `SelectMany`, `MapValues`, `GroupBy`'s key
+  selector (throwing or returning null), `WithEventTime`'s selector, `Aggregate`, `Sum`,
+  `Min`, `Max`, the result selectors of `Join`, of the stream `LeftJoin`/`FullJoin` and of the
+  table `Join`/`LeftJoin`, `Lookup` and `LookupAppendOnly` (which also reports a retraction
+  instead of faulting), and a keyed input's key selector. `OnError` on a stream
+  `LeftJoin`/`FullJoin` covers all of that join's selectors. A delegate returning null where a row is required counts as
+  throwing. **What still faults:** `TopK`'s ordering, `EvictWhen`/`WindowCloses` deadlines,
+  session windows, custom routing hashes, a linear aggregate's `Combine`, anything inside
+  `Recurse` that is not one of the operators above, and every failure that is not about one
+  record (storage, a sink, the engine).
+- **Keyed inputs.** Under `DeadLetter` an `UpsertAsync` whose key selector throws or returns
+  null does not throw to the producer: the record travels to the circuit, is reported as a
+  dead letter from `input[name]`, and its offset is consumed like any other. This follows
+  the circuit's policy only. `DeleteAsync(null)` is still an argument error.
+- **The dead-letter output is bounded and must be read.** It is one channel of
+  `DeadLetterCapacity` (1024) entries, published after each step like any output. Nobody
+  reading it stalls the circuit once it is full — backpressure, not unbounded memory.
+  `circuit.DeadLetters` throws if nothing in the circuit has the `DeadLetter` policy.
+- **Delivery.** Dead letters are published like a plain output: after the checkpoint
+  commits, so a crash can lose the ones from the last step — unless the circuit has an
+  acknowledged output, in which case everything is published before the commit and a
+  restart reports them again, under the same `Step`.
+- **Cost.** Under `Fault` the operators run the loops they always ran; there is no
+  exception handling on that path. Under `DeadLetter` a record that does not throw costs a
+  `try` region and allocates nothing.
+
 ## Running a circuit
 
 ```csharp
@@ -328,6 +642,7 @@ var builder = new CircuitBuilder(new CircuitOptions
     Workers = 4,                                  // parallel workers, state sharded by GroupBy keys
     Storage = new RedisStorageProvider(redis, …), // default: in-memory
     CheckpointInterval = 1,                       // steps between checkpoints
+    CheckpointMaxDelay = null,                    // …or at most this long uncommitted (TimeSpan)
 });
 // … declare the dataflow …
 await using var circuit = builder.Build();        // compiles + validates the graph
@@ -342,11 +657,58 @@ of bounded memory; there is no unbounded buffering to hide behind. It is also wh
 await your consumers (see the first example): an abandoned consumer eventually fills its
 channel and blocks disposal.
 
-State lives in a pluggable storage provider (in-memory or Redis today). Checkpoints commit
+State lives in a pluggable storage provider (in-memory, Redis, or in memory with a
+changelog). Checkpoints commit
 operator state and input offsets atomically, so a restarted circuit resumes where it left
 off; table-shaped output consumers resync automatically (their first batch is the current
 state). If you rename or restructure a circuit, pin operator identity with `.Named("…")` on
-the stages that carry state you want to survive the change.
+the stages that carry state you want to survive the change. A circuit whose `Start()`
+throws — the checkpoint does not match it, its storage is a standby, a table it writes
+cannot be resumed — is finished: it cannot be stepped or started again, and disposing it
+processes and commits nothing. Deal with the cause and build a new one.
+
+`ChangelogStorage` is the provider for a service that needs a warm standby. State stays on
+the heap, and each checkpoint appends what changed to a shared log:
+
+```csharp
+// The active process. One storage per process; one provider per circuit, by a stable id.
+await using var storage = await ChangelogStorage.OpenAsync(changelog);   // restores, takes the writer
+var builder = new CircuitBuilder(new CircuitOptions { Storage = storage.Pipeline("orders-by-region") });
+```
+
+`changelog` is an `IStateChangelog` — in production a compacted Kafka topic (not built
+yet), in tests `InMemoryStateChangelog`. A commit writes the entries the steps touched, not
+the state, plus one commit record with the offsets. The standby runs the same code with two
+differences: it follows instead of opening, and it does not start its circuits.
+
+```csharp
+// The standby: same tables, same circuits, nothing started.
+await using var storage = ChangelogStorage.Follow(changelog);            // keeps applying commits
+var instruments = await SharedTable<int, Instrument>.FollowAsync("instruments", i => i.Id, tableLog);
+var circuit = Build(storage.Pipeline("orders-by-region"), instruments);  // Build(), not Start()
+
+// Takeover — tables before circuits.
+await instruments.PromoteAsync();     // reads the table log to its end, becomes its writer
+await storage.PromoteAsync();         // fences the old active, reads the changelog to its end
+circuit.Start();                      // finds the last checkpoint already in memory
+```
+
+After `Start()` the circuit is exactly where the old active's last checkpoint left it:
+`CommittedOffsets`, `CommittedStep` and `CommittedVersion` say where the sources resume, and
+acknowledged outputs deliver again whatever was not yet checkpointed. Starting a circuit on
+a storage that has not been promoted throws. The old active, if it is still alive, cannot
+commit: its next checkpoint throws `ChangelogFencedException`, its circuits fault, and
+`storage.WhenFenced` completes, which is the signal to exit the process.
+`provider.StartNewIncarnationAsync()` discards a pipeline's state durably, for the cases
+where a circuit is told to "start against an empty state store". Clustered circuits cannot
+use this provider.
+
+A commit is due at the end of the step that reaches `CheckpointInterval`, or — with
+`CheckpointMaxDelay` set — of the first step that ends after the oldest uncommitted step has
+waited that long; an auto-stepping circuit that goes idle with steps uncommitted commits
+when the delay runs out. The circuit awaits the provider's `CommitAsync` and runs no step
+until it completes, so a provider whose commit is a network round trip holds no thread for
+it. A custom provider only has to implement `Commit`; `CommitAsync` defaults to calling it.
 
 ### Running it fast
 
@@ -455,6 +817,19 @@ What the host does for you:
   hand must follow the same rule — read the output to completion rather than cancelling on
   the stopping token — or the drain blocks on the unread output until the host's shutdown
   timeout abandons it (with a warning; state up to the last checkpoint is safe).
+- **Sinks.** `AddAcknowledgedOutputConsumer(d => d.Enriched, async (batch, ct) => …)` (or the
+  `IAcknowledgedOutputConsumer<T>` class form) delivers an acknowledged output: returning
+  acknowledges the batch. At shutdown the drain ends with the final checkpoint waiting for
+  the last acknowledgements, inside the shutdown timeout; if the timeout wins, that commit
+  is skipped and those steps are delivered again after the restart. A sink that throws
+  stops the circuit without committing past the failed batch — nothing is read and
+  discarded on its behalf — and the fault policy below applies.
+  `AddUpsertSink(d => d.Totals, sp => new RegionTotalsSink(…))` and
+  `AddAppendSink(d => d.Events, sp => …)` register a sink directly: collapse, retries and
+  acknowledgement as in *Sinks* above, with the sink created once, when the circuit starts.
+- **Dead letters.** `ErrorPolicy` and `DeadLetterCapacity` are on `HostedCircuitOptions`.
+  With `DeadLetter`, register `AddDeadLetterConsumer((letter, ct) => …)`: the host keeps the
+  dead-letter output read for the life of the circuit and through its drain.
 - **Faults.** A fault is terminal and recovery is a rebuild from the checkpoint, which under
   a host means a restart: by default the host logs at Critical, sets a non-zero exit code and
   stops the application (`CircuitFaultBehavior.StopHost`). `Ignore` leaves the host running;

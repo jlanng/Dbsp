@@ -24,6 +24,10 @@ public sealed class JsonStateSerializer : IStateSerializer
     public JsonStateSerializer(JsonSerializerOptions? options = null) =>
         _options = options ?? DefaultOptions;
 
+    /// <summary>For the changelog provider, which writes the same JSON straight to UTF-8
+    /// instead of through a string.</summary>
+    internal JsonSerializerOptions Options => _options;
+
     public string Serialize<T>(T value) => JsonSerializer.Serialize(value, _options);
 
     public T Deserialize<T>(string data) =>

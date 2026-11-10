@@ -101,6 +101,7 @@ internal sealed class WatermarkOperator<T>(
     where T : notnull
 {
     private readonly int _worker = context.WorkerId;
+    private readonly RecordErrors? _errors = context.Errors;
     private readonly OutputBuffer<T> _output = new();
 
     public object Step(object?[] inputs)
@@ -110,17 +111,44 @@ internal sealed class WatermarkOperator<T>(
         var output = _output.Next(delta.DistinctCount);
         var maxSeen = long.MinValue;
 
-        foreach (var (value, weight) in delta)
-        {
-            var ticks = eventTime(value).UtcTicks;
-            maxSeen = Math.Max(maxSeen, ticks);
-            if (ticks >= watermark)
-                output.Add(value, weight);
-        }
+        if (_errors is not null)
+            maxSeen = StepGuarded(delta, output, watermark, _errors);
+        else
+            foreach (var (value, weight) in delta)
+            {
+                var ticks = eventTime(value).UtcTicks;
+                maxSeen = Math.Max(maxSeen, ticks);
+                if (ticks >= watermark)
+                    output.Add(value, weight);
+            }
 
         if (maxSeen != long.MinValue)
             clock.Observe(tracker, _worker, maxSeen);
         return output;
+    }
+
+    // The dead-letter policy's loop; see MapOperator.StepGuarded. A record whose event time
+    // cannot be read never reaches the clock, so it cannot move the watermark either.
+    private long StepGuarded(ZSet<T> delta, ZSet<T> output, long watermark, RecordErrors errors)
+    {
+        var maxSeen = long.MinValue;
+        foreach (var (value, weight) in delta)
+        {
+            long ticks;
+            try
+            {
+                ticks = eventTime(value).UtcTicks;
+            }
+            catch (Exception ex)
+            {
+                errors.Add(value, weight, ex);
+                continue;
+            }
+            maxSeen = Math.Max(maxSeen, ticks);
+            if (ticks >= watermark)
+                output.Add(value, weight);
+        }
+        return maxSeen;
     }
 }
 

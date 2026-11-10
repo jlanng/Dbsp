@@ -7,6 +7,10 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
 - Build: `dotnet build`
 - Test: `dotnet test --project tests/Incremental.Tests` (xunit v3 on Microsoft.Testing.Platform,
   opted in by `global.json` — hence `--project`; Redis tests skip unless `docker compose up -d` has run)
+- Connector stack for development (nothing tests against it yet):
+  `docker compose --profile connectors up -d` adds Kafka (`localhost:9092`), Postgres with
+  logical decoding (`localhost:5432`, user/password/db `incremental`) and Debezium's Kafka
+  Connect (`localhost:8083`). Plain `docker compose up -d` stays Redis-only.
 - Examples: `dotnet run --project examples/Incremental.Example`,
   `dotnet run --project examples/Incremental.LogAnalytics [-- --redis]`
 - Showcase (the all-features demo): `dotnet run --project examples/Incremental.Showcase`
@@ -38,6 +42,19 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   across processes), windowed groupings route by the user key, and
   window-collapsing regroups (windowed `TopK`, window-sticky `GroupBy`) re-exchange by the
   window. Adding a stateful operator without this breaks multi-worker correctness silently.
+- The one exception to "never shared across threads" is `Tables/SharedTable`: reference rows
+  held once per process and read by many circuits (`docs/design/shared-tables.md`). Its
+  rules: one writer; readers never write and never lock per read — they pin a version and
+  read as of it; rows are immutable; only the writer trims, and never past the oldest pin.
+  Anything else that wants cross-thread state should go through a table, not copy the trick.
+- Table operators follow the same exchange rule. A table `Join` keeps its facts per key, so
+  the table's changes go through an exchange of their own, routed by the very hash the
+  facts' grouping used (`TableView.RouteLikeFacts`; an index join re-keys the changes by the
+  index first) — otherwise a change lands on a worker that does not hold the facts it
+  corrects. A remembered `Lookup` keeps what it emitted per fact, so it sits behind the
+  grouping's exchange on the lookup key (`stream.Lookup(table, key, …)` is
+  `GroupBy(key).Lookup(…)`). Only `LookupAppendOnly` has no state and no exchange; probes
+  themselves need no partitioning.
 - Exchange routing must be process-stable: route by `StableHash` (or a user-supplied
   stable hash), never `GetHashCode` — .NET randomizes string hashes per process, which
   silently breaks cluster routing and multi-worker checkpoint restore.
@@ -50,6 +67,10 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     that makes this safe (`OutputBuffer.cs`): nothing an operator returns from `Step` is
     written after return, nothing retains a delta past one more execution of its producer,
     and output ports copy — never adopt — worker slots.
+    The one exception is `TableRowsOperator`'s bootstrap: the first step of a new circuit
+    over `table.Changes()` emits every row of the table, once, in a Z-set allocated for that
+    step — so the operator's reused buffer is not left the size of the table. Do not copy it
+    for anything that happens more than once per circuit.
   - Keep flatten/probe/put scratch as cleared-per-step fields rather than rebuilding it.
   - Use the stores' `ApplyAll` / `GetGroupsInto` (batched update with no result array;
     batched group read into caller-owned buffers) rather than the allocating variants
@@ -71,7 +92,22 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   `.Named()` — changing store naming or the manifest format needs a format-version bump.
 - Backpressure comes only from bounded channels (inputs, outputs). Never buffer unboundedly.
   This includes outputs: stream-shaped outputs never maintain integrated (snapshot) state —
-  only table-shaped (keyed/windowed) outputs may, and theirs is bounded by eviction.
+  only table-shaped (keyed/windowed) outputs may, and theirs is bounded by eviction. The
+  dead-letter output and sink delivery (`Io/Sinks.cs`) obey it too: one bounded channel, one
+  batch in flight.
+- Commit ordering. A circuit with no acknowledged output commits its checkpoint, then
+  publishes (at-most-once). With one (`ToAcknowledgedOutput`, which sinks are delivered
+  from) the order turns round: publish, wait for every acknowledged output's
+  acknowledgement, then commit — and no step runs while that gate waits (`Circuit.GatesCommits`;
+  docs/design/durability-and-standby.md, *Commit after delivery*). A new output kind that
+  must be durable before the checkpoint implements `IAcknowledgedOutputPort`; nothing may
+  acknowledge a batch before its sink has it.
+- Per-record errors (`RecordErrors.cs`). Under `RecordErrorPolicy.Fault` (the default) an
+  operator's record loop must contain no exception handling: the dead-letter variant is a
+  separate loop or method chosen once per step on `OperatorContext.Errors` being non-null.
+  Dropping a record is only correct if its retraction is dropped too — stateless operators
+  get that from deterministic delegates, stateful ones must record the drop in their state.
+  Null checks on generic values go through `RecordErrors.IsNull` (`is null` boxes).
 - `Incremental.Hosting` (generic host + DI) is a separate package so the core keeps its one
   dependency. A hosted circuit is keyed by its definition class (`CircuitHost<TDefinition>`);
   the host supervises on `Circuit.Completion`. Shutdown order is the invariant: drain the

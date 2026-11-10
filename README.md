@@ -64,6 +64,8 @@ deltas. Integrating an output's deltas reproduces the current state of that view
 | `TopK` | Integrated group per key; emits only membership changes (displaced rows retracted). A threshold short-circuit skips the re-rank whenever a key's delta rows all fall strictly below the current K-th entry, so steady-state cost is O(delta) even for huge groups. Multiplicities count toward K |
 | `AntiJoin` | Integrated left side plus per-key right-side row counts; a key whose match-presence flips retracts or re-asserts its left rows |
 | `LeftJoin` / `FullJoin` | Pure composition: inner join ⊕ mapped anti-join(s) — the Z-set algebra makes the union incremental for free |
+| `Join` / `LeftJoin` against a table | The same bilinear rule with the right-hand state replaced by a probe of a shared table at the step's pinned version: Δ(F ⋈ T) = F ⋈ ΔT + ΔF ⋈ T. State is the fact side only, however many circuits join the table; the left join needs no anti-join. Through a secondary index (`By`) a key has a group of rows rather than one |
+| `Lookup` / `LookupAppendOnly` | Enrich on arrival: each record probes a shared table once and is never corrected, so table changes are not an input at all. `Lookup` remembers what it emitted per record and retracts exactly that; `LookupAppendOnly` is stateless and faults on a retraction |
 | `TumblingWindow` / `HoppingWindow` | Pure data transformation (flat-map) on a grouping: records join every window covering their event time, and the window composes into the group's identity automatically — aggregates over the windowed grouping are windowed aggregates, with eviction derived from the window. Late and deleted events correct their windows via ordinary deltas |
 | `SessionWindow` | Stateful, unlike the fixed windows: integrated events per session key, re-sessionized per touched key (never a full rescan). Rows whose session bounds change are retracted and re-asserted, so a bridging or late event merges sessions and a deletion shrinks or splits one — downstream aggregates correct themselves via the ordinary deltas |
 | `Recurse` | Fixed-point subcircuit (DBSP recursion), iterated to convergence within each step; the loop's `Join`/`Distinct` state is profiled by inner iteration (incremental in both time dimensions), so the emitted delta is exactly the change between successive fixed points — retractions included, cyclic derivations unwound in well-founded order |
@@ -148,6 +150,58 @@ decision is a global all-workers reduction on the exchange barrier), so the body
 shuffle correctly mid-loop, and a `maxIterations` guard (default 10 000) faults the circuit
 if a non-monotone body never converges. Bodies may use the linear operators plus
 `GroupBy`/`Join`/`Distinct`; aggregations and the like are rejected at definition time.
+
+**Shared tables.** Reference data that many circuits join — instruments, customers,
+accounts — fed through a `KeyedInput` is held once in the input and once more in every
+join that reads it, per circuit, and a circuit added later sees none of the rows already
+loaded. A `SharedTable<TKey, TRow>` is the same data held once per process, outside any
+circuit:
+
+```csharp
+var instruments = new SharedTable<int, Instrument>("instruments", i => i.Id);
+await instruments.Writer.UpsertAsync(row);            // stage…
+await instruments.Writer.CommitAsync();               // …and publish as one version
+await instruments.Writer.ReplaceAllAsync(snapshot);   // snapshot sync: deletes what it omits
+
+var inst = builder.Table(instruments);                // in any circuit, in any number of them
+
+trades.GroupBy(t => t.InstrumentId)                   // retroactive: corrected when the row changes
+      .Join(inst, (id, trade, instrument) => …);
+trades.Lookup(inst, t => t.InstrumentId,              // on arrival: enriched once, never corrected
+              (trade, instrument) => …);
+trades.GroupBy(t => t.Isin)                           // on a column that is not the table's key
+      .Join(inst.By("isin", i => i.Isin), (isin, trade, instrument) => …);
+inst.Changes();                                       // the table itself as a stream of its rows
+
+enriched.ToTable(traderDesks);                        // a circuit's result as a table: a derived table
+```
+
+The table is a change log plus a multi-version view. One writer applies batches; each
+batch that changes anything is the next *version*. Every circuit step pins the latest
+version of each table it reads and sees exactly that version on every worker for the whole
+step, and receives the net changes since the version its previous step saw — so to a
+circuit a table is an input whose rows live somewhere else. The pinned version commits
+with the checkpoint like an input offset, and a restarted circuit catches up from it.
+Probes are lock-free and allocation-free; rows must be immutable, because every circuit in
+the process shares the same objects. This is the one place state is shared across threads.
+
+The two ways to join differ in what happens after the fact arrived. `Join`/`LeftJoin` keep
+the facts and correct them whenever their row changes, so a hot row re-emits everything
+joined to it. `Lookup` enriches once: it keeps only what it emitted, so that retracting or
+upserting a record takes back exactly the row it produced, and reference changes cause no
+output at all. `LookupAppendOnly` keeps nothing, for streams that only ever insert. A new
+circuit needs no backfill for either — its first facts probe the table as it stands — and
+`Changes()` begins with the table's current rows for the pipelines that aggregate the
+reference data itself. Tables are per process: a clustered circuit cannot attach one.
+
+`ToTable` turns a circuit's table-shaped result into a shared table that other circuits
+join — a *derived table*, so a chain of dependent joins is computed once and costs each
+pipeline one hop. The circuit becomes the table's only writer. Each step is one table
+version, committed before the circuit's checkpoint, and the checkpoint records the version
+it covers; after a crash the circuit takes back what it wrote past that version before it
+replays, so the table always equals the circuit's state. A circuit cannot read a table it
+writes, directly or through other derived tables. The design, with what is still to come
+(a durable log, hosting), is in [docs/design/shared-tables.md](docs/design/shared-tables.md).
 
 **Exchange (multi-threading).** `CircuitOptions.Workers = N` runs N worker threads, each
 owning its own instance of every operator and its own shard of all operator state.
@@ -290,6 +344,8 @@ unlistened.
 | `incremental.circuit.records` | input records drained into steps (after replay dedup) |
 | `incremental.circuit.faults` | transitions to the terminal faulted state |
 | `incremental.circuit.checkpoint_commits`, `.checkpoint_commit_duration` | atomic state+offsets commits |
+| `incremental.circuit.sink_ack_wait` | seconds a commit waited for acknowledged outputs' consumers to confirm delivery, one measurement per commit |
+| `incremental.circuit.dead_letters` | records dropped under the `DeadLetter` error policy, tagged by `operator` |
 | `incremental.circuit.input_queue_depth`, `.output_queue_depth` | bounded-channel depths, per port |
 | `incremental.circuit.watermark_lag` | now minus the frozen watermark, seconds |
 | `incremental.circuit.barrier_wait` | cumulative seconds each worker has spent waiting on exchange and loop barriers |
@@ -344,11 +400,23 @@ so implementations never see cross-thread access to one store.
   };
   ```
 
+- `ChangelogStorage` / `ChangelogStorageProvider` — state on the heap, in the same stores
+  as the default provider, with every checkpoint appended to an `IStateChangelog` as one
+  transaction: the entries that changed since the last checkpoint and a commit record
+  carrying the offsets. One `ChangelogStorage` per process serves every circuit;
+  `storage.Pipeline("id")` is a circuit's provider. `OpenAsync` restores from the log and
+  takes its writer; `Follow` keeps a standby's copy warm, and `PromoteAsync` turns it into
+  the active — it fences the previous one, whose next commit throws
+  `ChangelogFencedException`. `SharedTable.FollowAsync` / `PromoteAsync` do the same for a
+  table over its log. `InMemoryStateChangelog` is the in-process log for tests; the Kafka
+  one is not built. Design and what was built:
+  [docs/design/durability-and-standby.md](docs/design/durability-and-standby.md).
+
 - Candidates that make sense next: RocksDB (large state, embedded, fast scans), SQLite.
 
 **Checkpointing and exactly-once restart.** A provider implementing
-`ICheckpointStorageProvider` (Redis does; `InMemoryCheckpointStorageProvider` is the
-in-process stand-in for testing) makes checkpoints of the circuit: operators stage their
+`ICheckpointStorageProvider` (Redis and the changelog provider do;
+`InMemoryCheckpointStorageProvider` is the in-process stand-in for testing) makes checkpoints of the circuit: operators stage their
 writes in per-store overlays, and every `CheckpointInterval` steps (default: every step) the
 circuit commits {all staged state changes + the input offsets those steps consumed}
 atomically — for Redis, one MULTI/EXEC transaction covering every worker's shard plus a
@@ -373,6 +441,7 @@ Restarts are guarded by a **state manifest**: every checkpoint commits a descrip
 the state it belongs to — each store's identity, the worker and process counts, a format
 version — and a rebuilt circuit refuses to start against a checkpoint whose manifest does
 not match, listing the mismatches, instead of silently reading another operator's state.
+A circuit refused this way is finished — disposing it processes and commits nothing.
 By default a store's identity is its position in the circuit, so inserting or reordering
 operators orphans downstream state (detected, loudly); `.Named("revenue")` on the stream a
 stateful operator returns pins its identity by name instead, so the circuit can evolve
@@ -394,6 +463,48 @@ single-consumer (a second `Changes()` throws rather than silently splitting the 
 plain stream outputs are pure changefeeds: at-most-once across a crash, exactly-once being
 the downstream consumer's offset/idempotency concern. (In a cluster an output covers the
 local process's workers, like the delta stream itself.)
+
+**Acknowledged outputs: at-least-once to a sink.** `stream.ToAcknowledgedOutput()` declares
+an output whose batches the consumer confirms. Each `OutputBatch<T>` carries the step's
+`Changes` and its `Sequence`; `handle.ConsumeAsync(sink)` acknowledges when the sink
+delegate returns, or read `handle.Batches()` and call `batch.Acknowledge()` yourself (an
+acknowledgement covers every earlier batch). A circuit with such an output commits *after*
+delivery: a step publishes first, and its checkpoint — state, input offsets, table versions
+— waits until every batch published so far has been acknowledged. A crash anywhere between
+publish and commit therefore re-runs those steps and delivers their batches again; nothing
+is lost, and some batches arrive twice. Sequences are step numbers, committed with the
+checkpoint (`Circuit.CommittedStep`) and continued after a restart, so a redelivery is
+recognisable as a sequence the sink has already applied. The circuit runs no step while a
+commit waits on the sink (`incremental.circuit.sink_ack_wait` measures it); use a larger
+`CheckpointInterval` with `CheckpointMaxDelay` — a commit at least that often in time — to
+keep steps flowing between commits. A consumer that stops reading faults the circuit rather
+than stall it. Plain outputs keep their semantics and hold no commit up. Single process
+only. Details in [docs/intro.md](docs/intro.md).
+
+**Sinks.** `handle.DeliverToAsync(sink)` delivers an acknowledged output to an
+`IUpsertSink<TKey, TRow>` — each step collapsed to at most one upsert or delete per key — or
+to an `IAppendSink<T>`, whose batches carry the step sequence to deduplicate by. The sink is
+awaited and the step acknowledged when it returns; a failing write is retried with a bounded
+backoff and then faults the circuit (`SinkDeliveryOptions`; `MaxRetries = null` stalls
+instead). `InMemoryUpsertSink` and `InMemoryAppendSink` are the test doubles. Under
+auto-stepping a crash replay may cut different steps: upserts converge except for a key that
+was delivered and is gone again within one merged replay step, and an append sink should
+truncate to `Circuit.CommittedStep` on restart — both spelled out in
+[docs/intro.md](docs/intro.md).
+
+**Per-record errors.** `CircuitOptions.ErrorPolicy` is `Fault` by default: a throwing
+delegate or a null key faults the circuit. `DeadLetter` drops the record instead, reports
+it — record, weight, operator, exception — on the bounded `circuit.DeadLetters` channel
+(which must be read) and counts it in `incremental.circuit.dead_letters`; `.OnError(policy)`
+overrides it for one operator. A dropped record's retraction is dropped too, which for
+stateless operators relies on deterministic delegates. The default path has no exception
+handling in it. The list of operators that can dead-letter is in
+[docs/intro.md](docs/intro.md).
+
+The circuit commits through `ICheckpointStorageProvider.CommitAsync` and awaits it, so a
+provider whose commit is I/O (Redis implements it with `ExecuteAsync`) holds no thread
+while it is in flight; the method defaults to the synchronous `Commit`, which is all a
+custom provider has to supply.
 
 **Stepping modes.** By default a pump task steps the circuit whenever input is available.
 With `AutoStep = false` the circuit advances only on explicit `StepAsync()` calls — exact,
@@ -596,6 +707,11 @@ disclosed trade-offs (below), not missing semantics:
       application by default — configuration binding, shared in-memory views and a health
       check; `Circuit.Completion` is the fault signal it supervises on)
 
+- [x] Sinks and a per-record error policy: `IUpsertSink`/`IAppendSink` delivered from an
+      acknowledged output (per-key collapse, bounded retries, backpressure), and
+      `RecordErrorPolicy.DeadLetter` with a bounded dead-letter output and per-operator
+      `OnError`
+
 ### Known limitations (deliberate, disclosed)
 
 - `Incremental.Hosting` does not host clustered circuits yet (no host-side lockstep stepping).
@@ -610,6 +726,21 @@ disclosed trade-offs (below), not missing semantics:
 - Exactly-once ends at the output edge: batches published after the last commit are not
   replayed after a crash; table-shaped outputs resync consumers automatically (batch zero
   of the changefeed), stream-shaped outputs are at-most-once across a crash by design.
+  Acknowledged outputs (`ToAcknowledgedOutput`) are the at-least-once alternative; they
+  stall the circuit at each commit point until the sink confirms (a gate, not a pipeline —
+  see `docs/design/durability-and-standby.md`), and are not available on clustered circuits.
+- Keyed upsert sinks converge after a crash only up to transient keys when the circuit
+  auto-steps: a key delivered before the crash and absent again within one merged replay
+  step is never deleted from the sink (the replayed delta has nothing to say about it).
+  Manual stepping repeats batches exactly and has no such case; nor does a derived table
+  (`ToTable`), which undoes what it wrote past the checkpoint before it replays.
+- The `DeadLetter` error policy does not cover every delegate: `TopK` ordering, eviction
+  deadlines, session windows and routing hashes still fault.
+- A warm standby takes over exactly — sinks end where an uninterrupted run would — only
+  if the sources re-send the uncommitted input cut into the same steps and table changes
+  land between checkpoints; otherwise failover is at-least-once with the transient-key
+  case above, and a `Lookup` may enrich a replayed record from a newer table row.
+  `ChangelogStorage` reads the whole changelog, so each process holds every pipeline in it.
 - Floating-point sums drift under retraction — prefer `decimal`/`long` accumulators.
 - Changing a persisted value type's shape (renaming/retyping members) invalidates its
   serialized state; there is no schema migration — change the key prefix and rebuild from
@@ -623,6 +754,15 @@ disclosed trade-offs (below), not missing semantics:
       so keyed inputs re-feed safely after a restore (the Showcase's Act 4 re-feeds every
       reference table and verifies nothing double-counts) and take source offsets
 - [ ] Keyed-input snapshot sync (`ReplaceAllAsync`: retract every key a full-table
-      snapshot omits — needs a key scan on value stores)
+      snapshot omits — needs a key scan on value stores; shared tables have it)
+- [ ] Shared tables (`docs/design/shared-tables.md`): built so far — the table, its
+      writer and change log seam, retroactive `Join`/`LeftJoin`, `Lookup`, secondary
+      indexes, `ReplaceAllAsync`, `Changes()`, derived tables (`ToTable`); to come — a
+      durable log, registration in `Incremental.Hosting`
+- [ ] Durability and warm standby (`docs/design/durability-and-standby.md`): built so
+      far — commit after delivery, acknowledged outputs and sinks, the state changelog seam
+      (`IStateChangelog`), `ChangelogStorage` with follower mode and promotion, table
+      followers, all against in-memory logs; to come — the Kafka changelog and table log,
+      the leader protocol, source adapters, active/standby roles in `Incremental.Hosting`
 - [ ] Investigate off-heap in-process storage to reduce GC (RocksDB, SQLite candidates)
 - [ ] Cluster transport TLS/authentication

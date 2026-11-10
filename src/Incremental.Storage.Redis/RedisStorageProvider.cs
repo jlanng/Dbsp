@@ -93,31 +93,12 @@ public sealed class RedisStorageProvider : ICheckpointStorageProvider
     {
         lock (_stores)
         {
-            var transaction = _db.CreateTransaction();
-            var pending = new List<Task>();
-            foreach (var store in _stores.Values)
-                store.Flush(transaction, pending);
-
-            if (inputOffsets.Count > 0)
-            {
-                var marker = new HashEntry[inputOffsets.Count];
-                var i = 0;
-                foreach (var (input, offset) in inputOffsets)
-                    marker[i++] = new HashEntry(input, offset);
-                pending.Add(transaction.HashSetAsync(_checkpointKey, marker));
-            }
-
-            // The staged manifests ride the same transaction, so a committed manifest always
-            // describes committed state; once landed they need no rewriting (cleared below).
-            foreach (var (scope, manifest) in _stagedManifests)
-                pending.Add(transaction.HashSetAsync(_manifestKey, scope, manifest));
+            var (transaction, pending) = BuildCommit(inputOffsets);
 
             // MULTI/EXEC: the commands travel as one unit and Redis applies them on EXEC,
             // so a crash anywhere before that leaves the previous checkpoint fully intact.
             if (!transaction.Execute())
-                throw new InvalidOperationException(
-                    "The checkpoint commit transaction was rejected by Redis; nothing was applied, " +
-                    "so the previous checkpoint is intact.");
+                throw CommitRejected();
 
             // EXEC does not roll back on per-command errors (e.g. WRONGTYPE against a
             // colliding key), so a true Execute() is not enough: every queued command must
@@ -128,17 +109,85 @@ public sealed class RedisStorageProvider : ICheckpointStorageProvider
             }
             catch (AggregateException ex)
             {
-                throw new InvalidOperationException(
-                    "The checkpoint commit transaction executed, but one or more of its commands failed; " +
-                    "the committed checkpoint may be incomplete and must not be trusted.",
-                    ex.InnerExceptions.Count == 1 ? ex.InnerException : ex);
+                throw CommandsFailed(ex.InnerExceptions.Count == 1 ? ex.InnerException! : ex);
             }
 
-            foreach (var store in _stores.Values)
-                store.Discard(); // the overlays' content is now the committed state
-            _stagedManifests.Clear();
+            CompleteCommit();
         }
     }
+
+    /// <summary>The same commit without holding a thread across the round trip. The circuit
+    /// runs no step while a commit is pending, so nothing stages into the stores between
+    /// building the transaction and discarding the overlays; the lock is taken only around
+    /// those two ends (a monitor cannot be held across an await).</summary>
+    public async ValueTask CommitAsync(IReadOnlyDictionary<string, long> inputOffsets, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        ITransaction transaction;
+        List<Task> pending;
+        lock (_stores)
+            (transaction, pending) = BuildCommit(inputOffsets);
+
+        // Not cancellable from here: once EXEC is on the wire the outcome is Redis's, and
+        // abandoning the wait would leave the overlays out of step with what was committed.
+        if (!await transaction.ExecuteAsync().ConfigureAwait(false))
+            throw CommitRejected();
+
+        try
+        {
+            await Task.WhenAll(pending).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            throw CommandsFailed(ex);
+        }
+
+        lock (_stores)
+            CompleteCommit();
+    }
+
+    /// <summary>Queues every staged write, the offsets marker and the staged manifests into
+    /// one transaction. Caller holds the lock.</summary>
+    private (ITransaction Transaction, List<Task> Pending) BuildCommit(IReadOnlyDictionary<string, long> inputOffsets)
+    {
+        var transaction = _db.CreateTransaction();
+        var pending = new List<Task>();
+        foreach (var store in _stores.Values)
+            store.Flush(transaction, pending);
+
+        if (inputOffsets.Count > 0)
+        {
+            var marker = new HashEntry[inputOffsets.Count];
+            var i = 0;
+            foreach (var (input, offset) in inputOffsets)
+                marker[i++] = new HashEntry(input, offset);
+            pending.Add(transaction.HashSetAsync(_checkpointKey, marker));
+        }
+
+        // The staged manifests ride the same transaction, so a committed manifest always
+        // describes committed state; once landed they need no rewriting (cleared after).
+        foreach (var (scope, manifest) in _stagedManifests)
+            pending.Add(transaction.HashSetAsync(_manifestKey, scope, manifest));
+        return (transaction, pending);
+    }
+
+    /// <summary>The overlays' content is now the committed state. Caller holds the lock.</summary>
+    private void CompleteCommit()
+    {
+        foreach (var store in _stores.Values)
+            store.Discard();
+        _stagedManifests.Clear();
+    }
+
+    private static InvalidOperationException CommitRejected() => new(
+        "The checkpoint commit transaction was rejected by Redis; nothing was applied, " +
+        "so the previous checkpoint is intact.");
+
+    private static InvalidOperationException CommandsFailed(Exception inner) => new(
+        "The checkpoint commit transaction executed, but one or more of its commands failed; " +
+        "the committed checkpoint may be incomplete and must not be trusted.",
+        inner);
 
     public string? CommittedManifest(string scope)
     {

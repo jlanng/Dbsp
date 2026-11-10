@@ -21,6 +21,11 @@ public sealed class OperatorContext
     /// a state manifest with each checkpoint and refuse a mismatched restore.</summary>
     internal Action<string>? ManifestObserver { get; init; }
 
+    /// <summary>Where the operator reports records it drops, or null when its policy is
+    /// <see cref="RecordErrorPolicy.Fault"/> (the default) and it must let exceptions
+    /// through. Operators branch on this once per step, outside their record loop.</summary>
+    internal RecordErrors? Errors { get; init; }
+
     /// <summary>A store name unique to this node, worker, and purpose (cluster-wide).</summary>
     public string StateName(string suffix)
     {
@@ -118,7 +123,7 @@ internal sealed class InputOperator<T> : IStepOperator where T : notnull
     }
 }
 
-internal sealed class MapOperator<TIn, TOut>(Func<TIn, TOut> selector) : IStepOperator
+internal sealed class MapOperator<TIn, TOut>(Func<TIn, TOut> selector, RecordErrors? errors = null) : IStepOperator
     where TIn : notnull
     where TOut : notnull
 {
@@ -131,13 +136,34 @@ internal sealed class MapOperator<TIn, TOut>(Func<TIn, TOut> selector) : IStepOp
     {
         var delta = (ZSet<TIn>)inputs[0]!;
         var output = _output.Next(delta.DistinctCount);
+        if (errors is not null)
+            return StepGuarded(delta, output, errors);
         foreach (var (value, weight) in delta)
             output.Add(selector(value), weight);
         return output;
     }
+
+    // The dead-letter policy's loop, kept apart so the default one above has no exception
+    // handling in it. A projection is stateless, so dropping is consistent as long as the
+    // selector is deterministic: it throws for the retraction of what it threw for.
+    private ZSet<TOut> StepGuarded(ZSet<TIn> delta, ZSet<TOut> output, RecordErrors errors)
+    {
+        foreach (var (value, weight) in delta)
+        {
+            try
+            {
+                output.Add(RecordErrors.Result(selector(value)), weight);
+            }
+            catch (Exception ex)
+            {
+                errors.Add(value, weight, ex);
+            }
+        }
+        return output;
+    }
 }
 
-internal sealed class FilterOperator<T>(Func<T, bool> predicate) : IStepOperator where T : notnull
+internal sealed class FilterOperator<T>(Func<T, bool> predicate, RecordErrors? errors = null) : IStepOperator where T : notnull
 {
     private readonly ZSet<T> _empty = new();
     private readonly OutputBuffer<T> _output = new();
@@ -148,14 +174,37 @@ internal sealed class FilterOperator<T>(Func<T, bool> predicate) : IStepOperator
     {
         var delta = (ZSet<T>)inputs[0]!;
         var output = _output.Next(delta.DistinctCount);
+        if (errors is not null)
+            return StepGuarded(delta, output, errors);
         foreach (var (value, weight) in delta)
             if (predicate(value))
                 output.Add(value, weight);
         return output;
     }
+
+    // See MapOperator.StepGuarded.
+    private ZSet<T> StepGuarded(ZSet<T> delta, ZSet<T> output, RecordErrors errors)
+    {
+        foreach (var (value, weight) in delta)
+        {
+            bool keep;
+            try
+            {
+                keep = predicate(value);
+            }
+            catch (Exception ex)
+            {
+                errors.Add(value, weight, ex);
+                continue;
+            }
+            if (keep)
+                output.Add(value, weight);
+        }
+        return output;
+    }
 }
 
-internal sealed class FlatMapOperator<TIn, TOut>(Func<TIn, IEnumerable<TOut>> selector) : IStepOperator
+internal sealed class FlatMapOperator<TIn, TOut>(Func<TIn, IEnumerable<TOut>> selector, RecordErrors? errors = null) : IStepOperator
     where TIn : notnull
     where TOut : notnull
 {
@@ -168,9 +217,38 @@ internal sealed class FlatMapOperator<TIn, TOut>(Func<TIn, IEnumerable<TOut>> se
     {
         var delta = (ZSet<TIn>)inputs[0]!;
         var output = _output.Next(delta.DistinctCount);
+        if (errors is not null)
+            return StepGuarded(delta, output, errors);
         foreach (var (value, weight) in delta)
             foreach (var expanded in selector(value))
                 output.Add(expanded, weight);
+        return output;
+    }
+
+    // Scratch for the dead-letter policy's loop: a record's expansion is gathered whole
+    // before any of it is emitted, so a selector that throws part-way through its sequence
+    // drops the record entirely rather than leaving the rows it had already yielded.
+    private List<TOut>? _expansion;
+
+    private ZSet<TOut> StepGuarded(ZSet<TIn> delta, ZSet<TOut> output, RecordErrors errors)
+    {
+        var expansion = _expansion ??= [];
+        foreach (var (value, weight) in delta)
+        {
+            expansion.Clear();
+            try
+            {
+                foreach (var expanded in selector(value))
+                    expansion.Add(RecordErrors.Result(expanded));
+            }
+            catch (Exception ex)
+            {
+                errors.Add(value, weight, ex);
+                continue;
+            }
+            foreach (var expanded in expansion)
+                output.Add(expanded, weight);
+        }
         return output;
     }
 }

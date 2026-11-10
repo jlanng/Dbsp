@@ -54,3 +54,21 @@ public sealed class Output<T> where T : notnull
     internal CircuitBuilder Builder { get; }
     internal string RegistrationName { get; }
 }
+
+/// <summary>
+/// The definition of an acknowledged circuit output, returned by
+/// <c>ToAcknowledgedOutput()</c>. Redeem it with
+/// <see cref="Circuit.Handle{T}(AcknowledgedOutput{T})"/> after <c>Build()</c> for the live
+/// <see cref="AcknowledgedOutputHandle{T}"/>.
+/// </summary>
+public sealed class AcknowledgedOutput<T> where T : notnull
+{
+    internal AcknowledgedOutput(CircuitBuilder builder, string registrationName)
+    {
+        Builder = builder;
+        RegistrationName = registrationName;
+    }
+
+    internal CircuitBuilder Builder { get; }
+    internal string RegistrationName { get; }
+}

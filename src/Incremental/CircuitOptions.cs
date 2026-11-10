@@ -18,7 +18,7 @@ public sealed class CircuitOptions
     /// Record contents are never logged. Null (default) — no logging. Metrics need no
     /// wiring: the <c>Incremental</c> <see cref="System.Diagnostics.Metrics.Meter"/> is
     /// always on (steps, step duration, records, queue depths, watermark lag, checkpoint
-    /// commits, faults, cluster frames/bytes) and costs nothing unlistened.</summary>
+    /// commits, sink acknowledgement wait, faults, cluster frames/bytes) and costs nothing unlistened.</summary>
     public ILoggerFactory? LoggerFactory { get; init; }
 
     /// <summary>Number of worker threads <em>on this process</em>. Keyed operators shard
@@ -51,6 +51,37 @@ public sealed class CircuitOptions
     /// amortizes commit cost at the price of a longer replay window after a crash. Ignored —
     /// at zero cost — when the provider does not checkpoint.</summary>
     public int CheckpointInterval { get; init; } = 1;
+
+    /// <summary>An upper bound on how long a completed step may stay uncommitted, beside
+    /// <see cref="CheckpointInterval"/>: a commit is due at the end of the step that reaches
+    /// the interval, or of the first step that ends after the oldest uncommitted one has
+    /// waited this long — and an auto-stepping circuit that goes idle with steps uncommitted
+    /// commits when the time runs out, without waiting for the next record. With manual
+    /// stepping the bound is checked only as steps end. Null (default) — the step count
+    /// alone. It is the better knob for a circuit with acknowledged outputs, where every
+    /// commit waits for the sinks: a large interval with a delay of, say, a second keeps
+    /// steps flowing between commits and still bounds what a crash replays, in time rather
+    /// than in steps. Not available on a clustered circuit, whose processes must commit on
+    /// the same steps.</summary>
+    public TimeSpan? CheckpointMaxDelay { get; init; }
+
+    /// <summary>What the circuit does with a record one of its operators cannot process — a
+    /// user delegate (<c>Select</c>, <c>Where</c>, a key selector, an aggregate, a join's
+    /// result selector) that throws on it, or a null key or result.
+    /// <see cref="RecordErrorPolicy.Fault"/> (default) faults the circuit, as before.
+    /// <see cref="RecordErrorPolicy.DeadLetter"/> drops the record, reports it on
+    /// <see cref="Circuit.DeadLetters"/> — which must then be read — and carries on;
+    /// <see cref="DeadLetter"/> says what that asks of the delegates. Override it for one
+    /// operator with <c>OnError</c> on the stream it returns. A keyed input follows this
+    /// setting only (it has no operator to override): under <c>DeadLetter</c> an upsert
+    /// whose key selector throws or returns null is reported instead of throwing to the
+    /// producer.</summary>
+    public RecordErrorPolicy ErrorPolicy { get; init; } = RecordErrorPolicy.Fault;
+
+    /// <summary>Capacity of the dead-letter output's bounded channel. When it is full the
+    /// circuit waits for its reader, like any output: dead letters are backpressure, never
+    /// unbounded memory.</summary>
+    public int DeadLetterCapacity { get; init; } = 1024;
 
     /// <summary>Runs this circuit as one process of a cluster: the same circuit definition
     /// runs on every process, each hosting a contiguous slice of the global worker set, and

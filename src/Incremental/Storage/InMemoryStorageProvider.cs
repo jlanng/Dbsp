@@ -10,19 +10,37 @@ namespace Incremental.Storage;
 public sealed class InMemoryStorageProvider : IStorageProvider
 {
     public IWeightStore<T> CreateWeightStore<T>(string name) where T : notnull =>
-        new InMemoryWeightStore<T>();
+        new WeightStore<T>();
 
     public IIndexedWeightStore<TKey, TValue> CreateIndexedWeightStore<TKey, TValue>(string name)
         where TKey : notnull
         where TValue : notnull =>
-        new InMemoryIndexedWeightStore<TKey, TValue>();
+        new IndexedWeightStore<TKey, TValue>();
 
     public IValueStore<TKey, TValue> CreateValueStore<TKey, TValue>(string name) where TKey : notnull =>
-        new InMemoryValueStore<TKey, TValue>();
+        new ValueStore<TKey, TValue>();
 
-    private sealed class InMemoryWeightStore<T> : IWeightStore<T> where T : notnull
+    // The three stores are internal, not private, because ChangelogStorageProvider keeps its
+    // state in them: the same structures and the same read path, with change capture
+    // wrapped around the writes. The members below each store's interface are for that.
+
+    internal sealed class WeightStore<T> : IWeightStore<T> where T : notnull
     {
         private readonly Dictionary<T, long> _weights = new();
+
+        /// <summary>Every value with its weight.</summary>
+        internal Dictionary<T, long> Entries => _weights;
+
+        /// <summary>Makes <paramref name="value"/>'s weight exactly <paramref name="weight"/>.</summary>
+        internal void Set(T value, long weight)
+        {
+            if (weight == 0)
+                _weights.Remove(value);
+            else
+                _weights[value] = weight;
+        }
+
+        internal void Clear() => _weights.Clear();
 
         public long Update(T value, long delta)
         {
@@ -48,52 +66,97 @@ public sealed class InMemoryStorageProvider : IStorageProvider
         public void Remove(T value) => _weights.Remove(value);
     }
 
-    private sealed class InMemoryIndexedWeightStore<TKey, TValue> : IIndexedWeightStore<TKey, TValue>
+    internal sealed class IndexedWeightStore<TKey, TValue> : IIndexedWeightStore<TKey, TValue>
         where TKey : notnull
         where TValue : notnull
     {
-        private readonly Dictionary<TKey, Dictionary<TValue, long>> _groups = new();
+        /// <summary>One key's values. A group of exactly one value is held inline: state
+        /// keyed by something row-like — what a lookup remembers per fact, the facts joined
+        /// on a unique key — is all such groups, and a dictionary each would be a couple of
+        /// hundred bytes allocated per record that arrives and thrown away per record that
+        /// leaves. A second distinct value moves the group into <see cref="Many"/>, where
+        /// it stays until it empties.</summary>
+        private struct Group
+        {
+            public TValue Single;
+            public long Weight; // of Single; unused once Many is set
+            public Dictionary<TValue, long>? Many;
+        }
 
-        // Groups appear and vanish constantly in a sliding workload — a key whose last row is
-        // retracted takes its dictionary with it, and the next insert on that key allocates
-        // another. Emptied dictionaries are parked here instead (bounded, and empty, so this
-        // holds nothing but their capacity) and handed back out on the next create.
+        private readonly Dictionary<TKey, Group> _groups = new();
+
+        // Multi-valued groups appear and vanish too in a sliding workload. Their emptied
+        // dictionaries are parked here (bounded, and empty, so this holds nothing but their
+        // capacity) and handed back out to the next group that outgrows one value.
         private readonly Stack<Dictionary<TValue, long>> _spare = new();
         private const int MaxSpare = 32;
 
-        public long Update(TKey key, TValue value, long delta)
-        {
-            ref var entry = ref CollectionsMarshal.GetValueRefOrAddDefault(_groups, key, out var hadGroup);
-            if (!hadGroup)
-                entry = _spare.Count > 0 ? _spare.Pop() : new Dictionary<TValue, long>();
-            // Held as a local, not through the ref: removing the key below clears the slot
-            // the ref points at, and the group is still needed after that.
-            var group = entry!;
+        public long Update(TKey key, TValue value, long delta) => Update(key, value, delta, out _);
 
-            ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(group, value, out _);
-            var updated = slot + delta;
-            if (updated == 0)
+        /// <summary><paramref name="many"/> is the group's dictionary when it has one and
+        /// is still reachable through the map afterwards, for <see cref="ApplyAll"/>.</summary>
+        private long Update(TKey key, TValue value, long delta, out Dictionary<TValue, long>? many)
+        {
+            ref var group = ref CollectionsMarshal.GetValueRefOrAddDefault(_groups, key, out var hadGroup);
+            many = hadGroup ? group.Many : null;
+            if (many is not null)
+                return UpdateMany(key, many, value, delta, ref many);
+
+            long updated;
+            if (!hadGroup)
             {
-                group.Remove(value);
-                if (group.Count == 0)
-                {
-                    _groups.Remove(key);
-                    if (_spare.Count < MaxSpare)
-                        _spare.Push(group);
-                }
+                group.Single = value;
+                updated = delta;
+            }
+            else if (EqualityComparer<TValue>.Default.Equals(group.Single, value))
+            {
+                updated = group.Weight + delta;
             }
             else
             {
-                slot = updated;
+                // A second value under the key: the group outgrows its inline slot.
+                if (delta == 0)
+                    return 0;
+                many = _spare.Count > 0 ? _spare.Pop() : new Dictionary<TValue, long>();
+                many.Add(group.Single, group.Weight);
+                many.Add(value, delta);
+                group = new Group { Many = many };
+                return delta;
             }
+
+            // Written through the ref before any removal: removing the key clears the slot.
+            group.Weight = updated;
+            if (updated == 0)
+                _groups.Remove(key);
             return updated;
         }
 
-        /// <summary>Batched update that remembers the group it last touched. Callers arrive
-        /// with entries grouped by key far more often than not — a snapshot output writes
-        /// every row of a step under one group, and the Min/Max tree emits its updates
-        /// bucket by bucket — and for a key like a tournament-tree slot or a category string
-        /// the group lookup is the expensive half of the update.</summary>
+        private long UpdateMany(TKey key, Dictionary<TValue, long> group, TValue value, long delta, ref Dictionary<TValue, long>? reachable)
+        {
+            ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(group, value, out _);
+            var updated = slot + delta;
+            if (updated != 0)
+            {
+                slot = updated;
+                return updated;
+            }
+
+            group.Remove(value);
+            if (group.Count == 0)
+            {
+                _groups.Remove(key);
+                if (_spare.Count < MaxSpare)
+                    _spare.Push(group);
+                reachable = null;
+            }
+            return 0;
+        }
+
+        /// <summary>Batched update that remembers the multi-valued group it last touched.
+        /// Callers arrive with entries grouped by key far more often than not — a snapshot
+        /// output writes every row of a step under one group, and the Min/Max tree emits its
+        /// updates bucket by bucket — and for a key like a tournament-tree slot or a category
+        /// string the group lookup is the expensive half of the update.</summary>
         public void ApplyAll(IReadOnlyList<(TKey Key, TValue Value, long Delta)> entries)
         {
             var comparer = EqualityComparer<TKey>.Default;
@@ -103,36 +166,12 @@ public sealed class InMemoryStorageProvider : IStorageProvider
             for (var i = 0; i < entries.Count; i++)
             {
                 var (key, value, delta) = entries[i];
-                Dictionary<TValue, long> group;
                 if (lastGroup is not null && comparer.Equals(key, lastKey!))
-                {
-                    group = lastGroup;
-                }
+                    UpdateMany(key, lastGroup, value, delta, ref lastGroup);
                 else
                 {
-                    ref var entry = ref CollectionsMarshal.GetValueRefOrAddDefault(_groups, key, out var hadGroup);
-                    if (!hadGroup)
-                        entry = _spare.Count > 0 ? _spare.Pop() : new Dictionary<TValue, long>();
-                    group = entry!;
-                    (lastKey, lastGroup) = (key, group);
-                }
-
-                ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(group, value, out _);
-                var updated = slot + delta;
-                if (updated == 0)
-                {
-                    group.Remove(value);
-                    if (group.Count == 0)
-                    {
-                        _groups.Remove(key);
-                        if (_spare.Count < MaxSpare)
-                            _spare.Push(group);
-                        lastGroup = null;  // no longer reachable through the map
-                    }
-                }
-                else
-                {
-                    slot = updated;
+                    Update(key, value, delta, out lastGroup);
+                    lastKey = key;
                 }
             }
         }
@@ -141,16 +180,18 @@ public sealed class InMemoryStorageProvider : IStorageProvider
         {
             if (!_groups.TryGetValue(key, out var group))
                 return [];
+            if (group.Many is not { } many)
+                return [new WeightedValue<TValue>(group.Single, group.Weight)];
 
-            var result = new WeightedValue<TValue>[group.Count];
+            var result = new WeightedValue<TValue>[many.Count];
             var i = 0;
-            foreach (var kv in group)
+            foreach (var kv in many)
                 result[i++] = new WeightedValue<TValue>(kv.Key, kv.Value);
             return result;
         }
 
         /// <summary>Reads whole groups without materializing one array per group: the entries
-        /// go straight from the live dictionaries into the caller's buffer, which the hot
+        /// go straight from the live groups into the caller's buffer, which the hot
         /// operators reuse across steps. Safe precisely because the contract is a copy —
         /// callers get values, not a view onto state that the next update would move.</summary>
         public void GetGroupsInto(IReadOnlyList<TKey> keys, List<WeightedValue<TValue>> into, List<int> bounds)
@@ -159,20 +200,84 @@ public sealed class InMemoryStorageProvider : IStorageProvider
             {
                 if (_groups.TryGetValue(keys[i], out var group))
                 {
-                    into.EnsureCapacity(into.Count + group.Count);
-                    foreach (var kv in group)
-                        into.Add(new WeightedValue<TValue>(kv.Key, kv.Value));
+                    if (group.Many is { } many)
+                    {
+                        into.EnsureCapacity(into.Count + many.Count);
+                        foreach (var kv in many)
+                            into.Add(new WeightedValue<TValue>(kv.Key, kv.Value));
+                    }
+                    else
+                    {
+                        into.Add(new WeightedValue<TValue>(group.Single, group.Weight));
+                    }
                 }
                 bounds.Add(into.Count);
             }
         }
 
         public void RemoveGroup(TKey key) => _groups.Remove(key);
+
+        /// <summary>The weight of one value under <paramref name="key"/>, 0 if absent.</summary>
+        internal long WeightOf(TKey key, TValue value)
+        {
+            if (!_groups.TryGetValue(key, out var group))
+                return 0;
+            if (group.Many is { } many)
+                return many.GetValueOrDefault(value);
+            return EqualityComparer<TValue>.Default.Equals(group.Single, value) ? group.Weight : 0;
+        }
+
+        /// <summary>Makes the weight of (<paramref name="key"/>, <paramref name="value"/>)
+        /// exactly <paramref name="weight"/>.</summary>
+        internal void Set(TKey key, TValue value, long weight)
+        {
+            var delta = weight - WeightOf(key, value);
+            if (delta != 0)
+                Update(key, value, delta);
+        }
+
+        /// <summary>Appends <paramref name="key"/>'s group to <paramref name="into"/>.</summary>
+        internal void CopyGroup(TKey key, List<WeightedValue<TValue>> into)
+        {
+            if (!_groups.TryGetValue(key, out var group))
+                return;
+            if (group.Many is { } many)
+            {
+                foreach (var kv in many)
+                    into.Add(new WeightedValue<TValue>(kv.Key, kv.Value));
+            }
+            else
+            {
+                into.Add(new WeightedValue<TValue>(group.Single, group.Weight));
+            }
+        }
+
+        /// <summary>Every (key, value, weight) held.</summary>
+        internal IEnumerable<(TKey Key, TValue Value, long Weight)> Entries()
+        {
+            foreach (var (key, group) in _groups)
+            {
+                if (group.Many is { } many)
+                {
+                    foreach (var (value, weight) in many)
+                        yield return (key, value, weight);
+                }
+                else
+                {
+                    yield return (key, group.Single, group.Weight);
+                }
+            }
+        }
+
+        internal void Clear() => _groups.Clear();
     }
 
-    private sealed class InMemoryValueStore<TKey, TValue> : IValueStore<TKey, TValue> where TKey : notnull
+    internal sealed class ValueStore<TKey, TValue> : IValueStore<TKey, TValue> where TKey : notnull
     {
         private readonly Dictionary<TKey, TValue> _values = new();
+
+        /// <summary>Every key with its value.</summary>
+        internal Dictionary<TKey, TValue> Entries => _values;
 
         public bool TryGet(TKey key, [MaybeNullWhen(false)] out TValue value) => _values.TryGetValue(key, out value);
         public void Put(TKey key, TValue value) => _values[key] = value;
