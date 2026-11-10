@@ -14,6 +14,9 @@
          does not round-trip is silent cross-process corruption. The tests reach it directly. -->
     <InternalsVisibleTo Include="Incremental.Tests" />
     <InternalsVisibleTo Include="Incremental.Torture" />
+    <!-- The Kafka logs write the default serializer's JSON straight to UTF-8 (its options)
+         and ask whether a table's key type serializes equal values alike. -->
+    <InternalsVisibleTo Include="Incremental.Kafka" />
   </ItemGroup>
 
 </Project>

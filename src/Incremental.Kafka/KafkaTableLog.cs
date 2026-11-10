@@ -1,0 +1,853 @@
+using System.Buffers;
+using System.Buffers.Binary;
+using System.Runtime.CompilerServices;
+using System.Text.Json;
+using Confluent.Kafka;
+using Incremental.Storage;
+using Incremental.Tables;
+
+namespace Incremental.Kafka;
+
+/// <summary>
+/// A shared table's change log on Kafka: <see cref="ITableLog{TKey,TRow}"/> over two topics
+/// written in the same transaction (see <c>docs/design/durability-and-standby.md</c>,
+/// <em>Kafka-backed table log</em>). Get one from <see cref="KafkaLog.OpenTableLogAsync"/>.
+/// <list type="bullet">
+/// <item><c>{prefix}.table.{name}.changes</c> — one partition, never compacted: the version
+/// history. A version is one record, or several chunks when it is large; the transaction
+/// makes the chunks atomic.</item>
+/// <item><c>{prefix}.table.{name}.rows</c> — compacted: one record per live key, a null
+/// value for a deleted one, and a <c>$head</c> record per partition rewritten by every
+/// version (epoch, version, source offsets). Restoring reads this topic only, so it is
+/// bounded by the table's size.</item>
+/// </list>
+/// <para>
+/// Keys are found again by their serialized bytes (compaction compares bytes), so the key
+/// type must serialize equal values alike; a type that does not (<c>decimal</c>,
+/// <c>double</c>, <c>DateTimeOffset</c>, a class with its own equality) is refused when the
+/// log is opened.
+/// </para>
+/// </summary>
+public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
+    where TKey : notnull
+    where TRow : class
+{
+    // NUL-led, so it cannot collide with a serialized key (a serializer's output never
+    // contains a NUL — the changelog provider's rule).
+    private static readonly byte[] HeadKey = "\0$head"u8.ToArray();
+    private static readonly JsonSerializerOptions HeadJson = new(JsonSerializerDefaults.Web);
+    private static readonly IReadOnlyDictionary<int, long> NoOffsets = new Dictionary<int, long>();
+
+    private readonly KafkaLog _log;
+    private readonly string _name;
+    private readonly TopicPartition _changes;
+    private readonly TopicPartition[] _rows;
+    private readonly RecordCodec _codec;
+    private readonly OffsetIndex _index = new();
+
+    private string _epoch = "";
+    private long _last;
+    private long _oldest;
+
+    // True once this instance knows the log's last version for certain: it read the head as
+    // the writer, or it appended. Until then the head is read from Kafka when asked.
+    private volatile bool _lastIsExact;
+
+    private KafkaTableLog(KafkaLog log, string name, int rowPartitions)
+    {
+        _log = log;
+        _name = name;
+        ChangesTopic = ChangesTopicName(log.Options, name);
+        RowsTopic = RowsTopicName(log.Options, name);
+        _changes = new TopicPartition(ChangesTopic, 0);
+        _rows = new TopicPartition[rowPartitions];
+        for (var p = 0; p < rowPartitions; p++)
+            _rows[p] = new TopicPartition(RowsTopic, p);
+        _codec = RecordCodec.For(log.Options.Serializer);
+    }
+
+    private static string ChangesTopicName(KafkaLogOptions options, string name) => $"{options.TopicPrefix}.table.{name}.changes";
+
+    private static string RowsTopicName(KafkaLogOptions options, string name) => $"{options.TopicPrefix}.table.{name}.rows";
+
+    internal static async Task<KafkaTableLog<TKey, TRow>> OpenAsync(KafkaLog log, string name, CancellationToken cancellationToken)
+    {
+        if (!ByteStableEquality.Holds<TKey>())
+            throw new NotSupportedException(
+                $"Table '{name}' has key type {typeof(TKey).Name}, whose equal values can serialize differently (10.0 and 10.00, " +
+                "one instant under two offsets, a hand-written Equals). The rows topic finds a key by its bytes, so a delete " +
+                "written under one form would leave the row written under another. Key the table by an integer, a string, a " +
+                "Guid, an enum, or a tuple or record of those.");
+
+        var options = log.Options;
+        var changesConfig = new Dictionary<string, string>
+        {
+            ["cleanup.policy"] = "delete",
+            ["retention.ms"] = "-1",
+            ["retention.bytes"] = "-1",
+        };
+        foreach (var (key, value) in options.TableChangesTopicConfig)
+            changesConfig[key] = value;
+        await log.EnsureTopicAsync(ChangesTopicName(options, name), 1, changesConfig, fixedPartitions: true, cancellationToken)
+            .ConfigureAwait(false);
+        var rowPartitions = await log.EnsureTopicAsync(
+            RowsTopicName(options, name), options.TableRowPartitions, KafkaLog.CompactedConfig(options, options.TableRowsTopicConfig),
+            fixedPartitions: false, cancellationToken).ConfigureAwait(false);
+
+        var table = new KafkaTableLog<TKey, TRow>(log, name, rowPartitions);
+        var asWriter = log.IsWriter;
+        var head = await table.ReadHeadAsync(cancellationToken).ConfigureAwait(false);
+        while (head is null)
+        {
+            if (log.IsWriter)
+            {
+                // A new table: mint its identity. Version 0, in every partition, so that a
+                // restore finds a head wherever it looks.
+                head = new Head(Guid.NewGuid().ToString("N"), 0, rowPartitions, new Dictionary<int, long>());
+                var commit = new LogCommit();
+                table.AddHeads(commit, head);
+                await table.CommitAsync(commit).ConfigureAwait(false);
+                asWriter = true;
+                break;
+            }
+
+            // A reader cannot create it: wait for the active to.
+            await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+            asWriter = log.IsWriter;
+            head = await table.ReadHeadAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        if (head.Partitions != rowPartitions)
+            throw new KafkaLogException(
+                $"Topic '{table.RowsTopic}' has {rowPartitions} partition(s) but the table was created with {head.Partitions}. " +
+                "A row's partition is derived from the count, so it can never change.");
+        table._epoch = head.Epoch;
+        table._last = head.Version;
+        table._lastIsExact = asWriter && log.IsWriter;
+        await table.RefreshOldestAsync(cancellationToken).ConfigureAwait(false);
+        return table;
+    }
+
+    /// <summary>The table's name.</summary>
+    public string Name => _name;
+
+    /// <summary>The version-history topic: <c>{prefix}.table.{name}.changes</c>.</summary>
+    public string ChangesTopic { get; }
+
+    /// <summary>The snapshot topic: <c>{prefix}.table.{name}.rows</c>.</summary>
+    public string RowsTopic { get; }
+
+    /// <summary>Partitions of the rows topic.</summary>
+    public int RowPartitions => _rows.Length;
+
+    public string Epoch => _epoch;
+
+    /// <summary>
+    /// The oldest version the changes topic still holds, as this process last saw it: at
+    /// open, after its own <see cref="TrimBeforeAsync"/>, and whenever
+    /// <see cref="LastVersionAsync"/> is asked on a reader (a standby's promotion asks). A
+    /// trim by another process in between is noticed by the read that runs into it.
+    /// </summary>
+    public long OldestRetainedVersion => Interlocked.Read(ref _oldest);
+
+    // ── the head ───────────────────────────────────────────────────────────────────────
+
+    private sealed record Head(string Epoch, long Version, int Partitions, Dictionary<int, long> Offsets);
+
+    private void AddHeads(LogCommit commit, Head head)
+    {
+        var value = JsonSerializer.SerializeToUtf8Bytes(head, HeadJson).Prefixed(KafkaLog.JsonFormat);
+        foreach (var partition in _rows)
+            commit.Add(partition, HeadKey, value);
+    }
+
+    private static Head ParseHead(byte[] value)
+    {
+        CheckFormat(value);
+        return JsonSerializer.Deserialize<Head>(value.AsSpan(1), HeadJson)
+            ?? throw new InvalidDataException("A table head record is empty.");
+    }
+
+    private static void CheckFormat(ReadOnlySpan<byte> value)
+    {
+        if (value.Length == 0 || value[0] != KafkaLog.JsonFormat)
+            throw new InvalidDataException(
+                $"A table log record has format byte {(value.Length == 0 ? "(none)" : value[0].ToString())}; this version reads format {KafkaLog.JsonFormat}.");
+    }
+
+    /// <summary>The last committed head, or null for a table nobody has created yet. Every
+    /// version ends, in each rows partition, with its head record, so the head is at the
+    /// tail of partition 0 and one short read finds it.</summary>
+    private async Task<Head?> ReadHeadAsync(CancellationToken cancellationToken)
+    {
+        var partition = _rows[0];
+        var end = await _log.EndOffsetAsync(partition, cancellationToken).ConfigureAwait(false);
+        if (end == 0)
+            return null;
+        var start = await _log.StartOffsetAsync(partition, cancellationToken).ConfigureAwait(false);
+        return await Task.Run(() =>
+        {
+            using var consumer = _log.CreateConsumer();
+            for (long window = 64; ; window *= 16)
+            {
+                var from = Math.Max(start, end - window);
+                Head? head = null;
+                consumer.Assign(new TopicPartitionOffset(partition, from));
+                _log.ReadTo(consumer, end, record =>
+                {
+                    if (record.Message.Value is { } value && record.Message.Key.AsSpan().SequenceEqual(HeadKey))
+                        head = ParseHead(value);
+                }, cancellationToken);
+                if (head is not null || from == start)
+                    return head;
+            }
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask<long> LastVersionAsync(CancellationToken cancellationToken = default)
+    {
+        if (_lastIsExact)
+            return Interlocked.Read(ref _last);
+
+        // As a reader, or as a writer that has not looked since it took over: ask Kafka.
+        // After the takeover's InitTransactions this is final — the old writer's last
+        // transaction is decided and its markers written.
+        var asWriter = _log.IsWriter;
+        var head = await ReadHeadAsync(cancellationToken).ConfigureAwait(false)
+            ?? throw new KafkaLogException($"Table '{_name}' has no head record in '{RowsTopic}'.");
+        CheckEpoch(head.Epoch);
+        NoteLast(head.Version);
+        if (asWriter)
+            _lastIsExact = true;
+        await RefreshOldestAsync(cancellationToken).ConfigureAwait(false);
+        return head.Version;
+    }
+
+    private void NoteLast(long version)
+    {
+        long seen;
+        while ((seen = Interlocked.Read(ref _last)) < version)
+            Interlocked.CompareExchange(ref _last, version, seen);
+    }
+
+    private void CheckEpoch(string epoch)
+    {
+        if (!string.Equals(epoch, _epoch, StringComparison.Ordinal))
+            throw new InvalidDataException(
+                $"Table '{_name}' was opened at epoch {_epoch} and its log now carries epoch {epoch}: the table has been dropped " +
+                "and recreated. Open the log again.");
+    }
+
+    // ── append ─────────────────────────────────────────────────────────────────────────
+
+    public async ValueTask AppendAsync(TableVersion<TKey, TRow> version, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(version);
+        cancellationToken.ThrowIfCancellationRequested();
+        var last = Interlocked.Read(ref _last);
+        if (version.Version != last + 1)
+            throw new InvalidOperationException(
+                $"Table log '{_name}' is at version {last}; the next append must be version {last + 1}, not {version.Version}.");
+
+        var commit = Build(version);
+        await CommitAsync(commit).ConfigureAwait(false);
+        Interlocked.Exchange(ref _last, version.Version);
+        _lastIsExact = true;
+        if (Volatile.Read(ref commit.TrackedOffset) is >= 0 and var offset)
+            _index.Add(version.Version, offset);
+    }
+
+    private async Task CommitAsync(LogCommit commit)
+    {
+        try
+        {
+            await _log.CommitAsync(commit).ConfigureAwait(false);
+        }
+        catch (KafkaLogFencedException ex)
+        {
+            throw new TableLogFencedException($"Table log '{_name}': {ex.Message}", ex);
+        }
+    }
+
+    /// <summary>One version as one atomic commit: its change record(s), a row record per
+    /// changed key, and the head in every rows partition.</summary>
+    private LogCommit Build(TableVersion<TKey, TRow> version)
+    {
+        var commit = new LogCommit();
+        var rows = new List<LogRecord>(version.Changes.Count + _rows.Length);
+        var versionKey = new byte[8];
+        BinaryPrimitives.WriteInt64BigEndian(versionKey, version.Version);
+
+        var chunk = new ArrayBufferWriter<byte>(Math.Min(_log.Options.MaxRecordBytes, 64 * 1024));
+        var row = new ArrayBufferWriter<byte>(1024);
+        using var chunkWriter = new Utf8JsonWriter(chunk, new JsonWriterOptions { SkipValidation = true });
+        using var rowWriter = new Utf8JsonWriter(row, new JsonWriterOptions { SkipValidation = true });
+        var chunkIndex = 0;
+
+        void StartChunk()
+        {
+            chunk.ResetWrittenCount();
+            chunk.GetSpan(1)[0] = KafkaLog.JsonFormat;
+            chunk.Advance(1);
+            chunkWriter.Reset(chunk);
+            chunkWriter.WriteStartObject();
+            chunkWriter.WriteString("epoch"u8, _epoch);
+            chunkWriter.WriteNumber("version"u8, version.Version);
+            chunkWriter.WriteNumber("chunk"u8, chunkIndex);
+            chunkWriter.WriteStartArray("changes"u8);
+        }
+
+        void EndChunk(bool last)
+        {
+            chunkWriter.WriteEndArray();
+            chunkWriter.WriteBoolean("last"u8, last);
+            if (last)
+            {
+                chunkWriter.WriteStartObject("offsets"u8);
+                foreach (var (partition, offset) in version.Offsets)
+                    chunkWriter.WriteNumber(partition.ToString(), offset);
+                chunkWriter.WriteEndObject();
+            }
+            chunkWriter.WriteEndObject();
+            chunkWriter.Flush();
+            if (chunkIndex == 0)
+                commit.TrackNext(); // the offset the version starts at, for the index
+            commit.Add(_changes, versionKey, chunk.WrittenSpan.ToArray());
+            chunkIndex++;
+        }
+
+        StartChunk();
+        foreach (var change in version.Changes)
+        {
+            if (chunk.WrittenCount + chunkWriter.BytesPending >= _log.Options.MaxRecordBytes)
+            {
+                EndChunk(last: false);
+                StartChunk();
+            }
+
+            var keyBytes = _codec.KeyBytes(change.Key);
+            chunkWriter.WriteStartObject();
+            chunkWriter.WritePropertyName("k"u8);
+            _codec.WriteKey(chunkWriter, keyBytes);
+            if (change.Old is not null)
+            {
+                chunkWriter.WritePropertyName("o"u8);
+                _codec.Write(chunkWriter, change.Old);
+            }
+
+            byte[]? rowValue = null;
+            if (change.New is not null)
+            {
+                // Serialized once, written twice: into the change, and as the row record.
+                row.ResetWrittenCount();
+                row.GetSpan(1)[0] = KafkaLog.JsonFormat;
+                row.Advance(1);
+                rowWriter.Reset(row);
+                rowWriter.WriteStartObject();
+                rowWriter.WriteNumber("v"u8, version.Version);
+                rowWriter.WritePropertyName("r"u8);
+                rowWriter.Flush();
+                var before = row.WrittenCount;
+                _codec.Write(rowWriter, change.New);
+                rowWriter.Flush();
+                var serialized = row.WrittenSpan[before..];
+                chunkWriter.WritePropertyName("n"u8);
+                chunkWriter.WriteRawValue(serialized, skipInputValidation: true);
+                rowWriter.WriteEndObject();
+                rowWriter.Flush();
+                rowValue = row.WrittenSpan.ToArray();
+            }
+            chunkWriter.WriteEndObject();
+
+            rows.Add(new LogRecord(_rows[PartitionOf(change.Key)], keyBytes, rowValue));
+        }
+        EndChunk(last: true);
+
+        commit.Records.AddRange(rows);
+        AddHeads(commit, new Head(_epoch, version.Version, _rows.Length, new Dictionary<int, long>(version.Offsets)));
+        return commit;
+    }
+
+    private int PartitionOf(TKey key) => (int)(StableHash.Of(key) % (ulong)_rows.Length);
+
+    // ── restore ────────────────────────────────────────────────────────────────────────
+
+    public async ValueTask<TableHead> RestoreAsync(Action<TKey, TRow> row, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(row);
+        var asWriter = _log.IsWriter;
+        var (rows, head) = await Task.Factory.StartNew(
+            () => ReadSnapshot(cancellationToken), cancellationToken, TaskCreationOptions.LongRunning, TaskScheduler.Default)
+            .ConfigureAwait(false);
+        foreach (var (key, current) in rows)
+            row(key, current);
+        NoteLast(head.Version);
+        if (asWriter && _log.IsWriter)
+            _lastIsExact = true;
+        return new TableHead(head.Version, head.Offsets);
+    }
+
+    /// <summary>
+    /// Reads the rows topic into a consistent snapshot. Each partition is read on its own
+    /// clock, so "to the end of each" could mix versions when the writer is busy. Instead:
+    /// every version ends with its head in every partition. A partition is read to its end
+    /// at least once; from then on it is stopped (paused) whenever it stands right after a
+    /// head at the highest version seen anywhere, and let run again if another partition
+    /// shows a higher one. The snapshot is done when every partition has reached its end
+    /// and stands right after the head of the same version.
+    /// </summary>
+    private (Dictionary<TKey, TRow> Rows, Head Head) ReadSnapshot(CancellationToken cancellationToken)
+    {
+        var rows = new Dictionary<TKey, TRow>();
+        var versions = new long[_rows.Length];
+        var atHead = new bool[_rows.Length];
+        var paused = new bool[_rows.Length];
+        var reachedEnd = new bool[_rows.Length];
+        Array.Fill(versions, -1);
+        Head? head = null;
+        var target = -1L;
+
+        using var consumer = _log.CreateConsumer();
+        consumer.Assign(_rows.Select(partition => new TopicPartitionOffset(partition, Offset.Beginning)));
+        var idleSince = Environment.TickCount64;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var result = consumer.Consume(TimeSpan.FromMilliseconds(100));
+            if (result is null)
+            {
+                if (Environment.TickCount64 - idleSince > (long)_log.Options.OperationTimeout.TotalMilliseconds)
+                    throw new TimeoutException(
+                        $"Restoring table '{_name}' stalled: no partition of '{RowsTopic}' produced a record or reached version {target}.");
+                continue;
+            }
+            idleSince = Environment.TickCount64;
+            var p = result.Partition.Value;
+            if (result.IsPartitionEOF)
+            {
+                // The end of committed data, so a transaction boundary: the last record
+                // was a head.
+                reachedEnd[p] = true;
+            }
+            else if (result.Message.Key.AsSpan().SequenceEqual(HeadKey))
+            {
+                if (result.Message.Value is not { } headValue)
+                    continue;
+                var read = ParseHead(headValue);
+                CheckEpoch(read.Epoch);
+                versions[p] = read.Version;
+                atHead[p] = true;
+                if (head is null || read.Version >= head.Version)
+                    head = read;
+                if (read.Version > target)
+                {
+                    target = read.Version;
+                    for (var other = 0; other < paused.Length; other++)
+                    {
+                        if (paused[other] && versions[other] < target)
+                        {
+                            consumer.Resume([_rows[other]]);
+                            paused[other] = false;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // A row. If it arrived on a paused partition it was already fetched, and it
+                // belongs to a version past the head this partition stopped at: read on to
+                // that version's head.
+                atHead[p] = false;
+                if (paused[p])
+                {
+                    consumer.Resume([_rows[p]]);
+                    paused[p] = false;
+                }
+                var rowKey = _codec.KeyFromBytes<TKey>(result.Message.Key);
+                if (result.Message.Value is { } value)
+                    rows[rowKey] = ParseRow(value);
+                else
+                    rows.Remove(rowKey);
+                continue;
+            }
+
+            if (reachedEnd[p] && atHead[p] && versions[p] >= target && !paused[p])
+            {
+                consumer.Pause([_rows[p]]);
+                paused[p] = true;
+            }
+            var done = head is not null;
+            for (var other = 0; other < versions.Length; other++)
+                done &= reachedEnd[other] && atHead[other] && versions[other] == target;
+            if (done)
+                return (rows, head!);
+        }
+    }
+
+    private TRow ParseRow(byte[] value)
+    {
+        CheckFormat(value);
+        var reader = new Utf8JsonReader(value.AsSpan(1));
+        reader.Read();
+        while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+        {
+            var isRow = reader.ValueTextEquals("r"u8);
+            reader.Read();
+            if (isRow)
+                return _codec.Read<TRow>(ref reader);
+            reader.Skip();
+        }
+        throw new InvalidDataException($"A row record of table '{_name}' carries no row.");
+    }
+
+    // ── reading versions ───────────────────────────────────────────────────────────────
+
+    public IAsyncEnumerable<TableVersion<TKey, TRow>> ReadAsync(
+        long fromExclusive, long toInclusive, CancellationToken cancellationToken = default) =>
+        ReadVersionsAsync(fromExclusive, toInclusive, bounded: true, cancellationToken);
+
+    public IAsyncEnumerable<TableVersion<TKey, TRow>> FollowAsync(long fromExclusive, CancellationToken cancellationToken = default) =>
+        ReadVersionsAsync(fromExclusive, long.MaxValue, bounded: false, cancellationToken);
+
+    private async IAsyncEnumerable<TableVersion<TKey, TRow>> ReadVersionsAsync(
+        long fromExclusive, long toInclusive, bool bounded, [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var next = fromExclusive + 1;
+        if (next > toInclusive)
+            yield break;
+        if (bounded)
+        {
+            var last = await LastVersionAsync(cancellationToken).ConfigureAwait(false);
+            if (toInclusive > last)
+                throw new ArgumentOutOfRangeException(nameof(toInclusive), toInclusive, $"Table log '{_name}' ends at version {last}.");
+            if (next < OldestRetainedVersion)
+                throw LostHistory(next, OldestRetainedVersion);
+        }
+
+        // The nearest offset known to be at or before the version; failing that, the start
+        // of what the topic still holds.
+        var start = _index.Floor(next) is { } known ? new Offset(known) : Offset.Beginning;
+        List<TableChange<TKey, TRow>>? changes = null;
+        var expectedChunk = 0;
+        await foreach (var batch in _log.ReadBatchesAsync(_changes, start, cancellationToken).ConfigureAwait(false))
+        {
+            foreach (var record in batch.Records)
+            {
+                if (record.Message.Value is not { } value || record.Message.Key.Length != 8)
+                    continue;
+                var version = BinaryPrimitives.ReadInt64BigEndian(record.Message.Key);
+                if (version < next)
+                    continue;
+                if (version > next)
+                {
+                    Interlocked.Exchange(ref _oldest, Math.Max(Interlocked.Read(ref _oldest), version));
+                    throw LostHistory(next, version);
+                }
+
+                changes ??= [];
+                var chunk = ParseChunk(value, changes);
+                CheckEpoch(chunk.Epoch);
+                if (chunk.Version != version || chunk.Index != expectedChunk)
+                    throw new InvalidDataException(
+                        $"Table log '{_name}': the record at offset {record.Offset.Value} is chunk {chunk.Index} of version {chunk.Version}; " +
+                        $"chunk {expectedChunk} of version {version} was expected.");
+                if (chunk.Index == 0)
+                    _index.Add(version, record.Offset.Value);
+                if (!chunk.Last)
+                {
+                    expectedChunk++;
+                    continue;
+                }
+
+                var read = new TableVersion<TKey, TRow>(version, changes, chunk.Offsets ?? NoOffsets);
+                changes = null;
+                expectedChunk = 0;
+                next++;
+                NoteLast(version);
+                yield return read;
+                if (next > toInclusive)
+                    yield break;
+            }
+        }
+    }
+
+    private InvalidOperationException LostHistory(long wanted, long oldest) => new(
+        $"Table log '{_name}' no longer retains version {wanted}: its history starts at version {oldest}.");
+
+    private readonly record struct Chunk(string Epoch, long Version, int Index, bool Last, Dictionary<int, long>? Offsets);
+
+    private Chunk ParseChunk(byte[] value, List<TableChange<TKey, TRow>> into)
+    {
+        CheckFormat(value);
+        var reader = new Utf8JsonReader(value.AsSpan(1));
+        string epoch = "";
+        long version = -1;
+        var index = -1;
+        var last = false;
+        Dictionary<int, long>? offsets = null;
+
+        reader.Read();
+        while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+        {
+            if (reader.ValueTextEquals("epoch"u8))
+            {
+                reader.Read();
+                epoch = reader.GetString() ?? "";
+            }
+            else if (reader.ValueTextEquals("version"u8))
+            {
+                reader.Read();
+                version = reader.GetInt64();
+            }
+            else if (reader.ValueTextEquals("chunk"u8))
+            {
+                reader.Read();
+                index = reader.GetInt32();
+            }
+            else if (reader.ValueTextEquals("last"u8))
+            {
+                reader.Read();
+                last = reader.GetBoolean();
+            }
+            else if (reader.ValueTextEquals("changes"u8))
+            {
+                reader.Read();
+                while (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
+                {
+                    TKey? key = default;
+                    var hasKey = false;
+                    TRow? before = null, after = null;
+                    while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+                    {
+                        if (reader.ValueTextEquals("k"u8))
+                        {
+                            reader.Read();
+                            key = _codec.ReadKey<TKey>(ref reader);
+                            hasKey = true;
+                        }
+                        else if (reader.ValueTextEquals("o"u8))
+                        {
+                            reader.Read();
+                            before = _codec.Read<TRow>(ref reader);
+                        }
+                        else if (reader.ValueTextEquals("n"u8))
+                        {
+                            reader.Read();
+                            after = _codec.Read<TRow>(ref reader);
+                        }
+                        else
+                        {
+                            reader.Read();
+                            reader.Skip();
+                        }
+                    }
+                    if (!hasKey)
+                        throw new InvalidDataException($"Table log '{_name}': a change of version {version} has no key.");
+                    into.Add(new TableChange<TKey, TRow>(key!, before, after));
+                }
+            }
+            else if (reader.ValueTextEquals("offsets"u8))
+            {
+                reader.Read();
+                offsets = [];
+                while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+                {
+                    var partition = int.Parse(reader.GetString()!);
+                    reader.Read();
+                    offsets[partition] = reader.GetInt64();
+                }
+            }
+            else
+            {
+                reader.Read();
+                reader.Skip();
+            }
+        }
+        return new Chunk(epoch, version, index, last, offsets);
+    }
+
+    // ── retention ──────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Deletes the changes topic's records below <paramref name="version"/>
+    /// (<c>DeleteRecords</c>). The rows topic is untouched. This is an admin call, which
+    /// Kafka does not fence: a deposed active can still trim. That is harmless as long as
+    /// the floor it trims to only ever rises, which is the caller's business.
+    /// </summary>
+    public async ValueTask TrimBeforeAsync(long version, CancellationToken cancellationToken = default)
+    {
+        if (version <= OldestRetainedVersion)
+            return;
+        var last = await LastVersionAsync(cancellationToken).ConfigureAwait(false);
+        var target = Math.Min(version, last + 1);
+        var offset = await LocateAsync(target, last, cancellationToken).ConfigureAwait(false);
+        await _log.DeleteRecordsBeforeAsync(_changes, offset, cancellationToken).ConfigureAwait(false);
+        Interlocked.Exchange(ref _oldest, Math.Max(Interlocked.Read(ref _oldest), target));
+        _index.TrimBefore(target);
+    }
+
+    /// <summary>The offset of the first record of <paramref name="version"/>, or the end of
+    /// the topic when the version is past the last.</summary>
+    private async Task<long> LocateAsync(long version, long last, CancellationToken cancellationToken)
+    {
+        var end = await _log.EndOffsetAsync(_changes, cancellationToken).ConfigureAwait(false);
+        if (version > last)
+            return end;
+        if (_index.Exact(version) is { } exact)
+            return exact;
+
+        var start = _index.Floor(version) is { } known ? new Offset(known) : Offset.Beginning;
+        await foreach (var batch in _log.ReadBatchesAsync(_changes, start, cancellationToken).ConfigureAwait(false))
+        {
+            foreach (var record in batch.Records)
+            {
+                if (record.Message.Key.Length == 8 && BinaryPrimitives.ReadInt64BigEndian(record.Message.Key) >= version)
+                    return record.Offset.Value;
+            }
+            if (batch.NextOffset >= end)
+                break;
+        }
+        return end;
+    }
+
+    private async Task RefreshOldestAsync(CancellationToken cancellationToken)
+    {
+        var start = await _log.StartOffsetAsync(_changes, cancellationToken).ConfigureAwait(false);
+        var end = await _log.EndOffsetAsync(_changes, cancellationToken).ConfigureAwait(false);
+        var oldest = Interlocked.Read(ref _last) + 1;
+        if (start < end)
+        {
+            await foreach (var batch in _log.ReadBatchesAsync(_changes, start, cancellationToken).ConfigureAwait(false))
+            {
+                var first = batch.Records.FirstOrDefault(record => record.Message.Key.Length == 8);
+                if (first is not null)
+                {
+                    oldest = BinaryPrimitives.ReadInt64BigEndian(first.Message.Key);
+                    break;
+                }
+                if (batch.NextOffset >= end)
+                    break;
+            }
+        }
+        Interlocked.Exchange(ref _oldest, oldest);
+    }
+
+    /// <summary>Version → offset of the version's first record in the changes topic, for
+    /// seeking. Filled by appends and by reads; sparse and bounded (when full, every other
+    /// entry is dropped). A miss costs a longer scan, never a wrong answer.</summary>
+    private sealed class OffsetIndex
+    {
+        private const int MaxEntries = 8192;
+        private readonly List<(long Version, long Offset)> _entries = [];
+
+        public void Add(long version, long offset)
+        {
+            lock (_entries)
+            {
+                if (_entries.Count > 0 && _entries[^1].Version >= version)
+                    return;
+                if (_entries.Count >= MaxEntries)
+                {
+                    var kept = 0;
+                    for (var i = 0; i < _entries.Count; i += 2)
+                        _entries[kept++] = _entries[i];
+                    _entries.RemoveRange(kept, _entries.Count - kept);
+                }
+                _entries.Add((version, offset));
+            }
+        }
+
+        public long? Floor(long version)
+        {
+            lock (_entries)
+            {
+                var i = Search(version);
+                return i >= 0 ? _entries[i].Offset : null;
+            }
+        }
+
+        public long? Exact(long version)
+        {
+            lock (_entries)
+            {
+                var i = Search(version);
+                return i >= 0 && _entries[i].Version == version ? _entries[i].Offset : null;
+            }
+        }
+
+        public void TrimBefore(long version)
+        {
+            lock (_entries)
+                _entries.RemoveAll(entry => entry.Version < version);
+        }
+
+        /// <summary>Index of the last entry at or below <paramref name="version"/>, or -1.</summary>
+        private int Search(long version)
+        {
+            int low = 0, high = _entries.Count;
+            while (low < high)
+            {
+                var middle = (low + high) >>> 1;
+                if (_entries[middle].Version <= version)
+                    low = middle + 1;
+                else
+                    high = middle;
+            }
+            return low - 1;
+        }
+    }
+}
+
+/// <summary>How keys and rows become JSON inside the table log's records. The default
+/// serializer's JSON is written and read directly as UTF-8; any other serializer goes
+/// through its strings, which are embedded as JSON strings.</summary>
+internal abstract class RecordCodec
+{
+    public static RecordCodec For(IStateSerializer serializer) =>
+        serializer is JsonStateSerializer json ? new Direct(json.Options) : new ViaText(serializer);
+
+    public abstract void Write<T>(Utf8JsonWriter writer, T value);
+    public abstract T Read<T>(ref Utf8JsonReader reader);
+
+    /// <summary>The bytes a key's row record is keyed by.</summary>
+    public abstract byte[] KeyBytes<T>(T key);
+    public abstract T KeyFromBytes<T>(ReadOnlySpan<byte> bytes);
+    public abstract void WriteKey(Utf8JsonWriter writer, ReadOnlySpan<byte> keyBytes);
+    public abstract T ReadKey<T>(ref Utf8JsonReader reader);
+
+    private sealed class Direct(JsonSerializerOptions options) : RecordCodec
+    {
+        public override void Write<T>(Utf8JsonWriter writer, T value) => JsonSerializer.Serialize(writer, value, options);
+
+        public override T Read<T>(ref Utf8JsonReader reader) =>
+            JsonSerializer.Deserialize<T>(ref reader, options)
+            ?? throw new InvalidDataException($"A table log record holds null where a {typeof(T).Name} was expected.");
+
+        public override byte[] KeyBytes<T>(T key) => JsonSerializer.SerializeToUtf8Bytes(key, options);
+
+        public override T KeyFromBytes<T>(ReadOnlySpan<byte> bytes) =>
+            JsonSerializer.Deserialize<T>(bytes, options)
+            ?? throw new InvalidDataException($"A table log record's key is null where a {typeof(T).Name} was expected.");
+
+        public override void WriteKey(Utf8JsonWriter writer, ReadOnlySpan<byte> keyBytes) =>
+            writer.WriteRawValue(keyBytes, skipInputValidation: true);
+
+        public override T ReadKey<T>(ref Utf8JsonReader reader) => Read<T>(ref reader);
+    }
+
+    private sealed class ViaText(IStateSerializer serializer) : RecordCodec
+    {
+        public override void Write<T>(Utf8JsonWriter writer, T value) => writer.WriteStringValue(serializer.Serialize(value));
+
+        public override T Read<T>(ref Utf8JsonReader reader) => serializer.Deserialize<T>(reader.GetString()!);
+
+        public override byte[] KeyBytes<T>(T key) => System.Text.Encoding.UTF8.GetBytes(serializer.Serialize(key));
+
+        public override T KeyFromBytes<T>(ReadOnlySpan<byte> bytes) =>
+            serializer.Deserialize<T>(System.Text.Encoding.UTF8.GetString(bytes));
+
+        public override void WriteKey(Utf8JsonWriter writer, ReadOnlySpan<byte> keyBytes) => writer.WriteStringValue(keyBytes);
+
+        public override T ReadKey<T>(ref Utf8JsonReader reader) => Read<T>(ref reader);
+    }
+}
