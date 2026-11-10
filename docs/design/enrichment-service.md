@@ -2,7 +2,7 @@
 
 > **Status:** proposed design, 2026-11-10, revised once after two reviews. S1 (the service
 > core, in memory, with the part of S0 it needed), S2 (the Kafka backend) and S3 (the admin
-> API and UI) are built; S4 is not. *As built*, at
+> API and UI) and S4 (the two examples and the guide) are built. *As built*, at
 > the end, says what exists and where it departs from this text — read it before relying
 > on any section. Build steps S0 to S4 (see *Build order*) record what they change there.
 > Sits on [shared-tables.md](shared-tables.md) and
@@ -2255,3 +2255,115 @@ topology reachable and selectable by keyboard. Screenshots are in `docs/images/a
 - The UI shows `Unbuilt` pipelines and declared-edge graphs on a standby; that is the
   alternative of *Open for James* 1 made visible, not a fault.
 
+### S4 — the examples and the guide
+
+Built: `examples/Incremental.TradeEnrichment` on shared tables,
+`examples/Incremental.EnrichmentService` (a host, a contract assembly, a plugin in two
+versions), [`docs/enrichment-service.md`](../enrichment-service.md), and
+`DocSnippetTests`. No change to the core, to `Incremental.Kafka`, to `Incremental.Service`
+or to `Incremental.Service.Admin`: the examples found nothing in them that had to move.
+
+**Departures from *Reference examples*.**
+
+- *(a) is a fixed narrative, not the interactive picker.* The design kept the column
+  prompt, `--ticks` and `--blotter`. The example now prints seven acts and twelve claims,
+  each checked against a model kept beside the circuits, and exits 1 on a wrong one;
+  `--trades N` sizes it. The Spectre.Console dependency went with the prompt. Which
+  columns are looked up and which joined is fixed in the source: the symbol is a
+  `Lookup`, desk (through the derived `trader-desks`) and rating are `Join`s.
+- *(b) has four projects, not five.* `Pipelines.Tests` is not built, because
+  `PipelineTestHarness` is not. The definitions are tested by the smoke test instead,
+  end to end.
+- *The host project is in the example's root directory*, with the contract and plugin
+  projects beneath it (`DefaultItemExcludes` keeps their files out of it), so that
+  `dotnet run --project examples/Incremental.EnrichmentService` works. The plugin is
+  copied to `plugins/enrichment.pipelines/` beside the host — one package directory,
+  not `plugins/v1/` — and version 2 is a zip in `plugin-packages/`, because a plugin
+  directory holding both versions would import both at first lead.
+- *The trade record is in the contract assembly.* The host's source connector and the
+  plugin have to agree on it; the design put only table rows there.
+- *Sinks in memory are a `view` connector written in the host*, not `memory`. A `memory`
+  sink is typed by the plugin's row type, which the host cannot name and which differs
+  between two versions of a plugin; the `view` sink keeps each key's row as JSON, which
+  is also what a Kafka sink topic holds, so one model checks both modes.
+- *No `file` dead-letter slot and no `file` sink* (not built in the service).
+- *Counterparties are loaded by the `file` loader in both modes*; the generator rewrites
+  the file. In the Kafka mode instruments, traders and desks all come from Postgres
+  through one Debezium connector, not instruments alone.
+- *The two custom table sources load different tables* (instruments with positions,
+  traders and desks by snapshot) rather than one source in two forms.
+- *`--kafka` takes `--node a|b`*, which fixes the admin and probe ports; there is no
+  `--peer`. `--prefix` names the topics and the Postgres tables, and `--clean` removes
+  them.
+- *The smoke test drives the admin HTTP API*, not the node's objects, in every mode, so
+  it also covers the API's refusals (invalid settings 400, `state-choice-required` 409,
+  `confirmation-required` 400, a mutation on a standby). With `--kafka` node a is the
+  child process and node b is in the test's process: the leader is the one killed.
+- *CI does not run the smokes.* The workflow runs no example, and this step was told to
+  follow it. The examples are built by the solution build, which is what the guide's
+  quoted code relies on.
+
+**The guide's code is the example's.** Each C# block in `docs/enrichment-service.md`
+and in the example's README follows a `<!-- snippet: path#name -->` comment and is the
+region of that file between `// <snippet:name>` and `// </snippet:name>`.
+`DocSnippetTests` compares them and refuses a C# block with no source. The MSK
+configuration is such a region too (`MskConfiguration.UseMsk`): compiled, never called.
+
+**Found while building.**
+
+- *A `Lookup` downstream of a retroactive `Join` looks again when the join re-emits.*
+  The first draft of `trade-enrichment` joined instruments and then looked the
+  counterparty up; a corrected multiplier then refreshed the counterparty too. The
+  lookup now comes first. The guide says so.
+- *`keep` across versions recomputes nothing*, so a sink holds rows of both versions'
+  shapes until something touches them. The model tracks which version last emitted each
+  row; the smoke test's claim is that the untouched ones are exactly as version 1 left
+  them.
+- *A reset does not un-write a Kafka sink.* After `desk-exposure` is reset to group by
+  region, its topic still holds every per-desk row. The Kafka smoke asserts exactly
+  that union. An operator has to delete the topic or tombstone the keys.
+- *A windowed aggregate does not retract a window's row when the window is evicted*: the
+  sink keeps closed windows' totals, which is what the model expects.
+- *A process started in the background of a non-interactive shell ignores SIGINT*; the
+  host stops on SIGTERM as well (the generic host's lifetime), which is what a supervisor
+  sends.
+
+**Measured** (local stack, Debug, five tables, four pipelines, `TakeoverAfter` 3 s):
+`kill -9` of the leader to the standby answering `/health/ready` as Leader, 3.5 s
+(silence 3.0 s, fence 152 ms, tables 32 ms, pipelines 189 ms, start 237 ms; takeover
+total 444 ms); in the Kafka smoke, 3.1 s from the kill to ready. A graceful stop of the
+leader (SIGTERM) to the other node Leader: 0.9 s. The whole Kafka smoke, including
+preparing Postgres, the connector and the topics and removing them: 18 s.
+
+**Tests.** `DocSnippetTests` (five cases) in `tests/Incremental.Service.Tests`, which is
+now 75 tests. The smokes are the examples' own: TradeEnrichment checks 12 claims; the
+service example 30 on one node, 38 with an in-memory takeover, 37 on Kafka with a kill.
+Each was run to exit 0 — the in-memory forms twenty times over without a failure, the
+Kafka form three times.
+
+**Mutation checks.** 23: five in TradeEnrichment (a computed column, the derived
+table's join, the lookup read as a join, a cancellation not sent, the aggregate's key),
+fifteen in the service example (each definition's joins, filter, window and version-2
+change; the source connector's resume; the two table sources; the view sink's deletes
+and reset), three on the snippet test. 21 were killed at once. Two survived and showed
+thin claims: an append source that replayed from offset 0 changed nothing, because the
+core drops records at or below an input's committed offset, and a table source that
+stamped no positions changed nothing, because its replay collapses into a commit that
+changes no row. The takeover act now checks the records read by both pipelines, and the
+reference-data act checks the table's committed offset against the feed; both mutants
+are killed. The script is in the session's scratch directory, not the repository.
+
+**Run by hand** against the local stack, besides the smokes: the default mode (the UI,
+`/views`, a deploy by `curl` as the guide gives it, a clean stop on SIGTERM);
+`--nodes 2`; and the two-process walk — `--kafka --node a`, `--kafka --node b`,
+`kill -9` of a (b Leader 3.5 s later), a restarted as the standby, SIGTERM to b (a
+Leader 0.9 s later), `--kafka --clean`. The UI was looked at in Chromium on both
+backends with no console error; that includes the Kafka-only fields (heartbeat age, the
+lease, the last takeover's stages), which S3 had not been able to see. The UI's upload
+and replace dialogs were not driven again here; the smoke does the same through the API.
+
+**Not done, still open from S0–S3.** The rest of C1 and C3 (warm circuits on a standby,
+the pre-stop state check), C7, `PipelineTestHarness`, `file` connectors, the
+`deadLetters` slot, contract schema-change detection, the 80% retention warning, a
+deploy form generated from the settings schema. Nothing has been run against MSK; the
+guide lists what that leaves unverified.

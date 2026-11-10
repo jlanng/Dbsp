@@ -1336,6 +1336,16 @@ faults, dead letters), tables (loader, readers, rows), plugins, cluster, audit â
 embedded in the package: nothing to build, nothing fetched from elsewhere.
 `dotnet run --project tests/Incremental.Service.AdminHost` runs it with data.
 
+**A guide and a complete host.** [enrichment-service.md](enrichment-service.md) walks
+through writing a contract, a definition and a plugin project, the host and its adapters
+(table sources with and without positions, a source connector, a sink connector), the
+UI, and operating notes. It is written around `examples/Incremental.EnrichmentService`,
+which runs in memory (`dotnet run --project examples/Incremental.EnrichmentService`), as
+two processes on Kafka with reference data arriving from Postgres through Debezium
+(`-- --kafka --node a`, `-- --kafka --node b`), and as a smoke test that checks every sink
+against a model (`-- --headless`). `examples/Incremental.TradeEnrichment` shows the table
+operators on their own, without the service.
+
 What is built and what is not is in
 [design/enrichment-service.md](design/enrichment-service.md), *As built*.
 

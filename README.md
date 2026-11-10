@@ -469,6 +469,23 @@ so implementations never see cross-thread access to one store.
   and eight pipelines on the in-memory backend (`-- --nodes 2` for a leader and a standby
   on ports 5180 and 5181; `--read-only`, `--no-rows`).
 
+- **Start here for the service:** [docs/enrichment-service.md](docs/enrichment-service.md)
+  is a guide from an empty directory to a running pipeline plugin — the contract, a
+  definition, the project file, a spec — then the host and its adapters, the admin UI,
+  and operating notes (failover, reset, retention, dead letters, MSK). Its code is quoted
+  from `examples/Incremental.EnrichmentService`, a complete host:
+
+  ```bash
+  dotnet run --project examples/Incremental.EnrichmentService                 # one node, in memory: http://127.0.0.1:5180/admin/
+  dotnet run --project examples/Incremental.EnrichmentService -- --nodes 2    # with a standby on 5181
+  dotnet run --project examples/Incremental.EnrichmentService -- --headless   # its smoke test; add --nodes 2, or --kafka
+  ```
+
+  With the connector stack up, `-- --kafka --node a` and `-- --kafka --node b` in two
+  terminals are an active and a standby on Kafka, with reference data in Postgres
+  arriving through Debezium; kill the first and the second leads in about three and a
+  half seconds.
+
 - `Incremental.Kafka` puts both logs on Kafka. One `KafkaLog` per process owns one
   transactional producer; `log.State` is the `IStateChangelog` over the compacted topic
   `{prefix}.state`, and `log.OpenTableLogAsync<TKey, TRow>(name)` is a table's `ITableLog`
@@ -717,6 +734,17 @@ examples/Incremental.TradeEnrichment trades enriched from shared tables, as a na
                                        on the acknowledged-output path. A trader moves desk, an
                                        instrument is renamed, a trade is amended; every claim it
                                        prints is checked against a model, and a wrong one exits 1
+examples/Incremental.EnrichmentService  a host for Incremental.Service with the admin UI: a contract
+                                       assembly, a pipeline plugin in two versions (three
+                                       definitions: joins and a lookup, event-time windows, a derived
+                                       table), two custom table sources, a source and a sink connector,
+                                       a generator. In memory by default (`--nodes 2` adds a standby);
+                                       `--kafka --node a|b` runs two processes on the connector stack
+                                       with Postgres → Debezium → tables and Kafka sinks; `--headless`
+                                       is the smoke test: it drives the admin API and checks every sink
+                                       against a model, through a replace keeping state, one resetting
+                                       it, a removal and a takeover (on Kafka: a kill -9).
+                                       docs/enrichment-service.md is written around it
 examples/Incremental.Showcase      the all-features demo: a marketplace payments desk, served as a
                                        local web app (`dotnet run`, then http://localhost:5170) in
                                        five tabs — enrichment joins (inner/left/full/anti) and

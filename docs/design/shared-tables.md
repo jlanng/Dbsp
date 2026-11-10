@@ -881,8 +881,11 @@ rules as an adapter.
    checkpoint so that a stopped pipeline counts; indexes are declared when a table is
    opened, before any loader runs; and a table commit stalled behind a reader is bounded
    by the supervisor's `StopTimeout`, then `Abandon()`, then `Wedged`, not by the host's
-   shutdown timeout. **Not done:** the TradeEnrichment example moved onto tables; the
-   worked example is still to come (enrichment-service.md, *Reference examples*).
+   shutdown timeout. The worked example is `examples/Incremental.TradeEnrichment`,
+   moved onto tables with the service's step S4: four `SharedTable`s, `trader-desks`
+   derived by a small circuit, a `Lookup` for the symbol and `Join`s for desk and rating,
+   two sinks through `DeliverToAsync`, every printed claim checked against a model. It is
+   a fixed narrative; the column picker it had before tables is gone.
 
 ## As built: seams for the enrichment service (2026-11-10)
 

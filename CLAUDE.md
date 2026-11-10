@@ -31,6 +31,23 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   `--ui-dir src/Incremental.Service.Admin/wwwroot` serves the UI's files from the checkout,
   so an edit is a browser reload away). The admin API's tests (`AdminApiTests`) run that
   host on a free port.
+- Enrichment service example: `dotnet run --project examples/Incremental.EnrichmentService`
+  serves one in-memory node with the admin UI at http://127.0.0.1:5180/admin/ and its sinks
+  at `/views` (`-- --nodes 2`: a standby on 5181). `-- --kafka --node a` and
+  `-- --kafka --node b` are two processes on the connector stack (reference data in
+  Postgres through Debezium, Kafka sinks; everything named after `--prefix`, default
+  `enrich`; `-- --kafka --clean` removes it). `-- --headless [--nodes 2 | --kafka]` is the
+  smoke test: it drives the admin API, checks every sink against `Host/Model.cs`, and
+  exits 1 on a claim that does not hold — run it after changing the service; CI does not.
+  Its build copies the plugin (`Pipelines/`) to `plugins/` beside the host and zips
+  version 2 (`Pipelines.V2/`, the same sources with `V2` defined) to `plugin-packages/`.
+- Trade enrichment on shared tables: `dotnet run --project examples/Incremental.TradeEnrichment`
+  prints a narrative of twelve checked claims and exits 1 if one is wrong (`-- --trades N`).
+- Service guide: `docs/enrichment-service.md`. Its C# blocks are regions of the example's
+  sources (`// <snippet:name>` … `// </snippet:name>`, quoted under
+  `<!-- snippet: path#name -->`); `DocSnippetTests` in `tests/Incremental.Service.Tests`
+  fails when a block and its region differ or a C# block has no source. Edit the source,
+  then copy the region into the document.
 - Connector stack: `docker compose --profile connectors up -d` adds Kafka (`localhost:9092`), Postgres with
   logical decoding (`localhost:5432`, user/password/db `incremental`) and Debezium's Kafka
   Connect (`localhost:8083`). Plain `docker compose up -d` stays Redis-only.
