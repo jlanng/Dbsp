@@ -1138,7 +1138,9 @@ cases:
 - *A leader that is alive and leads nothing blocks failover.* Heartbeats come from the
   log writer, not from the circuits. If every circuit has faulted for a reason of its
   own and the process stays up, the standby hears a healthy leader. The host must step
-  down or exit when its circuits are gone (step 7).
+  down or exit when its circuits are gone (step 7). *Step 7 decided this differently:* a
+  pipeline is tenant code and its failure never moves leadership; the service gives
+  leadership up by itself only when it cannot write its catalog. See *As built: step 7*.
 - *A Kafka outage longer than `transaction.timeout.ms` still ends the active* (steps 3
   and 4): its heartbeat's transaction times out and reports as a fence.
 - *Lag sampling builds no clients* (changed after review; it built two per table per
@@ -1865,7 +1867,12 @@ soak run on a real cluster before the failover number is believed.
    records stall the circuit once the channel is full; external sinks go through
    `leadership.Leased`, with `Term = () => leadership.Term`; and the failover app's
    generator can now be replaced by a source topic.
-7. Active and standby roles in `Incremental.Hosting`.
+7. **Done**, in `Incremental.Service` rather than `Incremental.Hosting`: a service node
+   on `KafkaServiceBackend` is an active or a standby, and the notes addressed to this
+   step are answered one by one in *As built: step 7* at the end of this document.
+   `Incremental.Hosting`'s `CircuitHost<TDefinition>` still knows nothing of roles: one
+   compiled-in circuit that needs a standby is wired by hand, as
+   `tests/Incremental.Kafka.FailoverApp` does, or run as a one-pipeline service.
 8. A soak on MSK to replace the estimates above with measurements.
 
 ## Out of scope
@@ -1994,3 +2001,68 @@ one that reads it serializes to other bytes: the new generation's writes go to n
 records and the old ones are never overwritten or tombstoned, so a restore after that
 reads both. A value store's value is not part of a key and may change shape. Nothing
 detects the unsafe case.
+
+## As built: step 7 — roles in the service (2026-11-10)
+
+Step 7 is `Incremental.Service` on `KafkaServiceBackend`
+(`src/Incremental.Service/KafkaBackend.cs`; enrichment-service.md, *As built*, S2). What
+this document asked of it, and where each request went:
+
+| Asked here | Built as |
+|---|---|
+| Wire `Changed`, `WhenFinished` and `Status` into the host | `INodeLeadership` over `KafkaLeadership`; `ServiceNode` publishes role changes as events and reports `NodeStatus` (role, terms, heartbeat age, lease, takeover timings, the fence's cause, follower lag, the peer's answer) |
+| `Fenced` and `Resigned` end the process, non-zero | On `WhenFinished` the node abandons its circuits without draining, sets exit code 3 (fenced) or 4 (resigned) and calls `IHostApplicationLifetime.StopApplication()`. Tested with real processes |
+| The commands need carrying between nodes | `ServiceNode.TakeOverAsync` and `StepDownAsync`: refused unless this node, or the peer, is ready (`Force` overrides), each returning a plan. The HTTP endpoint is the admin package's (S3) |
+| Step down or exit when the circuits have faulted | **Not done, on purpose.** Pipelines are tenant code: one deterministic bug would hand leadership over and fail the same way on the other node. The node gives leadership up by itself only when its catalog's writer has faulted and cannot be reopened — it steps down to a ready standby, or exits with 5. Every desired-running pipeline being `Failed` is `Unhealthy` in health, and an operator steps the node down by hand |
+| Sources start after `circuit.Start()` and stop before the circuit | The supervisor's generation: `Start()`, deliveries, the dead-letter reader, then sources; stop in the reverse order |
+| A table loader starts after its table is promoted | Tables are promoted by the registry inside `PrepareAsync`; loaders start at the end of `StartLeadingAsync`, and resume from `table.CommittedOffsets` |
+| A faulted source is a faulted circuit | The supervisor watches `source.Completion` with the circuit and the deliveries; any of them failing tears the generation down and restarts it under the backoff policy |
+| `circuit.DeadLetters` must be read | Always read, into a ring per pipeline |
+| External sinks go through `leadership.Leased`, with the term | Every sink a connector creates is wrapped; the `kafka` connector passes `Term = () => leadership.Term` |
+| The failover app's generator replaced by a source topic | `tests/Incremental.Service.FailoverApp`: a Kafka source topic, a table loaded from a topic, Kafka sinks, pipelines from a plugin assembly; `KafkaServiceProcessTests` |
+
+Tables are **not** tracked with `KafkaLeadership.Track(table, log)`: it promotes them one
+after another and any one throwing ends the takeover. The service promotes them itself in
+`PrepareAsync`, concurrently and each contained, which needed no change to
+`KafkaLeadership`. `TakeoverTimings.Tables` is therefore zero for a service node and the
+table stage is inside `Prepare`; `ServiceTakeoverTimings` splits it out.
+
+**Four changes to `Incremental.Kafka`, made for this step.**
+
+- *The probe's line has a fourth token* (K1). `LeadershipProbe.Listen(leadership,
+  endpoint, detail)` asks the host for a token each time it answers and appends it when it
+  holds no space or line break; `LeadershipProbe.QueryAsync(host, port)` returns the whole
+  answer as a `LeadershipProbeAnswer` (role, term, node, detail), or null. `Tcp(...)`
+  still reads the first token only, so old and new nodes probe each other. The service
+  puts `ready` or `notready:{reason}` there, which is how a leader learns whether a ready
+  standby exists.
+- *A row too large for one record is refused by name* (K2). `KafkaTableLog.AppendAsync`
+  builds a version before producing any of it; a change (old row plus new) or a row
+  record over `MaxRecordBytes` now throws `KafkaLogException` naming the key, the size and
+  the version, and nothing of the version is written. The table's writer still faults —
+  any failed append does — but the fault says which row.
+- *Short reads no longer wait out each other's long poll.* The log's shared short-read
+  consumer (a table's head, the last term) is assigned for one read and unassigned. Each
+  read stops at the end of a partition, by which time the client has sent the broker its
+  next fetch; with the default `fetch.wait.max.ms` that fetch waits half a second for
+  data that will not come, and the client sends one fetch per broker at a time, so the
+  next short read — of another partition — began half a second late. A takeover reads
+  one head per followed table: with one table (step 5's measurement) it never showed;
+  with 21 the table stage took 10.5 s. The short reader now sets `fetch.wait.max.ms` to
+  5. It polls only while a read runs. Followers and restores keep the default.
+- *The short reader is told a topic's leader before it is first assigned to it*
+  (`KafkaLog.AssignForShortRead`). A running consumer assigned a partition of a topic it
+  has not seen waits for the client's one-second housekeeping timer to look the leader
+  up, so each first short read of a topic took a second — two per table when a node
+  opens its tables (the head of the rows topic, the oldest version in the changes
+  topic), and one for the successor's read of the leader topic at a step-down. A
+  metadata request for the topic, through the consumer's own handle, before the first
+  assignment removes the wait: a standby following 21 tables went from 45 s to under 7,
+  and a step-down's hand-over from 1.2 s to about 0.3. A new consumer's first assignment
+  never paid this, which is why followers, restores and step 5's one-table measurements
+  did not show it. The suite in `tests/Incremental.Kafka.Tests` runs half a minute
+  faster for it.
+
+**Measured with the service** (two processes, 21 tables, two plugin pipelines, kill -9
+mid-stream, local broker): see enrichment-service.md, *As built*, S2 — detection is
+`TakeoverAfter`, and everything after the decision totals under a second.

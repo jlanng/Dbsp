@@ -214,7 +214,7 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
             {
                 var from = Math.Max(start, end - window);
                 Head? head = null;
-                consumer.Assign(new TopicPartitionOffset(partition, from));
+                _log.AssignForShortRead(consumer, new TopicPartitionOffset(partition, from));
                 _log.ReadTo(consumer, end, record =>
                 {
                     if (record.Message.Value is { } value && record.Message.Key.AsSpan().SequenceEqual(HeadKey))
@@ -734,7 +734,7 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
         return await _log.ShortReadAsync(consumer =>
         {
             var found = end;
-            consumer.Assign(new TopicPartitionOffset(_changes, start));
+            _log.AssignForShortRead(consumer, new TopicPartitionOffset(_changes, start));
             _log.ReadTo(consumer, end, record =>
             {
                 if (record.Message.Key.Length != 8 || BinaryPrimitives.ReadInt64BigEndian(record.Message.Key) < version)
@@ -763,7 +763,7 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
                 var first = await _log.ShortReadAsync(consumer =>
                 {
                     long? version = null;
-                    consumer.Assign(new TopicPartitionOffset(_changes, start));
+                    _log.AssignForShortRead(consumer, new TopicPartitionOffset(_changes, start));
                     _log.ReadTo(consumer, end, record =>
                     {
                         if (record.Message.Key.Length != 8)

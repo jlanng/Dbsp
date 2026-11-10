@@ -417,9 +417,12 @@ so implementations never see cross-thread access to one store.
   that runs one circuit per pipeline and deploys, replaces, resets and removes them one at
   a time, pipeline definitions loaded from plugin assemblies at runtime, and a catalog — a
   shared table — recording what is deployed, which a standby follows and a restarted node
-  rebuilds from. It is written against one backend interface; the in-memory backend is
-  built (one or several nodes in a process, real fencing, no broker), the Kafka backend
-  and the admin UI are not yet. See *Running many pipelines* in
+  rebuilds from. It is written against one backend interface with two implementations:
+  in memory (one or several nodes in a process, real fencing, no broker) and Kafka
+  (`UseKafkaBackend`: two processes on one `KafkaLog` are an active and a warm standby,
+  with the catalog, tables, state and plugin files all on the broker; the `kafka`
+  connector and the `kafka` and `debezium` table loaders bind slots and tables to topics
+  through named connections). The admin UI is not built yet. See *Running many pipelines* in
   [docs/intro.md](docs/intro.md) and
   [docs/design/enrichment-service.md](docs/design/enrichment-service.md), *As built*.
 
@@ -644,8 +647,11 @@ tests/Incremental.Kafka.Tests      xunit, against the local broker (`docker comp
                                        sources and sinks, and Postgres → Debezium → table CDC
 tests/Incremental.Kafka.FailoverApp  the process those failover tests launch twice: one pipeline,
                                        leader or standby as its KafkaLeadership decides
-tests/Incremental.Service.Tests    xunit, in memory (no broker): registry, supervisor, plugins,
-                                       catalog, two-node takeover
+tests/Incremental.Service.Tests    xunit: registry, supervisor, plugins, catalog and two-node
+                                       takeover in memory (no broker); the same node on the Kafka
+                                       backend, CDC through Debezium, and kill -9 failover between
+                                       real processes (skipped when the broker is unreachable)
+tests/Incremental.Service.FailoverApp  one service node as a process, for those failover tests
 tests/Incremental.Service.TestPlugins  contract and pipeline assemblies those tests load at
                                        runtime from their output directories; built, never referenced
 examples/Incremental.Example       joined + aggregated order analytics with live retraction

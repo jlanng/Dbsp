@@ -1,7 +1,8 @@
 # Design: the enrichment service
 
-> **Status:** proposed design, 2026-11-10, revised once after two reviews. S1 is built on
-> the in-memory backend, with the part of S0 it needed; S2 to S4 are not. *As built*, at
+> **Status:** proposed design, 2026-11-10, revised once after two reviews. S1 (the service
+> core, in memory, with the part of S0 it needed) and S2 (the Kafka backend) are built; S3
+> and S4 are not. *As built*, at
 > the end, says what exists and where it departs from this text — read it before relying
 > on any section. Build steps S0 to S4 (see *Build order*) record what they change there.
 > Sits on [shared-tables.md](shared-tables.md) and
@@ -1889,3 +1890,220 @@ and the rest of C1; example (a).
 - A standby runs no plugin code. If *Open for James* 1 goes the other way, the supervisor
   needs a build-without-start path and the core needs the rest of C1 first.
 - Start two nodes in one process one after the other (see the runtime crash above).
+
+### S2 — the Kafka backend
+
+`KafkaServiceBackend` and everything that makes a pipeline's edges Kafka. Two processes
+with the same `KafkaLogOptions` and different node ids are an active and its standby: the
+standby follows the catalog, the tables and the state through the broker, fetches plugin
+files from it, and leads when the leader is killed, resigns or is taken over.
+
+| File | Holds |
+|---|---|
+| `KafkaBackend.cs` | `KafkaServiceBackendOptions`, `KafkaServiceBackend`, the leadership over `KafkaLeadership`, the blob topic (`KafkaBlobStore`) |
+| `KafkaConnectors.cs` | `KafkaConnection`, `KafkaConnections`, the `kafka` connector, the `kafka` and `debezium` table loaders |
+| `tests/Incremental.Service.FailoverApp` | one node as a real process: `AddIncrementalService`, `UseKafkaBackend`, a contract compiled in, a plugin directory; commands on stdin, events on stdout |
+| `tests/Incremental.Service.Tests` | `KafkaServiceTests` (8), `KafkaServiceCdcTests` (1), `KafkaServiceProcessTests` (2) — all skipped without a broker — and `LeaderWatchTests` (2, in memory) |
+
+**As designed.** The catalog is `svc.catalog` on the log's transactional producer, so a
+deposed leader's catalog write is refused by the broker; tables are `KafkaTableLog`s,
+promoted by the registry inside `PrepareAsync`; pipeline state is `KafkaStateChangelog`
+followed by `ChangelogStorage.Follow` and promoted by the leadership; every sink is
+wrapped in `leadership.Leased`; blobs are `{p}.svc.blobs`, compacted, one partition,
+`{sha256}/{n}` in 256 KB records and `{sha256}/end` with the count, written by a plain
+idempotent producer. Exit codes are 3 (fenced), 4 (resigned) and 5 (cannot lead, no ready
+standby). K1 and K2 are built as specified.
+
+**Departures from the text above.**
+
+1. **The seam grew by two members.** `IServiceBackend.ConnectAsync` — `KafkaLog.ConnectAsync`
+   is asynchronous and a backend is made by a synchronous DI factory, so the node connects
+   it first in `StartAsync`. `INodeLeadership.PeerExpected` — whether a second node was
+   configured at all (Kafka: `PeerProbe` is set; in memory: the cluster has another node).
+   `KafkaLeadershipDetail` gained `Fault` (why the node is fenced, as text).
+2. **Two more changes to `Incremental.Kafka`, both found by measuring.** They are in the
+   log's shared short-read consumer (a table's head, the last term), which a node uses
+   once or twice per table, one read at a time:
+   - *It no longer waits out its own long poll.* A short read stops at the end of a
+     partition, where the client has already sent the broker its next fetch; that fetch
+     waits `fetch.wait.max.ms` (half a second) for data that will not come, and the client
+     sends a broker one fetch at a time, so the next short read — another table's head —
+     started half a second late. A takeover reads one head per table: 21 tables took
+     10.5 s in the table stage. The short reader now uses `fetch.wait.max.ms` 5, and they
+     take 0.14 s.
+   - *It asks for a topic's metadata before it is first assigned to it.* A consumer that
+     is already running learns the leader of a topic it has not seen only when the
+     client's one-second timer next looks, so every short read of a new topic took a
+     second: two per table when a node opens its tables. A standby took 45 s to follow 21
+     tables, and a step-down took 1.2 s to hand over (the successor's first read of the
+     leader topic). With the metadata fetched first those are 6.7 s and 0.3 s.
+
+   Followers, restores and sources have consumers of their own and were never affected.
+   Both are recorded in durability-and-standby.md.
+3. **Blobs are read through an index, not by scanning for one hash.** The store reads the
+   topic once per process (and what has been added since, before each call) into a map of
+   hash → record offsets, then reads a blob's records at their offsets. If a record is
+   not where the index says — the blob was written again and the cleaner removed the
+   older copy — the index is rebuilt once. A blob is gathered in memory before it is
+   written to the caller's stream (a plugin file, a few records), so a half-read file is
+   never left behind. `DeleteAsync` writes tombstones with the same plain producer, the
+   `end` record first; it is reached only after the catalog entry's deletion has
+   committed, which is fenced.
+4. **`UseKafkaBackend` registers the log's cluster as the Kafka connection `log`.**
+   `"producer": "log"` (the transactional producer) is accepted only on that connection.
+   The log's own topics — `{p}.state`, `{p}.leader`, `{p}.table.*`, `{p}.svc.*` — are
+   refused as a slot's or a loader's topic on every connection: a spec is tenant-written,
+   and a sink bound to the state topic would be a plain producer writing into it.
+   `KafkaConnections` is public and resolvable from DI, for a custom connector or table
+   source that needs the same cluster settings.
+5. **The `kafka` connector's config is a closed record**: `connector`, `connection`,
+   `topic`, `startFrom`, `format`, `producer`, `reloadWhenPositionLost`. Anything else —
+   bootstrap servers, a client property — is an unknown member and refused at the dry run,
+   as is a topic outside the connection's `AllowedTopicPrefixes`. `Describe(config)` does
+   not know the slot's kind, so the kind rules (`"format": "debezium"` only on a keyed
+   input; `producer` only on a sink; `startFrom` only on a source) are checked by the
+   supervisor's dry run asking the built-in connector directly (`KafkaConnector.RequireKind`,
+   internal). A custom connector has no such hook: it can refuse only at start. That is a
+   gap in `IConnector`, left for whoever needs it first.
+6. **Sources.** `SourceContext` and `KeyedSourceContext` gained `Stream` (the input as the
+   definition declared it), which `KafkaSource.StartAsync` needs. A record a Kafka source
+   cannot decode goes down the core's reject path and so into the pipeline's dead-letter
+   ring, rendered as `topic[partition]@offset: value`; `SourceStats` carries records,
+   unreadable, positions, lag (one offsets request every 5 s) and `PausedSince`.
+7. **Sinks are disposed with their generation.** A sink a connector creates that is
+   `IAsyncDisposable` (a Kafka sink owns a producer) is closed after the deliveries end.
+   Sink topics are not created by the service.
+8. **Loaders.** `kafka` and `debezium` are built in beside `file`; a table source the host
+   registers under one of those names replaces the built-in. Rows are read with the
+   process-wide JSON defaults (web for `kafka`, `Debezium.DefaultJson` for `debezium`):
+   rows are contract types, which never unload. An unreadable record goes to the table's
+   ring with its topic, partition and offset under either policy; under `fault` the call
+   throws inside the source and the loader stops there.
+9. **The retention cap is applied by the registry's trim** (`floor = max(floor, latest −
+   RetainedHistoryVersions)`), because a Kafka table log keeps whatever it is not told to
+   drop. `KafkaServiceBackendOptions.RetainedHistoryVersions` defaults to 100,000.
+10. **A standby fetches plugin files and loads none.** On each catalog version it
+    materialises the files of every plugin version a deployed pipeline names into its
+    cache directory, hash-checked, so a takeover loads them from local disk.
+    `StandbyReadiness.PluginsPending` counts versions not yet fetched and is a not-warm
+    reason. The standby still builds no circuits (S1, departure 1): the hand-on "takeover
+    with pipelines built on the standby" is **not** delivered; a takeover builds each
+    circuit from followed bytes.
+11. **The catalog-writer watchdog.** Once a second the leader asks the catalog's writer
+    whether it has faulted (a commit of nothing). A fence is left to the leadership.
+    Otherwise the catalog is reopened from its log in place, once per minute; a reopen
+    that fails, or a second fault within the minute, is "cannot lead": the node steps
+    down if the peer answers as a ready standby, and otherwise raises
+    `ServiceNode.CannotLead` and stops the host with exit code 5. A standby whose catalog
+    follower has faulted follows again from the rows, and a standby's first open of the
+    catalog is retried until it succeeds.
+12. **Health.** A leader with a peer configured and no ready standby answering is
+    `Degraded` with `no-ready-standby`; a lone node is not. `NodeStatus` gained `Peer`
+    (the last probe answer, sampled once a second) and `LastTakeover`
+    (`ServiceTakeoverTimings`: catalog, tables and their count, pipelines and their count,
+    all of `StartLeadingAsync`). The leadership's own `TakeoverTimings` is in
+    `Leadership.Kafka.LastTakeover`; its `Tables` is always zero here, because the
+    service promotes tables inside `Prepare`.
+13. **A takeover waits for a standby that is still opening tables.** The standby's
+    reconcile holds the role gate while it opens what the catalog names, and
+    `PrepareAsync` takes that gate. A node asked to lead while it is restoring a large
+    table finishes the restore first; it needs the rows either way.
+14. **Pipelines never move leadership**, as designed — which is not what
+    durability-and-standby.md's step-5 note asked of "the host" ("step down or exit when
+    its circuits are gone"). The reasoning is in *When it cannot lead*; that document now
+    points here.
+
+**Not built in S2:** `LagAge` and a `ReadyLag` threshold in readiness (a standby is warm
+when its state lag is zero at the last sample and no table is opening or faulted); the
+`file` connectors and the `deadLetters` slot (still as S1); tests of the catalog's
+follow-open retry, of a standby reopening a faulted catalog follower, of sink disposal and
+of exit code 5 from a real process (the path is tested in memory up to the event). The S1
+node tests were not re-run wholesale against the broker; the Kafka tests below were
+written instead.
+
+**Measured** (local single broker, Debug build, `TakeoverAfter` 3 s, heartbeat 1 s; two
+real processes, 21 tables of 500 rows, two plugin pipelines, the leader killed with
+`kill -9` mid-stream; `measurements.log` beside the test assembly):
+
+| | |
+|---|---|
+| detection (kill → the standby decides) | 3.0 – 3.1 s |
+| fence (`InitTransactions`, term) | 145 – 147 ms |
+| catalog | 10 – 11 ms |
+| tables, 21 concurrently | 134 – 141 ms |
+| storage | 9 – 10 ms |
+| start (leader record, pipelines built from bytes and started) | 211 – 256 ms, of which the two pipelines 174 – 181 ms |
+| takeover total | 515 – 562 ms |
+| kill → `Leader` | 3.5 – 3.6 s |
+| step-down → the standby is `Leader` | 246 – 362 ms |
+| a standby process, from start to warm (catalog, 21 tables, state, plugin files) | 6.7 s |
+| a first leader on an empty deployment, from process start (3 s of silence, 20 table seeds, a plugin import) | 7.9 s |
+
+Three runs; the ranges are theirs. The table stage is the number the design asked for
+(target under 2 s for 20 tables); it was 10.5 s before departure 2, and the test now
+holds it under 2 s. The pipelines here hold little state: the cost of decoding
+a large pipeline's state at takeover — the price of *Open for James* 1's alternative — is
+still unmeasured.
+
+**Tests.** In process, two nodes on one topic prefix, each with its own `KafkaLog`:
+a leader with a Kafka-loaded table and two pipelines on Kafka topics (one sink on the
+transactional producer), a standby that sees them, a takeover while the stream and the
+table move, both sink topics equal to the model and the sources resumed rather than
+replayed; a pipeline deployed, one removed and one replaced by reset immediately before a
+takeover that does not wait for the standby to see them; a deposed leader's catalog write
+refused by the broker and its leased sink write refused before the sink is touched; a
+plugin imported on the leader reaching the standby's cache through the blob topic, the
+standby running it after a takeover, and a cold third node with an empty cache rebuilding
+everything from the broker after both are gone; step-down refused with no standby,
+degraded health meanwhile, then handed over on the probe's "ready" with the takeover
+reason `resigned`; the blob store's chunking, idempotence, partial uploads and deletes;
+the connector's config rules; the history cap. CDC: Postgres → Debezium → a table declared
+with the `debezium` loader → a pipeline's `Lookup`, through snapshot, update, insert and
+delete, and on across a takeover where the new leader's loader resumes from the table's
+committed offsets. Two processes: the kill -9 run above, ending with the dead node
+restarted as the standby; and a fenced process exiting 3, a refused step-down, and a
+resigned process exiting 4 with the other leading each time.
+
+Mutation checks, each a one-line break of the behaviour run against the test that should
+notice: 23, all killed in the end — the lease made a pass-through, a blob without its
+`end` record read as present, a blob written twice, the standby not fetching plugin files,
+the catalog watchdog off, the catalog reopened without limit, "cannot lead" never stepping
+down, K2 off, K1's token dropped, a probe that never says ready, `no-ready-standby` not
+reported, unknown config members allowed, topic prefixes ignored, the service's own topics
+bindable, Debezium accepted on an append slot, `"producer": "log"` accepted on any
+connection, the history cap off, the `debezium` loader reading plain JSON, the exit code
+not set, the standby never syncing pipelines, the short reader assigned without metadata,
+the short reader long-polling. One survived its first run: nothing told a sink on the
+log's transactional producer from one with its own. The test now counts transaction
+markers in the two sink topics, and the mutation is killed.
+
+**What S3 must know.**
+
+- `NodeStatus.Leadership.Kafka` (heartbeat age, lease, the leadership's takeover
+  timings, the fence's cause), `NodeStatus.Peer`, `NodeStatus.LastTakeover`,
+  `NodeStatus.Standby` and `TableStats.LagVersions` are the node, lag and peer views.
+  `TableStats` on a standby costs one short read of the table's head per call; do not
+  call it for every table on every request.
+- The leader's admin address is `LeaderRecord.AdminUrl` under `node/leader` in the
+  catalog, which a standby follows: that is the leader redirect.
+- `ServiceNode.TakeOverAsync` and `StepDownAsync` are the guarded commands; after a
+  step-down or a fence the process exits (`ExitOnLeadershipLoss`), so the response to a
+  step-down request may be the last thing that node's admin API sends.
+- `KafkaServiceBackend.Log` and `.KafkaLeadership` are public for what the seam does not
+  carry.
+
+**What S4 must know.**
+
+- A two-process run is `UseKafkaBackend(new KafkaServiceBackendOptions { Log = …,
+  ProbeListen = …, PeerProbe = … })` with the same log options and different `NodeId`s.
+  Start the first node and let it lead before starting the second: two standbys that
+  start together both take over, one is fenced on its term commit and exits with 3
+  (durability-and-standby.md, *Simultaneous cold start*).
+- Give `PluginDirectory` to whichever node may lead first; the other gets plugins from
+  the blob topic. Each node needs its own `CacheDirectory`.
+- Create sink topics (compacted, for an upsert sink) before deploying; the service does
+  not. Spec bindings name `"connection": "log"` or one registered with
+  `AddKafkaConnection`.
+- A first lead applies table seeds one after another, each creating two topics: twenty
+  seeds and a plugin import took about five seconds on a local broker, after the three
+  seconds of silence a first node waits before it leads.

@@ -396,7 +396,7 @@ public sealed class KafkaLog : IAsyncDisposable
             {
                 var from = Math.Max(start, end - window);
                 var term = 0L;
-                consumer.Assign(new TopicPartitionOffset(_leaderPartition, from));
+                AssignForShortRead(consumer, new TopicPartitionOffset(_leaderPartition, from));
                 ReadTo(consumer, end, record =>
                 {
                     if (ParseLeaderRecord(record) is { } parsed)
@@ -1121,6 +1121,35 @@ public sealed class KafkaLog : IAsyncDisposable
         {
             _shortReadGate.Release();
         }
+    }
+
+    // Topics the current short reader has been told the leaders of. Guarded by the gate.
+    private readonly HashSet<string> _shortReaderTopics = new(StringComparer.Ordinal);
+    private IConsumer<byte[], byte[]>? _shortReaderOfTopics;
+
+    /// <summary>
+    /// Assigns the short reader to <paramref name="position"/>, for a read inside
+    /// <see cref="ShortReadAsync{T}"/>. The first time the consumer is pointed at a topic it
+    /// is first asked for that topic's metadata, and waits for the answer. Without that, a
+    /// consumer that is already running learns a new topic's leader only when the client's
+    /// one-second housekeeping timer next looks — so each short read of a topic the reader
+    /// had not seen took about a second: two per table when a node opens its tables, one
+    /// after another. A new consumer's first assignment does not pay this, which is why
+    /// followers and restores never showed it.
+    /// </summary>
+    internal void AssignForShortRead(IConsumer<byte[], byte[]> consumer, TopicPartitionOffset position)
+    {
+        if (!ReferenceEquals(_shortReaderOfTopics, consumer))
+        {
+            _shortReaderOfTopics = consumer;
+            _shortReaderTopics.Clear();
+        }
+        if (_shortReaderTopics.Add(position.Topic))
+        {
+            using var admin = new DependentAdminClientBuilder(consumer.Handle).Build();
+            admin.GetMetadata(position.Topic, _options.OperationTimeout);
+        }
+        consumer.Assign(position);
     }
 
     /// <summary>Reads an assigned single-partition consumer until it has seen every

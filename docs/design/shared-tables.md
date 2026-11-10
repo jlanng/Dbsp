@@ -747,8 +747,9 @@ As built (`Tables/DerivedTable.cs`: `ToTable`, `DerivedTablePort`, `TableLineage
   rule above, where a source adapter would chunk. The port and the writer give their
   scratch back after a step of more than 65,536 keys; a `--assert` contract holds a small
   change after a million-row bootstrap to the cost of one after a thousand.
-- **Not done.** Hosting knows nothing of this yet (step 7): in particular the host's
+- **Not done.** `Incremental.Hosting` knows nothing of this: a `CircuitHost`'s
   shutdown timeout cannot abandon a table commit that is waiting on a lagging reader.
+  (`Incremental.Service` bounds it: step 7 below.)
   `OnError(DeadLetter)` does not apply to a row `ToTable` rejects. Nothing stamps a
   version with the step that wrote it.
 
@@ -871,8 +872,17 @@ rules as an adapter.
    convenient — readers attach at whatever version the table is at; include
    `CommittedVersion(derivedTable)` of the writing circuit in the log's retention floor;
    and a stalled table commit is not ended by the host's shutdown timeout.
-7. Registration in `Incremental.Hosting`; the TradeEnrichment example moved onto tables as
-   the worked example.
+7. **Done** for registration, in `Incremental.Service` rather than `Incremental.Hosting`:
+   the table registry (enrichment-service.md, *Table registry* and *As built*). What this
+   list asked of the step: a derived table's circuit is built once per generation and the
+   old one disposed first (the supervisor's generation); tables are opened or promoted
+   before any circuit starts, in memory and on Kafka; the retention floor includes each
+   pipeline's committed `{table}#t` and a writing circuit's `{table}#w`, read from the
+   checkpoint so that a stopped pipeline counts; indexes are declared when a table is
+   opened, before any loader runs; and a table commit stalled behind a reader is bounded
+   by the supervisor's `StopTimeout`, then `Abandon()`, then `Wedged`, not by the host's
+   shutdown timeout. **Not done:** the TradeEnrichment example moved onto tables; the
+   worked example is still to come (enrichment-service.md, *Reference examples*).
 
 ## As built: seams for the enrichment service (2026-11-10)
 

@@ -38,11 +38,20 @@ public sealed class KafkaConnection
     /// transactional producer.</summary>
     internal Func<KafkaLog?>? Log { get; init; }
 
+    /// <summary>The topic prefix of the service's own log on this deployment. Its topics —
+    /// the state, the leader topic, the table logs, the blobs — are never a slot's or a
+    /// loader's to read or write, whatever connection is named.</summary>
+    internal string? ReservedPrefix { get; set; }
+
     internal void RequireTopic(string topic)
     {
         if (AllowedTopicPrefixes.Count > 0 && !AllowedTopicPrefixes.Any(prefix => topic.StartsWith(prefix, StringComparison.Ordinal)))
             throw new InvalidOperationException(
                 $"topic '{topic}' is outside what this connection allows (prefixes: {string.Join(", ", AllowedTopicPrefixes)})");
+        if (ReservedPrefix is { } prefix
+            && (topic == prefix + ".state" || topic == prefix + ".leader"
+                || topic.StartsWith(prefix + ".table.", StringComparison.Ordinal) || topic.StartsWith(prefix + ".svc.", StringComparison.Ordinal)))
+            throw new InvalidOperationException($"topic '{topic}' belongs to the service's own log and cannot be bound");
     }
 
     internal IReadOnlyDictionary<string, string> Config => new Dictionary<string, string>(ClientConfig);
@@ -78,7 +87,9 @@ public sealed class KafkaConnections
             if (!_registrations.KafkaConnections.TryGetValue(name, out var factory))
                 throw new InvalidOperationException(
                     $"no Kafka connection named '{name}' is registered (registered: {string.Join(", ", Names.Order())})");
-            return _resolved[name] = factory(_services);
+            var created = factory(_services) ?? throw new InvalidOperationException($"the factory of Kafka connection '{name}' returned null");
+            created.ReservedPrefix = _registrations.ReservedTopicPrefix?.Invoke(_services);
+            return _resolved[name] = created;
         }
     }
 }

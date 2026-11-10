@@ -1115,7 +1115,7 @@ the tables live outside them, once per process.
 
 ```csharp
 builder.Services.AddIncrementalService(o => o.PluginDirectory = "plugins")
-    .UseInMemoryBackend()                                   // the default; Kafka is to come
+    .UseInMemoryBackend()                                   // the default; or UseKafkaBackend, below
     .AddObjectStore("refdata", _ => new LocalObjectStore("/var/lib/refdata"))
     .AddContracts(typeof(Instrument).Assembly)              // row types and table definitions
     .AddPlugin(typeof(TradeEnrichment).Assembly)            // definitions compiled into the host
@@ -1208,7 +1208,79 @@ What to know before relying on it:
 
 `InMemoryServiceCluster` gives several nodes in one process — `cluster.Node("a")`,
 `cluster.Node("b")` — with real fencing, which is how the takeover order is tested without
-a broker. What is built and what is not is in
+a broker.
+
+**On Kafka, for availability.** The load fits one node; the second process exists so that
+losing the first costs seconds. Both are configured alike except for their names:
+
+```csharp
+builder.Services.AddIncrementalService(o => { o.PluginDirectory = "plugins"; o.CacheDirectory = "/var/cache/enrichment"; })
+    .UseKafkaBackend(new KafkaServiceBackendOptions
+    {
+        Log = new KafkaLogOptions { BootstrapServers = "…", TopicPrefix = "enrichment", NodeId = "node-a" },
+        ProbeListen = new IPEndPoint(IPAddress.Any, 7400),     // where this node answers its peer
+        PeerProbe = ("node-b", 7400),                           // where the other node listens
+    })
+    .AddKafkaConnection("msk-main", _ => new KafkaConnection
+    {
+        BootstrapServers = "…",
+        ClientConfig = { ["security.protocol"] = "SASL_SSL", ["sasl.mechanism"] = "OAUTHBEARER" },
+        ConfigureConsumer = b => b.SetOAuthBearerTokenRefreshHandler(Refresh),   // MSK IAM
+        ConfigureProducer = b => b.SetOAuthBearerTokenRefreshHandler(Refresh),
+        AllowedTopicPrefixes = { "tenants." },
+    })
+    .AddContracts(typeof(Instrument).Assembly);
+```
+
+Every node starts as a standby. The one that finds nobody leading takes over after
+`TakeoverAfter` (3 s) of silence; the other follows the catalog, the tables and every
+pipeline's state through the broker, fetches plugin files from it, and builds nothing.
+When the leader is killed the standby fences it, promotes the catalog, the tables and the
+state, builds the circuits from their committed state and starts the sources at their
+committed offsets. Locally, with 21 tables and two pipelines, that is about 3 s to notice
+and under a second to take over.
+
+A table loaded from a topic, and a pipeline bound to topics, name a connection and a
+topic and nothing of the cluster:
+
+```csharp
+await node.Tables.DeclareAsync(new TableSpec
+{
+    Name = "instruments", Definition = typeof(InstrumentsTable).FullName!,
+    Loader = new TableLoaderSpec("debezium", "msk-main", Json("""{ "topic": "tenants.cdc.public.instruments" }""")),
+}, ct);                                                        // or "kafka": a value upserts, a tombstone deletes
+
+Inputs = { ["trades"]   = Json("""{ "connector": "kafka", "connection": "msk-main", "topic": "tenants.eu.trades" }""") },
+Sinks  = { ["enriched"] = Json("""{ "connector": "kafka", "connection": "msk-main", "topic": "tenants.eu.trades.enriched" }""") },
+```
+
+What to know:
+
+- **The connection is the host's; the spec is the tenant's.** A `kafka` config accepts
+  `connection`, `topic`, `startFrom` (`earliest`/`latest`), `format` (`json`, or
+  `debezium` on a keyed input), and on a sink `producer` (`own`, or `log` for the
+  backend's transactional producer, on the connection `log` only). Bootstrap servers or
+  client properties in a spec are refused, as is a topic outside the connection's
+  `AllowedTopicPrefixes`. The backend's own cluster is registered as the connection `log`.
+- **Delivery is at least once.** A new leader resumes each source from the offsets in the
+  pipeline's last checkpoint and delivers again whatever the old one had not committed;
+  an upsert sink converges, an append sink sees duplicates. Create sink topics yourself —
+  compacted, for an upsert sink.
+- **Fenced and resigned are final.** A node that has been taken over, or has stepped
+  down, stops its host with exit code 3 or 4 and comes back, when its supervisor restarts
+  it, as the standby. `node.StepDownAsync` is refused unless the peer's probe answers as a
+  ready standby; `node.TakeOverAsync` unless this node is warm; both take `Force`.
+- **Failing pipelines do not move leadership.** Only a node that can no longer write its
+  catalog gives leadership up by itself: it steps down to a ready standby, or exits with 5.
+- **Start the first node before the second.** Two nodes that start together on an empty
+  deployment both take over; one is fenced at once and exits.
+- **Give each node its own `CacheDirectory`**, and the plugin directory to whichever may
+  lead first. Plugins reach the other through a compacted topic, `{prefix}.svc.blobs`.
+- `node.Status` has what a status page needs: role and terms, heartbeat age, whether the
+  delivery lease is held, how the last takeover's time was spent, the peer's answer, and
+  on a standby how far its catalog, tables and state are behind.
+
+What is built and what is not is in
 [design/enrichment-service.md](design/enrichment-service.md), *As built*.
 
 > **TODO:** cluster deployment (multi-process exchange over a transport), checkpoint

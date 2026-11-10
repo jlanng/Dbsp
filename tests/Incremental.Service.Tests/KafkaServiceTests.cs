@@ -85,6 +85,8 @@ public class KafkaServiceTests(ITestOutputHelper output)
         Assert.True(followed.Following);
         Assert.Equal(instruments.Count, followed.Rows);
         Assert.Equal(a.Tables.Stats("instruments").Epoch, followed.Epoch);
+        Assert.Equal(0, followed.LagVersions);
+        Assert.Equal(0, b.Node.Status.Standby!.StateLagRecords);
         Assert.Equal("a", b.Node.Status.Leadership.LeaderNodeId);
         Assert.NotNull(b.Node.Status.Leadership.Kafka);
         await Assert.ThrowsAsync<ServiceException>(() => b.Tables.DeclareAsync(InstrumentsFrom(instrumentsTopic, "other"), default));
@@ -106,6 +108,16 @@ public class KafkaServiceTests(ITestOutputHelper output)
 
         await KafkaTestEnv.TopicEqualsAsync(enrichedTopic, Enrich.Model(trades, instruments), "everything enriched after the takeover");
         await KafkaTestEnv.TopicEqualsAsync(countsTopic, Counts.Model(trades), "everything counted after the takeover");
+
+        // "producer": "log" really is the log's transactional producer: every transaction
+        // leaves a marker, an offset with no record. The sink's own producer leaves none.
+        static long Markers(string topic)
+        {
+            var records = KafkaTestEnv.ReadTopic(topic);
+            return records.Max(r => r.Offset.Value) + 1 - records.Count;
+        }
+        Assert.True(Markers(countsTopic) > 0, "the counts sink did not write in transactions");
+        Assert.Equal(0, Markers(enrichedTopic));
 
         // Resumed, not replayed: the new leader read each source from the committed offsets.
         var read = b.Pipelines.Get("counts").Sources.Single().Stats.Records;
@@ -187,6 +199,12 @@ public class KafkaServiceTests(ITestOutputHelper output)
         await using var b = await env.StartNodeAsync("b", memory);
         await WarmStandbyAsync(b);
 
+        // A sink as the supervisor hands it to a delivery: leased. While A leads, it writes.
+        var external = new CountingSink();
+        var leased = a.Node.Backend.Leadership.Leased(external);
+        await leased.WriteAsync(default, default).AsTask().WaitAsync(Timeout);
+        Assert.Equal(1, external.Writes);
+
         await b.Node.TakeOverAsync(new NodeActionOptions(), default).WaitAsync(Timeout);
 
         // Straight at the catalog's writer, under the node's own guards: whether or not the
@@ -209,10 +227,60 @@ public class KafkaServiceTests(ITestOutputHelper output)
         Assert.Equal("not-leader", notLeader.Code);
         Assert.NotNull(a.Node.Status.Leadership.Kafka!.Fault);
 
+        // Fencing does not reach a sink outside Kafka; the lease does. The deposed leader's
+        // delivery is refused before the sink is touched.
+        await Assert.ThrowsAsync<KafkaLogFencedException>(() => leased.WriteAsync(default, default).AsTask().WaitAsync(Timeout));
+        Assert.Equal(1, external.Writes);
+        Assert.False(a.Node.Status.Leadership.Kafka!.HoldsLease);
+        Assert.True(b.Node.Status.Leadership.Kafka!.HoldsLease);
+
         // The new leader's catalog never saw it, and still takes writes.
         await b.DeployAsync(Spec("after", "counts", "trades", "after-out"));
         Assert.Null(b.Node.Catalog.Get("pipeline/zombie"));
         Assert.Equal(["after", "counts"], b.Pipelines.Pipelines.Select(p => p.Id));
+    }
+
+    private sealed class CountingSink : IUpsertSink<string, long>
+    {
+        public int Writes;
+
+        public ValueTask WriteAsync(UpsertBatch<string, long> batch, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref Writes);
+            return default;
+        }
+    }
+
+    [Fact]
+    public async Task The_history_cap_trims_a_kafka_table_log_whatever_a_stopped_reader_holds()
+    {
+        await using var env = KafkaTestEnv.Create();
+        var memory = new MemoryConnector();
+        memory.Log<Trade>("trades").AppendRange(Trades(0, 50));
+        await using var a = await env.StartNodeAsync("a", memory, lead: true, retainedHistoryVersions: 5);
+        var table = await a.DeclareInstrumentsAsync(Instruments(10));
+        await a.DeployAsync(Spec("reader", "enrich", "trades", "out"));
+        await Eventually(() => memory.UpsertSink<long, EnrichedTrade>("out").Rows.Count == 50, "the reader's output");
+        await a.Pipelines.StopAsync("reader", new ActionOptions(), default);
+        var held = a.Tables.Stats("instruments").Readers.Single().CommittedVersion;
+
+        // Within the cap the stopped reader holds the floor: nothing it needs is dropped.
+        for (var i = 0; i < 3; i++)
+            await table.Writer.ReplaceAllAsync(Instruments(10).Select(x => x with { Symbol = $"R{i}-{x.Id}" }));
+        await a.Node.TrimAsync();
+        var within = a.Tables.Stats("instruments");
+        Assert.True(within.OldestRetainedVersion <= held + 1, $"history was trimmed to {within.OldestRetainedVersion} past a reader at {held}");
+        Assert.Equal("reader", within.FloorHeldBy);
+        Assert.Equal(5 - 3, within.Readers.Single().VersionsUntilCutLoose);
+
+        // Past it the cap wins, and the table says how far the reader is beyond it.
+        for (var i = 3; i < 12; i++)
+            await table.Writer.ReplaceAllAsync(Instruments(10).Select(x => x with { Symbol = $"R{i}-{x.Id}" }));
+        await a.Node.TrimAsync();
+        var past = a.Tables.Stats("instruments");
+        Assert.Equal(past.Version - 5 + 1, past.OldestRetainedVersion);
+        Assert.Null(past.FloorHeldBy);
+        Assert.Equal(0, past.Readers.Single().VersionsUntilCutLoose);
     }
 
     [Fact]
@@ -418,6 +486,13 @@ public class KafkaServiceTests(ITestOutputHelper output)
             $$"""{ "connector": "kafka", "connection": "tenants", "topic": "{{allowed}}", "format": "debezium" }""")).Details));
         Assert.Contains("only that one has the transactional producer", string.Join(" ", (await RefusedAsync(
             good, $$"""{ "connector": "kafka", "connection": "tenants", "topic": "{{allowed}}", "producer": "log" }""")).Details));
+
+        // The service's own topics are nobody's to bind, on any connection.
+        foreach (var own in new[] { ".state", ".leader", ".table.svc.catalog.rows", ".svc.blobs" })
+            Assert.Contains("belongs to the service's own log", string.Join(" ", (await RefusedAsync(
+                $$"""{ "connector": "kafka", "connection": "log", "topic": "{{env.Prefix}}{{own}}" }""")).Details));
+        Assert.Contains("belongs to the service's own log", string.Join(" ", (await RefusedAsync(
+            good, $$"""{ "connector": "kafka", "connection": "log", "topic": "{{env.Prefix}}.state" }""")).Details));
 
         // The same rules for a table's loader.
         var loader = await Assert.ThrowsAsync<ServiceException>(() => a.Tables.DeclareAsync(new TableSpec

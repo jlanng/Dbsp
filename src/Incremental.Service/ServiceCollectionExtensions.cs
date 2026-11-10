@@ -94,6 +94,7 @@ public sealed class IncrementalServiceBuilder
                 return resolved ??= options(services) ?? throw new InvalidOperationException("The Kafka backend's options factory returned null.");
         }
 
+        _registrations.ReservedTopicPrefix = services => Options(services).Log.TopicPrefix;
         _registrations.KafkaConnections["log"] = services =>
         {
             var log = Options(services).Log;

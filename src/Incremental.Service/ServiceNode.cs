@@ -23,6 +23,9 @@ internal sealed class ServiceRegistrations
     public Dictionary<string, Func<IServiceProvider, IObjectStore>> ObjectStores { get; } = new(StringComparer.Ordinal);
     public Dictionary<string, Func<IServiceProvider, KafkaConnection>> KafkaConnections { get; } = new(StringComparer.Ordinal);
     public Func<IServiceProvider, IServiceBackend>? Backend { get; set; }
+
+    /// <summary>The topic prefix of the Kafka backend's own log, when that is the backend.</summary>
+    public Func<IServiceProvider, string>? ReservedTopicPrefix { get; set; }
 }
 
 /// <summary>What the registry, the plugin catalog and the supervisor share.</summary>

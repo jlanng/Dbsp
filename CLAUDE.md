@@ -16,9 +16,15 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   `INCREMENTAL_KAFKA_BOOTSTRAP` points them at another broker. `KafkaFailoverProcessTests`
   launch `tests/Incremental.Kafka.FailoverApp` as real processes and kill, stop and
   command them; measured numbers go to `measurements.log` beside the test assembly.
-- Service tests: `dotnet test --project tests/Incremental.Service.Tests` — in memory, no
-  broker. They load real plugin assemblies from `tests/Incremental.Service.TestPlugins/*/bin`,
-  which a solution build produces (the test project references them build-order only).
+- Service tests: `dotnet test --project tests/Incremental.Service.Tests` — about a minute
+  and a half with the connector stack up, a few seconds without it: the Kafka-backed classes
+  (`KafkaService*Tests`) skip when the broker is unreachable, the CDC one also without
+  Postgres and Connect. They load real plugin assemblies from
+  `tests/Incremental.Service.TestPlugins/*/bin` and launch
+  `tests/Incremental.Service.FailoverApp` as real processes, both of which a solution build
+  produces (the test project references them build-order only). The Kafka classes share
+  one non-parallel collection; measured failover times go to `measurements.log` beside
+  the test assembly.
 - Connector stack: `docker compose --profile connectors up -d` adds Kafka (`localhost:9092`), Postgres with
   logical decoding (`localhost:5432`, user/password/db `incremental`) and Debezium's Kafka
   Connect (`localhost:8083`). Plain `docker compose up -d` stays Redis-only.
@@ -109,7 +115,11 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   last stable offset, and positions must pass transaction markers. Record values start
   with a format byte; keys must be byte-stable because compaction compares bytes.
   Assign consumers at numeric offsets, never `Offset.Beginning`: a logical offset on a new
-  consumer costs 500 ms.
+  consumer costs 500 ms. A read on the log's shared short-read consumer assigns through
+  `KafkaLog.AssignForShortRead`, never `consumer.Assign`: a running consumer pointed at a
+  topic it has not seen waits a second for the client to look the leader up, and that
+  consumer keeps `fetch.wait.max.ms` at 5 so one read does not wait out the last one's
+  long poll. Both cost a takeover or a start-up a second or half a second per table.
 - Kafka sources and sinks (`KafkaSource`, `KafkaSinks.cs`). A source's position lives in
   the checkpoint, never in a consumer group: records are handed on stamped with
   (partition, offset), and a source assigns each partition at the committed offset plus
@@ -120,7 +130,8 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   input's bounded channel plus the client's fetch buffer; never read ahead into a
   collection. A table loader is the table's writer: leader only. Sinks get an idempotent
   producer of their own unless given the log's (`KafkaSinkOptions.Log`); nothing else may
-  create a producer.
+  create a producer — except the service's blob store, whose records are content-addressed
+  (see `Incremental.Service` below).
 - Leadership (`KafkaLeadership`) lives in Kafka only. The log writer heartbeats to
   `{p}.leader` in every transaction and when idle; a standby takes over on silence. Safety
   is fencing, never the election or the probe. Every node starts as a standby; `Fenced`
@@ -167,9 +178,25 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
 - `Incremental.Service` (docs/design/enrichment-service.md, *As built*) is one circuit per
   pipeline over shared tables held by a registry, with the catalog — itself a shared table —
   as the only record of what exists. Its rules:
-  - Everything durable or about roles goes through `IServiceBackend`; nothing in the
-    service names Kafka or the in-memory logs directly. Only the leader writes the catalog,
+  - Everything durable or about roles goes through `IServiceBackend`; outside
+    `InMemoryBackend.cs`, `KafkaBackend.cs` and `KafkaConnectors.cs` nothing in the service
+    names Kafka or the in-memory logs. Only the leader writes the catalog,
     one action per version, and commits intent before it acts.
+  - The service promotes its tables itself, inside the leadership's `PrepareAsync`,
+    concurrently and each contained; it never calls `KafkaLeadership.Track(table, log)`,
+    which would let one table end a takeover. Only the storage is tracked.
+  - Pipelines failing never move leadership. The node gives it up by itself only when
+    the catalog's writer has faulted and one reopen did not mend it: step down to a ready
+    standby, else exit 5. Fenced exits 3, resigned 4; both are final for the process.
+  - A spec names a connection (`AddKafkaConnection`, `AddObjectStore`) and never carries
+    bootstrap servers, client properties or absolute paths: specs are tenant-written JSON
+    that the admin API returns. A built-in connector's config is a closed record with
+    unknown members refused.
+  - Plugin blobs are written by a plain idempotent producer, unfenced, which is safe only
+    because the key is the content's hash and a blob without its `end` record reads as
+    absent. Do not put anything not content-addressed on that topic.
+  - Every sink a connector creates is wrapped in `leadership.Leased` by the supervisor;
+    a connector must not write from anywhere but the sink's `WriteAsync`.
   - A table, plugin or pipeline that fails is that thing's failure: shown, retried, never
     thrown out of a takeover callback. Only the catalog and the storage may fail a node.
   - Nothing waits without a bound, and nothing holds another pipeline's queue: teardown is

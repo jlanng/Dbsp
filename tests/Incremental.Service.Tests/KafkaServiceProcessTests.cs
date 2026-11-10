@@ -270,8 +270,10 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         await env.FlushAsync();
 
         // A leads a deployment nobody led: after TakeoverAfter of silence, by itself.
+        var startedA = Now;
         using var a = new AppNode(env, "a", ports[0], ports[1], plugins: true, tables: extraTables);
-        await a.WaitForRoleAsync("Leader");
+        var firstLead = await a.WaitForRoleAsync("Leader");
+        Measured($"service first lead on an empty deployment, {extraTables} table seeds and a plugin import: {T(firstLead) - startedA} ms from process start");
         await a.RunAsync("declare " + JsonSerializer.Serialize(new TableSpec
         {
             Name = "instruments",
@@ -290,10 +292,14 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         await a.StatusWhenAsync(s => State(s, "main") == "Running", "the first pipeline to run on the leader");
 
         // B stands by. It was never given the plugin: it has only the broker.
+        var startedB = Now;
         using var b = new AppNode(env, "b", ports[1], ports[0], tables: extraTables);
         var standing = await b.StatusWhenAsync(
             s => s.GetProperty("warm").GetBoolean() && State(s, "main") == "Unbuilt" && s.GetProperty("leader").GetString() == "a",
             "the standby to be warm");
+        Measured($"service standby warm (catalog, {extraTables + 1} tables, state, plugin files): {T(standing) - startedB} ms from process start");
+        Assert.True(T(standing) - startedB < 25_000,
+            $"the standby took {T(standing) - startedB} ms to open and follow {extraTables + 1} tables; each table's open should cost two short reads, not two seconds");
         Assert.Equal("Standby", standing.GetProperty("role").GetString());
         Assert.Equal(extraTables + 1, standing.GetProperty("tables").GetArrayLength());
         Assert.All(standing.GetProperty("tables").EnumerateArray(), t => Assert.True(t.GetProperty("following").GetBoolean()));
@@ -412,6 +418,6 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         var handed = await again.StatusAsync();
         Assert.Equal("resigned", handed.GetProperty("takeover").GetProperty("reason").GetString());
         Measured($"service step-down: resigned to Leader in {T(leading) - asked} ms (no silence waited out; TakeoverAfter is 3000 ms)");
-        Assert.True(T(leading) - asked < 3000 + 2500, "the hand-over waited out the takeover timeout instead of reading the resignation");
+        Assert.True(T(leading) - asked < 2500, "the hand-over waited out the takeover timeout instead of reading the resignation");
     }
 }
