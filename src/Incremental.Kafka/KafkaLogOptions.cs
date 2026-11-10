@@ -86,6 +86,13 @@ public sealed class KafkaLogOptions
     /// commits in it fail.</summary>
     public int MaxAbortRetries { get; init; } = 5;
 
+    /// <summary>The most each of this log's consumers may hold of records fetched and not yet
+    /// applied (<c>queued.max.messages.kbytes</c>), in kilobytes. A follower or a restore
+    /// runs one consumer per state partition and one per followed table, so while it is
+    /// behind it can hold this much native memory for each. Default 8 MB (the client's own
+    /// default is 64).</summary>
+    public int FetchBufferKilobytes { get; init; } = 8 * 1024;
+
     /// <summary>Timeout of admin calls, and of a read that makes no progress.</summary>
     public TimeSpan OperationTimeout { get; init; } = TimeSpan.FromSeconds(30);
 
@@ -142,6 +149,7 @@ public sealed class KafkaLogOptions
         ArgumentOutOfRangeException.ThrowIfLessThan(ReplicationFactor, (short)1);
         ArgumentOutOfRangeException.ThrowIfLessThan(MaxTransactionRecords, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(MaxRecordBytes, 1024);
+        ArgumentOutOfRangeException.ThrowIfLessThan(FetchBufferKilobytes, 1);
         ArgumentOutOfRangeException.ThrowIfNegative(MaxAbortRetries);
         ArgumentOutOfRangeException.ThrowIfLessThan(GroupCommitLinger, TimeSpan.Zero);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(TransactionTimeout, TimeSpan.Zero);

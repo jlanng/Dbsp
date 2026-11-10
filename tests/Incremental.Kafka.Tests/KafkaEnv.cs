@@ -52,8 +52,18 @@ internal sealed class KafkaEnv : IAsyncDisposable
         IReadOnlyDictionary<string, string>? rowsTopic = null,
         IStateSerializer? serializer = null,
         string? nodeId = null,
-        TimeSpan? heartbeat = null) => new()
+        TimeSpan? heartbeat = null,
+        int maxTransactionRecords = 100_000,
+        int maxAbortRetries = 5,
+        int fetchBufferKilobytes = 8 * 1024,
+        IReadOnlyDictionary<string, string>? clientConfig = null,
+        Action<ConsumerBuilder<byte[], byte[]>>? configureConsumer = null) => new()
         {
+            MaxTransactionRecords = maxTransactionRecords,
+            MaxAbortRetries = maxAbortRetries,
+            FetchBufferKilobytes = fetchBufferKilobytes,
+            ClientConfig = clientConfig ?? new Dictionary<string, string>(),
+            ConfigureConsumer = configureConsumer,
             NodeId = nodeId,
             HeartbeatInterval = heartbeat ?? TimeSpan.FromSeconds(1),
             BootstrapServers = Bootstrap,

@@ -60,6 +60,9 @@ public sealed class KafkaLog : IAsyncDisposable
     private long _term;
     private long _heartbeatSequence;
     private long _idleHeartbeats;
+    private long _inTransactionHeartbeats;
+    private long _consumersCreated;
+    private long _readerRecordsTaken;
     private long _lastTransactionTicks;
     private long _transactions;
     private long _aborted;
@@ -177,13 +180,27 @@ public sealed class KafkaLog : IAsyncDisposable
     /// <summary>How long ago the last transaction this log committed was begun — a commit,
     /// or the heartbeat an idle writer commits every
     /// <see cref="KafkaLogOptions.HeartbeatInterval"/>. Null on a reader and once fenced. Local elapsed
-    /// time; it is what the delivery lease is measured from.</summary>
+    /// time; it is what the delivery lease is measured from. On Linux it is read from a
+    /// clock that keeps counting while the machine is suspended (<c>CLOCK_BOOTTIME</c>), so a
+    /// leader that slept through its lease does not wake up still holding it.</summary>
     public TimeSpan? SinceLastTransaction =>
-        IsWriter ? TimeSpan.FromMilliseconds(Environment.TickCount64 - Interlocked.Read(ref _lastTransactionTicks)) : null;
+        IsWriter ? TimeSpan.FromMilliseconds(LeaseClock.Milliseconds - Interlocked.Read(ref _lastTransactionTicks)) : null;
 
     /// <summary>Transactions that carried nothing but a heartbeat, committed because the
     /// writer was idle. Not counted in <see cref="TransactionsCommitted"/>.</summary>
     public long IdleHeartbeats => Interlocked.Read(ref _idleHeartbeats);
+
+    /// <summary>Heartbeats written inside a transaction that was still being produced or
+    /// flushed when another was due: what tells a standby that a long commit is a live
+    /// leader and not a dead one.</summary>
+    public long InTransactionHeartbeats => Interlocked.Read(ref _inTransactionHeartbeats);
+
+    /// <summary>Consumer clients this log has built. For tests.</summary>
+    internal long ConsumersCreated => Interlocked.Read(ref _consumersCreated);
+
+    /// <summary>Records the follower threads have taken from their clients, whether or not
+    /// anything has read them yet. For tests.</summary>
+    internal long ReaderRecordsTaken => Interlocked.Read(ref _readerRecordsTaken);
 
     /// <summary>Kafka transactions committed by this log that carried at least one commit.</summary>
     public long TransactionsCommitted => Interlocked.Read(ref _transactions);
@@ -200,7 +217,9 @@ public sealed class KafkaLog : IAsyncDisposable
 
     // ── tables ─────────────────────────────────────────────────────────────────────────
 
-    private readonly Dictionary<string, object> _tables = new(StringComparer.Ordinal);
+    // Table name → the open of its log, running or done. Holding the task rather than the
+    // result is what makes two opens of one name share a single open (and a single epoch).
+    private readonly Dictionary<string, Task> _tables = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Opens the log of the shared table <paramref name="name"/>: the topics
@@ -208,7 +227,7 @@ public sealed class KafkaLog : IAsyncDisposable
     /// <c>{prefix}.table.{name}.rows</c> (compacted, the current rows), created if they do
     /// not exist. Pass the result to <c>SharedTable.OpenAsync</c> (the active) or
     /// <c>SharedTable.FollowAsync</c> (the standby). The same instance is returned for the
-    /// same name.
+    /// same name, and concurrent calls for one name share one open.
     /// <para>
     /// A table's identity (its epoch) is written by the writer the first time the table is
     /// opened. On a reader this call therefore waits until the active has opened the table
@@ -223,23 +242,49 @@ public sealed class KafkaLog : IAsyncDisposable
         if (!IsTopicSafe(name))
             throw new ArgumentException(
                 $"Table name '{name}' is not usable in a topic name: use letters, digits, '.', '_' and '-'.", nameof(name));
-        lock (_gate)
+        while (true)
         {
-            ObjectDisposedException.ThrowIf(_closed, this);
-            if (_tables.TryGetValue(name, out var existing))
-                return existing as KafkaTableLog<TKey, TRow>
-                    ?? throw new InvalidOperationException(
-                        $"Table log '{name}' is already open in this process with different key or row types.");
-        }
+            Task<KafkaTableLog<TKey, TRow>> open;
+            var mine = false;
+            lock (_gate)
+            {
+                ObjectDisposedException.ThrowIf(_closed, this);
+                if (_tables.TryGetValue(name, out var existing))
+                {
+                    open = existing as Task<KafkaTableLog<TKey, TRow>>
+                        ?? throw new InvalidOperationException(
+                            $"Table log '{name}' is already open in this process with different key or row types.");
+                }
+                else
+                {
+                    open = Task.Run(() => KafkaTableLog<TKey, TRow>.OpenAsync(this, name, cancellationToken), CancellationToken.None);
+                    _tables[name] = open;
+                    mine = true;
+                }
+            }
 
-        var opened = await KafkaTableLog<TKey, TRow>.OpenAsync(this, name, cancellationToken).ConfigureAwait(false);
-        lock (_gate)
-        {
-            if (_tables.TryGetValue(name, out var raced))
-                return (KafkaTableLog<TKey, TRow>)raced;
-            _tables[name] = opened;
+            try
+            {
+                return await open.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // A failed open is forgotten, so the next call tries again.
+                if (open.IsCompleted)
+                {
+                    lock (_gate)
+                    {
+                        if (_tables.TryGetValue(name, out var current) && ReferenceEquals(current, open))
+                            _tables.Remove(name);
+                    }
+                }
+
+                // Another caller's open, ended by that caller's cancellation: not this one's.
+                if (!mine && ex is OperationCanceledException && !cancellationToken.IsCancellationRequested)
+                    continue;
+                throw;
+            }
         }
-        return opened;
     }
 
     // ── becoming the writer ────────────────────────────────────────────────────────────
@@ -345,9 +390,8 @@ public sealed class KafkaLog : IAsyncDisposable
         if (end == 0)
             return 0;
         var start = await StartOffsetAsync(_leaderPartition, cancellationToken).ConfigureAwait(false);
-        return await Task.Run(() =>
+        return await ShortReadAsync(consumer =>
         {
-            using var consumer = CreateConsumer();
             for (long window = 32; ; window *= 16)
             {
                 var from = Math.Max(start, end - window);
@@ -498,7 +542,7 @@ public sealed class KafkaLog : IAsyncDisposable
         var interval = (long)_options.HeartbeatInterval.TotalMilliseconds;
         if (!_isWriter)
             return (int)interval;
-        return (int)Math.Clamp(interval - (Environment.TickCount64 - Interlocked.Read(ref _lastTransactionTicks)), 1, interval);
+        return (int)Math.Clamp(interval - (LeaseClock.Milliseconds - Interlocked.Read(ref _lastTransactionTicks)), 1, interval);
     }
 
     private void IdleHeartbeat()
@@ -553,8 +597,9 @@ public sealed class KafkaLog : IAsyncDisposable
             Interlocked.Increment(ref _aborted);
             if (culprit is not null)
             {
-                // One commit's own record was refused (too large, say). The transaction is
-                // aborted for everyone; only that commit fails, the rest go again.
+                // One commit's own record was refused by the client (too large, say). The
+                // transaction is aborted for everyone; only that commit fails, the rest go
+                // again.
                 culprit.Completion.TrySetException(Aborted(error!));
                 batch.Remove(culprit);
                 continue;
@@ -584,14 +629,14 @@ public sealed class KafkaLog : IAsyncDisposable
         ((error as KafkaException)?.Error.Reason ?? error.Message), error);
 
     /// <summary>One Kafka transaction. True: committed. False: aborted cleanly, with the
-    /// reason in <paramref name="error"/> and, when one commit's own record was refused, that
-    /// commit in <paramref name="culprit"/>. Throws when the writer is finished.</summary>
+    /// reason in <paramref name="error"/> and, when the client refused one commit's own
+    /// record, that commit in <paramref name="culprit"/>. Throws when the writer is finished.</summary>
     private bool TryRunTransaction(List<LogCommit> batch, out LogCommit? culprit, out Exception? error)
     {
         culprit = null;
         error = null;
         BeforeTransaction?.Invoke();
-        var began = Environment.TickCount64;
+        var began = LeaseClock.Milliseconds;
         try
         {
             _producer.BeginTransaction();
@@ -610,20 +655,56 @@ public sealed class KafkaLog : IAsyncDisposable
             // is the record that stays. Before the first term is committed there is no
             // term to announce, and the term record is the sign of life.
             if (_isWriter)
-                _producer.Produce(_leaderPartition, new Message<byte[], byte[]> { Key = HeartbeatKey, Value = HeartbeatValue(resigned: false) });
+                Produce(_leaderPartition, new Message<byte[], byte[]> { Key = HeartbeatKey, Value = HeartbeatValue(resigned: false) }, null);
+
+            // A transaction's heartbeat is readable only once it commits, so a long one
+            // would read as silence. While this one is being produced and flushed, another
+            // heartbeat goes into it every half interval: unreadable until the commit, but
+            // each moves the leader topic's end, which is what a standby checks before it
+            // decides the leader is gone (KafkaLeadership.NoteProgressAsync). Not after a
+            // resignation, which must stay the last heartbeat in the transaction.
+            var beatEvery = Math.Max(1, (long)_options.HeartbeatInterval.TotalMilliseconds / 2);
+            var lastBeat = Environment.TickCount64;
+            var beats = _isWriter;
+            var produced = 0;
             foreach (var commit in batch)
             {
                 producing = commit;
                 tracked |= commit.TrackIndex >= 0;
+                beats &= !commit.Resigns;
                 for (var i = 0; i < commit.Records.Count; i++)
+                {
                     Produce(commit, i);
+                    if ((++produced & 255) == 0)
+                    {
+                        WhileProducing?.Invoke();
+                        if (beats)
+                            BeatIfDue(beatEvery, ref lastBeat);
+                    }
+                }
+            }
+            producing = null;
+
+            // What CommitTransaction would flush anyway, flushed here in slices so that the
+            // heartbeats continue. What is left for the commit is one round trip.
+            while (_fenced is null && _producer.Flush(TimeSpan.FromMilliseconds(Math.Min(beatEvery, 250))) > 0)
+            {
+                _stop.Token.ThrowIfCancellationRequested();
+                if (beats)
+                    BeatIfDue(beatEvery, ref lastBeat);
             }
         }
         catch (KafkaException ex)
         {
             if (IsFencing(ex))
                 throw MarkFenced(ex);
-            culprit = producing;
+
+            // Only an error that is about the record itself names a culprit. Anything else
+            // — above all Local_State, which every Produce throws once an earlier record's
+            // delivery has failed and put the transaction in its abortable state — says
+            // nothing about the commit that happened to be producing: the batch goes
+            // again, and the retries single the real cause out.
+            culprit = IsRecordRefusal(ex) ? producing : null;
             error = ex;
             Abort();
             return false;
@@ -673,16 +754,40 @@ public sealed class KafkaLog : IAsyncDisposable
         return true;
     }
 
+    /// <summary>Called on the writer thread after every 256 records of a transaction. For
+    /// tests: sleeping here is a commit that takes long to produce.</summary>
+    internal Action? WhileProducing { get; set; }
+
+    private void BeatIfDue(long every, ref long last)
+    {
+        var now = Environment.TickCount64;
+        if (now - last < every)
+            return;
+        last = now;
+        Produce(_leaderPartition, new Message<byte[], byte[]> { Key = HeartbeatKey, Value = HeartbeatValue(resigned: false) }, null);
+        Interlocked.Increment(ref _inTransactionHeartbeats);
+    }
+
+    /// <summary>Whether a <c>Produce</c> failed because of the record it was given, as
+    /// opposed to the state of the producer or of the transaction.</summary>
+    internal static bool IsRecordRefusal(KafkaException exception) =>
+        exception.Error.Code is ErrorCode.MsgSizeTooLarge
+            or ErrorCode.Local_UnknownPartition or ErrorCode.Local_UnknownTopic or ErrorCode.Local_InvalidArg;
+
     private void Produce(LogCommit commit, int index)
     {
         var record = commit.Records[index];
         var message = new Message<byte[], byte[]> { Key = record.Key!, Value = record.Value!, Headers = record.Headers };
-        var handler = index == commit.TrackIndex ? commit.OnDelivered : null;
+        Produce(record.Target, message, index == commit.TrackIndex ? commit.OnDelivered : null);
+    }
+
+    private void Produce(TopicPartition target, Message<byte[], byte[]> message, Action<DeliveryReport<byte[], byte[]>>? handler)
+    {
         while (true)
         {
             try
             {
-                _producer.Produce(record.Target, message, handler);
+                _producer.Produce(target, message, handler);
                 return;
             }
             catch (ProduceException<byte[], byte[]> ex) when (ex.Error.Code == ErrorCode.Local_QueueFull)
@@ -834,6 +939,11 @@ public sealed class KafkaLog : IAsyncDisposable
     internal Task<long> EndOffsetAsync(TopicPartition partition, CancellationToken cancellationToken) =>
         ListOffsetAsync(partition, OffsetSpec.Latest(), cancellationToken);
 
+    /// <summary>The end of everything written to a partition, an open transaction's records
+    /// included (its high watermark).</summary>
+    internal Task<long> UncommittedEndOffsetAsync(TopicPartition partition, CancellationToken cancellationToken) =>
+        ListOffsetAsync(partition, OffsetSpec.Latest(), cancellationToken, IsolationLevel.ReadUncommitted);
+
     /// <summary>The ends of committed data of several partitions, in one request.</summary>
     internal Task<long[]> EndOffsetsAsync(IReadOnlyList<TopicPartition> partitions, CancellationToken cancellationToken) =>
         RetryAsync(async () =>
@@ -859,12 +969,14 @@ public sealed class KafkaLog : IAsyncDisposable
     internal Task<long> StartOffsetAsync(TopicPartition partition, CancellationToken cancellationToken) =>
         ListOffsetAsync(partition, OffsetSpec.Earliest(), cancellationToken);
 
-    private Task<long> ListOffsetAsync(TopicPartition partition, OffsetSpec spec, CancellationToken cancellationToken) =>
+    private Task<long> ListOffsetAsync(
+        TopicPartition partition, OffsetSpec spec, CancellationToken cancellationToken,
+        IsolationLevel isolation = IsolationLevel.ReadCommitted) =>
         RetryAsync(async () =>
         {
             var result = await _admin.ListOffsetsAsync(
                 [new TopicPartitionOffsetSpec { TopicPartition = partition, OffsetSpec = spec }],
-                new ListOffsetsOptions { IsolationLevel = IsolationLevel.ReadCommitted, RequestTimeout = _options.OperationTimeout })
+                new ListOffsetsOptions { IsolationLevel = isolation, RequestTimeout = _options.OperationTimeout })
                 .ConfigureAwait(false);
             return result.ResultInfos[0].TopicPartitionOffsetError.Offset.Value;
         }, cancellationToken);
@@ -898,12 +1010,20 @@ public sealed class KafkaLog : IAsyncDisposable
         }
     }
 
-    private static bool IsTransient(KafkaException exception)
+    /// <summary>Whether an admin call failed for a reason that passes: a topic too new for
+    /// the broker asked, a partition between leaders, a broker out of reach.
+    /// <c>Local_NoEnt</c> is the client's own "Failed to query partition leaders: No leaders
+    /// found" — what <c>ListOffsets</c> and <c>DeleteRecords</c> throw, as a plain
+    /// <see cref="KafkaException"/>, when the client's metadata has no leader for a
+    /// partition yet (seen for just-created topics on a busy broker).</summary>
+    internal static bool IsTransient(KafkaException exception)
     {
         static bool Transient(ErrorCode code) => code is ErrorCode.UnknownTopicOrPart or ErrorCode.LeaderNotAvailable
             or ErrorCode.NotLeaderForPartition or ErrorCode.RequestTimedOut or ErrorCode.Local_TimedOut
             or ErrorCode.Local_Transport or ErrorCode.Local_AllBrokersDown or ErrorCode.NotEnoughReplicas
-            or ErrorCode.NetworkException;
+            or ErrorCode.NetworkException or ErrorCode.Local_NoEnt or ErrorCode.BrokerNotAvailable
+            or ErrorCode.ReplicaNotAvailable or ErrorCode.KafkaStorageError or ErrorCode.FencedLeaderEpoch
+            or ErrorCode.UnknownLeaderEpoch or ErrorCode.NotController or ErrorCode.Local_WaitCoord;
 
         return exception switch
         {
@@ -929,13 +1049,64 @@ public sealed class KafkaLog : IAsyncDisposable
             EnablePartitionEof = true,
             // A position that no longer exists is an error, never a silent jump.
             AutoOffsetReset = AutoOffsetReset.Error,
+            // What a reader that is behind may hold fetched and not yet applied. The
+            // client's own default is 64 MB, per consumer.
+            QueuedMaxMessagesKbytes = _options.FetchBufferKilobytes,
+            // With the buffer full the client postpones its next fetch by this long, and
+            // its default is a second: a restore would be held to one buffer a second.
+            FetchQueueBackoffMs = 10,
         };
         Apply(config);
         var builder = new ConsumerBuilder<byte[], byte[]>(config)
             .SetLogHandler((_, message) => Log(message))
             .SetErrorHandler((_, error) => LogError("consumer", error));
         _options.ConfigureConsumer?.Invoke(builder);
+        Interlocked.Increment(ref _consumersCreated);
         return builder.Build();
+    }
+
+    // One consumer for every short read (a table's head, the last term): the reads are
+    // brief and a new client for each costs threads, connections and, on MSK, a TLS and
+    // IAM handshake — per table, per lag sample. Guarded by the gate; rebuilt after a failure.
+    private readonly SemaphoreSlim _shortReadGate = new(1, 1);
+    private IConsumer<byte[], byte[]>? _shortReader;
+
+    /// <summary>Runs <paramref name="read"/> on a thread-pool thread with the log's shared
+    /// short-read consumer, which <paramref name="read"/> assigns itself. One at a time.</summary>
+    internal async Task<T> ShortReadAsync<T>(Func<IConsumer<byte[], byte[]>, T> read, CancellationToken cancellationToken)
+    {
+        await _shortReadGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await Task.Run(() =>
+            {
+                ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+                var consumer = _shortReader ??= CreateConsumer();
+                try
+                {
+                    var result = read(consumer);
+                    consumer.Unassign();
+                    return result;
+                }
+                catch
+                {
+                    // Whatever state the read left it in, the next one starts clean.
+                    _shortReader = null;
+                    try
+                    {
+                        consumer.Dispose();
+                    }
+                    catch (KafkaException)
+                    {
+                    }
+                    throw;
+                }
+            }, CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            _shortReadGate.Release();
+        }
     }
 
     /// <summary>Reads an assigned single-partition consumer until it has seen every
@@ -952,10 +1123,21 @@ public sealed class KafkaLog : IAsyncDisposable
     /// end-of-partition event settles it after all.
     /// </para></summary>
     internal void ReadTo(
-        IConsumer<byte[], byte[]> consumer, long end, Action<ConsumeResult<byte[], byte[]>> onRecord, CancellationToken cancellationToken)
+        IConsumer<byte[], byte[]> consumer, long end, Action<ConsumeResult<byte[], byte[]>> onRecord, CancellationToken cancellationToken) =>
+        ReadTo(consumer, end, record =>
+        {
+            onRecord(record);
+            return false;
+        }, cancellationToken);
+
+    /// <summary>As the other overload, stopping early when <paramref name="onRecord"/>
+    /// returns true.</summary>
+    internal void ReadTo(
+        IConsumer<byte[], byte[]> consumer, long end, Func<ConsumeResult<byte[], byte[]>, bool> onRecord, CancellationToken cancellationToken)
     {
         if (end <= 0)
             return; // nothing was ever committed here
+        var assigned = consumer.Assignment.FirstOrDefault();
         var position = -1L;
         var idleSince = Environment.TickCount64;
         while (position < end - 1)
@@ -970,6 +1152,9 @@ public sealed class KafkaLog : IAsyncDisposable
                         $"Reading {consumer.Assignment.FirstOrDefault()} stalled at offset {position} before reaching {end}.");
                 continue;
             }
+            // The consumer is reused between reads: nothing of an earlier assignment counts.
+            if (assigned is not null && result.TopicPartition != assigned)
+                continue;
             idleSince = Environment.TickCount64;
             if (result.IsPartitionEOF)
             {
@@ -978,7 +1163,8 @@ public sealed class KafkaLog : IAsyncDisposable
             }
             if (result.Offset.Value >= end)
                 return;
-            onRecord(result);
+            if (onRecord(result))
+                return;
             position = result.Offset.Value + 1;
         }
     }
@@ -1047,6 +1233,7 @@ public sealed class KafkaLog : IAsyncDisposable
                         break;
                     }
                     records.Add(result);
+                    Interlocked.Increment(ref _readerRecordsTaken);
                     next = result.Offset.Value + 1;
                     if (records.Count >= MaxBatch)
                         break;
@@ -1134,6 +1321,19 @@ public sealed class KafkaLog : IAsyncDisposable
         // consumers before the process moves on.
         for (var i = 0; i < 100 && Volatile.Read(ref _readers) > 0; i++)
             await Task.Delay(20).ConfigureAwait(false);
+
+        // A short read in flight ends on the stop token; then its consumer can go.
+        if (await _shortReadGate.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false))
+        {
+            try
+            {
+                _shortReader?.Dispose();
+            }
+            catch (KafkaException)
+            {
+            }
+            _shortReader = null;
+        }
 
         await Task.Run(() =>
         {

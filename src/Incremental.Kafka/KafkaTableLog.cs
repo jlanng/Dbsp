@@ -102,6 +102,15 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
         {
             if (log.IsWriter)
             {
+                // Read as the writer, the head is final: every earlier writer's transactions
+                // are decided. The read above may have been made as a reader, a moment
+                // before this process took the log over — and missed a table the previous
+                // writer had just created.
+                asWriter = true;
+                head = await table.ReadHeadAsync(cancellationToken).ConfigureAwait(false);
+                if (head is not null)
+                    break;
+
                 // A new table: mint its identity. Version 0, in every partition, so that a
                 // restore finds a head wherever it looks.
                 head = new Head(Guid.NewGuid().ToString("N"), 0, rowPartitions, new Dictionary<int, long>());
@@ -199,9 +208,8 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
         if (end == 0)
             return null;
         var start = await _log.StartOffsetAsync(partition, cancellationToken).ConfigureAwait(false);
-        return await Task.Run(() =>
+        return await _log.ShortReadAsync(consumer =>
         {
-            using var consumer = _log.CreateConsumer();
             for (long window = 64; ; window *= 16)
             {
                 var from = Math.Max(start, end - window);
@@ -683,36 +691,53 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
         if (version <= OldestRetainedVersion)
             return;
         var last = await LastVersionAsync(cancellationToken).ConfigureAwait(false);
+        if (AfterTrimReadsLast is { } hook)
+            await hook().ConfigureAwait(false);
         var target = Math.Min(version, last + 1);
-        var offset = await LocateAsync(target, last, cancellationToken).ConfigureAwait(false);
+        var offset = await LocateAsync(target, cancellationToken).ConfigureAwait(false);
         await _log.DeleteRecordsBeforeAsync(_changes, offset, cancellationToken).ConfigureAwait(false);
         Interlocked.Exchange(ref _oldest, Math.Max(Interlocked.Read(ref _oldest), target));
         _index.TrimBefore(target);
     }
 
-    /// <summary>The offset of the first record of <paramref name="version"/>, or the end of
-    /// the topic when the version is past the last.</summary>
-    private async Task<long> LocateAsync(long version, long last, CancellationToken cancellationToken)
+    /// <summary>Called by <see cref="TrimBeforeAsync"/> between reading the last version and
+    /// locating the offset to trim to. For tests: appending here is a version committed
+    /// while a trim is under way.</summary>
+    internal Func<Task>? AfterTrimReadsLast { get; set; }
+
+    /// <summary>The offset of the first record at or above <paramref name="version"/>, or the
+    /// end of committed data when there is none. Always found by looking: a version past the
+    /// last one this process knows of may have been committed since it looked — appends are
+    /// not serialised with trims, and another process may be the writer — and "the end of
+    /// the topic" would then lie past that version's records and delete them.</summary>
+    private async Task<long> LocateAsync(long version, CancellationToken cancellationToken)
     {
-        var end = await _log.EndOffsetAsync(_changes, cancellationToken).ConfigureAwait(false);
-        if (version > last)
-            return end;
         if (_index.Exact(version) is { } exact)
             return exact;
 
-        var start = await StartNearAsync(version, cancellationToken).ConfigureAwait(false);
-        await foreach (var batch in _log.ReadBatchesAsync(_changes, start, cancellationToken).ConfigureAwait(false))
+        var end = await _log.EndOffsetAsync(_changes, cancellationToken).ConfigureAwait(false);
+        var start = (await StartNearAsync(version, cancellationToken).ConfigureAwait(false)).Value;
+        if (start >= end)
+            return end;
+        return await _log.ShortReadAsync(consumer =>
         {
-            foreach (var record in batch.Records)
+            var found = end;
+            consumer.Assign(new TopicPartitionOffset(_changes, start));
+            _log.ReadTo(consumer, end, record =>
             {
-                if (record.Message.Key.Length == 8 && BinaryPrimitives.ReadInt64BigEndian(record.Message.Key) >= version)
-                    return record.Offset.Value;
-            }
-            if (batch.NextOffset >= end)
-                break;
-        }
-        return end;
+                if (record.Message.Key.Length != 8 || BinaryPrimitives.ReadInt64BigEndian(record.Message.Key) < version)
+                    return false;
+                found = record.Offset.Value;
+                return true;
+            }, cancellationToken);
+            return found;
+        }, cancellationToken).ConfigureAwait(false);
     }
+
+    // The changes topic's start offset when the oldest version was last read from it, and
+    // the version found there: while the start has not moved, neither has the oldest.
+    private long _oldestReadAtStart = -1;
+    private long _oldestReadVersion;
 
     private async Task RefreshOldestAsync(CancellationToken cancellationToken)
     {
@@ -721,17 +746,33 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
         var oldest = Interlocked.Read(ref _last) + 1;
         if (start < end)
         {
-            await foreach (var batch in _log.ReadBatchesAsync(_changes, start, cancellationToken).ConfigureAwait(false))
+            if (Interlocked.Read(ref _oldestReadAtStart) != start)
             {
-                var first = batch.Records.FirstOrDefault(record => record.Message.Key.Length == 8);
-                if (first is not null)
+                var first = await _log.ShortReadAsync(consumer =>
                 {
-                    oldest = BinaryPrimitives.ReadInt64BigEndian(first.Message.Key);
-                    break;
+                    long? version = null;
+                    consumer.Assign(new TopicPartitionOffset(_changes, start));
+                    _log.ReadTo(consumer, end, record =>
+                    {
+                        if (record.Message.Key.Length != 8)
+                            return false;
+                        version = BinaryPrimitives.ReadInt64BigEndian(record.Message.Key);
+                        return true;
+                    }, cancellationToken);
+                    return version;
+                }, cancellationToken).ConfigureAwait(false);
+                if (first is { } read)
+                {
+                    Interlocked.Exchange(ref _oldestReadVersion, read);
+                    Interlocked.Exchange(ref _oldestReadAtStart, start);
                 }
-                if (batch.NextOffset >= end)
-                    break;
+                else
+                {
+                    Interlocked.Exchange(ref _oldestReadAtStart, -1);
+                }
             }
+            if (Interlocked.Read(ref _oldestReadAtStart) == start)
+                oldest = Interlocked.Read(ref _oldestReadVersion);
         }
         Interlocked.Exchange(ref _oldest, oldest);
     }

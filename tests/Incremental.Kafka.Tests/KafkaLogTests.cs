@@ -237,6 +237,190 @@ public class KafkaLogTests(ITestOutputHelper output)
         Assert.Equal(["after", "before", "later"], keys.Order());
     }
 
+    /// <summary>
+    /// The broker, not the client, refuses one record: under the client's limit, over the
+    /// topic's. The refusal arrives while a neighbour in the same transaction is still
+    /// producing, and from then on every Produce fails with "erroneous state". That says
+    /// nothing about the neighbour: only the commit whose record was refused may fail.
+    /// </summary>
+    [Fact]
+    public async Task A_record_the_broker_refuses_does_not_fail_the_neighbour_that_was_producing_when_the_news_came()
+    {
+        await using var env = KafkaEnv.Create();
+        var log = await env.ConnectWriterAsync(env.Options(
+            linger: TimeSpan.FromMilliseconds(300), maxAbortRetries: 1,
+            stateTopic: new Dictionary<string, string> { ["max.message.bytes"] = "60000" }));
+
+        var refused = new LogCommit();
+        var huge = new byte[500_000];
+        new Random(11).NextBytes(huge); // incompressible: the batch stays over the topic's limit
+        refused.Add(new TopicPartition(log.State.Topic, 0), Bytes("huge"), huge);
+
+        // Large enough to be still producing when the broker's answer to the first arrives.
+        var innocent = new LogCommit();
+        var value = Bytes("v");
+        for (var i = 0; i < 400_000; i++)
+            innocent.Add(new TopicPartition(log.State.Topic, 1), Bytes("k" + i), value);
+
+        var refusedTask = log.CommitAsync(refused);
+        var innocentTask = log.CommitAsync(innocent);
+
+        var failure = await Assert.ThrowsAsync<KafkaLogException>(() => refusedTask).WaitAsync(Timeout * 2);
+        Assert.IsNotType<KafkaLogFencedException>(failure);
+        Assert.Contains("too large", failure.Message, StringComparison.OrdinalIgnoreCase);
+        await innocentTask.WaitAsync(Timeout * 2);
+        Assert.True(log.TransactionsAborted >= 2, "the two commits never shared a transaction, so this proved nothing");
+        Assert.True(log.IsWriter);
+
+        var successor = await env.ConnectWriterAsync(env.Options(
+            stateTopic: new Dictionary<string, string> { ["max.message.bytes"] = "60000" }));
+        Assert.Equal(400_000, (await KafkaEnv.ReadToEndAsync(successor.State, 1)).Count);
+        Assert.Empty(await KafkaEnv.ReadToEndAsync(successor.State, 0));
+    }
+
+    [Fact]
+    public void Only_an_error_about_the_record_itself_names_a_culprit()
+    {
+        static KafkaException Error(ErrorCode code) => new(new Error(code));
+        Assert.True(KafkaLog.IsRecordRefusal(Error(ErrorCode.MsgSizeTooLarge)));
+        Assert.True(KafkaLog.IsRecordRefusal(Error(ErrorCode.Local_UnknownPartition)));
+        Assert.False(KafkaLog.IsRecordRefusal(Error(ErrorCode.Local_State)));
+        Assert.False(KafkaLog.IsRecordRefusal(Error(ErrorCode.Local_MsgTimedOut)));
+    }
+
+    /// <summary>"Failed to query partition leaders: No leaders found" is what the client's
+    /// ListOffsets and DeleteRecords say of a partition whose leader its metadata does not
+    /// hold yet. It passes; it must be retried, not thrown into a takeover.</summary>
+    [Fact]
+    public void A_missing_partition_leader_is_a_transient_admin_error()
+    {
+        Assert.True(KafkaLog.IsTransient(new KafkaException(new Error(ErrorCode.Local_NoEnt, "Failed to query partition leaders: No leaders found"))));
+        Assert.True(KafkaLog.IsTransient(new KafkaException(new Error(ErrorCode.NotLeaderForPartition))));
+        Assert.True(KafkaLog.IsTransient(new KafkaException(new Error(ErrorCode.LeaderNotAvailable))));
+        Assert.False(KafkaLog.IsTransient(new KafkaException(new Error(ErrorCode.TopicAuthorizationFailed))));
+        Assert.False(KafkaLog.IsTransient(new KafkaException(new Error(ErrorCode.InvalidConfig))));
+    }
+
+    /// <summary>Tables opened the moment the log exists, many at once, on one broker: each
+    /// open creates two topics and at once asks for their offsets. Before
+    /// <c>Local_NoEnt</c> was retried a good share of these failed.</summary>
+    [Fact]
+    public async Task Many_tables_opened_at_once_on_new_topics_all_open()
+    {
+        await using var env = KafkaEnv.Create();
+        var log = await env.ConnectWriterAsync(env.Options(rowPartitions: 6));
+        var opened = await Task.WhenAll(Enumerable.Range(0, 32).Select(i =>
+            Task.Run(() => log.OpenTableLogAsync<int, Row>("t" + i)))).WaitAsync(Timeout * 2);
+        Assert.Equal(32, opened.Select(t => t.Epoch).Distinct().Count());
+        foreach (var table in opened)
+            Assert.Equal(0, await table.LastVersionAsync());
+    }
+
+    [Fact]
+    public async Task A_transaction_takes_waiting_commits_only_up_to_MaxTransactionRecords()
+    {
+        await using var env = KafkaEnv.Create();
+        // The linger makes sure all thirty commits are waiting when the first transaction begins.
+        var log = await env.ConnectWriterAsync(env.Options(linger: TimeSpan.FromMilliseconds(300), maxTransactionRecords: 10));
+        var transactionsBefore = log.TransactionsCommitted;
+
+        var commits = new List<Task>();
+        for (var c = 0; c < 30; c++)
+        {
+            var commit = new LogCommit();
+            for (var r = 0; r < 4; r++)
+                commit.Add(new TopicPartition(log.State.Topic, 0), Bytes($"c{c}/r{r}"), Bytes("v"));
+            commits.Add(log.CommitAsync(commit));
+        }
+        await Task.WhenAll(commits).WaitAsync(Timeout);
+
+        // Four records a commit, ten a transaction: a transaction is full at three commits.
+        var transactions = log.TransactionsCommitted - transactionsBefore;
+        Assert.InRange(transactions, 10, 30);
+        Assert.Equal(0, log.TransactionsAborted);
+
+        // And a single commit over the cap is not split: it rides alone, whole.
+        var large = new LogCommit();
+        for (var r = 0; r < 55; r++)
+            large.Add(new TopicPartition(log.State.Topic, 1), Bytes($"large/{r}"), Bytes("v"));
+        transactionsBefore = log.TransactionsCommitted;
+        await log.CommitAsync(large).WaitAsync(Timeout);
+        Assert.Equal(1, log.TransactionsCommitted - transactionsBefore);
+    }
+
+    /// <summary>
+    /// A follower that has stopped applying, under a writer that has not stopped writing:
+    /// what it holds is two batches in its channel and the one in its hand on the managed
+    /// side, and the client's fetch buffer on the native side — whatever the topic holds.
+    /// </summary>
+    [Fact]
+    public async Task A_stalled_follower_holds_a_bounded_amount_of_the_log()
+    {
+        const int Commits = 60, PerCommit = 1000, PayloadBytes = 300, BufferKilobytes = 1024;
+        await using var env = KafkaEnv.Create();
+        var active = await env.ConnectWriterAsync();
+
+        long peak = 0;
+        var samples = 0;
+        var standby = await env.ConnectAsync(env.Options(
+            fetchBufferKilobytes: BufferKilobytes,
+            clientConfig: new Dictionary<string, string> { ["statistics.interval.ms"] = "100" },
+            configureConsumer: consumer => consumer.SetStatisticsHandler((_, json) =>
+            {
+                using var statistics = System.Text.Json.JsonDocument.Parse(json);
+                foreach (var t in statistics.RootElement.GetProperty("topics").EnumerateObject())
+                    foreach (var p in t.Value.GetProperty("partitions").EnumerateObject())
+                        peak = Math.Max(peak, p.Value.GetProperty("fetchq_size").GetInt64());
+                Interlocked.Increment(ref samples);
+            })));
+
+        var random = new Random(5);
+        for (var c = 0; c < Commits; c++)
+        {
+            var commit = new LogCommit();
+            for (var r = 0; r < PerCommit; r++)
+            {
+                var payload = new byte[PayloadBytes];
+                random.NextBytes(payload);
+                commit.Add(new TopicPartition(active.State.Topic, 0), Bytes($"c{c}/r{r}"), payload);
+            }
+            await active.CommitAsync(commit).WaitAsync(Timeout);
+        }
+        var topicBytes = (long)Commits * PerCommit * PayloadBytes;
+        var end = 0L;
+        await KafkaEnv.EventuallyAsync(
+            async () => (end = await standby.EndOffsetAsync(new TopicPartition(standby.State.Topic, 0), default)) >= Commits * (PerCommit + 1),
+            "every commit is readable");
+
+        using var stop = new CancellationTokenSource(Timeout);
+        await using var batches = standby.ReadBatchesAsync(new TopicPartition(standby.State.Topic, 0), 0, stop.Token).GetAsyncEnumerator();
+        Assert.True(await batches.MoveNextAsync());
+        var read = (long)batches.Current.Records.Count;
+
+        // Stalled with one batch in hand. The reader thread fills the channel and stops.
+        await Task.Delay(TimeSpan.FromSeconds(2));
+        var taken = standby.ReaderRecordsTaken;
+        Assert.InRange(taken, read, 4 * 1024); // in hand, two in the channel, one waiting to be written
+        await Task.Delay(TimeSpan.FromSeconds(1));
+        Assert.Equal(taken, standby.ReaderRecordsTaken);
+
+        // Released: everything arrives, once.
+        while (batches.Current.NextOffset < end)
+        {
+            Assert.True(await batches.MoveNextAsync());
+            read += batches.Current.Records.Count;
+        }
+        Assert.Equal(Commits * PerCommit, read);
+
+        // The client's limit plus the fetch (a megabyte) in flight when it was reached.
+        var bound = (BufferKilobytes + 1024 + 512) * 1024L;
+        Assert.True(Volatile.Read(ref samples) > 10, "the client reported no statistics");
+        Assert.InRange(peak, 1, bound);
+        Assert.True(topicBytes > 5 * bound, "the topic must dwarf the bound for this to mean anything");
+        KafkaEnv.Measured(output, $"stalled follower: topic {topicBytes / 1048576} MB, held {taken} records in managed memory, " +
+            $"client buffer limit {BufferKilobytes} KB, peak held by the client {peak / 1024} KB");
+    }
+
     [Fact]
     public async Task A_read_to_the_end_gets_past_an_aborted_transaction_at_the_tail()
     {

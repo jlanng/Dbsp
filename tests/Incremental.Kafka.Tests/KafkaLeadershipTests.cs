@@ -559,6 +559,205 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         Assert.Equal(2, b.Leadership.Term);
     }
 
+    // ── a long commit ──────────────────────────────────────────────────────────────────
+
+    private static LogCommit StateRecords(KafkaLog log, int count)
+    {
+        var commit = new LogCommit();
+        var value = new byte[] { 1, (byte)'1' };
+        for (var i = 0; i < count; i++)
+            commit.Add(new TopicPartition(log.State.Topic, StatePartition), Encoding.UTF8.GetBytes("k" + i), value);
+        return commit;
+    }
+
+    /// <summary>
+    /// One commit that takes several takeover timeouts to produce. Its heartbeat cannot be
+    /// read until it commits, and no idle heartbeat can be written meanwhile, so to a
+    /// standby that reads committed records the leader has gone silent. It has not: it is
+    /// writing, and the standby must see that and wait.
+    /// </summary>
+    [Fact]
+    public async Task A_leader_inside_one_long_commit_is_not_taken_for_dead()
+    {
+        await using var env = KafkaEnv.Create();
+        await using var a = await StartAsync(env, "a");
+        await LeadsAsync(a);
+        await using var b = await StartAsync(env, "b");
+        await Task.Delay(After);
+        Assert.Equal(NodeRole.Standby, b.Role);
+
+        // 120 pauses of 25 ms: three seconds of producing, against a timeout of 0.8 s.
+        a.Log.WhileProducing = () => Thread.Sleep(25);
+        var beatsBefore = a.Log.InTransactionHeartbeats;
+        var clock = Stopwatch.StartNew();
+        await a.Log.CommitAsync(StateRecords(a.Log, 256 * 120)).WaitAsync(Timeout);
+        clock.Stop();
+        a.Log.WhileProducing = null;
+
+        Assert.True(clock.Elapsed > After * 3, $"the commit took only {clock.Elapsed}; it must outlast the takeover timeout to prove anything");
+        Assert.Equal(NodeRole.Leader, a.Role);
+        Assert.Equal(NodeRole.Standby, b.Role);
+        Assert.True(a.Log.IsWriter);
+        Assert.True(a.Log.InTransactionHeartbeats - beatsBefore >= 10, "the long transaction carried no heartbeats of its own");
+        KafkaEnv.Measured(output,
+            $"a commit of {clock.Elapsed.TotalMilliseconds:F0} ms under a takeover timeout of {After.TotalMilliseconds:F0} ms: " +
+            $"{a.Log.InTransactionHeartbeats - beatsBefore} in-transaction heartbeats, the standby stayed a standby");
+
+        // The commit is whole and the leader carries on as before.
+        await CommitStateAsync(a.Log, "p", "after");
+        await Task.Delay(After * 2);
+        Assert.Equal(NodeRole.Standby, b.Role);
+        Assert.Equal(1, b.Leadership.Status.LeaderTerm);
+    }
+
+    /// <summary>The other side of the same rule: a leader that stops in the middle of a
+    /// transaction — its first heartbeat written, nothing after — is silent, and the open
+    /// transaction must not buy it any time.</summary>
+    [Fact]
+    public async Task A_leader_that_stops_inside_a_transaction_is_replaced_on_time()
+    {
+        await using var env = KafkaEnv.Create();
+        await using var a = await StartAsync(env, "a");
+        await LeadsAsync(a);
+        await using var b = await StartAsync(env, "b");
+        await Task.Delay(After);
+
+        using var frozen = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        a.Log.WhileProducing = () =>
+        {
+            frozen.Set();
+            release.Wait(Timeout);
+        };
+        var commit = a.Log.CommitAsync(StateRecords(a.Log, 2048));
+        Assert.True(frozen.Wait(Timeout));
+        var stopped = Stopwatch.StartNew();
+
+        await LeadsAsync(b);
+        var took = stopped.Elapsed;
+        Assert.Equal("silence", b.Leadership.Status.LastTakeover!.Reason);
+        Assert.True(took < After * 3, $"the standby took {took} to replace a leader stopped mid-transaction (timeout {After})");
+        KafkaEnv.Measured(output, $"leader stopped inside a transaction: replaced {took.TotalMilliseconds:F0} ms later (timeout {After.TotalMilliseconds:F0} ms)");
+
+        // The old leader's transaction was aborted under it: the commit fails as fenced.
+        release.Set();
+        await Assert.ThrowsAsync<KafkaLogFencedException>(() => commit).WaitAsync(Timeout);
+        await a.Leadership.WhenFinished.WaitAsync(Timeout);
+        Assert.Equal(NodeRole.Fenced, a.Role);
+    }
+
+    // ── stopping part-way, stepping down twice ─────────────────────────────────────────
+
+    [Fact]
+    public async Task Disposing_the_leadership_in_the_middle_of_a_takeover_closes_the_writer()
+    {
+        await using var env = KafkaEnv.Create();
+        var preparing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var a = await StartAsync(env, "a", prepare: async (_, token) =>
+        {
+            preparing.TrySetResult();
+            await Task.Delay(System.Threading.Timeout.Infinite, token);
+        });
+        await preparing.Task.WaitAsync(Timeout);
+        Assert.Equal(NodeRole.Promoting, a.Role);
+        Assert.True(a.Log.IsWriter); // it has fenced whoever led, and heartbeats
+        await KafkaEnv.EventuallyAsync(() => Task.FromResult(a.Log.IdleHeartbeats >= 2), "the half-promoted node heartbeats");
+
+        await a.Leadership.DisposeAsync().AsTask().WaitAsync(Timeout);
+
+        // It leads nothing and never will: it must not look alive.
+        Assert.False(a.Log.IsWriter);
+        Assert.True(a.Log.IsFenced);
+        Assert.Equal(NodeRole.Fenced, a.Role);
+        Assert.True(a.Leadership.WhenFinished.IsCompleted);
+        var beats = a.Log.IdleHeartbeats;
+        await using var b = await StartAsync(env, "b");
+        await LeadsAsync(b);
+        Assert.Equal(beats, a.Log.IdleHeartbeats);
+        Assert.Equal(2, b.Leadership.Term);
+    }
+
+    [Fact]
+    public async Task Step_downs_asked_for_together_are_one_step_down()
+    {
+        await using var env = KafkaEnv.Create();
+        for (var round = 0; round < 3; round++)
+        {
+            await using var a = await StartAsync(env, "a" + round, automatic: false);
+            await a.Leadership.TakeOverAsync().WaitAsync(Timeout);
+
+            using var together = new Barrier(6);
+            var calls = Enumerable.Range(0, 6).Select(_ => Task.Run(() =>
+            {
+                together.SignalAndWait(Timeout);
+                return a.Leadership.StepDownAsync();
+            })).ToArray();
+            await Task.WhenAll(calls).WaitAsync(Timeout); // every caller: no exception
+
+            Assert.Equal(NodeRole.Resigned, a.Role);
+            Assert.Null(a.Leadership.Status.Fault);
+            lock (a.Calls)
+                Assert.Single(a.Calls, call => call == "stop");
+
+            // And once more, afterwards: the same answer, nothing done again.
+            await a.Leadership.StepDownAsync().WaitAsync(Timeout);
+            lock (a.Calls)
+                Assert.Single(a.Calls, call => call == "stop");
+        }
+    }
+
+    [Fact]
+    public async Task Measuring_lag_builds_no_clients()
+    {
+        await using var env = KafkaEnv.Create();
+        var active = await env.ConnectWriterAsync(env.Options(nodeId: "a", heartbeat: Beat));
+        var names = Enumerable.Range(0, 4).Select(i => "t" + i).ToArray();
+        var writers = new List<SharedTable<int, Row>>();
+        foreach (var name in names)
+        {
+            var table = await SharedTable<int, Row>.OpenAsync(name, r => r.Id, await active.OpenTableLogAsync<int, Row>(name)).WaitAsync(Timeout);
+            await table.Writer.UpsertAsync(new Row(1, "one"));
+            await table.Writer.CommitAsync().AsTask().WaitAsync(Timeout);
+            writers.Add(table);
+        }
+
+        await using var b = await StartAsync(env, "b", begin: false, automatic: false);
+        foreach (var name in names)
+        {
+            var log = await b.Log.OpenTableLogAsync<int, Row>(name).WaitAsync(Timeout);
+            b.Leadership.Track(await SharedTable<int, Row>.FollowAsync(name, r => r.Id, log).WaitAsync(Timeout), log);
+        }
+        await KafkaEnv.EventuallyAsync(async () => (await b.Leadership.MeasureLagAsync()).IsCaughtUp, "the standby has caught up");
+
+        var clients = b.Log.ConsumersCreated;
+        for (var i = 0; i < 5; i++)
+            Assert.True((await b.Leadership.MeasureLagAsync()).IsCaughtUp);
+        Assert.Equal(clients, b.Log.ConsumersCreated);
+
+        // Still a measurement: a version the standby's view has not reached yet shows.
+        await writers[2].Writer.UpsertAsync(new Row(2, "two"));
+        await writers[2].Writer.CommitAsync().AsTask().WaitAsync(Timeout);
+        await KafkaEnv.EventuallyAsync(async () => (await b.Leadership.MeasureLagAsync()).IsCaughtUp, "the standby follows the new version");
+        Assert.Equal(clients, b.Log.ConsumersCreated);
+        foreach (var table in writers)
+            await table.DisposeAsync();
+    }
+
+    [Fact]
+    public void The_lease_clock_counts_time_spent_suspended_where_the_platform_has_such_a_clock()
+    {
+        var first = LeaseClock.Milliseconds;
+        Thread.Sleep(30);
+        var second = LeaseClock.Milliseconds;
+        Assert.InRange(second - first, 20, 5000);
+        if (OperatingSystem.IsLinux())
+        {
+            // CLOCK_BOOTTIME: never behind the monotonic clock, which stops in a suspend.
+            Assert.True(LeaseClock.CountsSuspendedTime);
+            Assert.True(LeaseClock.Milliseconds >= Environment.TickCount64 - 50);
+        }
+    }
+
     [Fact]
     public async Task A_leased_sink_writes_for_the_leader_and_refuses_for_anyone_else()
     {

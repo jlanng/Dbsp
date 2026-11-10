@@ -228,6 +228,13 @@ public sealed class KafkaLeadership : IAsyncDisposable
     private bool _leaderResigned;
     private long _heardTicks;
     private long _watchPosition;
+
+    // Signs of life short of a readable heartbeat: the leader topic's end as last sampled
+    // with an open transaction's records counted (-1: no sample since the last record was
+    // heard), and when it was last seen to move.
+    private long _uncommittedEnd = -1;
+    private long _progressTicks;
+    private Task? _stepDown;
     private bool _manual;
     private FollowerLag? _lag;
     private TakeoverTimings? _lastTakeover;
@@ -465,17 +472,41 @@ public sealed class KafkaLeadership : IAsyncDisposable
     /// (<see cref="KafkaLeadershipOptions.StopLeadingAsync"/>), commits a resignation to the
     /// leader topic — on reading it a standby takes over at once, with no silence to wait
     /// out — and ends as <see cref="NodeRole.Resigned"/>. The process should then exit and
-    /// return as a standby.
+    /// return as a standby. Calls made while one is under way, or after it, share its
+    /// outcome: the circuits are stopped once and one resignation is written.
     /// </summary>
-    public async Task StepDownAsync(CancellationToken cancellationToken = default)
+    public Task StepDownAsync(CancellationToken cancellationToken = default)
     {
+        Task stepDown;
         lock (_lock)
         {
-            if (_role is not NodeRole.Leader)
-                throw new InvalidOperationException($"Node '{NodeId}' is {_role}; only the leader can step down.");
+            // One step-down, however many ask: a second caller waits for the first's.
+            if (_stepDown is null)
+            {
+                if (_role is not NodeRole.Leader)
+                    return Task.FromException(new InvalidOperationException($"Node '{NodeId}' is {_role}; only the leader can step down."));
+                _stepDown = Task.Run(() => StepDownCoreAsync(cancellationToken), CancellationToken.None);
+            }
+            stepDown = _stepDown;
         }
-        if (_options.StopLeadingAsync is { } stop)
-            await stop(cancellationToken).ConfigureAwait(false);
+        return stepDown.WaitAsync(cancellationToken);
+    }
+
+    private async Task StepDownCoreAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (_options.StopLeadingAsync is { } stop)
+                await stop(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Nothing was resigned: the node still leads, and may be asked again.
+            lock (_lock)
+                _stepDown = null;
+            throw;
+        }
+
         try
         {
             await _log.ResignAsync().ConfigureAwait(false);
@@ -633,6 +664,7 @@ public sealed class KafkaLeadership : IAsyncDisposable
             _leaderAt = record.At;
             _leaderResigned = record.Resigned;
             _heardTicks = Environment.TickCount64;
+            _uncommittedEnd = -1;
         }
 
         // A higher term than this node's own is another node's takeover: sooner news than
@@ -678,30 +710,43 @@ public sealed class KafkaLeadership : IAsyncDisposable
     private async Task<(string Reason, TimeSpan Silence)?> WaitToTakeOverAsync(CancellationToken token)
     {
         var tick = TimeSpan.FromMilliseconds(Math.Clamp(_options.TakeoverAfter.TotalMilliseconds / 20, 10, 100));
+        var beat = _log.Options.HeartbeatInterval;
+        var sampleEvery = Math.Max((long)tick.TotalMilliseconds, (long)beat.TotalMilliseconds / 4);
         var nextProbe = 0L;
+        var nextSample = 0L;
         while (true)
         {
             bool manual, resigned;
-            TimeSpan silence;
+            TimeSpan silence, quiet;
             lock (_lock)
             {
                 if (_role is not NodeRole.Standby)
                     return null;
                 manual = _manual;
                 resigned = _leaderResigned;
-                silence = TimeSpan.FromMilliseconds(Environment.TickCount64 - _heardTicks);
+                (silence, quiet) = Silence();
             }
 
             if (manual)
                 return ("manual", silence);
             if (_options.AutomaticTakeover)
             {
+                // A heartbeat is late. Before the silence is long enough to act on, start
+                // watching for the other sign of life: a leader inside a long transaction.
+                if (!resigned && silence > beat * 1.25 && Environment.TickCount64 >= nextSample)
+                {
+                    await NoteProgressAsync(token).ConfigureAwait(false);
+                    nextSample = Environment.TickCount64 + sampleEvery;
+                    lock (_lock)
+                        (silence, quiet) = Silence();
+                }
+
                 string? reason = null;
                 if (resigned)
                     reason = "resigned";
                 else if (silence >= _options.TakeoverCeiling)
                     reason = "ceiling";
-                else if (silence >= _options.TakeoverAfter)
+                else if (quiet >= _options.TakeoverAfter)
                 {
                     if (_options.ProbeLeader is null)
                         reason = "silence";
@@ -721,6 +766,49 @@ public sealed class KafkaLeadership : IAsyncDisposable
                 }
             }
             await Task.Delay(tick, token).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>How long since a record was read from the leader topic, and how long since
+    /// any sign of life: that, or the topic's end moving under an open transaction. The
+    /// caller holds the lock.</summary>
+    private (TimeSpan Silence, TimeSpan Quiet) Silence()
+    {
+        var now = Environment.TickCount64;
+        return (TimeSpan.FromMilliseconds(now - _heardTicks),
+            TimeSpan.FromMilliseconds(now - Math.Max(_heardTicks, _progressTicks)));
+    }
+
+    /// <summary>
+    /// Looks for a leader that is alive inside one long transaction. Its heartbeat is a
+    /// record in that transaction, readable only when the transaction commits, so a commit
+    /// that takes longer than <see cref="KafkaLeadershipOptions.TakeoverAfter"/> reads as
+    /// silence. The log writer therefore keeps adding heartbeats to a transaction while it
+    /// produces and flushes it; nobody can read them yet, but each moves the leader topic's
+    /// end as an uncommitted read sees it. Only the current writer can move it — a fenced
+    /// producer's records are refused and a dead one writes nothing — so an end that has
+    /// moved since the last sample is a live leader, and counts against the silence like a
+    /// probe that answers: until <see cref="KafkaLeadershipOptions.TakeoverCeiling"/>.
+    /// </summary>
+    private async Task NoteProgressAsync(CancellationToken token)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+        timeout.CancelAfter(TimeSpan.FromSeconds(1));
+        try
+        {
+            var end = await _log.UncommittedEndOffsetAsync(_log.LeaderPartition, timeout.Token).ConfigureAwait(false);
+            lock (_lock)
+            {
+                // The first sample after a heartbeat is only a baseline: the end may hold
+                // the first record of a transaction whose writer died a moment later.
+                if (_uncommittedEnd >= 0 && end > _uncommittedEnd)
+                    _progressTicks = Environment.TickCount64;
+                _uncommittedEnd = Math.Max(_uncommittedEnd, end);
+            }
+        }
+        catch (Exception) when (!token.IsCancellationRequested)
+        {
+            // Unreachable: no news either way. The last check before a takeover says so.
         }
     }
 
@@ -809,8 +897,16 @@ public sealed class KafkaLeadership : IAsyncDisposable
             _logger?.LogInformation("Node {Node} leads under term {Term} after {Elapsed}.", NodeId, _log.Term, clock.Elapsed);
             return true;
         }
-        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        catch (OperationCanceledException ex) when (token.IsCancellationRequested)
         {
+            // Disposed part-way. If the log is already the writer, this node has fenced
+            // the previous leader and leads nothing: left alone its log would heartbeat on
+            // and hold every standby back. Close the writer, as for any failed takeover.
+            if (_log.IsWriter)
+            {
+                _log.Depose($"Node '{NodeId}' was stopped in the middle of its takeover.");
+                Finish(NodeRole.Fenced, ex);
+            }
             throw;
         }
         catch (Exception ex)
@@ -877,7 +973,10 @@ public sealed class KafkaLeadership : IAsyncDisposable
     }
 
     /// <summary>Stops watching and electing. It does not step down and does not dispose
-    /// the log: a leader stays the log's writer until the log is disposed or fenced.</summary>
+    /// the log: a leader stays the log's writer until the log is disposed or fenced. A
+    /// node caught in the middle of a takeover is different: it is not the leader and
+    /// cannot become one now, so if it had already become the writer its writer is closed
+    /// and it ends as <see cref="NodeRole.Fenced"/>.</summary>
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)

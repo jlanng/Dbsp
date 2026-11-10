@@ -260,6 +260,79 @@ public class KafkaTableLogTests(ITestOutputHelper output)
         Assert.Equal(7, await next.WaitAsync(Timeout));
     }
 
+    /// <summary>
+    /// A trim "of everything" while the writer keeps committing. The version committed
+    /// after the trim read the last version, and before it asked where the topic ends, is
+    /// not part of what was asked to go: it must still be there, as the log says it is.
+    /// </summary>
+    [Fact]
+    public async Task A_trim_past_the_last_version_keeps_a_version_committed_while_it_ran()
+    {
+        await using var env = KafkaEnv.Create();
+        var active = await env.ConnectWriterAsync();
+        var log = await active.OpenTableLogAsync<int, Row>("rows").WaitAsync(Timeout);
+        for (var v = 1; v <= 5; v++)
+            await log.AppendAsync(Version(v, null, Put(v, "v" + v)));
+
+        log.AfterTrimReadsLast = async () =>
+        {
+            await log.AppendAsync(Version(6, null, Put(6, "v6")));
+            await Task.Delay(200); // until the commit's markers are written and the end has moved
+        };
+        await log.TrimBeforeAsync(long.MaxValue).AsTask().WaitAsync(Timeout);
+        log.AfterTrimReadsLast = null;
+
+        Assert.Equal(6, log.OldestRetainedVersion);
+        Assert.Equal(6, await log.LastVersionAsync());
+        Assert.Equal(1, await CountRecordsAsync(active, log.ChangesTopic, 1));
+        var kept = Assert.Single(await ReadAsync(log, 5, 6));
+        Assert.Equal(6, kept.Version);
+
+        // Another process finds the same: its history starts at 6 and holds it.
+        var successor = await env.ConnectWriterAsync();
+        var reopened = await successor.OpenTableLogAsync<int, Row>("rows").WaitAsync(Timeout);
+        Assert.Equal(6, reopened.OldestRetainedVersion);
+        Assert.Equal(6, Assert.Single(await ReadAsync(reopened, 5, 6)).Version);
+
+        // And with nothing committed meanwhile, a trim past the end leaves nothing.
+        await reopened.TrimBeforeAsync(long.MaxValue).AsTask().WaitAsync(Timeout);
+        Assert.Equal(7, reopened.OldestRetainedVersion);
+        await KafkaEnv.EventuallyAsync(
+            async () => await CountRecordsAsync(successor, log.ChangesTopic, 1) == 0, "the changes topic is empty");
+    }
+
+    /// <summary>Two parts of one process open the same new table at the same moment. One
+    /// identity may come of it: a second epoch in the rows topic is a table no standby can open.</summary>
+    [Fact]
+    public async Task Concurrent_first_opens_of_a_table_mint_one_identity()
+    {
+        await using var env = KafkaEnv.Create();
+        var active = await env.ConnectWriterAsync();
+        var standby = await env.ConnectAsync();
+        for (var t = 0; t < 4; t++)
+        {
+            var name = "t" + t;
+            var opened = await Task.WhenAll(Enumerable.Range(0, 6).Select(_ =>
+                Task.Run(() => active.OpenTableLogAsync<int, Row>(name)))).WaitAsync(Timeout);
+            Assert.All(opened, log => Assert.Same(opened[0], log));
+
+            var seen = await standby.OpenTableLogAsync<int, Row>(name).WaitAsync(Timeout);
+            Assert.Equal(opened[0].Epoch, seen.Epoch);
+            await using var followed = await SharedTable<int, Row>.FollowAsync(name, r => r.Id, seen).WaitAsync(Timeout);
+            Assert.Equal(0, followed.LatestVersion);
+
+            // One head per rows partition and no more: nobody minted twice.
+            Assert.Equal(seen.RowPartitions, await CountRecordsAsync(standby, seen.RowsTopic, seen.RowPartitions));
+        }
+
+        // A failed or cancelled open is forgotten, so the name can be opened again.
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => active.OpenTableLogAsync<int, Row>("later", cancelled.Token));
+        Assert.Equal(0, await (await active.OpenTableLogAsync<int, Row>("later").WaitAsync(Timeout)).LastVersionAsync());
+        await Assert.ThrowsAsync<InvalidOperationException>(() => active.OpenTableLogAsync<string, Row>("later"));
+    }
+
     [Fact]
     public async Task A_new_process_follows_from_the_head_without_reading_the_history()
     {
@@ -460,8 +533,10 @@ public class KafkaTableLogTests(ITestOutputHelper output)
 
         var successor = await env.ConnectWriterAsync(options);
         var reopened = await successor.OpenTableLogAsync<int, Instrument>("instruments").WaitAsync(Timeout);
-        var written = await CountRecordsAsync(successor, log.RowsTopic, 1);
-        Assert.True(written >= Keys * Versions);
+        // What was written, by arithmetic and not by reading: a row record per change, a
+        // head per version (version 0 included). With these settings a closed segment is
+        // cleanable at once, so a count read here could already be a compacted one.
+        long written = Keys * Versions + deletes.Count + (Versions + 2);
         var (before, headBefore) = await RestoreAsync(reopened);
         Assert.Equal(Keys - deletes.Count, before.Count);
 
