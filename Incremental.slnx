@@ -13,6 +13,7 @@
   <Folder Name="/src/">
     <Project Path="src/Incremental.Hosting/Incremental.Hosting.csproj" />
     <Project Path="src/Incremental.Kafka/Incremental.Kafka.csproj" />
+    <Project Path="src/Incremental.Service.Admin/Incremental.Service.Admin.csproj" />
     <Project Path="src/Incremental.Service/Incremental.Service.csproj" />
     <Project Path="src/Incremental.Storage.Redis/Incremental.Storage.Redis.csproj" />
     <Project Path="src/Incremental/Incremental.csproj" />
@@ -28,6 +29,7 @@
     <Project Path="tests/Incremental.ClusterHost/Incremental.ClusterHost.csproj" />
     <Project Path="tests/Incremental.Kafka.FailoverApp/Incremental.Kafka.FailoverApp.csproj" />
     <Project Path="tests/Incremental.Kafka.Tests/Incremental.Kafka.Tests.csproj" />
+    <Project Path="tests/Incremental.Service.AdminHost/Incremental.Service.AdminHost.csproj" />
     <Project Path="tests/Incremental.Service.FailoverApp/Incremental.Service.FailoverApp.csproj" />
     <Project Path="tests/Incremental.Service.Tests/Incremental.Service.Tests.csproj" />
     <Project Path="tests/Incremental.Tests/Incremental.Tests.csproj" />

@@ -1,0 +1,131 @@
+using System.Net;
+using System.Text.Json;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+
+namespace Incremental.Service.Admin;
+
+/// <summary>The one shape every refusal has:
+/// <c>{ "error": { "code", "message", "details"?, "leader"? } }</c>.</summary>
+internal static class AdminErrors
+{
+    public static object Body(string code, string message, IReadOnlyList<string>? details = null, object? leader = null) =>
+        new { error = new { code, message, details = details is { Count: > 0 } ? details : null, leader } };
+
+    public static IResult Result(int status, string code, string message, IReadOnlyList<string>? details = null, object? leader = null) =>
+        Results.Json(Body(code, message, details, leader), AdminJson.Options, statusCode: status);
+
+    public static Task WriteAsync(HttpContext context, int status, string code, string message)
+    {
+        context.Response.StatusCode = status;
+        return context.Response.WriteAsJsonAsync(Body(code, message), AdminJson.Options);
+    }
+}
+
+/// <summary>A refusal raised inside a handler; the error filter turns it into the error shape.</summary>
+internal sealed class AdminException(int status, string code, string message) : Exception(message)
+{
+    public int Status { get; } = status;
+    public string Code { get; } = code;
+}
+
+internal static class AdminSecurity
+{
+    private static readonly string[] ForwardingHeaders = ["Forwarded", "X-Forwarded-For", "X-Forwarded-Host"];
+
+    /// <summary>With no authorization policy the package enforces loopback itself: it
+    /// cannot choose what the server binds, and an admin API that is reachable is an admin
+    /// API that is open.</summary>
+    public static IResult? RefuseUnlessLoopback(HttpContext context, ServiceAdminOptions options)
+    {
+        if (options.AuthorizationPolicy is not null)
+            return null;
+
+        var remote = context.Connection.RemoteIpAddress;
+        if (remote is { IsIPv4MappedToIPv6: true })
+            remote = remote.MapToIPv4();
+        if (remote is null || !IPAddress.IsLoopback(remote))
+            return AdminErrors.Result(403, "loopback-only",
+                "The admin API answers loopback requests only until ServiceAdminOptions.AuthorizationPolicy is set.");
+
+        // Behind a reverse proxy on the same machine every request arrives from loopback.
+        foreach (var header in ForwardingHeaders)
+            if (context.Request.Headers.ContainsKey(header))
+                return AdminErrors.Result(403, "forwarded",
+                    "This request was forwarded by a proxy; the admin API answers forwarded requests only when ServiceAdminOptions.AuthorizationPolicy is set.");
+
+        var host = context.Request.Host.Host;
+        var loopbackName = string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase)
+            || (IPAddress.TryParse(host.Trim('[', ']'), out var address) && IPAddress.IsLoopback(address));
+        if (!loopbackName && !options.AllowedHosts.Contains(host, StringComparer.OrdinalIgnoreCase))
+            return AdminErrors.Result(403, "host-not-allowed",
+                $"Host '{host}' is not a loopback name and is not in ServiceAdminOptions.AllowedHosts.");
+        return null;
+    }
+
+    /// <summary>What every mutation must carry. The header is what stops a page on the
+    /// operator's machine from posting to loopback: a browser will not send it cross-site
+    /// without a preflight, and the API answers none.</summary>
+    public static IResult? RefuseMutation(HttpContext context, ServiceAdminOptions options)
+    {
+        if (options.ReadOnly)
+            return AdminErrors.Result(403, "read-only", "This admin API is read-only (ServiceAdminOptions.ReadOnly).");
+        if (context.Request.Headers["X-Incremental-Admin"].FirstOrDefault() != "1")
+            return AdminErrors.Result(400, "missing-header", "A mutating request must carry the header 'X-Incremental-Admin: 1'.");
+        return null;
+    }
+
+    public static string Caller(HttpContext context) =>
+        context.User.Identity is { IsAuthenticated: true, Name: { Length: > 0 } name } ? name : "local";
+}
+
+/// <summary>Wraps every endpoint: the loopback rule first, then the handler, with whatever
+/// it throws turned into the error shape.</summary>
+internal sealed class AdminEndpointFilter(AdminState state, bool mutation) : IEndpointFilter
+{
+    public async ValueTask<object?> InvokeAsync(EndpointFilterInvocationContext invocation, EndpointFilterDelegate next)
+    {
+        var context = invocation.HttpContext;
+        if (AdminSecurity.RefuseUnlessLoopback(context, state.Options) is { } refused)
+            return refused;
+        if (mutation && AdminSecurity.RefuseMutation(context, state.Options) is { } refusedMutation)
+            return refusedMutation;
+        try
+        {
+            return await next(invocation).ConfigureAwait(false);
+        }
+        catch (ServiceException ex)
+        {
+            object? leader = null;
+            if (ex.Code == "not-leader")
+            {
+                var record = state.Leader();
+                leader = record is null ? null : new { nodeId = record.NodeId, term = record.Term, adminUrl = record.AdminUrl };
+            }
+            return AdminErrors.Result(ex.Status, ex.Code, ex.Message, ex.Details, leader);
+        }
+        catch (AdminException ex)
+        {
+            return AdminErrors.Result(ex.Status, ex.Code, ex.Message);
+        }
+        catch (JsonException ex)
+        {
+            return AdminErrors.Result(400, "invalid-json", $"The request body is not the JSON this endpoint reads: {ex.Message}");
+        }
+        catch (BadHttpRequestException ex)
+        {
+            return AdminErrors.Result(ex.StatusCode, ex.StatusCode == 413 ? "too-large" : "bad-request", ex.Message);
+        }
+        catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            state.Logger.LogError(ex, "Admin API: {Method} {Path} failed", context.Request.Method, context.Request.Path);
+            // An exception nobody expected may quote a row; its type never does.
+            return AdminErrors.Result(500, "internal",
+                state.Options.ExposeRowData ? $"{ex.GetType().Name}: {ex.Message}" : $"{ex.GetType().Name} (the message is hidden: ExposeRowData is off).");
+        }
+    }
+}

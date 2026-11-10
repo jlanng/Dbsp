@@ -44,4 +44,17 @@ public static class Tables
 {
     public static readonly InstrumentsTable Instruments = new();
     public static readonly PositionsTable Positions = new();
+    public static readonly CounterpartiesTable Counterparties = new();
+}
+
+/// <summary>Reference data loaded from a file: the admin host's second shared table.</summary>
+public sealed record Counterparty(string Id, string Name, string Country, string Tier);
+
+public sealed class CounterpartiesTable : TableDefinition<string, Counterparty>
+{
+    public static readonly IndexDefinition<Counterparty, string> ByCountry = new("country", c => c.Country);
+
+    public override string Name => "counterparties";
+    public override string KeyOf(Counterparty row) => row.Id;
+    protected override void Configure(TableBuilder<string, Counterparty> table) => table.Index(ByCountry);
 }
