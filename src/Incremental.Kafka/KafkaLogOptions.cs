@@ -22,6 +22,19 @@ public sealed class KafkaLogOptions
     /// active and the standby share it. Defaults to <c>{prefix}.writer</c>.</summary>
     public string? TransactionalId { get; init; }
 
+    /// <summary>This process's name in the leader topic: it is written with the term and
+    /// with every heartbeat, and it is how a status page says who leads. The active and
+    /// its standby must differ. Defaults to the machine name and the process id.</summary>
+    public string? NodeId { get; init; }
+
+    /// <summary>How often an idle writer commits a transaction carrying only a heartbeat to
+    /// <c>{prefix}.leader</c>. Every other transaction carries one too, so this is the
+    /// longest a healthy writer is silent — and the longest a writer that was fenced while
+    /// idle takes to find out. A standby's takeover timeout
+    /// (<see cref="KafkaLeadershipOptions.TakeoverAfter"/>) must be a few of these. Default
+    /// 1 s.</summary>
+    public TimeSpan HeartbeatInterval { get; init; } = TimeSpan.FromSeconds(1);
+
     /// <summary>Partitions of <c>{prefix}.state</c> (the design's <c>P</c>). Fixed for the
     /// life of the topic: a pipeline's partition is derived from it, so an existing topic
     /// with a different count is refused.</summary>
@@ -108,6 +121,10 @@ public sealed class KafkaLogOptions
 
     internal string EffectiveTransactionalId => TransactionalId ?? TopicPrefix + ".writer";
 
+    private static readonly string DefaultNodeId = $"{Environment.MachineName}-{Environment.ProcessId}";
+
+    internal string EffectiveNodeId => NodeId ?? DefaultNodeId;
+
     internal void Validate()
     {
         ArgumentException.ThrowIfNullOrEmpty(BootstrapServers);
@@ -117,6 +134,9 @@ public sealed class KafkaLogOptions
                 $"Topic prefix '{TopicPrefix}' is not usable in a topic name: use letters, digits, '.', '_' and '-'.", nameof(TopicPrefix));
         if (TransactionalId is { Length: 0 })
             throw new ArgumentException("The transactional id cannot be empty.", nameof(TransactionalId));
+        if (NodeId is { Length: 0 })
+            throw new ArgumentException("The node id cannot be empty.", nameof(NodeId));
+        ArgumentOutOfRangeException.ThrowIfLessThan(HeartbeatInterval, TimeSpan.FromMilliseconds(10));
         ArgumentOutOfRangeException.ThrowIfLessThan(StatePartitions, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(TableRowPartitions, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(ReplicationFactor, (short)1);

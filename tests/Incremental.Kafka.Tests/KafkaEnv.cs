@@ -50,8 +50,12 @@ internal sealed class KafkaEnv : IAsyncDisposable
         TimeSpan? linger = null,
         IReadOnlyDictionary<string, string>? stateTopic = null,
         IReadOnlyDictionary<string, string>? rowsTopic = null,
-        IStateSerializer? serializer = null) => new()
+        IStateSerializer? serializer = null,
+        string? nodeId = null,
+        TimeSpan? heartbeat = null) => new()
         {
+            NodeId = nodeId,
+            HeartbeatInterval = heartbeat ?? TimeSpan.FromSeconds(1),
             BootstrapServers = Bootstrap,
             TopicPrefix = Prefix,
             ReplicationFactor = 1,

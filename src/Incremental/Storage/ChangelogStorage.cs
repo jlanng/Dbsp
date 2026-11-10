@@ -115,6 +115,21 @@ public sealed class ChangelogStorage : IAsyncDisposable
     /// to stop being the active. Never faults.</summary>
     public Task WhenFenced => _whenFenced.Task;
 
+    /// <summary>The changelog's partition count.</summary>
+    public int PartitionCount => _positions.Length;
+
+    /// <summary>
+    /// Where this storage's reader stands in each partition of the changelog: the offset
+    /// it will read next. Set against the partition's end offset
+    /// (<see cref="IStateChangelog.EndOffsetAsync"/>) it is a follower's lag. After a
+    /// promotion it stays at the offsets the storage took over at.
+    /// </summary>
+    public long[] FollowedOffsets()
+    {
+        lock (_lock)
+            return (long[])_positions.Clone();
+    }
+
     /// <summary>
     /// The storage provider of one pipeline: pass it as <see cref="CircuitOptions.Storage"/>
     /// of the one circuit that is that pipeline. The same instance is returned every time.

@@ -35,6 +35,7 @@ public sealed class KafkaLog : IAsyncDisposable
     internal const byte JsonFormat = 1;
 
     private static readonly byte[] TermKey = "term"u8.ToArray();
+    private static readonly byte[] HeartbeatKey = "heartbeat"u8.ToArray();
 
     private readonly KafkaLogOptions _options;
     private readonly IAdminClient _admin;
@@ -57,6 +58,9 @@ public sealed class KafkaLog : IAsyncDisposable
     private volatile KafkaLogFencedException? _fenced;
     private readonly TaskCompletionSource _whenFenced = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private long _term;
+    private long _heartbeatSequence;
+    private long _idleHeartbeats;
+    private long _lastTransactionTicks;
     private long _transactions;
     private long _aborted;
     private long _commits;
@@ -119,8 +123,11 @@ public sealed class KafkaLog : IAsyncDisposable
             await log.EnsureTopicAsync(
                 log.State.Topic, options.StatePartitions, CompactedConfig(options, options.StateTopicConfig),
                 fixedPartitions: true, cancellationToken).ConfigureAwait(false);
+            // Two keys, rewritten every second: roll segments hourly so the cleaner keeps
+            // the topic at a few megabytes instead of a week of heartbeats.
             await log.EnsureTopicAsync(
-                log._leaderPartition.Topic, 1, CompactedConfig(options, new Dictionary<string, string>()),
+                log._leaderPartition.Topic, 1,
+                CompactedConfig(options, new Dictionary<string, string> { ["segment.ms"] = "3600000" }),
                 fixedPartitions: true, cancellationToken).ConfigureAwait(false);
             return log;
         }
@@ -148,11 +155,37 @@ public sealed class KafkaLog : IAsyncDisposable
     /// <summary>Whether the writer has been fenced or has failed fatally.</summary>
     public bool IsFenced => _fenced is not null;
 
+    /// <summary>Why the writer is finished; null while it is not.</summary>
+    internal KafkaLogFencedException? FencedBy => _fenced;
+
+    /// <summary>The writer ended by <see cref="ResignAsync"/>, not by being fenced.</summary>
+    internal bool HasResigned { get; private set; }
+
     /// <summary>Completes when the writer is fenced or fails fatally: the signal for the
     /// process to stop being the active. Never faults.</summary>
     public Task WhenFenced => _whenFenced.Task;
 
-    /// <summary>Kafka transactions committed by this log.</summary>
+    /// <summary>This process's name in the leader topic: <see cref="KafkaLogOptions.NodeId"/>.</summary>
+    public string NodeId => _options.EffectiveNodeId;
+
+    /// <summary>The leader topic, <c>{prefix}.leader</c>: one partition holding the term
+    /// (key <c>term</c>) and the writer's heartbeat (key <c>heartbeat</c>).</summary>
+    public string LeaderTopic => _leaderPartition.Topic;
+
+    internal TopicPartition LeaderPartition => _leaderPartition;
+
+    /// <summary>How long ago the last transaction this log committed was begun — a commit,
+    /// or the heartbeat an idle writer commits every
+    /// <see cref="KafkaLogOptions.HeartbeatInterval"/>. Null on a reader and once fenced. Local elapsed
+    /// time; it is what the delivery lease is measured from.</summary>
+    public TimeSpan? SinceLastTransaction =>
+        IsWriter ? TimeSpan.FromMilliseconds(Environment.TickCount64 - Interlocked.Read(ref _lastTransactionTicks)) : null;
+
+    /// <summary>Transactions that carried nothing but a heartbeat, committed because the
+    /// writer was idle. Not counted in <see cref="TransactionsCommitted"/>.</summary>
+    public long IdleHeartbeats => Interlocked.Read(ref _idleHeartbeats);
+
+    /// <summary>Kafka transactions committed by this log that carried at least one commit.</summary>
     public long TransactionsCommitted => Interlocked.Read(ref _transactions);
 
     /// <summary>Kafka transactions this log aborted (and retried or failed).</summary>
@@ -278,30 +311,85 @@ public sealed class KafkaLog : IAsyncDisposable
         }
 
         var commit = new LogCommit();
-        commit.Add(_leaderPartition, TermKey, JsonSerializer.SerializeToUtf8Bytes(new TermRecord(term, DateTimeOffset.UtcNow)).Prefixed(JsonFormat));
+        commit.Add(_leaderPartition, TermKey,
+            JsonSerializer.SerializeToUtf8Bytes(new LeaderRecord(term, NodeId, DateTimeOffset.UtcNow)).Prefixed(JsonFormat));
         await EnqueueAsync(commit, acquiring: true).ConfigureAwait(false);
         Interlocked.Exchange(ref _term, term);
         _isWriter = true;
     }
 
-    private sealed record TermRecord(long Term, DateTimeOffset At);
+    /// <summary>A record of the leader topic. Under the key <c>term</c>: written once by
+    /// each new writer, in its first transaction. Under the key <c>heartbeat</c>: rewritten
+    /// in every transaction, and once per heartbeat interval by an idle writer. Terms never
+    /// fall along the topic, so the last record carries the current one.
+    /// <c>Resigned</c>: the writer stepped down after this record and will write no more.</summary>
+    internal sealed record LeaderRecord(long Term, string? Node, DateTimeOffset At, long Sequence = 0, bool Resigned = false);
 
+    /// <summary>Parses a leader-topic record; null for one this version does not know.</summary>
+    internal static (LeaderRecord Record, bool IsHeartbeat)? ParseLeaderRecord(ConsumeResult<byte[], byte[]> record)
+    {
+        if (record.Message.Value is not { Length: > 1 } value || value[0] != JsonFormat || record.Message.Key is not { } key)
+            return null;
+        var heartbeat = key.AsSpan().SequenceEqual(HeartbeatKey);
+        if (!heartbeat && !key.AsSpan().SequenceEqual(TermKey))
+            return null;
+        return JsonSerializer.Deserialize<LeaderRecord>(value.AsSpan(1)) is { } parsed ? (parsed, heartbeat) : null;
+    }
+
+    /// <summary>The last term in the leader topic, 0 when there is none. Terms never fall
+    /// and every heartbeat carries one, so the tail of the topic is enough; the window
+    /// widens only when the tail holds nothing readable (aborted transactions).</summary>
     private async Task<long> ReadLastTermAsync(CancellationToken cancellationToken)
     {
         var end = await EndOffsetAsync(_leaderPartition, cancellationToken).ConfigureAwait(false);
-        var term = 0L;
-        await Task.Run(() =>
+        if (end == 0)
+            return 0;
+        var start = await StartOffsetAsync(_leaderPartition, cancellationToken).ConfigureAwait(false);
+        return await Task.Run(() =>
         {
             using var consumer = CreateConsumer();
-            consumer.Assign(new TopicPartitionOffset(_leaderPartition, Offset.Beginning));
-            ReadTo(consumer, end, record =>
+            for (long window = 32; ; window *= 16)
             {
-                if (record.Message.Value is { Length: > 1 } value && record.Message.Key.AsSpan().SequenceEqual(TermKey))
-                    term = Math.Max(term, JsonSerializer.Deserialize<TermRecord>(value.AsSpan(1))!.Term);
-            }, cancellationToken);
+                var from = Math.Max(start, end - window);
+                var term = 0L;
+                consumer.Assign(new TopicPartitionOffset(_leaderPartition, from));
+                ReadTo(consumer, end, record =>
+                {
+                    if (ParseLeaderRecord(record) is { } parsed)
+                        term = Math.Max(term, parsed.Record.Term);
+                }, cancellationToken);
+                if (term > 0 || from == start)
+                    return term;
+            }
         }, cancellationToken).ConfigureAwait(false);
-        return term;
     }
+
+    // ── stepping down, being deposed ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// Gives the writer up for good: commits a last heartbeat marked as a resignation —
+    /// which tells a standby it may take over now rather than after a silence — and closes
+    /// the writer. Commit everything that should be durable first; afterwards every write
+    /// through this log fails with <see cref="KafkaLogFencedException"/>, and
+    /// <see cref="WhenFenced"/> completes. The process is expected to exit and return as a
+    /// standby.
+    /// </summary>
+    public async Task ResignAsync()
+    {
+        if (!IsWriter)
+            throw new InvalidOperationException("This Kafka log is not the writer, so it has nothing to resign.");
+        var commit = new LogCommit { Resigns = true };
+        commit.Add(_leaderPartition, HeartbeatKey, HeartbeatValue(resigned: true));
+        await EnqueueAsync(commit, acquiring: false).ConfigureAwait(false);
+    }
+
+    /// <summary>Ends the writer because this process has learnt, from something other than
+    /// a failed write, that it is no longer the active (a higher term in the leader topic,
+    /// a takeover that could not be completed). Heartbeats stop at once.</summary>
+    internal void Depose(string reason) => MarkFenced(new KafkaLogFencedException(reason), reason);
+
+    private byte[] HeartbeatValue(bool resigned) => JsonSerializer.SerializeToUtf8Bytes(
+        new LeaderRecord(Term, NodeId, DateTimeOffset.UtcNow, Interlocked.Increment(ref _heartbeatSequence), resigned)).Prefixed(JsonFormat);
 
     // ── the writer thread: group commit ────────────────────────────────────────────────
 
@@ -338,7 +426,16 @@ public sealed class KafkaLog : IAsyncDisposable
             while (true)
             {
                 batch.Clear();
-                batch.Add(_queue.Take(token));
+                if (!_queue.TryTake(out var first, HeartbeatWait(), token))
+                {
+                    // Idle. A visible heartbeat means "the active can still commit", so it
+                    // is a transaction like any other — and it is how a writer fenced while
+                    // idle finds out.
+                    if (_isWriter && _fenced is null)
+                        IdleHeartbeat();
+                    continue;
+                }
+                batch.Add(first);
                 var records = batch[0].Records.Count;
 
                 // Group commit: everything that queued while the last transaction was in
@@ -392,6 +489,29 @@ public sealed class KafkaLog : IAsyncDisposable
         }
     }
 
+    private int HeartbeatWait()
+    {
+        var interval = (long)_options.HeartbeatInterval.TotalMilliseconds;
+        if (!_isWriter)
+            return (int)interval;
+        return (int)Math.Clamp(interval - (Environment.TickCount64 - Interlocked.Read(ref _lastTransactionTicks)), 1, interval);
+    }
+
+    private void IdleHeartbeat()
+    {
+        try
+        {
+            if (TryRunTransaction([], out _, out var error))
+                Interlocked.Increment(ref _idleHeartbeats);
+            else
+                _options.Logger?.LogWarning(error, "Kafka heartbeat transaction aborted; the next one is due in {Interval}.", _options.HeartbeatInterval);
+        }
+        catch (KafkaLogFencedException)
+        {
+            // Marked; WhenFenced has completed.
+        }
+    }
+
     /// <summary>Commits <paramref name="batch"/>, completing every commit in it. Throws
     /// <see cref="KafkaLogFencedException"/> when the writer is finished, with the commits
     /// not yet completed left for the caller to fail.</summary>
@@ -407,6 +527,16 @@ public sealed class KafkaLog : IAsyncDisposable
             if (TryRunTransaction(batch, out var culprit, out var error))
             {
                 Interlocked.Increment(ref _transactions);
+                var resigned = false;
+                foreach (var commit in batch)
+                    resigned |= commit.Resigns;
+                if (resigned)
+                {
+                    HasResigned = true;
+                    MarkFenced(
+                        new KafkaLogFencedException("stepped down"),
+                        "This process stepped down as the active (KafkaLog.ResignAsync); nothing more can be written through this log.");
+                }
                 foreach (var commit in batch)
                 {
                     Interlocked.Add(ref _records, commit.Records.Count);
@@ -456,6 +586,7 @@ public sealed class KafkaLog : IAsyncDisposable
     {
         culprit = null;
         error = null;
+        var began = Environment.TickCount64;
         try
         {
             _producer.BeginTransaction();
@@ -470,6 +601,11 @@ public sealed class KafkaLog : IAsyncDisposable
         LogCommit? producing = null;
         try
         {
+            // The heartbeat goes first, so that a resignation riding in this transaction
+            // is the record that stays. Before the first term is committed there is no
+            // term to announce, and the term record is the sign of life.
+            if (_isWriter)
+                _producer.Produce(_leaderPartition, new Message<byte[], byte[]> { Key = HeartbeatKey, Value = HeartbeatValue(resigned: false) });
             foreach (var commit in batch)
             {
                 producing = commit;
@@ -524,6 +660,11 @@ public sealed class KafkaLog : IAsyncDisposable
         // a tracked offset has to be there before the commit completes.
         if (tracked)
             _producer.Flush(TimeSpan.FromSeconds(10));
+
+        // Measured from before the transaction began: a standby cannot have seen this
+        // heartbeat earlier than that, so a lease counted from here ends before the
+        // standby's silence does.
+        Interlocked.Exchange(ref _lastTransactionTicks, began);
         return true;
     }
 
@@ -578,7 +719,7 @@ public sealed class KafkaLog : IAsyncDisposable
         exception.Error.IsFatal
         || exception.Error.Code is ErrorCode.Local_Fenced or ErrorCode.ProducerFenced or ErrorCode.Local_Fatal;
 
-    private KafkaLogFencedException MarkFenced(Exception cause)
+    private KafkaLogFencedException MarkFenced(Exception cause, string? message = null)
     {
         lock (_gate)
         {
@@ -587,9 +728,9 @@ public sealed class KafkaLog : IAsyncDisposable
                 var taken = cause is KafkaException { Error.Code: ErrorCode.Local_Fenced or ErrorCode.ProducerFenced };
                 var reason = (cause as KafkaException)?.Error.Reason ?? cause.Message;
                 _fenced = new KafkaLogFencedException(
-                    taken
+                    message ?? (taken
                         ? $"Another process has initialised transactional.id '{_options.EffectiveTransactionalId}' and taken the log over ({reason})."
-                        : $"The Kafka log's producer has failed and cannot write again ({reason}).",
+                        : $"The Kafka log's producer has failed and cannot write again ({reason})."),
                     cause);
             }
         }
@@ -677,6 +818,27 @@ public sealed class KafkaLog : IAsyncDisposable
     /// <summary>The end of committed data in a partition (its last stable offset).</summary>
     internal Task<long> EndOffsetAsync(TopicPartition partition, CancellationToken cancellationToken) =>
         ListOffsetAsync(partition, OffsetSpec.Latest(), cancellationToken);
+
+    /// <summary>The ends of committed data of several partitions, in one request.</summary>
+    internal Task<long[]> EndOffsetsAsync(IReadOnlyList<TopicPartition> partitions, CancellationToken cancellationToken) =>
+        RetryAsync(async () =>
+        {
+            var result = await _admin.ListOffsetsAsync(
+                partitions.Select(p => new TopicPartitionOffsetSpec { TopicPartition = p, OffsetSpec = OffsetSpec.Latest() }),
+                new ListOffsetsOptions { IsolationLevel = IsolationLevel.ReadCommitted, RequestTimeout = _options.OperationTimeout })
+                .ConfigureAwait(false);
+            var ends = new long[partitions.Count];
+            foreach (var info in result.ResultInfos)
+            {
+                var at = info.TopicPartitionOffsetError;
+                for (var i = 0; i < ends.Length; i++)
+                {
+                    if (partitions[i].Topic == at.Topic && partitions[i].Partition == at.Partition)
+                        ends[i] = at.Offset.Value;
+                }
+            }
+            return ends;
+        }, cancellationToken);
 
     /// <summary>The first offset a partition still holds.</summary>
     internal Task<long> StartOffsetAsync(TopicPartition partition, CancellationToken cancellationToken) =>
@@ -973,6 +1135,9 @@ internal sealed class LogCommit
 {
     public readonly List<LogRecord> Records = [];
     public readonly TaskCompletionSource Completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>The commit carries the writer's resignation: once it lands, the writer closes.</summary>
+    public bool Resigns;
 
     /// <summary>Index of the one record whose offset the committer wants, or -1.</summary>
     public int TrackIndex = -1;

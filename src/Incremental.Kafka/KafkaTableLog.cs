@@ -392,11 +392,15 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
     {
         ArgumentNullException.ThrowIfNull(row);
         var asWriter = _log.IsWriter;
-        var ends = new long[_rows.Length];
-        for (var p = 0; p < ends.Length; p++)
-            ends[p] = await _log.EndOffsetAsync(_rows[p], cancellationToken).ConfigureAwait(false);
+        var ends = await _log.EndOffsetsAsync(_rows, cancellationToken).ConfigureAwait(false);
+
+        // Numbers, not "the beginning": a consumer asked for a logical offset before it
+        // knows the partition's leader waits half a second before it asks again.
+        var starts = new long[_rows.Length];
+        for (var p = 0; p < starts.Length; p++)
+            starts[p] = await _log.StartOffsetAsync(_rows[p], cancellationToken).ConfigureAwait(false);
         var (rows, head) = await Task.Factory.StartNew(
-            () => ReadSnapshot(ends, cancellationToken), cancellationToken, TaskCreationOptions.LongRunning, TaskScheduler.Default)
+            () => ReadSnapshot(starts, ends, cancellationToken), cancellationToken, TaskCreationOptions.LongRunning, TaskScheduler.Default)
             .ConfigureAwait(false);
         foreach (var (key, current) in rows)
             row(key, current);
@@ -408,7 +412,7 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
 
     /// <summary>Reads the rows topic into a consistent snapshot: every partition from its
     /// start, stopped where <see cref="SnapshotCut"/> says they all stand at one version.</summary>
-    private (Dictionary<TKey, TRow> Rows, Head Head) ReadSnapshot(long[] ends, CancellationToken cancellationToken)
+    private (Dictionary<TKey, TRow> Rows, Head Head) ReadSnapshot(long[] starts, long[] ends, CancellationToken cancellationToken)
     {
         var rows = new Dictionary<TKey, TRow>();
         var cut = new SnapshotCut(ends);
@@ -416,7 +420,7 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
         Head? head = null;
 
         using var consumer = _log.CreateConsumer();
-        consumer.Assign(_rows.Select(partition => new TopicPartitionOffset(partition, Offset.Beginning)));
+        consumer.Assign(_rows.Select((partition, p) => new TopicPartitionOffset(partition, starts[p])));
         var idleSince = Environment.TickCount64;
         while (true)
         {
@@ -562,10 +566,9 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
     /// or another — so it is never taken below the topic's start.</summary>
     private async Task<Offset> StartNearAsync(long version, CancellationToken cancellationToken)
     {
-        if (_index.Floor(version) is not { } known)
-            return Offset.Beginning;
+        // Always a number: see RestoreAsync on what a logical offset costs.
         var low = await _log.StartOffsetAsync(_changes, cancellationToken).ConfigureAwait(false);
-        return new Offset(Math.Max(known, low));
+        return new Offset(Math.Max(_index.Floor(version) ?? low, low));
     }
 
     /// <summary>The offset the index would start a read for <paramref name="version"/> at,
