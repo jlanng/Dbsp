@@ -113,7 +113,7 @@ public sealed class PipelineBuilder
         var stream = Circuit.Input<T>(slot);
         Inputs.Add(new InputSlot(slot, SlotKind.AppendInput, typeof(T).Name,
             (connector, start) => connector is IAppendSourceConnector append
-                ? append.StartAsync(new SourceContext<T>(start, start.Circuit.Handle(stream)), start.Cancellation)
+                ? append.StartAsync(new SourceContext<T>(start, stream), start.Cancellation)
                 : throw Mismatch(slot, connector, "an append input (Input<T>)")));
         return stream;
     }
@@ -127,7 +127,7 @@ public sealed class PipelineBuilder
         var stream = Circuit.KeyedInput(slot, key);
         Inputs.Add(new InputSlot(slot, SlotKind.KeyedInput, typeof(TValue).Name,
             (connector, start) => connector is IKeyedSourceConnector keyed
-                ? keyed.StartAsync(new KeyedSourceContext<TKey, TValue>(start, start.Circuit.Handle(stream)), start.Cancellation)
+                ? keyed.StartAsync(new KeyedSourceContext<TKey, TValue>(start, stream), start.Cancellation)
                 : throw Mismatch(slot, connector, "a keyed input (KeyedInput<TKey, TValue>)")));
         return stream;
     }
@@ -145,6 +145,7 @@ public sealed class PipelineBuilder
                 var sink = connector is IUpsertSinkConnector upsert
                     ? upsert.Create<TKey, TRow>(start.Sink)
                     : throw Mismatch(slot, connector, "an upsert sink");
+                start.Own(sink);
                 var observed = new ObservedUpsertSink<TKey, TRow>(start.Leadership.Leased(sink), start.Stats);
                 return start.Circuit.Handle(output).DeliverToAsync(observed, start.Delivery);
             },
@@ -165,6 +166,7 @@ public sealed class PipelineBuilder
                 var sink = connector is IUpsertSinkConnector upsert
                     ? upsert.Create<TKey, T>(start.Sink)
                     : throw Mismatch(slot, connector, "an upsert sink");
+                start.Own(sink);
                 var observed = new ObservedUpsertSink<TKey, T>(start.Leadership.Leased(sink), start.Stats);
                 return start.Circuit.Handle(output).DeliverToAsync(observed, key, start.Delivery);
             },
@@ -182,6 +184,7 @@ public sealed class PipelineBuilder
                 var sink = connector is IAppendSinkConnector append
                     ? append.Create<T>(start.Sink)
                     : throw Mismatch(slot, connector, "an append sink");
+                start.Own(sink);
                 var observed = new ObservedAppendSink<T>(start.Leadership.Leased(sink), start.Stats);
                 return start.Circuit.Handle(output).DeliverToAsync(observed, start.Delivery);
             },
@@ -235,6 +238,16 @@ internal sealed class SlotStart
     public required INodeLeadership Leadership { get; init; }
     public required CancellationToken Cancellation { get; init; }
     public SinkSlotStats Stats { get; init; } = new();
+
+    /// <summary>Where a sink the connector made for this generation is kept so that it is
+    /// disposed with the generation (a Kafka sink owns a producer).</summary>
+    public List<object>? Owned { get; init; }
+
+    public void Own(object sink)
+    {
+        if (sink is IAsyncDisposable or IDisposable)
+            Owned?.Add(sink);
+    }
     public SinkDeliveryOptions? Delivery { get; init; }
 
     public SinkContext Sink => new(this);

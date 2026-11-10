@@ -1043,7 +1043,7 @@ public sealed class KafkaLog : IAsyncDisposable
 
     /// <summary>A consumer that reads committed records only, from wherever it is assigned;
     /// it belongs to no group and commits no offsets.</summary>
-    internal IConsumer<byte[], byte[]> CreateConsumer()
+    internal IConsumer<byte[], byte[]> CreateConsumer(bool forShortReads = false)
     {
         var config = new ConsumerConfig
         {
@@ -1062,6 +1062,14 @@ public sealed class KafkaLog : IAsyncDisposable
             // its default is a second: a restore would be held to one buffer a second.
             FetchQueueBackoffMs = 10,
         };
+        // A short read stops at the end of a partition, where the client has already asked
+        // the broker for more: that fetch waits fetch.wait.max.ms (half a second by default)
+        // for data that will not come, and the client sends a broker one fetch at a time —
+        // so the NEXT short read, of another partition, would wait out the previous one's
+        // long poll. With many tables that is half a second each, in a takeover. The short
+        // reader therefore polls briefly; it is assigned only while a read runs.
+        if (forShortReads)
+            config.FetchWaitMaxMs = 5;
         Apply(config);
         var builder = new ConsumerBuilder<byte[], byte[]>(config)
             .SetLogHandler((_, message) => Log(message))
@@ -1087,7 +1095,7 @@ public sealed class KafkaLog : IAsyncDisposable
             return await Task.Run(() =>
             {
                 ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-                var consumer = _shortReader ??= CreateConsumer();
+                var consumer = _shortReader ??= CreateConsumer(forShortReads: true);
                 try
                 {
                     var result = read(consumer);

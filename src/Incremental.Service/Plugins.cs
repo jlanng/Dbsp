@@ -558,6 +558,49 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
             $"(loaded: {string.Join(", ", ContractAssemblies.All.Select(a => a.GetName().Name).Order())}).");
     }
 
+    /// <summary>
+    /// A standby's part in plugins: the files of every pipeline plugin version a deployed
+    /// pipeline names are fetched from the blob store into the cache directory and checked
+    /// against their hashes. No code is loaded. Returns how many versions are still
+    /// missing — a manifest the catalog does not hold yet, or a blob not yet readable.
+    /// </summary>
+    internal async Task<int> PrefetchAsync(IReadOnlyDictionary<string, string> catalog, CancellationToken cancellationToken)
+    {
+        var pending = 0;
+        var wanted = catalog.Where(e => e.Key.StartsWith("pipeline/", StringComparison.Ordinal))
+            .Select(e => ServiceJson.Read<PipelineSpec>(e.Value))
+            .Where(p => p.Desired != DesiredState.Removed)
+            .Select(p => (p.Plugin, p.Version)).Distinct().ToList();
+        foreach (var (name, version) in wanted)
+        {
+            if (_builtIn.TryGetValue(name, out var builtIn) && builtIn.Version == version)
+                continue;
+            lock (_lock)
+                if (_loaded.ContainsKey((name, version)) || _prefetched.Contains((name, version)))
+                    continue;
+            try
+            {
+                if (!catalog.TryGetValue($"plugin/{name}/{version}", out var json))
+                {
+                    pending++;
+                    continue;
+                }
+                await MaterializeAsync(ServiceJson.Read<PluginManifest>(json), cancellationToken).ConfigureAwait(false);
+                lock (_lock)
+                    _prefetched.Add((name, version));
+                _logger.LogInformation("Plugin {Plugin} version {Version} fetched from the blob store", name, version);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                pending++;
+                _logger.LogDebug(ex, "Plugin {Plugin} version {Version} is not fetched yet", name, version);
+            }
+        }
+        return pending;
+    }
+
+    private readonly HashSet<(string Name, string Version)> _prefetched = [];
+
     // ── leases ─────────────────────────────────────────────────────────────────────────
 
     /// <summary>Loads the version if this node has not, and counts one more user of it.</summary>

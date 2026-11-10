@@ -21,6 +21,7 @@ internal sealed class ServiceRegistrations
     public Dictionary<string, Func<IServiceProvider, ITableSourceFactory>> TableSources { get; } = new(StringComparer.Ordinal);
     public Dictionary<string, Func<IServiceProvider, IConnector>> Connectors { get; } = new(StringComparer.Ordinal);
     public Dictionary<string, Func<IServiceProvider, IObjectStore>> ObjectStores { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, Func<IServiceProvider, KafkaConnection>> KafkaConnections { get; } = new(StringComparer.Ordinal);
     public Func<IServiceProvider, IServiceBackend>? Backend { get; set; }
 }
 
@@ -37,6 +38,7 @@ internal sealed class ServiceContext
     public required ILoggerFactory LoggerFactory { get; init; }
     public required EventRing Events { get; init; }
     public required Catalog Catalog { get; init; }
+    public required KafkaConnections KafkaConnections { get; init; }
     public ChangelogStorage Storage { get; set; } = null!;
     public PluginCatalog Plugins { get; set; } = null!;
     public TableRegistry Tables { get; set; } = null!;
@@ -91,14 +93,32 @@ public sealed record NodeHealth(bool Live, bool Ready, HealthLevel Level, IReadO
 
 /// <summary>How ready a standby is to lead, in terms an operator can act on. On this
 /// build a standby holds pipeline state as bytes and builds circuits at takeover.</summary>
+/// <remarks><c>PluginsPending</c> counts plugin versions a deployed pipeline names whose files
+/// this node has not yet fetched from the blob store.</remarks>
 public sealed record StandbyReadiness(
     long CatalogVersionApplied, long CatalogVersionLatest, long StateLagRecords, int TablesBehind, int TablesFaulted,
-    bool TakeoverWouldBeWarm, IReadOnlyList<string> NotWarmBecause);
+    int PluginsPending, bool TakeoverWouldBeWarm, IReadOnlyList<string> NotWarmBecause);
 
+/// <summary>Where the service's part of this node's takeover went. The leadership's own
+/// record (<see cref="KafkaLeadershipDetail.LastTakeover"/>) has the stages around it:
+/// its <c>Prepare</c> is <see cref="Catalog"/> plus <see cref="Tables"/>, and its
+/// <c>Start</c> is <see cref="StartLeading"/>.</summary>
+/// <remarks><c>Catalog</c>: opening or promoting the catalog and loading stored contracts.
+/// <c>Tables</c>: promoting or opening every table, concurrently. <c>Pipelines</c>:
+/// finishing pending resets and removals, then building and starting every pipeline from
+/// its committed state, in parallel. <c>StartLeading</c>: all of <c>StartLeadingAsync</c> —
+/// the leader record, the plugin directory, seeds and the pipelines.</remarks>
+public sealed record ServiceTakeoverTimings(
+    long Term, DateTimeOffset At, TimeSpan Catalog, TimeSpan Tables, int TableCount, TimeSpan Pipelines, int PipelineCount,
+    TimeSpan StartLeading);
+
+/// <summary>A node at a glance. <c>Peer</c> is what the other node last answered (null when
+/// none is configured or none answered); <c>LastTakeover</c> is how this node's takeover
+/// went (null if it has not led).</summary>
 public sealed record NodeStatus(
     string NodeId, NodeLeadershipStatus Leadership, long CatalogVersion, int Tables, int Pipelines,
     IReadOnlyDictionary<PipelineState, int> PipelinesByState, StandbyReadiness? Standby, BackendInfo Backend,
-    string? AdvertisedAdminUrl, NodeHealth Health);
+    string? AdvertisedAdminUrl, NodeHealth Health, PeerInfo? Peer = null, ServiceTakeoverTimings? LastTakeover = null);
 
 public sealed record NodeActionOptions(bool Force = false, bool DryRun = false, string? Caller = null);
 
@@ -126,6 +146,13 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
     private Task _finished = Task.CompletedTask;
     private long _catalogApplied = -1;
     private long _stateLag;
+    private int _pluginsPending;
+    private volatile PeerInfo? _peer;
+    private volatile bool _peerSampled;
+    private volatile ServiceTakeoverTimings? _lastTakeover;
+    private (TimeSpan Catalog, TimeSpan Tables, int TableCount) _prepared;
+    private DateTimeOffset _catalogReopenedAt = DateTimeOffset.MinValue;
+    private int _cannotLead;
     private volatile bool _started;
     private int _disposed;
 
@@ -150,6 +177,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
             LoggerFactory = loggerFactory,
             Events = events,
             Catalog = new Catalog(backend, options),
+            KafkaConnections = services.GetService<KafkaConnections>() ?? new KafkaConnections(services, registrations),
         };
         _context.Plugins = new PluginCatalog(_context);
         _context.Tables = new TableRegistry(_context);
@@ -178,6 +206,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         if (_started)
             throw new InvalidOperationException("The service node has already been started.");
         var backend = _context.Backend;
+        await backend.ConnectAsync(cancellationToken).ConfigureAwait(false);
         _context.Storage = ChangelogStorage.Follow(backend.State);
         backend.Leadership.Track(_context.Storage);
         backend.Leadership.Changed += status =>
@@ -188,7 +217,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         // node is the writer, so this completes inside the first takeover.
         _catalogFollow = new CancellationTokenSource();
         var follow = _catalogFollow.Token;
-        _catalogOpen = Task.Run(() => _context.Catalog.OpenAsync(follow: true, follow), CancellationToken.None);
+        _catalogOpen = Task.Run(() => FollowCatalogAsync(follow), CancellationToken.None);
         _catalogOpen.Forget();
 
         _started = true;
@@ -197,6 +226,25 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
             new LeadershipCallbacks(PrepareAsync, StartLeadingAsync, StopLeadingAsync, DescribeSelf), cancellationToken).ConfigureAwait(false);
         _loop = Task.Run(() => RunAsync(_stopping.Token), CancellationToken.None);
         _logger.LogInformation("Service node {Node} started as {Role}", NodeId, backend.Leadership.Status.Role);
+    }
+
+    /// <summary>A standby's catalog: opened as a follower, and tried again until it is —
+    /// a node that could not follow the catalog would stand by for nothing.</summary>
+    private async Task FollowCatalogAsync(CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            try
+            {
+                await _context.Catalog.OpenAsync(follow: true, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex, "Service node {Node} could not open the catalog to follow it; trying again", NodeId);
+                await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken).ConfigureAwait(false);
+            }
+        }
     }
 
     // ── takeover ───────────────────────────────────────────────────────────────────────
@@ -209,6 +257,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         await _roleGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
             var catalog = _context.Catalog;
             if (!catalog.IsOpen)
             {
@@ -228,7 +277,9 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
 
             var entries = catalog.Read();
             await _context.Plugins.LoadContractsAsync(entries, cancellationToken).ConfigureAwait(false);
+            var catalogDone = clock.Elapsed;
             await _context.Tables.ReconcileAsync(entries, asWriter: true, cancellationToken).ConfigureAwait(false);
+            _prepared = (catalogDone, clock.Elapsed - catalogDone, _context.Tables.Handles.Count());
         }
         finally
         {
@@ -244,6 +295,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         await _roleGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
             _context.Leading = true;
             var catalog = _context.Catalog;
 
@@ -274,7 +326,10 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
                     await Contained($"seeding table '{seed.Name}'", () => _context.Tables.DeclareAsync(seed, cancellationToken, "seed")).ConfigureAwait(false);
             }
 
+            var beforePipelines = clock.Elapsed;
             await _context.Supervisor.StartLeadingAsync(catalog.Read(), cancellationToken).ConfigureAwait(false);
+            var pipelines = clock.Elapsed - beforePipelines;
+            var pipelineCount = _context.Supervisor.Specs.Count;
             foreach (var seed in _context.Registrations.Pipelines)
             {
                 if (catalog.Get("pipeline/" + seed.Id) is null)
@@ -283,7 +338,12 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
             }
             _context.Tables.StartLoaders();
             _catalogApplied = catalog.Version;
-            _logger.LogInformation("Service node {Node} leads, term {Term}", NodeId, term);
+            _lastTakeover = new ServiceTakeoverTimings(
+                term, DateTimeOffset.UtcNow, _prepared.Catalog, _prepared.Tables, _prepared.TableCount, pipelines, pipelineCount, clock.Elapsed);
+            _logger.LogInformation(
+                "Service node {Node} leads, term {Term}: catalog {Catalog} ms, {Tables} table(s) {TablesMs} ms, {Pipelines} pipeline(s) {PipelinesMs} ms",
+                NodeId, term, (long)_prepared.Catalog.TotalMilliseconds, _prepared.TableCount, (long)_prepared.Tables.TotalMilliseconds,
+                pipelineCount, (long)pipelines.TotalMilliseconds);
         }
         finally
         {
@@ -331,6 +391,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         var options = _context.Options;
         var lastTrim = DateTimeOffset.UtcNow;
         var lastLag = DateTimeOffset.MinValue;
+        var lastWatch = DateTimeOffset.MinValue;
         while (!stop.IsCancellationRequested)
         {
             try
@@ -344,14 +405,26 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
                     {
                         if (_context.Backend.Leadership.Status.Role == NodeRole.Standby)
                         {
+                            // A catalog follower that has lost its history sees no more
+                            // versions: follow again from the rows, like any other table.
+                            if (catalog.Table is { FollowFault: { } catalogFault })
+                            {
+                                _logger.LogWarning(catalogFault, "Service node {Node}: the catalog's follower faulted; following it again", NodeId);
+                                await catalog.ReopenAsync(follow: true, stop).ConfigureAwait(false);
+                                _context.Events.Publish("catalog", NodeId, "follower reopened from the log");
+                            }
                             var version = catalog.Version;
                             var faulted = _context.Tables.Handles.Any(h => h.FollowFault is not null);
-                            if (version != _catalogApplied || faulted)
+                            if (version != _catalogApplied || faulted || Volatile.Read(ref _pluginsPending) > 0)
                             {
                                 var entries = catalog.Read();
                                 await _context.Plugins.LoadContractsAsync(entries, stop).ConfigureAwait(false);
                                 await _context.Tables.ReconcileAsync(entries, asWriter: false, stop).ConfigureAwait(false);
                                 _context.Supervisor.SyncFromCatalog(entries);
+
+                                // No plugin code runs on a standby, but its files are fetched
+                                // now, so that a takeover loads them from this node's disk.
+                                Volatile.Write(ref _pluginsPending, await _context.Plugins.PrefetchAsync(entries, stop).ConfigureAwait(false));
                                 if (version != _catalogApplied)
                                     _context.Events.Publish("catalog", NodeId, $"version {version} applied");
                                 _catalogApplied = version;
@@ -369,6 +442,18 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
                 {
                     lastLag = now;
                     _stateLag = (await _context.Backend.Leadership.MeasureStateLagAsync(stop).ConfigureAwait(false))?.Sum() ?? 0;
+                }
+
+                if (now - lastWatch >= TimeSpan.FromSeconds(1))
+                {
+                    lastWatch = now;
+                    if (role is NodeRole.Standby or NodeRole.Leader)
+                    {
+                        _peer = await ProbePeerAsync(stop).ConfigureAwait(false);
+                        _peerSampled = true;
+                    }
+                    if (role == NodeRole.Leader && _context.IsLeader)
+                        await WatchCatalogWriterAsync(stop).ConfigureAwait(false);
                 }
 
                 if (!_context.IsLeader)
@@ -390,6 +475,86 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
             }
         }
     }
+
+    private async Task<PeerInfo?> ProbePeerAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _context.Backend.Leadership.ProbePeerAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The one condition under which this node gives leadership up by itself: the catalog's
+    /// writer has faulted and the node is not fenced, so it can record nothing. Heartbeats
+    /// come from the log writer, not from the catalog, so the standby would wait on a
+    /// leader that can do no part of its job. The catalog is reopened once, in place; if
+    /// that fails, or its writer faults again within a minute, the node steps down when a
+    /// ready standby answers and otherwise exits with code 5 for its process supervisor.
+    /// Pipelines failing never do this: a pipeline is tenant code.
+    /// </summary>
+    private async Task WatchCatalogWriterAsync(CancellationToken stop)
+    {
+        var catalog = _context.Catalog;
+        if (await catalog.WriterFaultAsync(stop).ConfigureAwait(false) is not { } fault)
+            return;
+        for (var inner = fault; inner is not null; inner = inner.InnerException)
+            if (inner is Incremental.Tables.TableLogFencedException or KafkaLogFencedException)
+                return; // fenced: the leadership ends this node
+        if (_context.Storage.IsFenced || !_context.IsLeader)
+            return;
+
+        _logger.LogError(fault, "Service node {Node}: the catalog's writer has faulted", NodeId);
+        _context.Events.Publish("catalog", NodeId, $"writer faulted: {fault.Message}");
+        var now = DateTimeOffset.UtcNow;
+        if (now - _catalogReopenedAt > TimeSpan.FromMinutes(1))
+        {
+            try
+            {
+                await catalog.ReopenAsync(follow: false, stop).ConfigureAwait(false);
+                _catalogReopenedAt = now;
+                _context.Events.Publish("catalog", NodeId, "reopened from its log");
+                _logger.LogWarning("Service node {Node}: the catalog was reopened from its log and is writable again", NodeId);
+                return;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogError(ex, "Service node {Node}: the catalog could not be reopened", NodeId);
+            }
+        }
+        await CannotLeadAsync("the catalog cannot be written", stop).ConfigureAwait(false);
+    }
+
+    private async Task CannotLeadAsync(string why, CancellationToken stop)
+    {
+        if (Interlocked.Exchange(ref _cannotLead, 1) != 0)
+            return;
+        var leadership = _context.Backend.Leadership;
+        var peer = await ProbePeerAsync(stop).ConfigureAwait(false);
+        if (peer is { Role: NodeRole.Standby, Ready: true })
+        {
+            _logger.LogError("Service node {Node} cannot lead ({Why}); stepping down to '{Peer}'", NodeId, why, peer.NodeId);
+            _context.Events.Publish("node", NodeId, $"cannot lead ({why}); stepping down to '{peer.NodeId}'");
+            leadership.StepDownAsync(CancellationToken.None).Forget(); // ends in Resigned: OnFinishedAsync exits with 4
+            return;
+        }
+        _logger.LogCritical("Service node {Node} cannot lead ({Why}) and no ready standby answers; exiting with code 5", NodeId, why);
+        _context.Events.Publish("node", NodeId, $"cannot lead ({why}); no ready standby answers");
+        CannotLead?.Invoke(why);
+        if (_lifetime is not null && _context.Options.ExitOnLeadershipLoss)
+        {
+            Environment.ExitCode = 5;
+            _lifetime.StopApplication();
+        }
+    }
+
+    /// <summary>Raised when this node finds it cannot lead and no ready standby answers,
+    /// just before it stops the host with exit code 5.</summary>
+    public event Action<string>? CannotLead;
 
     private long _mirrored = -1;
 
@@ -447,8 +612,11 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
             reasons.Add("table-opening");
         if (Interlocked.Read(ref _stateLag) > 0)
             reasons.Add("state-behind");
+        var pending = Volatile.Read(ref _pluginsPending);
+        if (pending > 0)
+            reasons.Add("plugin-pending");
         return new StandbyReadiness(
-            Math.Max(0, _catalogApplied), catalog.Version, Interlocked.Read(ref _stateLag), opening, faulted, reasons.Count == 0, reasons);
+            Math.Max(0, _catalogApplied), catalog.Version, Interlocked.Read(ref _stateLag), opening, faulted, pending, reasons.Count == 0, reasons);
     }
 
     public NodeStatus Status
@@ -461,7 +629,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
             return new NodeStatus(
                 NodeId, leadership, _context.Catalog.Version, _context.Tables.Tables.Count, pipelines.Count,
                 pipelines.GroupBy(p => p.State).ToDictionary(g => g.Key, g => g.Count()), standby, _context.Backend.Describe(),
-                _context.Options.AdvertisedAdminUrl, ComputeHealth(leadership, pipelines, standby));
+                _context.Options.AdvertisedAdminUrl, ComputeHealth(leadership, pipelines, standby), _peer, _lastTakeover);
         }
     }
 
@@ -485,6 +653,10 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
                     reasons.Add("loader-faulted");
                 if (tables.Any(t => t.State is TableState.Faulted or TableState.Failed))
                     reasons.Add("table-faulted");
+                // The absence of a standby is something seen, not something that is not
+                // there — but only where a second node was configured at all.
+                if (_peerSampled && _context.Backend.Leadership.PeerExpected && _peer is not { Role: NodeRole.Standby, Ready: true })
+                    reasons.Add("no-ready-standby");
                 if (reasons.Count > 0 && level == HealthLevel.Healthy)
                     level = HealthLevel.Degraded;
                 var running = pipelines.Where(p => p.Desired == DesiredState.Running).ToList();

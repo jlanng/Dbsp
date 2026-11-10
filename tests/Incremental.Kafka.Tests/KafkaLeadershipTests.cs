@@ -296,6 +296,41 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public async Task A_probe_query_returns_the_whole_answer_with_the_hosts_token()
+    {
+        await using var env = KafkaEnv.Create();
+        await using var a = await StartAsync(env, "a", begin: false);
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+
+        Assert.Null(await LeadershipProbe.QueryAsync("127.0.0.1", port));          // nobody listens
+        string? detail = "notready:state-behind";
+        await using (LeadershipProbe.Listen(a.Leadership, new IPEndPoint(IPAddress.Loopback, port), () => detail))
+        {
+            Assert.Equal(new LeadershipProbeAnswer(NodeRole.Standby, 0, "a", "notready:state-behind"), await LeadershipProbe.QueryAsync("127.0.0.1", port));
+            await a.Leadership.StartAsync();
+            await LeadsAsync(a);
+            detail = "ready";
+            Assert.Equal(new LeadershipProbeAnswer(NodeRole.Leader, a.Leadership.Term, "a", "ready"), await LeadershipProbe.QueryAsync("127.0.0.1", port));
+
+            // The old probe reads the first token and is not confused by a fourth.
+            Assert.True(await LeadershipProbe.Tcp("127.0.0.1", port)(default));
+
+            // No token, and a token that would break the line, are both left out.
+            detail = null;
+            Assert.Null((await LeadershipProbe.QueryAsync("127.0.0.1", port))!.Detail);
+            detail = "two words";
+            Assert.Equal(new LeadershipProbeAnswer(NodeRole.Leader, a.Leadership.Term, "a", null), await LeadershipProbe.QueryAsync("127.0.0.1", port));
+        }
+
+        // A listener with no token at all answers the three it always did.
+        await using (LeadershipProbe.Listen(a.Leadership, new IPEndPoint(IPAddress.Loopback, port)))
+            Assert.Equal(new LeadershipProbeAnswer(NodeRole.Leader, a.Leadership.Term, "a", null), await LeadershipProbe.QueryAsync("127.0.0.1", port));
+    }
+
+    [Fact]
     public async Task The_tcp_probe_tells_a_leader_from_a_standby_and_from_nobody()
     {
         await using var env = KafkaEnv.Create();

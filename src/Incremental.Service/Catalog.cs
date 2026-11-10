@@ -107,6 +107,50 @@ public sealed class Catalog : IAsyncDisposable
         await OpenAsync(follow: false, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>Opens the catalog from its log again, in place: the only mend for a writer
+    /// that has faulted or a follower that has lost its history. Holds the write lock, so
+    /// no action is half-way through the old table.</summary>
+    internal async Task ReopenAsync(bool follow, CancellationToken cancellationToken)
+    {
+        await _write.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_table is { } old)
+                await old.DisposeAsync().ConfigureAwait(false);
+            _table = null;
+            await OpenAsync(follow, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _write.Release();
+        }
+    }
+
+    /// <summary>The writer's fault, if it has one. A commit of nothing asks it: a faulted
+    /// writer refuses every call, and the core exposes its fault no other way.</summary>
+    internal async Task<Exception?> WriterFaultAsync(CancellationToken cancellationToken)
+    {
+        if (_table is not { IsFollowing: false } table || !await _write.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+            return null; // not the writer here, or an action holds the lock and will find out itself
+        try
+        {
+            await table.Writer.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return null;
+        }
+        catch (InvalidOperationException ex) when (ex.Message.Contains("has faulted", StringComparison.Ordinal))
+        {
+            return ex.InnerException ?? ex;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return null;
+        }
+        finally
+        {
+            _write.Release();
+        }
+    }
+
     /// <summary>Every entry as of the latest version here: one scan of a pinned snapshot.</summary>
     public IReadOnlyDictionary<string, string> Read()
     {

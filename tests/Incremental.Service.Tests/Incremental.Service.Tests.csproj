@@ -16,6 +16,7 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="8.0.1" />
     <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.1" />
+    <PackageReference Include="Npgsql" Version="10.0.3" />
     <PackageReference Include="xunit.v3" Version="4.0.1" />
   </ItemGroup>
 
@@ -33,6 +34,8 @@
     <ProjectReference Include="..\Incremental.Service.TestPlugins\Acme.Pipelines\Acme.Pipelines.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\Incremental.Service.TestPlugins\Acme.Pipelines.V2\Acme.Pipelines.V2.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\Incremental.Service.TestPlugins\Acme.Desks\Acme.Desks.csproj" ReferenceOutputAssembly="false" />
+    <!-- The node the kill -9 tests run twice, as real processes. -->
+    <ProjectReference Include="..\Incremental.Service.FailoverApp\Incremental.Service.FailoverApp.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

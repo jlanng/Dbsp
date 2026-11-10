@@ -17,6 +17,7 @@ internal sealed class Generation
     public List<(string Slot, IRunningSource Source)> Sources { get; } = [];
     public List<Task> Deliveries { get; } = [];
     public Dictionary<string, SinkSlotStats> SinkStats { get; } = new(StringComparer.Ordinal);
+    public List<object> OwnedSinks { get; } = [];
     public Task DeadLetters { get; set; } = Task.CompletedTask;
     public CancellationTokenSource Stop { get; } = new();
     public volatile bool Stopping;
@@ -193,6 +194,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             {
                 connector = context.Connector(config);
                 connector.Describe(config);
+                (connector as KafkaConnector)?.RequireKind(config, kind);
             }
             catch (Exception ex)
             {
@@ -753,6 +755,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             Leadership = context.Backend.Leadership,
             Cancellation = generation.Stop.Token,
             Stats = generation.SinkStats.TryGetValue(slot, out var stats) ? stats : new SinkSlotStats(),
+            Owned = generation.OwnedSinks,
         };
 
         foreach (var sink in generation.Builder.Sinks)
@@ -819,6 +822,13 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
     {
         if (record is null)
             return null;
+
+        // A record a Kafka source could not decode: where it is, then what it holds.
+        if (record is Incremental.Kafka.KafkaRecord unreadable)
+        {
+            var value = unreadable.Value is { } bytes ? System.Text.Encoding.UTF8.GetString(bytes, 0, Math.Min(bytes.Length, 4096)) : "(no value)";
+            return $"{unreadable.Topic}[{unreadable.Partition}]@{unreadable.Offset}: {value}";
+        }
         string text;
         try
         {
@@ -905,7 +915,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
     private static bool IsFence(Exception? ex)
     {
         for (; ex is not null; ex = ex.InnerException)
-            if (ex is ChangelogFencedException or TableLogFencedException)
+            if (ex is ChangelogFencedException or TableLogFencedException or Incremental.Kafka.KafkaLogFencedException)
                 return true;
         return false;
     }
@@ -1023,7 +1033,37 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             _logger.LogWarning("Pipeline {Pipeline}: a delivery did not end within {Timeout} of the circuit", runtime.Id, abandon);
         edges.Forget();
         generation.Stop.Cancel();
+        await DisposeSinksAsync(runtime, generation).ConfigureAwait(false);
         return true;
+    }
+
+    /// <summary>Sinks a connector made for the generation and that own something (a Kafka
+    /// sink's producer): disposed last, once the deliveries have ended.</summary>
+    private async Task DisposeSinksAsync(PipelineRuntime runtime, Generation generation)
+    {
+        object[] owned;
+        lock (generation.OwnedSinks)
+        {
+            owned = [.. generation.OwnedSinks];
+            generation.OwnedSinks.Clear();
+        }
+        foreach (var sink in owned)
+        {
+            try
+            {
+                if (sink is IAsyncDisposable asyncDisposable)
+                {
+                    if (!await asyncDisposable.DisposeAsync().AsTask().CompletesWithin(context.Options.AbandonTimeout).ConfigureAwait(false))
+                        _logger.LogWarning("Pipeline {Pipeline}: a sink did not close within {Timeout}", runtime.Id, context.Options.AbandonTimeout);
+                }
+                else if (sink is IDisposable disposable)
+                    disposable.Dispose();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Pipeline {Pipeline}: closing a sink failed", runtime.Id);
+            }
+        }
     }
 
     // ── the node's calls ───────────────────────────────────────────────────────────────

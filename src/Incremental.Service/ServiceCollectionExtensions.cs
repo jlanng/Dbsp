@@ -30,7 +30,9 @@ public static class IncrementalServiceCollectionExtensions
         {
             registrations = new ServiceRegistrations();
             registrations.Connectors["memory"] = sp => sp.GetRequiredService<MemoryConnector>();
+            registrations.Connectors["kafka"] = sp => new KafkaConnector(sp.GetRequiredService<KafkaConnections>());
             services.AddSingleton(registrations);
+            services.AddSingleton(sp => new KafkaConnections(sp, registrations));
             services.TryAddSingleton<MemoryConnector>();
             services.AddSingleton(sp => new ServiceNode(sp, sp.GetRequiredService<IOptions<ServiceOptions>>().Value));
             services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<ServiceNode>());
@@ -70,6 +72,64 @@ public sealed class IncrementalServiceBuilder
     public IncrementalServiceBuilder UseBackend(Func<IServiceProvider, IServiceBackend> backend)
     {
         _registrations.Backend = backend ?? throw new ArgumentNullException(nameof(backend));
+        return this;
+    }
+
+    /// <summary>
+    /// The Kafka backend: this node is one of an active and its standby on one
+    /// <see cref="Incremental.Kafka.KafkaLog"/>. Both nodes are configured alike except for
+    /// <see cref="Incremental.Kafka.KafkaLogOptions.NodeId"/> and the probe endpoints. The
+    /// log's own cluster settings are also registered as the Kafka connection <c>log</c>,
+    /// which a spec may name, and whose sinks may ask for <c>"producer": "log"</c>.
+    /// </summary>
+    public IncrementalServiceBuilder UseKafkaBackend(Func<IServiceProvider, KafkaServiceBackendOptions> options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        KafkaServiceBackendOptions? resolved = null;
+        KafkaServiceBackend? backend = null;
+        var gate = new object();
+        KafkaServiceBackendOptions Options(IServiceProvider services)
+        {
+            lock (gate)
+                return resolved ??= options(services) ?? throw new InvalidOperationException("The Kafka backend's options factory returned null.");
+        }
+
+        _registrations.KafkaConnections["log"] = services =>
+        {
+            var log = Options(services).Log;
+            var connection = new KafkaConnection
+            {
+                BootstrapServers = log.BootstrapServers,
+                ConfigureConsumer = log.ConfigureConsumer,
+                ConfigureProducer = log.ConfigureProducer,
+                Log = () => Volatile.Read(ref backend) is { } connected ? connected.Log : null,
+            };
+            foreach (var (key, value) in log.ClientConfig)
+                connection.ClientConfig[key] = value;
+            return connection;
+        };
+        return UseBackend(services =>
+        {
+            var created = new KafkaServiceBackend(Options(services), services.GetService<Microsoft.Extensions.Logging.ILoggerFactory>());
+            Volatile.Write(ref backend, created);
+            return created;
+        });
+    }
+
+    /// <inheritdoc cref="UseKafkaBackend(Func{IServiceProvider, KafkaServiceBackendOptions})"/>
+    public IncrementalServiceBuilder UseKafkaBackend(KafkaServiceBackendOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return UseKafkaBackend(_ => options);
+    }
+
+    /// <summary>A Kafka cluster a spec may name as its connection: bootstrap servers,
+    /// client settings and the builder callbacks stay with the host; the spec carries only
+    /// the name and a topic.</summary>
+    public IncrementalServiceBuilder AddKafkaConnection(string name, Func<IServiceProvider, KafkaConnection> connection)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(name);
+        _registrations.KafkaConnections[name] = connection ?? throw new ArgumentNullException(nameof(connection));
         return this;
     }
 

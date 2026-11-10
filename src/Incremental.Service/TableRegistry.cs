@@ -347,6 +347,15 @@ internal sealed class TableHandle<TKey, TRow>(TableRegistry registry, TableDefin
         }
         _floorHeldBy = heldBy;
 
+        // The cap, whatever the floor: a reader further behind than this is cut loose. The
+        // in-memory log enforces its own; a Kafka log keeps what it is not told to drop.
+        var capped = table.LatestVersion - registry.Context.Backend.RetainedHistoryVersions;
+        if (capped > floor)
+        {
+            floor = capped;
+            _floorHeldBy = null;
+        }
+
         // A reader at version v next reads v + 1.
         if (floor + 1 > log.OldestRetainedVersion)
             await log.TrimBeforeAsync(floor + 1, cancellationToken).ConfigureAwait(false);
@@ -701,23 +710,44 @@ internal sealed class TableRegistry(ServiceContext context) : ITableRegistry
 
     private void RequireSourceKind(TableLoaderSpec loader)
     {
-        if (loader.Kind != "file" && !context.Registrations.TableSources.ContainsKey(loader.Kind))
-            throw ServiceException.Invalid(
-                $"No table source of kind '{loader.Kind}' is registered (built in: file; registered: " +
-                $"{string.Join(", ", context.Registrations.TableSources.Keys.Order())}).");
-        if (loader.Kind == "file")
-            context.ObjectStore(loader.Connection);
+        if (context.Registrations.TableSources.ContainsKey(loader.Kind))
+            return;
+        switch (loader.Kind)
+        {
+            case "file":
+                context.ObjectStore(loader.Connection);
+                break;
+            case "kafka" or "debezium":
+                try
+                {
+                    KafkaTableSource<string, string>.Check(context.KafkaConnections, loader);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    throw ServiceException.Invalid($"The {loader.Kind} loader: {ex.Message}.");
+                }
+                break;
+            default:
+                throw ServiceException.Invalid(
+                    $"No table source of kind '{loader.Kind}' is registered (built in: file, kafka, debezium; registered: " +
+                    $"{string.Join(", ", context.Registrations.TableSources.Keys.Order())}).");
+        }
     }
 
     internal ITableSource<TKey, TRow> CreateSource<TKey, TRow>(TableLoaderSpec loader)
         where TKey : notnull
         where TRow : class
     {
-        if (loader.Kind == "file")
-            return new FileTableSource<TKey, TRow>(context.ObjectStore(loader.Connection));
-        if (!context.Registrations.TableSources.TryGetValue(loader.Kind, out var factory))
-            throw new InvalidOperationException($"No table source of kind '{loader.Kind}' is registered.");
-        return factory(context.Services).Create<TKey, TRow>(loader);
+        // A registered kind wins, so a host can replace a built-in loader.
+        if (context.Registrations.TableSources.TryGetValue(loader.Kind, out var factory))
+            return factory(context.Services).Create<TKey, TRow>(loader);
+        return loader.Kind switch
+        {
+            "file" => new FileTableSource<TKey, TRow>(context.ObjectStore(loader.Connection)),
+            "kafka" => new KafkaTableSource<TKey, TRow>(context.KafkaConnections, loader, debezium: false),
+            "debezium" => new KafkaTableSource<TKey, TRow>(context.KafkaConnections, loader, debezium: true),
+            _ => throw new InvalidOperationException($"No table source of kind '{loader.Kind}' is registered."),
+        };
     }
 
     public async ValueTask DisposeAsync()

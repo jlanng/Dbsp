@@ -348,6 +348,7 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
             }
 
             var keyBytes = _codec.KeyBytes(change.Key);
+            var changeStart = chunk.WrittenCount + chunkWriter.BytesPending;
             chunkWriter.WriteStartObject();
             chunkWriter.WritePropertyName("k"u8);
             _codec.WriteKey(chunkWriter, keyBytes);
@@ -380,6 +381,17 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
                 rowValue = row.WrittenSpan.ToArray();
             }
             chunkWriter.WriteEndObject();
+
+            // One change is never split across records, so one that is too large cannot be
+            // written at all. Refused here, before anything is produced, so that the
+            // message names the row: the broker's refusal would name nothing.
+            var changeBytes = chunk.WrittenCount + chunkWriter.BytesPending - changeStart;
+            var largest = Math.Max(changeBytes, rowValue?.Length ?? 0);
+            if (largest > _log.Options.MaxRecordBytes)
+                throw new KafkaLogException(
+                    $"Table log '{_name}': the row with key {System.Text.Encoding.UTF8.GetString(keyBytes)} makes a record of {largest} bytes " +
+                    $"in version {version.Version}; a record may be at most MaxRecordBytes ({_log.Options.MaxRecordBytes}). Nothing of the " +
+                    "version was written.");
 
             rows.Add(new LogRecord(_rows[PartitionOf(change.Key)], keyBytes, rowValue));
         }

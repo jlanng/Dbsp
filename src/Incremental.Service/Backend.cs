@@ -14,6 +14,10 @@ public interface IServiceBackend : IAsyncDisposable
 {
     string NodeId { get; }
 
+    /// <summary>Connects to whatever the backend is made of. Called once, first, by the
+    /// node's start; nothing else of the backend is used before it completes.</summary>
+    Task ConnectAsync(CancellationToken cancellationToken);
+
     /// <summary>The changelog every pipeline's state is committed to. The node follows it
     /// with <see cref="ChangelogStorage.Follow"/> and the leadership promotes that storage.</summary>
     IStateChangelog State { get; }
@@ -90,6 +94,10 @@ public interface INodeLeadership
     /// none answered.</summary>
     ValueTask<PeerInfo?> ProbePeerAsync(CancellationToken cancellationToken);
 
+    /// <summary>Whether this node has been told of another node at all. Without one a
+    /// missing standby is not something to report: a lone node is a deployment too.</summary>
+    bool PeerExpected { get; }
+
     /// <summary>Wraps a sink so that it writes only while this node holds the lease.</summary>
     IUpsertSink<TKey, TRow> Leased<TKey, TRow>(IUpsertSink<TKey, TRow> sink) where TKey : notnull;
 
@@ -103,9 +111,11 @@ public sealed record NodeLeadershipStatus(
     string NodeId, NodeRole Role, long Term, string? LeaderNodeId, long LeaderTerm,
     KafkaLeadershipDetail? Kafka = null);
 
+/// <summary>What only a Kafka-backed node knows of its leadership. <c>Fault</c> is why the
+/// node is <see cref="NodeRole.Fenced"/>, as text.</summary>
 public sealed record KafkaLeadershipDetail(
     TimeSpan HeartbeatAge, DateTimeOffset? LeaderHeartbeatAt, bool LeaderResigned, bool HoldsLease,
-    TakeoverTimings? LastTakeover);
+    TakeoverTimings? LastTakeover, string? Fault = null);
 
 public sealed record PeerInfo(string NodeId, NodeRole Role, long Term, bool Ready, string? NotReadyReason);
 

@@ -164,6 +164,40 @@ public class KafkaTableLogTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public async Task A_row_too_large_for_one_record_is_refused_by_name_before_anything_is_written()
+    {
+        await using var env = KafkaEnv.Create();
+        var active = await env.ConnectWriterAsync(env.Options(maxRecordBytes: 4096));
+        var log = await active.OpenTableLogAsync<int, Instrument>("instruments").WaitAsync(Timeout);
+
+        var huge = Instrument.Make(7) with { Notes = new string('x', 5000) };
+        var changes = Enumerable.Range(0, 20)
+            .Select(i => new TableChange<int, Instrument>(i, null, i == 7 ? huge : Instrument.Make(i))).ToList();
+        var refused = await Assert.ThrowsAsync<KafkaLogException>(
+            async () => await log.AppendAsync(new TableVersion<int, Instrument>(1, changes, new Dictionary<int, long>())));
+        Assert.IsNotType<KafkaLogFencedException>(refused);
+        Assert.Contains("key 7 ", refused.Message);
+        Assert.Contains("MaxRecordBytes (4096)", refused.Message);
+
+        // Nothing of the version was produced: the log is where it was, and the same
+        // version number is still the next one.
+        Assert.Equal(0, await log.LastVersionAsync());
+        Assert.True(active.IsWriter);
+        var small = changes.Where(c => c.Key != 7).ToList();
+        await log.AppendAsync(new TableVersion<int, Instrument>(1, small, new Dictionary<int, long>()));
+        var (rows, head) = await RestoreAsync(log);
+        Assert.Equal(1, head.Version);
+        Assert.Equal(19, rows.Count);
+
+        // A change is its old row and its new one: two rows that each fit can still be too much.
+        var wide = Instrument.Make(3) with { Notes = new string('y', 2500) };
+        await log.AppendAsync(new TableVersion<int, Instrument>(2, [new TableChange<int, Instrument>(3, Instrument.Make(3), wide)], new Dictionary<int, long>()));
+        var both = await Assert.ThrowsAsync<KafkaLogException>(async () => await log.AppendAsync(new TableVersion<int, Instrument>(
+            3, [new TableChange<int, Instrument>(3, wide, wide with { Notes = new string('z', 2500) })], new Dictionary<int, long>())));
+        Assert.Contains("key 3 ", both.Message);
+    }
+
+    [Fact]
     public async Task A_large_version_is_split_into_chunks_and_read_back_whole()
     {
         await using var env = KafkaEnv.Create();

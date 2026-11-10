@@ -86,6 +86,8 @@ public sealed class InMemoryServiceBackend : IServiceBackend, ICatalogMirror
     }
 
     public string NodeId { get; }
+
+    public Task ConnectAsync(CancellationToken cancellationToken) => Task.CompletedTask;
     public InMemoryServiceCluster Cluster => _cluster;
     public IStateChangelog State => _cluster.State;
     public int RetainedHistoryVersions => _cluster.Options.RetainedHistoryVersions;
@@ -405,6 +407,15 @@ public sealed class InMemoryServiceBackend : IServiceBackend, ICatalogMirror
             lock (_cluster.Gate)
                 peer = _cluster.Nodes.FirstOrDefault(n => n != backend);
             return new ValueTask<PeerInfo?>(peer?._leadership._callbacks?.DescribeSelf());
+        }
+
+        public bool PeerExpected
+        {
+            get
+            {
+                lock (_cluster.Gate)
+                    return _cluster.Nodes.Count > 1;
+            }
         }
 
         public IUpsertSink<TKey, TRow> Leased<TKey, TRow>(IUpsertSink<TKey, TRow> sink) where TKey : notnull => sink;

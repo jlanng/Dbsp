@@ -84,10 +84,18 @@ public abstract class SlotContext
 
 public sealed class SourceContext<T> : SlotContext where T : notnull
 {
-    internal SourceContext(SlotStart start, InputHandle<T> input) : base(start) => Input = input;
+    internal SourceContext(SlotStart start, InputStream<T> stream) : base(start)
+    {
+        Stream = stream;
+        Input = start.Circuit.Handle(stream);
+    }
 
     public Circuit Circuit => CircuitCore;
     public InputHandle<T> Input { get; }
+
+    /// <summary>The input as the definition declared it, for a source that is started
+    /// with the circuit and the stream (<c>KafkaSource.StartAsync</c>).</summary>
+    public InputStream<T> Stream { get; }
 
     /// <summary>Partition → offset of the last record in the committed checkpoint: resume
     /// each partition just above it.</summary>
@@ -98,10 +106,17 @@ public sealed class KeyedSourceContext<TKey, TValue> : SlotContext
     where TKey : notnull
     where TValue : notnull
 {
-    internal KeyedSourceContext(SlotStart start, KeyedInputHandle<TKey, TValue> input) : base(start) => Input = input;
+    internal KeyedSourceContext(SlotStart start, KeyedInputStream<TKey, TValue> stream) : base(start)
+    {
+        Stream = stream;
+        Input = start.Circuit.Handle(stream);
+    }
 
     public Circuit Circuit => CircuitCore;
     public KeyedInputHandle<TKey, TValue> Input { get; }
+
+    /// <inheritdoc cref="SourceContext{T}.Stream"/>
+    public KeyedInputStream<TKey, TValue> Stream { get; }
 
     /// <inheritdoc cref="SourceContext{T}.CommittedOffsets"/>
     public IReadOnlyDictionary<int, long> CommittedOffsets => Circuit.CommittedOffsets(Slot);
