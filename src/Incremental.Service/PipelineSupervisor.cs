@@ -48,6 +48,12 @@ internal sealed class PipelineRuntime(PipelineSpec spec, ServiceOptions options)
     public volatile Generation? Current;
     public PluginLease? Lease;
     public volatile PipelineShape? Shape;
+
+    /// <summary>A generation of this pipeline is being started here: its circuit runs
+    /// before <see cref="Current"/> names it.</summary>
+    public volatile bool Starting;
+    public volatile PipelineGraph? Graph;
+    public Ring<PipelineTransition> History { get; } = new(32);
     public Queue<PipelineFault> Faults { get; } = new();
     public Queue<DateTimeOffset> FaultTimes { get; } = new();
     public int Restarts;
@@ -115,11 +121,82 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         return new PipelineStatus(
             runtime.Id, runtime.State, spec.Desired, spec.Generation, spec.Plugin, spec.Version, spec.Definition,
             blockedOn, runtime.Since, runtime.Operation, runtime.Restarts, runtime.DeadLetters.Total,
-            generation?.Circuit.CommittedStep, committed, faults, runtime.Shape, sources, sinks);
+            generation?.Circuit.CommittedStep, committed, faults, runtime.Shape, sources, sinks, runtime.History.After());
+    }
+
+    public PipelineGraph? Graph(string id) => Require(id).Graph;
+
+    public PipelineSpec RedactedSpec(string id)
+    {
+        var spec = Require(id).Spec;
+        return spec with { Inputs = Redact(spec.Inputs), Sinks = Redact(spec.Sinks) };
+    }
+
+    private IReadOnlyDictionary<string, JsonElement> Redact(IReadOnlyDictionary<string, JsonElement> bindings)
+    {
+        Dictionary<string, JsonElement>? redacted = null;
+        foreach (var (slot, config) in bindings)
+        {
+            IReadOnlyList<string>? secret = null;
+            try
+            {
+                secret = TryConnector(config)?.Describe(config).SecretProperties;
+            }
+            catch
+            {
+                // A config its connector refuses is shown as it is stored, less nothing.
+            }
+            if (secret is not { Count: > 0 } || config.ValueKind != JsonValueKind.Object)
+                continue;
+            var copy = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+            foreach (var property in config.EnumerateObject())
+                copy[property.Name] = secret.Contains(property.Name) ? JsonSerializer.SerializeToElement("***") : property.Value;
+            (redacted ??= new Dictionary<string, JsonElement>(bindings, StringComparer.Ordinal))[slot] = JsonSerializer.SerializeToElement(copy);
+        }
+        return redacted ?? bindings;
+    }
+
+    /// <summary>Whether this node runs, or is starting, the circuit of that pipeline: whose
+    /// measurements this node's metrics count.</summary>
+    internal bool RunsHere(string id) =>
+        _pipelines.TryGetValue(id, out var runtime) && runtime.Exists && (runtime.Starting || runtime.Current is not null);
+
+    /// <summary>What the metrics sampler reads once a second: cheap, no copies of offsets.</summary>
+    internal void SampleInto(List<PipelineSampleInput> into)
+    {
+        foreach (var runtime in _pipelines.Values)
+        {
+            if (!runtime.Exists)
+                continue;
+            var generation = runtime.Current;
+            long records = 0;
+            long? lag = null;
+            if (generation is not null)
+            {
+                foreach (var stats in generation.SinkStats.Values)
+                    records += Interlocked.Read(ref stats.Upserts) + Interlocked.Read(ref stats.Deletes) + Interlocked.Read(ref stats.Appends);
+                foreach (var (_, source) in generation.Sources)
+                {
+                    try
+                    {
+                        if (source.Stats.Lag is { } sourceLag)
+                            lag = (lag ?? 0) + sourceLag;
+                    }
+                    catch
+                    {
+                        // A source's stats are its own business.
+                    }
+                }
+            }
+            into.Add(new PipelineSampleInput(runtime.Id, generation?.Number ?? 0, records, lag, runtime.DeadLetters.Total));
+        }
     }
 
     public IReadOnlyList<DeadLetterRecord> DeadLetters(string id, long afterSequence = 0, int limit = 256) =>
         Require(id).DeadLetters.After(afterSequence, limit);
+
+    public IReadOnlyList<DeadLetterRecord> DeadLettersBefore(string id, long beforeSequence = long.MaxValue, int limit = 256) =>
+        Require(id).DeadLetters.Before(beforeSequence, limit);
 
     private void Set(PipelineRuntime runtime, PipelineState state, string? why = null)
     {
@@ -127,6 +204,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             return;
         runtime.State = state;
         runtime.Since = DateTimeOffset.UtcNow;
+        runtime.History.Add(new PipelineTransition(runtime.Since, state, runtime.Spec.Generation, why));
         if (state is not PipelineState.Blocked)
             runtime.BlockedOn = null;
         _logger.LogInformation("Pipeline {Pipeline} generation {Generation} is {State}{Why}",
@@ -136,11 +214,17 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
 
     // ── the dry run ────────────────────────────────────────────────────────────────────
 
-    public async Task<PipelineShape> ValidateAsync(PipelineSpec spec, CancellationToken cancellationToken)
+    public async Task<PipelineShape> ValidateAsync(PipelineSpec spec, CancellationToken cancellationToken) =>
+        (await DescribeAsync(spec, cancellationToken).ConfigureAwait(false)).Shape;
+
+    public async Task<PipelineValidation> DescribeAsync(PipelineSpec spec, CancellationToken cancellationToken)
     {
         var (resolved, lease) = await ResolveAsync(spec, cancellationToken).ConfigureAwait(false);
         using (lease)
-            return DryRun(resolved, lease);
+        {
+            var (shape, graph) = DryRun(resolved, lease);
+            return new PipelineValidation(resolved, shape, graph);
+        }
     }
 
     private async Task<(PipelineSpec Spec, PluginLease Lease)> ResolveAsync(PipelineSpec spec, CancellationToken cancellationToken)
@@ -157,7 +241,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
     /// tables it declares, with every binding checked. No side effects — a table is claimed
     /// only at <c>Circuit.Build()</c>.</summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private PipelineShape DryRun(PipelineSpec spec, PluginLease lease)
+    private (PipelineShape Shape, PipelineGraph Graph) DryRun(PipelineSpec spec, PluginLease lease)
     {
         var definition = lease.Definition(spec.Definition);
         var settings = definition.BindSettings(spec.Settings, lease.Json);
@@ -176,7 +260,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             throw ServiceException.Invalid($"Definition '{spec.Definition}' threw while describing its circuit: {ex.GetType().Name}: {ex.Message}");
         }
         CheckBindings(spec, pipeline);
-        return pipeline.Shape;
+        return (pipeline.Shape, pipeline.Graph);
     }
 
     private void CheckBindings(PipelineSpec spec, PipelineBuilder pipeline)
@@ -370,7 +454,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                     "state-choice-required",
                     $"This change to pipeline '{spec.Id}' can change what its state means; say whether to keep the state or reset it.", 409, changes);
 
-            var shape = DryRun(spec, lease);
+            var (shape, graph) = DryRun(spec, lease);
             foreach (var table in shape.TablesWritten)
             {
                 if (_pipelines.Values.FirstOrDefault(p => p.Exists && p.Id != spec.Id && p.Spec.Writes.Contains(table)) is { } other)
@@ -406,6 +490,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             };
             await CommitAsync(runtime, spec, plan.Action, options.Caller, steps, cancellationToken).ConfigureAwait(false);
             runtime.Shape = shape;
+            runtime.Graph = graph;
 
             if (runtime.Current is not null || existing is not null)
                 await StopCurrentAsync(runtime, context.Options.StopTimeout).ConfigureAwait(false);
@@ -685,14 +770,17 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 Bind(runtime, await context.Plugins.AcquireAsync(spec.Plugin, spec.Version, cancellationToken).ConfigureAwait(false));
             }
             generation = Build(runtime, number);
+            runtime.Starting = true;
             generation.Circuit.Start();
             await StartEdgesAsync(runtime, generation).ConfigureAwait(false);
             runtime.Current = generation;
+            runtime.Starting = false;
             Set(runtime, PipelineState.Running);
             Watch(runtime, generation);
         }
         catch (TableNotOpenException ex)
         {
+            runtime.Starting = false;
             if (generation is not null)
                 await TeardownAsync(runtime, generation, context.Options.StopTimeout).ConfigureAwait(false);
             if (runtime.Wedged)
@@ -703,6 +791,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         }
         catch (Exception ex)
         {
+            runtime.Starting = false;
             if (generation is not null)
                 await TeardownAsync(runtime, generation, context.Options.StopTimeout).ConfigureAwait(false);
             if (!runtime.Wedged)
@@ -732,6 +821,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         definition.Build(pipeline, settings);
         CheckBindings(spec, pipeline);
         runtime.Shape = pipeline.Shape;
+        runtime.Graph = pipeline.Graph;
         return new Generation { Number = number, Circuit = builder.Build(), Builder = pipeline };
     }
 

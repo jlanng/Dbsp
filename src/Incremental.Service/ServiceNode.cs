@@ -186,6 +186,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         _context.Tables = new TableRegistry(_context);
         _context.Supervisor = new PipelineSupervisor(_context);
         _context.Tables.Reopened += _context.Supervisor.OnTableReopened;
+        Metrics = new ServiceMetrics(_context.Supervisor);
         events.Published += e => Events?.Invoke(e);
     }
 
@@ -196,6 +197,13 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
     public IPipelineSupervisor Pipelines => _context.Supervisor;
     public IPluginCatalog Plugins => _context.Plugins;
     public bool IsLeader => _started && _context.IsLeader;
+
+    /// <summary>Recent per-pipeline and node-wide numbers, sampled once a second from the
+    /// core's meter and the supervisor's counters.</summary>
+    public ServiceMetrics Metrics { get; }
+
+    /// <summary>The options this node runs with.</summary>
+    public ServiceOptions Options => _context.Options;
 
     /// <summary>Role changes, pipeline and table transitions, catalog versions.</summary>
     public event Action<ServiceEvent>? Events;
@@ -224,6 +232,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         _catalogOpen.Forget();
 
         _started = true;
+        Metrics.Start();
         _finished = backend.Leadership.WhenFinished.ContinueWith(_ => OnFinishedAsync(), TaskScheduler.Default).Unwrap();
         await backend.Leadership.StartAsync(
             new LeadershipCallbacks(PrepareAsync, StartLeadingAsync, StopLeadingAsync, DescribeSelf), cancellationToken).ConfigureAwait(false);
@@ -828,6 +837,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
+        Metrics.Dispose();
         if (_started)
         {
             await StopAsync(CancellationToken.None).ConfigureAwait(false);

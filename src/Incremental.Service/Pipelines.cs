@@ -40,6 +40,18 @@ public sealed record PipelineShape(
     IReadOnlyList<SlotShape> Inputs, IReadOnlyList<SlotShape> Sinks,
     IReadOnlyList<string> TablesRead, IReadOnlyList<string> TablesWritten);
 
+/// <summary>The circuit a definition declared, node by node (the core's
+/// <see cref="CircuitBuilder.Describe"/>), and which of its outputs is which sink slot.
+/// Input slots and tables are in the nodes' kinds: <c>input[slot]</c>, <c>table[name]</c>.</summary>
+public sealed record PipelineGraph(CircuitGraph Circuit, IReadOnlyDictionary<string, string> SinkSlots);
+
+/// <summary>A dry run's result: the spec with its plugin version resolved, the slots and
+/// tables, and the graph.</summary>
+public sealed record PipelineValidation(PipelineSpec Spec, PipelineShape Shape, PipelineGraph Graph);
+
+/// <summary>One state change of a pipeline on this node.</summary>
+public sealed record PipelineTransition(DateTimeOffset Time, PipelineState State, long Generation, string? Why);
+
 /// <summary>
 /// What a definition builds against. <see cref="Circuit"/> is the core's builder, so
 /// lookups, aggregates, event time and windows are the core API with nothing in between;
@@ -75,6 +87,13 @@ public sealed class PipelineBuilder
     internal List<SinkSlot> Sinks { get; } = [];
     internal List<string> TablesRead { get; } = [];
     internal List<string> TablesWritten { get; } = [];
+
+    private readonly Dictionary<string, string> _sinkOutputs = new(StringComparer.Ordinal);
+
+    /// <summary>The output just registered belongs to <paramref name="slot"/>.</summary>
+    private void MarkSink(string slot) => _sinkOutputs[Circuit.Describe().Outputs[^1].Name] = slot;
+
+    internal PipelineGraph Graph => new(Circuit.Describe(), new Dictionary<string, string>(_sinkOutputs, StringComparer.Ordinal));
 
     internal PipelineShape Shape => new(
         Inputs.Select(i => new SlotShape(i.Name, i.Kind, i.Type)).ToList(),
@@ -139,6 +158,7 @@ public sealed class PipelineBuilder
     {
         Claim(slot);
         var output = rows.ToAcknowledgedOutput();
+        MarkSink(slot);
         Sinks.Add(new SinkSlot(slot, SlotKind.UpsertSink, typeof(TRow).Name,
             (connector, start) =>
             {
@@ -160,6 +180,7 @@ public sealed class PipelineBuilder
     {
         Claim(slot);
         var output = rows.ToAcknowledgedOutput();
+        MarkSink(slot);
         Sinks.Add(new SinkSlot(slot, SlotKind.UpsertSink, typeof(T).Name,
             (connector, start) =>
             {
@@ -178,6 +199,7 @@ public sealed class PipelineBuilder
     {
         Claim(slot);
         var output = rows.ToAcknowledgedOutput();
+        MarkSink(slot);
         Sinks.Add(new SinkSlot(slot, SlotKind.AppendSink, typeof(T).Name,
             (connector, start) =>
             {
@@ -333,7 +355,8 @@ public sealed record PipelineStatus(
     string? BlockedOn, DateTimeOffset? Since, string? Operation, int Restarts, long DeadLetters,
     long? CommittedStep, IReadOnlyDictionary<string, long> CommittedOffsets,
     IReadOnlyList<PipelineFault> Faults, PipelineShape? Shape,
-    IReadOnlyList<SourceSlotStatus> Sources, IReadOnlyList<SinkSlotStatus> Sinks);
+    IReadOnlyList<SourceSlotStatus> Sources, IReadOnlyList<SinkSlotStatus> Sinks,
+    IReadOnlyList<PipelineTransition>? History = null);
 
 public interface IPipelineSupervisor
 {
@@ -350,6 +373,17 @@ public interface IPipelineSupervisor
     /// <summary>A dry run of a spec that need not be deployed: binds its settings, runs
     /// its definition and checks every slot and table. Nothing is touched.</summary>
     Task<PipelineShape> ValidateAsync(PipelineSpec spec, CancellationToken cancellationToken);
+
+    /// <summary><see cref="ValidateAsync"/> with the circuit's graph and the resolved spec.</summary>
+    Task<PipelineValidation> DescribeAsync(PipelineSpec spec, CancellationToken cancellationToken);
+
+    /// <summary>The graph of the pipeline's circuit as this node last built or dry-ran it;
+    /// null where it never has — a standby runs no plugin code.</summary>
+    PipelineGraph? Graph(string id);
+
+    /// <summary>The spec with every config property a connector declares secret replaced
+    /// by <c>***</c>: the form to show.</summary>
+    PipelineSpec RedactedSpec(string id);
     Task<ActionPlan> StartAsync(string id, ActionOptions options, CancellationToken cancellationToken);
     Task<ActionPlan> StopAsync(string id, ActionOptions options, CancellationToken cancellationToken);
 
@@ -361,4 +395,8 @@ public interface IPipelineSupervisor
     Task<ActionPlan> ResetAsync(string id, ActionOptions options, CancellationToken cancellationToken);
     Task<ActionPlan> RemoveAsync(string id, ActionOptions options, CancellationToken cancellationToken);
     IReadOnlyList<DeadLetterRecord> DeadLetters(string id, long afterSequence = 0, int limit = 256);
+
+    /// <summary>The newest <paramref name="limit"/> dead letters older than
+    /// <paramref name="beforeSequence"/>, oldest first: a page back from the newest.</summary>
+    IReadOnlyList<DeadLetterRecord> DeadLettersBefore(string id, long beforeSequence = long.MaxValue, int limit = 256);
 }

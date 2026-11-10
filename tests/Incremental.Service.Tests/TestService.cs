@@ -38,6 +38,10 @@ internal sealed class TestService : IAsyncDisposable
         await Eventually(() => sink.Rows.Count == 1, "the warm-up pipeline's output");
     });
 
+    /// <summary>For tests that build their nodes another way (the admin host): the same
+    /// warm-up first.</summary>
+    public static Task WarmedUpAsync() => WarmUp.Value;
+
     public static async Task<TestService> StartAsync(
         InMemoryServiceCluster? cluster = null, string nodeId = "a", MemoryConnector? memory = null,
         Action<ServiceOptions>? options = null, Action<IncrementalServiceBuilder>? configure = null)

@@ -69,6 +69,14 @@ public interface IPluginCatalog
     /// validated while it is unpacked.</summary>
     Task<PluginManifest> ImportZipAsync(Stream zip, CancellationToken cancellationToken, string? caller = null);
 
+    /// <summary>Leader: imports every package in <see cref="ServiceOptions.PluginDirectory"/>
+    /// the catalog lacks, as the first lead does. A package that cannot be imported is
+    /// logged and skipped; the result is what is stored afterwards.</summary>
+    Task<IReadOnlyList<PluginInfo>> RescanAsync(CancellationToken cancellationToken);
+
+    /// <summary>The stored manifest of a plugin version: its files and definitions.</summary>
+    PluginManifest? Manifest(string name, string version);
+
     /// <summary>Leader: refused while a pipeline spec names the version.</summary>
     Task DeleteAsync(string name, string version, CancellationToken cancellationToken, string? caller = null);
 }
@@ -455,7 +463,16 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
     private IEnumerable<PluginManifest> Stored() =>
         context.Catalog.Read().Where(e => e.Key.StartsWith("plugin/", StringComparison.Ordinal)).Select(e => ServiceJson.Read<PluginManifest>(e.Value));
 
-    internal PluginManifest? Manifest(string name, string version) =>
+    public async Task<IReadOnlyList<PluginInfo>> RescanAsync(CancellationToken cancellationToken)
+    {
+        context.RequireLeader();
+        if (context.Options.PluginDirectory is null)
+            throw ServiceException.Conflict("This node has no plugin directory configured.");
+        await ImportPluginDirectoryAsync(cancellationToken).ConfigureAwait(false);
+        return Plugins;
+    }
+
+    public PluginManifest? Manifest(string name, string version) =>
         _builtIn.TryGetValue(name, out var builtIn) && builtIn.Version == version
             ? builtIn
             : context.Catalog.Get<PluginManifest>($"plugin/{name}/{version}");

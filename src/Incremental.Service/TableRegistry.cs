@@ -33,6 +33,7 @@ internal interface ITableHandle : IAsyncDisposable
     Task TrimAsync(DateTimeOffset now, IReadOnlyList<(string Pipeline, long Version)> readers, CancellationToken cancellationToken);
     Task<TableStats> StatsAsync(IReadOnlyList<(string Pipeline, long Version)> readers, string writer);
     IReadOnlyList<UnreadableRecord> Unreadable(long afterSequence);
+    TableRowPage ReadRows(TableRowQuery query);
 }
 
 internal sealed class TableHandle<TKey, TRow>(TableRegistry registry, TableDefinition<TKey, TRow> definition, TableSpec spec) : ITableHandle
@@ -101,8 +102,8 @@ internal sealed class TableHandle<TKey, TRow>(TableRegistry registry, TableDefin
                 : await SharedTable<TKey, TRow>.OpenAsync(Spec.Name, definition.KeyOf, log, _configured.Options, cancellationToken).ConfigureAwait(false);
 
             // Before any loader runs; on a table with rows each is one scan.
-            foreach (var (_, declare) in _configured.Indexes)
-                declare(table);
+            foreach (var index in _configured.Indexes)
+                index.Declare(table);
             _log = log;
             _table = table;
             _fault = null;
@@ -405,7 +406,75 @@ internal sealed class TableHandle<TKey, TRow>(TableRegistry registry, TableDefin
             State, Fault,
             table?.Count ?? 0, version, log?.OldestRetainedVersion ?? 0, _rate,
             _configured.Indexes.Select(i => i.Name).ToList(), writer,
-            loader, lag, readerStats, _floorHeldBy);
+            loader, lag, readerStats, _floorHeldBy,
+            _configured.Indexes.ToDictionary(i => i.Name, i => i.KeyType.Name, StringComparer.Ordinal));
+    }
+
+    // Rows are contract types, which never unload, so one options instance serves.
+    private static readonly JsonSerializerOptions RowJson = TableKeys.Json;
+
+    public TableRowPage ReadRows(TableRowQuery query)
+    {
+        var table = _table ?? throw new ServiceException("not-ready", $"Table '{Spec.Name}' is not open on this node.", 503);
+        using var snapshot = table.Snapshot();
+        var count = table.Count;
+        var limit = Math.Max(1, query.Limit);
+        var rows = new List<TableRowData>(Math.Min(limit, 64));
+
+        static TableRowData Data(TKey key, TRow row) =>
+            new(JsonSerializer.SerializeToElement(key, RowJson), JsonSerializer.SerializeToElement(row, RowJson));
+
+        if (query.Index is { Length: > 0 } indexName)
+        {
+            var index = _configured.Indexes.FirstOrDefault(i => i.Name == indexName)
+                ?? throw ServiceException.Invalid(
+                    $"Table '{Spec.Name}' has no index named '{indexName}' (declared: {string.Join(", ", _configured.Indexes.Select(i => i.Name))}).");
+            if (query.Key is not { Length: > 0 } indexKey)
+                throw ServiceException.Invalid("A read by index needs a key.");
+            var found = index.ReadBy(snapshot, indexKey);
+            foreach (var (key, row) in found.Take(limit))
+                rows.Add(Data(key, row));
+            return new TableRowPage(snapshot.Version, count, found.Count, false, found.Count > limit, rows);
+        }
+
+        if (query.Key is { Length: > 0 } keyText)
+        {
+            if (snapshot.TryGet(TableKeys.Parse<TKey>(keyText), out var row))
+                rows.Add(Data(definition.KeyOf(row), row));
+            return new TableRowPage(snapshot.Version, count, 1, false, false, rows);
+        }
+
+        // One scan, in the table's own order: stable while the table does not change, and
+        // a sample rather than a cursor when it does — the version says which it was.
+        var skip = Math.Max(0, query.Skip);
+        var contains = string.IsNullOrEmpty(query.Contains) ? null : query.Contains;
+        long scanned = 0, matched = 0;
+        var truncated = false;
+        var more = false;
+        foreach (var (key, row) in snapshot.Rows())
+        {
+            if (scanned >= query.MaxScanned)
+            {
+                truncated = true;
+                break;
+            }
+            scanned++;
+            if (contains is not null)
+            {
+                var text = JsonSerializer.Serialize(row, RowJson);
+                if (!text.Contains(contains, StringComparison.OrdinalIgnoreCase))
+                    continue;
+            }
+            if (matched++ < skip)
+                continue;
+            if (rows.Count == limit)
+            {
+                more = true;
+                break;
+            }
+            rows.Add(Data(key, row));
+        }
+        return new TableRowPage(snapshot.Version, count, scanned, truncated, more || truncated, rows);
     }
 
     public async ValueTask DisposeAsync()
@@ -491,7 +560,15 @@ internal sealed class TableRegistry(ServiceContext context) : ITableRegistry
 
     public TableStats Stats(string name) => StatsAsync(name).GetAwaiter().GetResult();
 
-    internal Task<TableStats> StatsAsync(string name)
+    public TableSpec Spec(string name) => Require(name).Spec;
+
+    public TableRowPage ReadRows(string name, TableRowQuery query)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        return Require(name).ReadRows(query);
+    }
+
+    public Task<TableStats> StatsAsync(string name)
     {
         var handle = Require(name);
         var pipelines = context.PipelineSpecs();

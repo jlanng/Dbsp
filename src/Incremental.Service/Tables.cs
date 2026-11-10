@@ -59,14 +59,22 @@ public sealed class TableBuilder<TKey, TRow>
     where TKey : notnull
     where TRow : class
 {
-    internal List<(string Name, Action<SharedTable<TKey, TRow>> Declare)> Indexes { get; } = [];
+    internal List<DeclaredIndex> Indexes { get; } = [];
+
+    /// <summary>A declared index: how to add it to a table, and how to read it with a key
+    /// that arrives as JSON (the admin API's row lookup).</summary>
+    internal sealed record DeclaredIndex(
+        string Name, Type KeyType, Action<SharedTable<TKey, TRow>> Declare,
+        Func<TableSnapshot<TKey, TRow>, string, IReadOnlyList<KeyValuePair<TKey, TRow>>> ReadBy);
 
     public SharedTableOptions Options { get; set; } = new();
 
     public TableBuilder<TKey, TRow> Index<TIndexKey>(IndexDefinition<TRow, TIndexKey> index) where TIndexKey : notnull
     {
         ArgumentNullException.ThrowIfNull(index);
-        Indexes.Add((index.Name, table => table.AddIndex(index.Name, index.Selector)));
+        Indexes.Add(new DeclaredIndex(
+            index.Name, typeof(TIndexKey), table => table.AddIndex(index.Name, index.Selector),
+            (snapshot, key) => snapshot.RowsBy(index.Name, TableKeys.Parse<TIndexKey>(key))));
         return this;
     }
 }
@@ -80,6 +88,35 @@ public static class TableDefinitionExtensions
         where TRow : class
         where TIndexKey : notnull =>
         table.By(index.Name, index.Selector);
+}
+
+internal static class TableKeys
+{
+    // Keys are contract or primitive types, which never unload, so one options instance serves.
+    public static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
+
+    /// <summary>A key given as text: JSON (<c>42</c>, <c>"GB00"</c>, <c>{"a":1}</c>), or —
+    /// for a key that is a JSON string, such as a string, a Guid or a date — the bare text.</summary>
+    public static T Parse<T>(string text) where T : notnull
+    {
+        try
+        {
+            if (JsonSerializer.Deserialize<T>(text, Json) is { } parsed)
+                return parsed;
+        }
+        catch (Exception ex) when (ex is JsonException or NotSupportedException or FormatException)
+        {
+        }
+        try
+        {
+            if (JsonSerializer.Deserialize<T>(JsonSerializer.Serialize(text), Json) is { } quoted)
+                return quoted;
+        }
+        catch (Exception ex) when (ex is JsonException or NotSupportedException or FormatException)
+        {
+        }
+        throw ServiceException.Invalid($"'{(text.Length > 80 ? text[..80] + "…" : text)}' is not a key of type {typeof(T).Name}; give it as JSON.");
+    }
 }
 
 public enum UnreadablePolicy
@@ -203,7 +240,26 @@ public sealed record TableStats(
     LoaderStats? Loader,
     long? LagVersions,
     IReadOnlyList<TableReader> Readers,
-    string? FloorHeldBy);
+    string? FloorHeldBy,
+    IReadOnlyDictionary<string, string>? IndexKeyTypes = null);
+
+/// <summary>What to read of a table's rows: one row by <see cref="Key"/>; the rows under
+/// one key of <see cref="Index"/>; or, with neither, a page of one scan — <see cref="Skip"/>
+/// rows passed over, then up to <see cref="Limit"/>, keeping only rows whose JSON text
+/// contains <see cref="Contains"/>. The scan stops after <see cref="MaxScanned"/> rows
+/// whatever it has found.</summary>
+public sealed record TableRowQuery(
+    int Limit = 50, int Skip = 0, string? Contains = null, string? Key = null, string? Index = null, int MaxScanned = 100_000);
+
+/// <summary>One row: its key and the row, both as JSON.</summary>
+public sealed record TableRowData(JsonElement Key, JsonElement Row);
+
+/// <summary>Rows read from one pinned snapshot. <c>Version</c> is the snapshot;
+/// <c>Scanned</c> how many rows the read looked at; <c>Truncated</c> that the scan stopped
+/// at its bound before the end of the table, so "not found" means "not reached";
+/// <c>More</c> that another page follows.</summary>
+public sealed record TableRowPage(
+    long Version, long TableRows, long Scanned, bool Truncated, bool More, IReadOnlyList<TableRowData> Rows);
 
 public interface ITableRegistry
 {
@@ -213,6 +269,18 @@ public interface ITableRegistry
     /// types are not the table's — which is what a row type loaded twice looks like.</summary>
     SharedTable<TKey, TRow> Get<TKey, TRow>(string name) where TKey : notnull where TRow : class;
     TableStats Stats(string name);
+
+    /// <summary><see cref="Stats"/> without blocking: on a standby the lag costs one short
+    /// read of the table's log.</summary>
+    Task<TableStats> StatsAsync(string name);
+
+    /// <summary>The declared table's spec, as the catalog holds it.</summary>
+    TableSpec Spec(string name);
+
+    /// <summary>Rows of the table as this node holds it — any node answers, a standby from
+    /// its followed copy. Bounded by the query; a row is serialized only if it is returned
+    /// or filtered by text.</summary>
+    TableRowPage ReadRows(string name, TableRowQuery query);
     IReadOnlyList<UnreadableRecord> Unreadable(string name, long afterSequence = 0);
 
     /// <summary>Leader: opens the table's log as its writer, commits <c>table/{name}</c>

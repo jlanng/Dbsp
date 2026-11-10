@@ -144,6 +144,24 @@ internal sealed class Ring<T>(int capacity)
         lock (_items)
             return _items.Where(i => i.Sequence > sequence).Select(i => i.Item).Take(limit).ToList();
     }
+
+    /// <summary>The newest <paramref name="limit"/> items older than
+    /// <paramref name="sequence"/>, oldest first: paging backwards from the newest.</summary>
+    public IReadOnlyList<T> Before(long sequence = long.MaxValue, int limit = int.MaxValue)
+    {
+        lock (_items)
+            return _items.Where(i => i.Sequence < sequence).Select(i => i.Item).TakeLast(limit).ToList();
+    }
+
+    /// <summary>The sequence of the oldest item kept; 0 when there is none.</summary>
+    public long Oldest
+    {
+        get
+        {
+            lock (_items)
+                return _items.Count == 0 ? 0 : _items.Peek().Sequence;
+        }
+    }
 }
 
 internal static class TaskExtensions
