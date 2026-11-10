@@ -709,14 +709,14 @@ examples/Incremental.LogAnalytics  simulated clickstream → 5s tumbling windows
                                        (bar gauges per window, watermark in the header);
                                        `--redis` keeps operator state in Redis. The hosted
                                        example: a worker service on `Incremental.Hosting`
-examples/Incremental.TradeEnrichment trades ⋈ reference data, composed interactively: pick which
-                                       enrichment columns to join (grouped by table: instrument;
-                                       trader → desk, a two-hop join; counterparty) and which
-                                       dimensions to group by — no dimensions gives a top-trades
-                                       blotter instead. Every input is a keyed upsert input:
-                                       amendments, cancellations, and master-data changes (desk
-                                       moves, re-ratings) are single UpsertAsync/DeleteAsync calls
-                                       that re-attribute historical trades in microseconds
+examples/Incremental.TradeEnrichment trades enriched from shared tables, as a narrative that checks
+                                       itself: four reference tables held once (`SharedTable`), a
+                                       derived table written by a small circuit (`ToTable`), a
+                                       trade circuit that looks the symbol up on arrival (`Lookup`)
+                                       and joins desk and rating retroactively (`Join`), two sinks
+                                       on the acknowledged-output path. A trader moves desk, an
+                                       instrument is renamed, a trade is amended; every claim it
+                                       prints is checked against a model, and a wrong one exits 1
 examples/Incremental.Showcase      the all-features demo: a marketplace payments desk, served as a
                                        local web app (`dotnet run`, then http://localhost:5170) in
                                        five tabs — enrichment joins (inner/left/full/anti) and
