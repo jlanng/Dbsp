@@ -1,6 +1,6 @@
 # Design: durability and warm standby
 
-> **Status:** agreed design, 2026-11-09. Build-order steps 1 to 5 are built: commit after
+> **Status:** agreed design, 2026-11-09. Build-order steps 1 to 6 are built: commit after
 > delivery (with the sink side of keyed upsert delivery and the per-record error policy; see
 > the two *As built* sections under *Commit after delivery*); the state changelog seam,
 > the changelog provider, the in-memory changelog and follower mode for stores and tables
@@ -8,8 +8,9 @@
 > writer, the state changelog and the table log on Kafka (see *As built:
 > `Incremental.Kafka`*); and the leader protocol — heartbeats, election, takeover, step
 > down, the delivery lease — with a kill -9 test between real processes (see *As built
-> (step 5)* under *Leadership and fencing*). The source adapter and the hosting roles are
-> not.
+> (step 5)* under *Leadership and fencing*); and Kafka sources, sinks and Debezium change
+> data capture (see *As built (step 6)* under *Source resumption*). The gRPC and file
+> adapters and the hosting roles are not.
 > Sibling of [shared-tables.md](shared-tables.md); it fills the `ITableLog` seam that
 > design leaves open. Blocks marked **Decided** record a choice James made.
 > Kafka and MSK facts were checked against the sources in *References*; anything not
@@ -1323,6 +1324,217 @@ step — on `Circuit.DeadLetters`.
   slot only up to committed positions. The slot allows one connection, which fences the
   old active as a side effect. Slot survival across a database failover is out of scope.
 
+### As built (step 6)
+
+Code: `src/Incremental.Kafka` — `KafkaSource.cs` (the source, its options, lag),
+`KafkaRecord.cs` (the record, deserializers, the keyed decoder), `KafkaSinks.cs`
+(`KafkaUpsertSink`, `KafkaAppendSink`), `Debezium.cs` (the change-event decoder),
+`KafkaConnect.cs` (the Connect REST helper and the Postgres connector configuration).
+Tests: `KafkaSourceTests.cs`, `KafkaTableLoaderTests.cs`, `KafkaSinkTests.cs`,
+`KafkaSourceResumptionTests.cs`, `DebeziumDecoderTests.cs` (no broker),
+`DebeziumCdcTests.cs` (Postgres 17 and Debezium 3.0.8 on the local stack). Of the
+adapters this section lists, only Kafka and CDC through Debezium are built; gRPC and
+files are not.
+
+```csharp
+circuit.Start();                                                   // in StartLeadingAsync
+await using var facts = await KafkaSource.StartAsync(circuit, ordersInput, ordersTopic);
+await using var accounts = await KafkaSource.StartAsync(circuit, accountsKeyedInput, accountsTopic);
+await using var loader = await KafkaSource.StartTableLoaderAsync(customers, cdcTopic, Debezium.Changes<int, Customer>());
+
+await using var sink = new KafkaUpsertSink<string, Total>(new KafkaSinkOptions { Topic = "totals", BootstrapServers = "…" });
+_ = circuit.Handle(totals).DeliverToAsync(leadership.Leased(sink), t => t.Key);
+```
+
+**One source, three targets.** `KafkaSource` is one consumer on one thread reading one
+topic. What differs is where records go: a circuit input (each record with a value is
+an insertion; a record with none is passed over), a keyed input (upsert or delete, as a
+`KafkaChangeDecoder` reads the record; by default a value is an upsert and a tombstone a
+delete), or a shared table's writer (the table loader).
+
+**The position is the checkpoint**, as *Kafka* above specifies. Every record is handed on
+through the stamped overloads with its partition and offset, so the circuit commits the
+position with the state it produced. A source assigns all the topic's partitions itself,
+each at `circuit.CommittedOffsets(input)[p] + 1`; the table loader uses
+`table.CommittedOffsets` (the offsets a table records with its versions — "the table's
+`$head` offsets" above). The consumer has a `group.id` because the client insists, joins
+no group and commits nothing; `auto.offset.reset` is `error`. Particulars:
+
+- Starts are numbers (a logical offset costs half a second; steps 3 to 5). The source
+  asks for each partition's first and last offsets once, at start.
+- A partition with no committed position starts at `StartFrom`: `Earliest` (default) or
+  `Latest`.
+- A committed position below the partition's first retained offset is
+  `KafkaSourcePositionLostException` at start. So is one past the partition's end, or
+  one for a partition the topic does not have: that is another topic (recreated, or
+  another cluster).
+- *Deviation.* The text has a compacted reference topic re-read from the start through
+  `ReplaceAllAsync` when its position has aged out. That is built for the table loader
+  and is opt-in (`ReloadTableWhenPositionLost`): the loader reads the topic to the end it
+  had, replaces the table's rows with the result and records the end as the position. It
+  is not built for a keyed circuit input, whose replay check would drop the re-read
+  records (keyed-input snapshot sync does not exist). And it cannot mend a recreated
+  topic, whose offsets are below the table's position: that is refused.
+- Offsets with no record behind them (transaction markers, compacted-away records) need
+  nothing: the committed position is a real record's offset and the next read starts
+  after it.
+- A source reads the partitions the topic has when it starts. New partitions are seen at
+  the next start.
+
+**Core change: `RejectAsync`.** "Poison records go through the error policy with their
+offset" needed a seam, because deserialization happens in the source, outside any
+operator. `InputHandle<T>.RejectAsync(record, error, partition, offset)` and the same on
+`KeyedInputHandle` send a record that has no value through the input's channel in its
+place. The drain admits its offset like any record's — so the checkpoint covers it and a
+replay drops it — and then reports it from `input[name]` under `DeadLetter`, or throws
+under `Fault`, which faults the circuit. The cost on the ordinary path is one more
+reference in each queued entry and one null check per drained record. `InputPort` now
+takes part in `IDeadLetteringInput` as `KeyedInputPort` did. A `KafkaSource` passes a
+`KafkaRecord` (topic, partition, offset, key and value bytes, timestamp, headers) as the
+record. A table has no dead-letter output: its loader stops on an unreadable record
+unless `OnUnreadableTableRecord` is set.
+
+**Backpressure, and two things librdkafka does.** The source writes one record at a time
+into the input's bounded channel and waits when it is full, so it stops polling; the
+client then stops fetching when it holds `FetchBufferKilobytes`
+(`queued.max.messages.kbytes`, set to 16 MB instead of the client's 64). A wait longer
+than `PauseAfter` (1 s) pauses the partitions until the write goes through. Measured
+with a 76 MB topic, a channel of 256 records and a 2 MB buffer, the circuit not stepping:
+the source had read 256 records and the client held at most 3.4 MB (the limit plus the
+fetches in flight when it was reached), for as long as the stall lasted; then all 40,000
+records arrived once each.
+
+- *Pausing does not free memory.* A paused client keeps what it had fetched until it is
+  next polled, then drops it and fetches it again. So the bound is the fetch buffer, with
+  or without the pause; the pause only stops fetch requests during a long stall, and
+  costs one refetch of the buffer. That is why `PauseAfter` is a second and not
+  milliseconds.
+- *`fetch.queue.backoff.ms` throttles a small buffer.* When the buffer is full the client
+  postpones its next fetch by this long, and the default is 1 s — so a source could
+  drain at most one buffer a second. With the 2 MB buffer the 40,000 records took 19 s;
+  with the backoff at 10 ms, which the source now sets, 0.3 s.
+
+**The table loader.** Each change is staged with `(partition, offset)`, so the table's
+own replay check drops whatever is read twice. A version is committed when the loader
+has read everything the client had fetched, or `MaxTableBatch` records (4096): with a
+Kafka log behind the table, what arrives during one commit is the next version. 4,300
+records at a cap of 500 became 9 versions. `Positions`, `MeasureLagAsync()` and
+`WhenCaughtUpAsync()` report progress; for a loader a position counts once its version
+has committed. It is the table's writer, so it runs on the leader only:
+`StartTableLoaderAsync` refuses a following table, and the tested takeover is
+`AcquireWriterAsync`, `table.PromoteAsync()`, then the loader, which read exactly the
+records the followed table did not have. A deposed leader's loader ends at its next
+commit with the table log's fence. One consequence of shared-tables.md stands: offsets
+ride with versions, so a tail of records that changed nothing is read again after a
+restart, harmlessly.
+
+**Sinks, and which producer.** `KafkaUpsertSink` (key → row, delete → tombstone) and
+`KafkaAppendSink` (one record each). Both stamp `incremental.step` on every record and
+`incremental.term` when given `Term`. Both place a keyed record by the Java client's
+murmur2, computed here, so placement does not depend on which producer wrote it (checked
+against librdkafka's own `murmur2` partitioner). A sink does not create its topic.
+
+> **Decided in step 6: sinks use an idempotent producer of their own by default, and the
+> log's transactional producer on request.** The default (`BootstrapServers`) is
+> `enable.idempotence` with `acks=all`, not transactional. Reasoning: the delivery
+> guarantee is the engine's and is at-least-once either way — a batch is acknowledged
+> when every delivery report is in, the checkpoint commits after, and a crash between
+> the two delivers the batch again; putting the sink write in a transaction would not
+> change that, because it would be a different transaction from the checkpoint's
+> (exactly-once to sinks is out of scope). A sink topic belongs to its readers and may
+> live on another cluster, and a non-transactional topic asks nothing of them. What the
+> default lacks is fencing, so it is to be wrapped in `leadership.Leased` and given
+> `Term`. With `KafkaSinkOptions.Log` the batch is instead one commit in the log
+> writer's group commit: a deposed leader cannot write the topic at all (*The sink
+> gap*: "a Kafka sink written through the transactional producer is fenced outright").
+> The price is that the topic is on the log's cluster, a delivery waits for a
+> transaction, and readers should use `read_committed`. Tested both ways; the fenced
+> case is tested (the batch does not reach the topic and the delivery fails with
+> `KafkaLogFencedException`).
+
+For that, a log commit's records may now carry headers and a null key
+(`LogRecord`); the log's own records use neither.
+
+*What the step header can and cannot do.* Along a partition the step never falls except
+at a restart, where it steps back to the first replayed step. With manual stepping the
+replay cuts the same steps, and a reader that skips steps it has seen is exact. An
+auto-stepping replay may cut other steps — a record can come back under a different
+step, and a replayed step may deliver nothing to this sink at all — so there a reader
+gets at-least-once and no more (the resumption test saw 103 and 177 of 6,000 facts
+twice in two runs). Making it exact needs the sink to say where a run begins (a run id
+and the committed step it resumed from, as headers) so a reader can drop what an
+earlier run wrote above it. Not built.
+
+**Debezium.** `Debezium.Changes<TKey, TRow>()` is a `KafkaChangeDecoder` for the JSON
+converter's output, with or without `schemas.enable`. `c`, `u` and `r` upsert `after`;
+`d` deletes the record key; the tombstone after a delete deletes it again; `m` is
+passed over; `t` is unreadable. The key is the primary key from the record key: one
+column as a scalar, several as a record. Checked against what the connector really
+writes (the decoder tests use captured records):
+
+- Under Postgres's default replica identity a delete's `before` holds the key and
+  *defaults* in every other column — empty strings, zero, the epoch — not nulls. Nothing
+  here reads `before` for a keyed table. `REPLICA IDENTITY FULL` is needed only to read
+  `before` (`Debezium.Events<TRow>()`), or for a table with no primary key, whose
+  deletes are keyed from `before` by a `keyOf` selector.
+- An update of the primary key arrives as a delete of the old key, its tombstone, and a
+  create of the new key.
+- `numeric` arrives as bytes unless the connector has `decimal.handling.mode=string`,
+  which `DebeziumPostgres.ConnectorConfig` sets. `timestamptz` is ISO-8601 text.
+- A second connector on the same slot snapshots every row again. The table read the 50
+  duplicate rows and minted no version, because an upsert that changes nothing is not a
+  change.
+
+`KafkaConnectClient` (validate, create or update, status, wait until running, restart,
+delete) and `DebeziumPostgres.ConnectorConfig` are in the main package: they need
+`HttpClient` and nothing else. Not handled: truncates, the TOAST placeholder for an
+untouched large column (it arrives as the placeholder text), schema changes, topics
+flattened by `ExtractNewRecordState`, and Avro (which plugs in as a Confluent
+deserializer through `KafkaDeserializers.From`, untested).
+
+**The CDC test.** Rows are in Postgres before the connector exists (the snapshot); the
+connector is validated and registered through the helper; a loader fills a shared table
+that a circuit reads through a table `Join` and a `Lookup`, and a second table with a
+composite key feeds a keyed input. Then an insert, an update and a delete; a key change;
+a connector restart in the middle of sixty statements; and the second snapshot. After
+each the table is compared with the database, and the join's sink with what the rows
+imply. Run with and without embedded schemas.
+
+**The resumption test.** Two source topics are produced to for about seven seconds while
+a circuit reads them — facts into a stream input, accounts with deletes into a keyed
+input — with its state on the Kafka changelog and its results in four Kafka sink topics.
+The process is dropped at six random moments. Each successor opens a new log (fencing
+the last), restores, and starts its sources; the test checks that each source's first
+record is at exactly the committed offset plus one. At the end sums and counts per key
+are exact, the append topic holds every fact at least once, and the keyed topic holds
+every surviving account with its last row. One run: 7,200 records, 211 read again
+across the six restarts. The keyed sink may also keep an account the model deleted (*A
+gap in "keyed upserts converge"*: the source cannot make an auto-stepping replay cut the
+same steps); the test allows that only for keys the model deleted, and saw none in the
+runs made.
+
+**Mutation checks.** 27 mutations of the sources, the sinks, the decoder and the core
+seam — resume one record late or early, ignore the checkpoint, drop the fetch bound,
+never pause, swallow an unreadable record, read a tombstone as nothing, stage table
+changes without offsets, lift the batch cap, let a follower load, miss a lost position,
+write a delete as an empty value, misplace a key, shift the step header, let a fenced
+log's sink carry on, and others. 25 were caught as the tests stood. Two were not. A
+sink that returned before its delivery reports were in passed everything, so a test now
+has the broker refuse a record and requires the write to fail unacknowledged. A decoder
+that ignored `d` events passed the CDC test, because the tombstone that follows a delete
+does the same work; the decoder's own tests catch it, and it only matters for a
+connector with `tombstones.on.delete=false`.
+
+**Limits.**
+
+- One topic, one consumer and one thread per source.
+- No metrics are published; the counters (`RecordsRead`, `RecordsUnreadable`, `Pauses`)
+  and `MeasureLagAsync()` are there to be read.
+- A source is not leased or fenced: a deposed leader's source reads until its circuit
+  faults at the next commit. Reading changes nothing, so nothing depends on it.
+- `WhenCaughtUpAsync()` on a circuit input means written to the input, not stepped.
+- Not built: gRPC and file adapters, keyed-input snapshot sync, the run headers above.
+
 ## Failure modes
 
 | Failure | What happens |
@@ -1390,6 +1602,17 @@ Against the local stack (`docker compose --profile connectors up -d`; tests skip
   stalled writer and a leased sink refusing a deposed leader. *Built.*
 - **CDC**, through the Debezium container: Postgres changes reach a shared table, the
   connector is restarted to force duplicates, and the table matches the database.
+  *Built* (`DebeziumCdcTests`, skipped when Postgres or Kafka Connect is unreachable); the
+  duplicates come from a second connector's snapshot, since a restart alone need not
+  produce any. See *As built (step 6)*.
+- **Sources and sinks** (`KafkaSourceTests`, `KafkaTableLoaderTests`, `KafkaSinkTests`,
+  `KafkaSourceResumptionTests`): resumption at the committed offset plus one, per
+  partition; refusal when the position is gone; tombstones on a keyed input; unreadable
+  records dead-lettered with topic, partition and offset, and their offsets
+  checkpointed; a stalled circuit holding the client to its fetch buffer; the table
+  loader's versions, lag, takeover by a standby and reload; an upsert sink's topic read
+  back by a keyed source in a second circuit, through either producer; the append
+  sink's headers; and sources resumed after six crashes against a model. *Built.*
 
 Not testable locally: MSK-specific quotas and broker patching behaviour. Those need a
 soak run on a real cluster before the failover number is believed.
@@ -1437,7 +1660,19 @@ soak run on a real cluster before the failover number is believed.
    faulted, since heartbeats come from the log writer and not from them; the commands are
    methods and need an endpoint; `Status` and `MeasureLagAsync` are what an admin page
    reads; wrap external sinks in `leadership.Leased`.
-6. Kafka source adapter; resumption contracts for gRPC, files and CDC adapters.
+6. **Done** for Kafka and for CDC through Debezium: `KafkaSource` into inputs, keyed
+   inputs and tables, `KafkaUpsertSink` and `KafkaAppendSink`, the Debezium decoder. See
+   *As built (step 6)* under *Source resumption*. Not built: the gRPC and file adapters,
+   whose contracts stand as written there. Step 7 should know: a source is started after
+   `circuit.Start()` — its factory reads `circuit.CommittedOffsets` — and disposed
+   before the circuit, so both belong in `StartLeadingAsync` / `StopLeadingAsync`; a
+   table loader starts after its table is promoted, which the takeover has done by then;
+   `source.Completion` faults when the source fails (position lost, a read error, the
+   circuit's fault) and the host should treat that as it treats a circuit fault;
+   `circuit.DeadLetters` must be read when the policy is `DeadLetter`, or unreadable
+   records stall the circuit once the channel is full; external sinks go through
+   `leadership.Leased`, with `Term = () => leadership.Term`; and the failover app's
+   generator can now be replaced by a source topic.
 7. Active and standby roles in `Incremental.Hosting`.
 8. A soak on MSK to replace the estimates above with measurements.
 
@@ -1494,6 +1729,16 @@ soak run on a real cluster before the failover number is believed.
   writes from a stale epoch. The design does not rely on them for a well-behaved client.
 - KAFKA-13727 (cleaner removing abort markers too early) should be confirmed fixed in the
   chosen broker version, since both compacted topics carry transactional data.
+- Sources and sinks on MSK: IAM or TLS through `ClientConfig` and the builder hooks,
+  and a source through a broker election. Nothing was run against either.
+- Whether `fetch.queue.backoff.ms` at 10 ms and a 16 MB fetch buffer are the right
+  defaults at production record sizes and rates. They were chosen from one local
+  measurement.
+- A source's behaviour when the broker fails a fetch for a reason the client does not
+  retry: `Consume` then throws and the source ends with the error. Which errors those
+  are in practice was not explored.
+- Debezium beyond the Postgres connector 3.0.8 with `pgoutput` and the JSON converter:
+  other databases, Avro, incremental snapshots, schema changes.
 - Every latency figure in this document.
 
 ## References

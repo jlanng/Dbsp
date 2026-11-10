@@ -410,6 +410,13 @@ durability design is recorded there (*As built: `Incremental.Kafka`*). Two thing
 owner must know: the key type must serialize equal values alike (it is refused
 otherwise), and nothing trims the log unless the host calls `TrimBeforeAsync`.
 
+**The Kafka adapter** (built with durability step 6) is `KafkaSource.StartTableLoaderAsync`
+in `Incremental.Kafka`: it reads a topic as the table's writer, stages each change with
+its partition and offset, commits a version whenever it has read all that was fetched,
+and resumes from `table.CommittedOffsets`. With `Debezium.Changes<TKey, TRow>()` as its
+decoder the topic is a database table's change stream. Recorded in
+durability-and-standby.md, *As built (step 6)*.
+
 `InMemoryTableLog` now models fencing. An instance is one connection to the log;
 `Connect()` returns another to the same log (the standby's), `TakeOver()` makes a
 connection the writer, and an append through any other connection throws

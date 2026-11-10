@@ -239,6 +239,9 @@ internal sealed class SinkWriter : IAsyncDisposable
             MessageTimeoutMs = (int)options.DeliveryTimeout.TotalMilliseconds,
             LingerMs = 1,
         };
+        // A producer may ask the broker to create a topic it names; a sink must not — a
+        // topic made that way has whatever partitions and cleanup policy the broker defaults to.
+        config.Set("allow.auto.create.topics", "false");
         foreach (var (key, value) in options.ClientConfig)
             config.Set(key, value);
         var builder = new ProducerBuilder<byte[], byte[]>(config)

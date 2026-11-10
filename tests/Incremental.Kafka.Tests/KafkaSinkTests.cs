@@ -239,7 +239,6 @@ public class KafkaSinkTests(ITestOutputHelper output)
         {
             Topic = env.Prefix + ".nowhere",
             BootstrapServers = KafkaEnv.Bootstrap,
-            ClientConfig = new Dictionary<string, string> { ["allow.auto.create.topics"] = "false" },
         });
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false });
         var lines = builder.Input<Line>("lines");
@@ -251,5 +250,43 @@ public class KafkaSinkTests(ITestOutputHelper output)
         await circuit.StepAsync().WaitAsync(Timeout);
         var failure = await Assert.ThrowsAsync<SinkDeliveryException>(() => delivery).WaitAsync(Timeout);
         Assert.Contains("does not exist", Assert.IsType<KafkaSinkException>(failure.InnerException).Message);
+
+        // And asking did not make the broker create it.
+        using var admin = new AdminClientBuilder(new AdminClientConfig { BootstrapServers = KafkaEnv.Bootstrap }).Build();
+        Assert.DoesNotContain(admin.GetMetadata(TimeSpan.FromSeconds(10)).Topics, t => t.Topic == env.Prefix + ".nowhere");
+    }
+
+    /// <summary>A write returns when the broker has the records, and not before: a batch
+    /// the broker refuses must fail the write, or the checkpoint would pass it.</summary>
+    [Fact]
+    public async Task ABatchTheBrokerRefuses_FailsTheWrite_AndIsNotAcknowledged()
+    {
+        await using var env = KafkaEnv.Create();
+        var topic = await env.CreateTopicAsync("small", config: new Dictionary<string, string> { ["max.message.bytes"] = "2000" });
+        await using var sink = new KafkaAppendSink<Line>(new KafkaSinkOptions
+        {
+            Topic = topic,
+            BootstrapServers = KafkaEnv.Bootstrap,
+            Compression = CompressionType.None,
+        });
+        var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false });
+        var lines = builder.Input<Line>("lines");
+        var appended = lines.ToAcknowledgedOutput();
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var handle = circuit.Handle(appended);
+        var delivery = handle.DeliverToAsync(sink, new SinkDeliveryOptions { MaxRetries = 0 });
+
+        await circuit.Handle(lines).InsertAsync(new Line(1, "fits"));
+        await circuit.StepAsync().WaitAsync(Timeout);
+        await KafkaEnv.EventuallyAsync(() => Task.FromResult(handle.AcknowledgedSequence == 1), "the small record is acknowledged");
+
+        await circuit.Handle(lines).InsertAsync(new Line(2, new string('x', 20_000)));
+        await circuit.StepAsync().WaitAsync(Timeout);
+        var failure = await Assert.ThrowsAsync<SinkDeliveryException>(() => delivery).WaitAsync(Timeout);
+        Assert.IsType<KafkaSinkException>(failure.InnerException);
+        Assert.Equal(1, handle.AcknowledgedSequence);
+        Assert.Single(KafkaEnv.ReadTopic(topic));
+        Assert.Equal(1, sink.RecordsWritten);
     }
 }

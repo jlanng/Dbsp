@@ -8,11 +8,14 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
 - Test: `dotnet test --project tests/Incremental.Tests` (xunit v3 on Microsoft.Testing.Platform,
   opted in by `global.json` — hence `--project`; Redis tests skip unless `docker compose up -d` has run)
 - Kafka tests: `dotnet test --project tests/Incremental.Kafka.Tests` — integration tests of
-  `Incremental.Kafka` against the local broker; they skip unless the connector stack is up.
-  Each test uses its own topic prefix. About a minute and a half. `INCREMENTAL_KAFKA_BOOTSTRAP`
-  points them at another broker. `KafkaFailoverProcessTests` launch
-  `tests/Incremental.Kafka.FailoverApp` as real processes and kill, stop and command them;
-  measured numbers go to `measurements.log` beside the test assembly.
+  `Incremental.Kafka` against the connector stack (start it first, below): the logs,
+  leadership, sources, sinks, and CDC from Postgres through Debezium. Tests skip, not fail,
+  when what they need is unreachable — the broker for most, Postgres and Kafka Connect
+  too for `DebeziumCdcTests`; a handful need nothing and always run. Each test uses its
+  own topic prefix (and its own Postgres tables, slot and connector). About a minute and a half.
+  `INCREMENTAL_KAFKA_BOOTSTRAP` points them at another broker. `KafkaFailoverProcessTests`
+  launch `tests/Incremental.Kafka.FailoverApp` as real processes and kill, stop and
+  command them; measured numbers go to `measurements.log` beside the test assembly.
 - Connector stack: `docker compose --profile connectors up -d` adds Kafka (`localhost:9092`), Postgres with
   logical decoding (`localhost:5432`, user/password/db `incremental`) and Debezium's Kafka
   Connect (`localhost:8083`). Plain `docker compose up -d` stays Redis-only.
@@ -104,6 +107,17 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   with a format byte; keys must be byte-stable because compaction compares bytes.
   Assign consumers at numeric offsets, never `Offset.Beginning`: a logical offset on a new
   consumer costs 500 ms.
+- Kafka sources and sinks (`KafkaSource`, `KafkaSinks.cs`). A source's position lives in
+  the checkpoint, never in a consumer group: records are handed on stamped with
+  (partition, offset), and a source assigns each partition at the committed offset plus
+  one (`circuit.CommittedOffsets`, or `table.CommittedOffsets` for a table loader) — no
+  group is joined, nothing is committed to Kafka, and a position that is gone is an error.
+  A record the source cannot deserialize goes through `InputHandle.RejectAsync`, so its
+  offset is consumed and the circuit's error policy decides. A source's memory is the
+  input's bounded channel plus the client's fetch buffer; never read ahead into a
+  collection. A table loader is the table's writer: leader only. Sinks get an idempotent
+  producer of their own unless given the log's (`KafkaSinkOptions.Log`); nothing else may
+  create a producer.
 - Leadership (`KafkaLeadership`) lives in Kafka only. The log writer heartbeats to
   `{p}.leader` in every transaction and when idle; a standby takes over on silence. Safety
   is fencing, never the election or the probe. Every node starts as a standby; `Fenced`
@@ -124,6 +138,18 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   docs/design/durability-and-standby.md, *Commit after delivery*). A new output kind that
   must be durable before the checkpoint implements `IAcknowledgedOutputPort`; nothing may
   acknowledge a batch before its sink has it.
+- Derived tables (`ToTable`, `Tables/DerivedTable.cs`). The circuit is the table's single
+  writer: `table.Writer` refuses while it is claimed. A step's table version commits
+  before the checkpoint that covers it (it is an acknowledged output), and the checkpoint
+  records that version under `{table}#w`; a restart undoes the versions written past it.
+  A circuit never reads a table it writes, directly or through other derived tables —
+  `Build()` refuses.
+- `ChangelogStorage` (`Storage/ChangelogStorage*.cs`). Its record keys
+  (`pipeline NUL incarnation NUL store NUL entry`) and the format byte in front of every
+  value are a persisted format: changing either needs a new format byte, not an edit. A
+  follower applies the log to the stores until `PromoteAsync`, and `Recover()` and commits
+  throw before it. Takeover order: promote tables, then the storage, then `Start()` each
+  circuit.
 - Per-record errors (`RecordErrors.cs`). Under `RecordErrorPolicy.Fault` (the default) an
   operator's record loop must contain no exception handling: the dead-letter variant is a
   separate loop or method chosen once per step on `OperatorContext.Errors` being non-null.

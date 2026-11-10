@@ -622,6 +622,13 @@ The rules:
   null does not throw to the producer: the record travels to the circuit, is reported as a
   dead letter from `input[name]`, and its offset is consumed like any other. This follows
   the circuit's policy only. `DeleteAsync(null)` is still an argument error.
+- **Records a source could not read.** A source adapter that cannot turn a record into a
+  value — it does not deserialize — calls `handle.RejectAsync(record, exception, partition,
+  offset)` instead of `InsertAsync`. The rejection takes the record's place in the feed: its
+  offset is consumed and checkpointed, so a restart does not meet it again. Under
+  `DeadLetter` it is reported from `input[name]` with whatever the source passed as the
+  record (a `KafkaSource` passes a `KafkaRecord`: topic, partition, offset, key and value
+  bytes); under `Fault` it faults the circuit.
 - **The dead-letter output is bounded and must be read.** It is one channel of
   `DeadLetterCapacity` (1024) entries, published after each step like any output. Nobody
   reading it stalls the circuit once it is full — backpressure, not unbounded memory.
@@ -818,7 +825,123 @@ await leadership.StartAsync();
   heartbeat's age, whether the lease is held, and a standby's lag — offsets behind per
   state partition, versions behind per table (`MeasureLagAsync()` measures it now).
 
-A Kafka source adapter is not built yet.
+**Reading from Kafka.** `KafkaSource` reads one topic into a circuit input, a keyed input
+or a shared table. Start it after `circuit.Start()`, on the leader only (in
+`StartLeadingAsync`), and dispose it before the circuit:
+
+```csharp
+var orders = new KafkaSourceOptions { BootstrapServers = "…", Topic = "orders" };
+
+// A stream input: each record with a value is one insertion (JSON unless told otherwise).
+await using var facts = await KafkaSource.StartAsync(circuit, ordersInput, orders);
+
+// A keyed input: a value is an upsert, a record with no value (a tombstone) deletes its key.
+await using var accounts = await KafkaSource.StartAsync(circuit, accountsInput, accountsTopic);
+
+// A shared table: the source is the table's writer.
+await using var loader = await KafkaSource.StartTableLoaderAsync(instruments, instrumentsTopic);
+```
+
+- **The position is the checkpoint.** Every record is handed on with its partition and
+  offset. The source assigns every partition itself, one record after
+  `circuit.CommittedOffsets(input)` — for a table, after `table.CommittedOffsets` — so a
+  restart or a takeover re-reads exactly what the checkpoint does not cover. It joins no
+  consumer group and commits no offsets. A partition with no committed position starts at
+  `StartFrom` (`Earliest` by default). A committed position that is no longer in the topic
+  is `KafkaSourcePositionLostException`, never a silent jump: for a fact topic that is
+  lost data. A table loader can instead re-read a compacted topic from its start and
+  replace the table's rows (`ReloadTableWhenPositionLost`).
+- **Backpressure.** Records go into the input's bounded channel one at a time. When the
+  circuit is slow the write waits, the source stops polling, and the client stops fetching
+  once it holds `FetchBufferKilobytes` (16 MB). A wait longer than `PauseAfter` (1 s)
+  also pauses the partitions. Memory is the channel plus that buffer, whatever the size
+  of the topic.
+- **Formats.** A stream input takes a `KafkaDeserializer<T>`; a keyed input or a table
+  takes a `KafkaChangeDecoder<TKey, TRow>`, which reads a record as an upsert, a delete
+  or nothing. `KafkaDeserializers` has JSON (the default), UTF-8 text, raw bytes, the
+  plain keyed decoder, and `From(IDeserializer<T>)` for any Confluent deserializer — the
+  schema-registry ones included (`AsSyncOverAsync()` first); this package does not
+  reference the registry client.
+- **Unreadable records.** For a circuit input they follow the circuit's `ErrorPolicy`
+  (above): dead-lettered as a `KafkaRecord` with its offset checkpointed, or a fault. A
+  table has no dead-letter output, so its loader stops on one unless
+  `OnUnreadableTableRecord` is set, which is then called and the record passed over.
+- **The table loader** stages each change with its partition and offset — the table drops
+  anything it is handed twice — and commits a version whenever it has read all that has
+  been fetched, or `MaxTableBatch` (4096) records. `MeasureLagAsync()` and `Positions`
+  say how far behind it is; `WhenCaughtUpAsync()` completes when the initial load is in.
+  It needs the table's writer, so it runs on the leader: a standby's table follows its
+  log, and `StartTableLoaderAsync` refuses it until the table is promoted.
+- **Limits.** One topic per source, one consumer and one thread per source. Partitions
+  added to a topic are seen at the next start.
+
+**Change data capture.** `Debezium.Changes<TKey, TRow>()` is a decoder for the topics
+Debezium writes with the JSON converter, with or without embedded schemas:
+
+```csharp
+var customers = new SharedTable<int, Customer>("customers", c => c.Id);
+await using var loader = await KafkaSource.StartTableLoaderAsync(
+    customers,
+    new KafkaSourceOptions { BootstrapServers = "…", Topic = DebeziumPostgres.Topic("shop", "public", "customers") },
+    Debezium.Changes<int, Customer>());
+
+var enriched = orders.GroupBy(o => o.CustomerId)
+    .Join(builder.Table(customers), (_, o, c) => new Enriched(o.Id, c.Name, c.Region));
+```
+
+- Snapshot rows (`op` `r`), creates and updates upsert `after`. A delete removes the key
+  in the record's key, and the tombstone Debezium writes after it removes it again, which
+  changes nothing. The key is the table's primary key: one column read as a scalar
+  (`int`, `string`, `Guid`, …) or several read as a record with a property per column.
+- Column names match properties in snake_case, ignoring case. `numeric` needs the
+  connector's `decimal.handling.mode=string`; `timestamptz` arrives as ISO-8601 text;
+  `timestamp` and `date` arrive as numbers. Pass your own `JsonSerializerOptions` for
+  anything else.
+- Debezium delivers at least once. After a connector restart, or a second snapshot, the
+  same rows arrive again at new offsets; upserts absorb them, and an upsert that changes
+  nothing mints no table version.
+- **Replica identity.** The default identity is enough for a table with a primary key,
+  because deletes are keyed by the record key. `before` is then null on an update and
+  holds only the key (other columns at their defaults) on a delete — use
+  `REPLICA IDENTITY FULL` if you read `before` through `Debezium.Events<TRow>()`. A table
+  with no primary key has no record key: it needs `REPLICA IDENTITY FULL` and
+  `Debezium.Changes<TKey, TRow>(keyOf: row => …)` for its deletes to be applied. A
+  truncate is refused (the connector does not emit them unless asked).
+- `KafkaConnectClient` wraps the Connect REST calls needed to register a connector
+  (validate, create or update, status, restart, delete), and
+  `DebeziumPostgres.ConnectorConfig(…)` builds a configuration the decoder can read.
+
+**Writing to Kafka.** Two sinks for `DeliverToAsync`:
+
+```csharp
+await using var totals = new KafkaUpsertSink<string, RegionTotal>(
+    new KafkaSinkOptions { Topic = "region-totals", BootstrapServers = "…", Term = () => leadership.Term });
+_ = circuit.Handle(totalsOutput).DeliverToAsync(leadership.Leased(totals), row => row.Region);
+
+await using var audit = new KafkaAppendSink<Enriched>(
+    new KafkaSinkOptions { Topic = "enriched-orders", Log = log });       // through the log's producer
+_ = circuit.Handle(enrichedOutput).DeliverToAsync(audit);
+```
+
+- `KafkaUpsertSink` writes `key → row` and a tombstone for a delete: the shape of a
+  compacted topic. A keyed `KafkaSource` in another circuit reads it back as the same
+  rows. `KafkaAppendSink` writes one record per appended record.
+- Every record carries the header `incremental.step` (the step's sequence, decimal text)
+  and, with `Term` set, `incremental.term`. Keys are placed as the Java client places
+  them (murmur2), so a key stays in one partition whichever client wrote it. The sink
+  does not create its topic.
+- **Delivery is at-least-once**, as for any sink: the batch is acknowledged when every
+  record is durable in the topic, the checkpoint commits after that, and a crash in
+  between delivers the batch again. Upserts make that harmless. For appends, a reader
+  that sees the step fall back along a partition knows a restart happened; with manual
+  stepping (the replay cuts the same steps) it can skip the steps it has seen, and
+  otherwise it must tolerate duplicates.
+- **Which producer.** With `BootstrapServers` the sink has an idempotent producer of its
+  own (`acks=all`): any cluster, readers need no isolation level, but a deposed leader
+  can still write — wrap the sink in `leadership.Leased(…)` and stamp the term. With
+  `Log` the sink writes through the log's transactional producer: a deposed leader
+  cannot write the topic at all, at the price of the topic being on the log's cluster
+  and readers using `read_committed`.
 
 A commit is due at the end of the step that reaches `CheckpointInterval`, or — with
 `CheckpointMaxDelay` set — of the first step that ends after the oldest uncommitted step has

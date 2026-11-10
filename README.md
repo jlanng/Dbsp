@@ -466,8 +466,44 @@ so implementations never see cross-thread access to one store.
   last commit is older than the lease, and `leadership.Status` reports role, term, leader,
   heartbeat age and follower lag. Measured locally with real processes: 3.2 s from
   `kill -9` to the standby's first output, 3.05 s of which is the timeout (4.7 s when the
-  leader died with a transaction open). Not built yet:
-  the Kafka source adapter, hosting roles.
+  leader died with a transaction open). Not built yet: hosting roles.
+
+- `KafkaSource` reads a topic into a circuit input, a keyed input, or a shared table. The
+  position is the checkpoint's, not a consumer group's: every record is handed on stamped
+  with its partition and offset, and a source started against a circuit (or a table)
+  assigns each partition one record after `circuit.CommittedOffsets(...)` (or
+  `table.CommittedOffsets`). The input's bounded channel is the backpressure. A record
+  that does not deserialize goes through the circuit's error policy as a `KafkaRecord` —
+  topic, partition, offset, bytes — via `InputHandle.RejectAsync`.
+
+  ```csharp
+  var source = new KafkaSourceOptions { BootstrapServers = "localhost:9092", Topic = "orders" };
+  circuit.Start();
+  await using var orders = await KafkaSource.StartAsync(circuit, ordersInput, source);       // JSON values
+  await using var accounts = await KafkaSource.StartAsync(circuit, accountsKeyedInput,       // value = upsert,
+      new KafkaSourceOptions { BootstrapServers = "localhost:9092", Topic = "accounts" });   // tombstone = delete
+  await using var loader = await KafkaSource.StartTableLoaderAsync(instruments,              // topic → SharedTable
+      new KafkaSourceOptions { BootstrapServers = "localhost:9092", Topic = "instruments" });
+  ```
+
+  `KafkaDeserializers.From(...)` adapts any Confluent deserializer, which is how
+  schema-registry formats plug in. `Debezium.Changes<TKey, TRow>()` is the decoder for a
+  Debezium change-event topic (JSON converter, with or without schemas), so a Postgres
+  table becomes a shared table to `Join` or `Lookup` against; `KafkaConnectClient` and
+  `DebeziumPostgres.ConnectorConfig` register the connector.
+
+- `KafkaUpsertSink` (`IUpsertSink`: key → row, a delete is a tombstone, for a compacted
+  topic) and `KafkaAppendSink` (`IAppendSink`: every record carries its step in the
+  header `incremental.step`) write results to Kafka, at-least-once. By default each has
+  an idempotent producer of its own; with `KafkaSinkOptions.Log` set it writes through
+  the log's transactional producer instead and a deposed leader cannot write it at all.
+  A keyed `KafkaSource` reads an upsert sink's topic back as the same table.
+
+  ```csharp
+  await using var sink = new KafkaUpsertSink<string, RegionTotal>(
+      new KafkaSinkOptions { Topic = "region-totals", BootstrapServers = "localhost:9092" });
+  _ = circuit.Handle(totals).DeliverToAsync(leadership.Leased(sink), row => row.Region);
+  ```
 
 - Candidates that make sense next: RocksDB (large state, embedded, fast scans), SQLite.
 
@@ -575,13 +611,15 @@ src/Incremental                    core: Z-sets, builder API, operators, windows
 src/Incremental.Storage.Redis      Redis-backed IStorageProvider
 src/Incremental.Kafka              Kafka-backed state changelog and shared-table logs, written
                                        through one transactional producer per process; leader
-                                       election and takeover (KafkaLeadership)
+                                       election and takeover (KafkaLeadership); sources into
+                                       inputs and tables (KafkaSource), sinks, Debezium decoding
 tests/Incremental.Tests            xunit: Z-set algebra, per-step delta semantics, multi-worker runs,
                                        Redis integration (auto-skipped when Redis is down)
 tests/Incremental.Kafka.Tests      xunit, against the local broker (`docker compose --profile
                                        connectors up -d`; auto-skipped when it is down): the log
                                        writer, fencing, restore, compaction, failover end to end,
-                                       leadership, and kill -9 failover between real processes
+                                       leadership, kill -9 failover between real processes,
+                                       sources and sinks, and Postgres → Debezium → table CDC
 tests/Incremental.Kafka.FailoverApp  the process those failover tests launch twice: one pipeline,
                                        leader or standby as its KafkaLeadership decides
 examples/Incremental.Example       joined + aggregated order analytics with live retraction
@@ -832,7 +870,8 @@ disclosed trade-offs (below), not missing semantics:
       followers, and both logs on Kafka through one transactional producer with group
       commit and `transactional.id` fencing (`Incremental.Kafka`), and leader heartbeats,
       election, takeover, step down and the delivery lease (`KafkaLeadership`), tested by
-      `kill -9` between real processes; to come — source adapters, active/standby roles in
-      `Incremental.Hosting`
+      `kill -9` between real processes, and Kafka sources, sinks and Debezium CDC
+      (`KafkaSource`, `KafkaUpsertSink`, `KafkaAppendSink`, `Debezium`); to come —
+      active/standby roles in `Incremental.Hosting`, gRPC and file source adapters
 - [ ] Investigate off-heap in-process storage to reduce GC (RocksDB, SQLite candidates)
 - [ ] Cluster transport TLS/authentication
