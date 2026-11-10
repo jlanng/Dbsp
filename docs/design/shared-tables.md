@@ -894,3 +894,7 @@ Two small public reads, made for `Incremental.Service` (enrichment-service.md, *
 - `SharedTable.FollowFault`: why a following table stopped following, or null. A follower
   whose next version was trimmed keeps serving its last version and can never be
   promoted; this makes that visible before a takeover fails on it.
+- `TableSnapshot.RowsBy<TIndexKey>(index, key)`: the rows under one key of a declared
+  index as of the pinned version — the public form of `TableIndex.Read` followed by a row
+  read per key. It throws for an index that is not declared or is keyed by another type.
+  The admin API's lookup by index is this (enrichment-service.md, *As built*, S3).

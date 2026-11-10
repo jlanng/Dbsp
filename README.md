@@ -422,9 +422,52 @@ so implementations never see cross-thread access to one store.
   (`UseKafkaBackend`: two processes on one `KafkaLog` are an active and a warm standby,
   with the catalog, tables, state and plugin files all on the broker; the `kafka`
   connector and the `kafka` and `debezium` table loaders bind slots and tables to topics
-  through named connections). The admin UI is not built yet. See *Running many pipelines* in
+  through named connections). See *Running many pipelines* in
   [docs/intro.md](docs/intro.md) and
   [docs/design/enrichment-service.md](docs/design/enrichment-service.md), *As built*.
+
+- `Incremental.Service.Admin` is the service's admin surface: a JSON API and a web UI on
+  top of it, mounted with two calls in any ASP.NET Core host.
+
+  ```csharp
+  builder.Services.AddIncrementalService(o => o.AdvertisedAdminUrl = "http://node-a:5180/admin/");
+  builder.Services.AddIncrementalAdmin(o => o.ExposeRowData = true);
+  var app = builder.Build();
+  app.MapIncrementalAdmin("/admin");      // UI at /admin/, API at /admin/api
+  app.MapIncrementalHealth("/health");    // /health/live, /ready, /status
+  ```
+
+  ![The overview: the node's role, throughput, pipelines by state, tables, events](docs/images/admin/overview.png)
+
+  The UI shows the node and its role (leader, standby, fenced — a word, a shape and a
+  colour), every pipeline with its rates, its topology, its faults and its dead letters,
+  every table with its loader, its readers and who holds its retention floor, plugins,
+  the cluster and the audit trail. It is fed by one server-sent event stream and says so
+  when that stream is gone. Every action asks the node what it will do first and shows
+  the plan; a reset or a removal also asks for the id to be typed.
+
+  | | |
+  |---|---|
+  | ![A pipeline: live metrics, sources, sinks, committed table versions](docs/images/admin/pipeline.png) | ![The circuit of a pipeline, sixty operators, dark theme](docs/images/admin/topology-dark.png) |
+  | ![A table: loader, indexes, readers, rows](docs/images/admin/table.png) | ![Reset asks for the pipeline's id](docs/images/admin/reset-dialog.png) |
+  | ![A standby's cluster page: readiness and lag](docs/images/admin/cluster-standby.png) | ![Dead letters: the record, the error, the operator](docs/images/admin/dead-letters.png) |
+
+  It is cautious until told otherwise. With no `AuthorizationPolicy` it answers loopback
+  requests only — it refuses another host name and anything a proxy forwarded — so
+  reaching it from another machine means setting a policy (`PipelinePolicy`,
+  `TablePolicy`, `NodePolicy` and `PluginPolicy` narrow the mutations further).
+  `ReadOnly` refuses every mutation. Row data is off by default: without
+  `ExposeRowData` the row endpoints answer 403 and faults, dead letters and events carry
+  exception types, not messages, because a message can quote a row. Plugin upload and
+  rescan are each a switch, off by default. The health endpoints sit outside all of this
+  and return codes only. Every list is paged and bounded by `MaxRows`; every refusal is
+  `{ "error": { "code", "message", "details"? } }`; a slow event-stream client loses
+  ticks and then its connection, never the server's memory. The UI is hand-written HTML,
+  CSS and JavaScript embedded in the assembly: no build step, no CDN, no web font.
+
+  `dotnet run --project tests/Incremental.Service.AdminHost` runs it against three tables
+  and eight pipelines on the in-memory backend (`-- --nodes 2` for a leader and a standby
+  on ports 5180 and 5181; `--read-only`, `--no-rows`).
 
 - `Incremental.Kafka` puts both logs on Kafka. One `KafkaLog` per process owns one
   transactional producer; `log.State` is the `IStateChangelog` over the compacted topic
@@ -636,8 +679,10 @@ src/Incremental.Kafka              Kafka-backed state changelog and shared-table
                                        inputs and tables (KafkaSource), sinks, Debezium decoding
 src/Incremental.Service            the generic parts of an enrichment service: table registry,
                                        pipeline supervisor (one circuit per pipeline), plugin
-                                       loading, catalog, service node; an in-memory backend
-                                       (Kafka backend and admin UI to come)
+                                       loading, catalog, service node, metrics; an in-memory
+                                       backend and a Kafka one
+src/Incremental.Service.Admin      the admin JSON API and web UI for a service node (ASP.NET
+                                       Core; the UI is embedded, hand-written, no build step)
 tests/Incremental.Tests            xunit: Z-set algebra, per-step delta semantics, multi-worker runs,
                                        Redis integration (auto-skipped when Redis is down)
 tests/Incremental.Kafka.Tests      xunit, against the local broker (`docker compose --profile
@@ -648,9 +693,13 @@ tests/Incremental.Kafka.Tests      xunit, against the local broker (`docker comp
 tests/Incremental.Kafka.FailoverApp  the process those failover tests launch twice: one pipeline,
                                        leader or standby as its KafkaLeadership decides
 tests/Incremental.Service.Tests    xunit: registry, supervisor, plugins, catalog and two-node
-                                       takeover in memory (no broker); the same node on the Kafka
+                                       takeover in memory (no broker); the admin API over real
+                                       Kestrel and a smoke test of the UI; the same node on the Kafka
                                        backend, CDC through Debezium, and kill -9 failover between
                                        real processes (skipped when the broker is unreachable)
+tests/Incremental.Service.AdminHost  one or two nodes with the admin UI mounted, tables,
+                                       pipelines and a generator: what the admin API's tests
+                                       run against, and how to look at the UI
 tests/Incremental.Service.FailoverApp  one service node as a process, for those failover tests
 tests/Incremental.Service.TestPlugins  contract and pipeline assemblies those tests load at
                                        runtime from their output directories; built, never referenced

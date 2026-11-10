@@ -599,7 +599,7 @@
             selected ? kv([
               ['Node', h('strong', null, selected.label)],
               ['Kind', h('span', { class: 'mono' }, selected.kind || selected.role)],
-              selected.detail && ['Bound to', selected.detail],
+              selected.detail && (selected.role === 'input' || selected.role === 'sink') && ['Bound to', selected.detail],
               selected.stateName && ['State stores', h('span', null, h('span', { class: 'mono' }, selected.stateName), selected.name ? ' — named, so it survives changes to the circuit around it' : ' — positional: an upstream change renumbers it')],
               selected.errorPolicy && ['On a record error', selected.errorPolicy === 'DeadLetter' ? 'drop the record to the dead letters' : 'fault the pipeline'],
               selected.stateName && dead[selected.stateName] && ['Dead letters', h('a', { href: `#/pipelines/${enc(detail.pipeline.id)}/dead-letters` }, `${dead[selected.stateName]} of those kept came from here`)],

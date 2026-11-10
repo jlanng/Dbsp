@@ -305,6 +305,8 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         Assert.Contains(nodes, n => n.GetProperty("role").GetString() == "exchange");
         Assert.Contains(nodes, n => n.TryGetProperty("name", out var name) && name.GetString() == "priced-rates");
 
+        var keyed = await Admin.Get("pipelines/trader-activity/graph");
+        Assert.Equal(["counts", "quantities"], keyed["nodes"].EnumerateArray().Where(n => n.GetProperty("role").GetString() == "sink").Select(n => n.GetProperty("label").GetString()).Order());
         var writer = await Admin.Get("pipelines/positions/graph");
         Assert.Contains(writer["nodes"].EnumerateArray(), n => n.GetProperty("role").GetString() == "table-out" && n.GetProperty("label").GetString() == "positions");
         var lenient = await Admin.Get("pipelines/lenient-orders/graph");
@@ -592,6 +594,37 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         return new ByteArrayContent(buffer.ToArray()) { Headers = { ContentType = new MediaTypeHeaderValue(type) } };
     }
 
+    /// <summary>A body sent chunked: no length is declared for it.</summary>
+    private sealed class Unsized : HttpContent
+    {
+        private readonly byte[] _bytes;
+
+        public Unsized(byte[] bytes)
+        {
+            _bytes = bytes;
+            Headers.ContentType = new MediaTypeHeaderValue("application/zip");
+        }
+
+        protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context)
+        {
+            try
+            {
+                for (var sent = 0; sent < _bytes.Length; sent += 8192)
+                    await stream.WriteAsync(_bytes.AsMemory(sent, Math.Min(8192, _bytes.Length - sent)));
+            }
+            catch (Exception ex) when (ex is IOException or HttpRequestException)
+            {
+                // The server answered and stopped reading before the body ended.
+            }
+        }
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
+    }
+
     private static void Add(ZipArchive archive, string name, byte[] bytes)
     {
         using var stream = archive.CreateEntry(name).Open();
@@ -612,6 +645,8 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         (await admin.Post("plugins", new ByteArrayContent([]) { Headers = { ContentType = new MediaTypeHeaderValue("application/zip") } })).IsError(400, "invalid");
         (await admin.Post("plugins", new ByteArrayContent(Encoding.UTF8.GetBytes("this is not a zip")) { Headers = { ContentType = new MediaTypeHeaderValue("application/zip") } })).IsError(400, "invalid-zip");
         (await admin.Post("plugins", new ByteArrayContent(new byte[300_000]) { Headers = { ContentType = new MediaTypeHeaderValue("application/zip") } })).IsError(413, "too-large");
+        // The same without a Content-Length to refuse it by: counted as it arrives.
+        (await admin.Post("plugins", new Unsized(new byte[300_000]))).IsError(413, "too-large");
         // A name that would leave the directory it is unpacked into.
         (await admin.Post("plugins", Zip(a => Add(a, "../evil.dll", [1, 2, 3])))).IsError(400, "invalid");
         // A zip with no assembly in it.

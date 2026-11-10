@@ -25,6 +25,12 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   produces (the test project references them build-order only). The Kafka classes share
   one non-parallel collection; measured failover times go to `measurements.log` beside
   the test assembly.
+- Admin UI: `dotnet run --project tests/Incremental.Service.AdminHost` serves a node with
+  tables, pipelines and a generator at http://127.0.0.1:5180/admin/ (`-- --nodes 2` adds a
+  standby on 5181; `--read-only`, `--no-rows`, `--port`;
+  `--ui-dir src/Incremental.Service.Admin/wwwroot` serves the UI's files from the checkout,
+  so an edit is a browser reload away). The admin API's tests (`AdminApiTests`) run that
+  host on a free port.
 - Connector stack: `docker compose --profile connectors up -d` adds Kafka (`localhost:9092`), Postgres with
   logical decoding (`localhost:5432`, user/password/db `incremental`) and Debezium's Kafka
   Connect (`localhost:8083`). Plain `docker compose up -d` stays Redis-only.
@@ -210,6 +216,23 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   - The state binding: a pipeline's typed stores belong to one plugin version. Changing
     the version, or anything else that changes what the state means, goes through
     `ChangelogStorageProvider.ReleaseStores()` first.
+- `Incremental.Service.Admin` (the JSON API and the embedded UI). Its rules:
+  - Nothing is returned unbounded: every list goes through `Page`/`Newest` and every
+    `limit` is clamped to `MaxRows`. The event feed is one bounded drop-oldest queue per
+    client, a cap on clients and a write timeout; a frame is serialized once for all.
+  - A new endpoint is mapped through `Get(…)` or `Mutation(…, areaPolicy)` so that it runs
+    under `AdminEndpointFilter` (loopback rule, read-only, the mutation header, the error
+    shape). A handler throws `ServiceException` or `AdminException`; it never writes an
+    error body of its own.
+  - Exception messages, stacks, rows and records pass through `AdminState.Message`,
+    `Fault`, `Head` or `Event` on their way out: with `ExposeRowData` off none of them may
+    leave, and a service event's text after its first colon counts as a message.
+  - The UI is six files in `wwwroot`, no build step, no dependency, no request to another
+    origin, and a content security policy without `unsafe-inline`: no inline script, no
+    `style` attribute (set styles through the CSSOM), no `innerHTML` with data. Every
+    render goes through `morph`, and handlers are `on:` properties found by the delegated
+    listener — `addEventListener` on a rendered node is lost at the next patch. A path the
+    scripts call must be a route the API maps: `The_UI_is_served_whole…` checks it.
 - Public API is fluent delegates with LINQ-dialect names (`Select`/`Where`/`GroupBy`),
   intentionally not LINQ/expression trees. The 0.2 surface is specced in `docs/intro.md`:
   windows exist only on groupings of an `EventTimeStream`; grouping types are staging types

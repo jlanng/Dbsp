@@ -1,8 +1,8 @@
 # Design: the enrichment service
 
 > **Status:** proposed design, 2026-11-10, revised once after two reviews. S1 (the service
-> core, in memory, with the part of S0 it needed) and S2 (the Kafka backend) are built; S3
-> and S4 are not. *As built*, at
+> core, in memory, with the part of S0 it needed), S2 (the Kafka backend) and S3 (the admin
+> API and UI) are built; S4 is not. *As built*, at
 > the end, says what exists and where it departs from this text — read it before relying
 > on any section. Build steps S0 to S4 (see *Build order*) record what they change there.
 > Sits on [shared-tables.md](shared-tables.md) and
@@ -2107,3 +2107,151 @@ markers in the two sink topics, and the mutation is killed.
 - A first lead applies table seeds one after another, each creating two topics: twenty
   seeds and a plugin import took about five seconds on a local broker, after the three
   seconds of silence a first node waits before it leads.
+
+### S3 — the admin API and UI
+
+`src/Incremental.Service.Admin` (net8.0; net10.0; `FrameworkReference`
+Microsoft.AspNetCore.App and nothing else; packed in CI): the JSON API under
+`{prefix}/api`, the health endpoints, and the UI — six hand-written files embedded in the
+assembly (`wwwroot/index.html`, `app.css`, `app.js`, `actions.js`, `views.js`, `shell.js`),
+no build step, no request to anywhere but the API beside them.
+
+| File | Holds |
+|---|---|
+| `ServiceAdminOptions.cs` | the switches |
+| `AdminExtensions.cs` | `AddIncrementalAdmin`, `MapIncrementalAdmin`, `MapIncrementalHealth`, the health check, the embedded files and their headers |
+| `AdminSecurity.cs` | the loopback rule, the mutation rule, the one error shape, the filter every endpoint runs under |
+| `AdminApi.cs` | the endpoints and what they return |
+| `AdminEvents.cs` | the server-sent event hub |
+| `tests/Incremental.Service.AdminHost` | one or two nodes in a process on the in-memory backend with the UI mounted: three tables, eight pipelines (one that fails, one that dead-letters, one stopped, one of sixty operators), a generator. The API's tests run against it; `dotnet run --project tests/Incremental.Service.AdminHost` is how to look at the UI |
+
+**What S3 added outside its package** (each the smallest change found; the first two are
+the rest of C3 and C4):
+
+| | Where | Change |
+|---|---|---|
+| C3, the graph half | `CircuitBuilder` | `Describe()`: `CircuitGraph` — every node (id, kind, state name, inputs, exchange, name, error policy), every output (stream, acknowledged, table) and every loop — read from the builder, before or after `Build()`, claiming nothing. The store names `Build()` would mint, and so the pre-stop state check, are still not built |
+| C4 | `TableSnapshot` | `RowsBy<TIndexKey>(index, key)` |
+| | `Incremental.Service` | `ServiceMetrics` (`ServiceNode.Metrics`), as designed in *Where the numbers come from* but for the service's own meter; `ITableRegistry.ReadRows`, `StatsAsync`, `Spec`; `TableStats.IndexKeyTypes`; `IPipelineSupervisor.DescribeAsync` (a dry run with its graph), `Graph(id)`, `RedactedSpec(id)`, `DeadLettersBefore`; `PipelineStatus.History` (the last 32 transitions on this node); `IPluginCatalog.RescanAsync` and `Manifest`; `ServiceNode.Options` |
+
+**Departures from the text above.**
+
+1. **Names.** `AddIncrementalAdmin`, `MapIncrementalAdmin`, `MapIncrementalHealth` (the
+   step was asked for under these names), not `…ServiceAdmin` / `…ServiceHealth`.
+2. **Every list is paged**, not only bounded: `skip` and `limit` on tables, pipelines and
+   plugins (`{ total, skip, limit, next, items }`), `before`/`after` and `limit` on the
+   sequence-numbered rings (events, audit, dead letters), and `limit` is clamped to
+   `MaxRows` whatever is asked. A row read adds `more` beside `truncated`.
+3. **The event feed** has, beside the bounded queue (`EventQueueLength`, 64, oldest
+   dropped), a cap on streams (`MaxEventClients`, 32; one more is 503) and a write timeout
+   (`EventWriteTimeout`, 10 s) after which the connection is aborted — a queue that drops
+   bounds the memory, but a client that never reads would otherwise hold a connection for
+   ever. A client whose queue dropped is told so (`event: lagged`) before the next frame,
+   and the UI reloads its view. The `metrics` tick carries the node's role, health and
+   counts beside every pipeline's rates, so the header needs no polling.
+4. **With row data off, events and a pipeline's history keep only what stands before the
+   first colon** of their message. The service writes a fault's message into the event
+   that reports it (`Failed: 4 faults …: FormatException: …`), so the design's rule —
+   messages are row data — has to reach there too. Found by the test that greps every
+   response for the offending value.
+5. **The graph** is drawn from `PipelineGraph` (the core's `CircuitGraph` plus which output
+   is which sink slot). Dead letters are counted per node from the ring, an operator's
+   name in a dead letter being its node's state name. A node that has never run the
+   definition — a standby — returns the declared edges instead (`"source": "declared"`):
+   input slots, tables and sinks around one box. There are no dead-letter counts on
+   operators from the meter, only from the ring.
+6. **`ServiceMetrics` counts a circuit only on the node that runs it.** Two nodes in one
+   process hear each other's measurements; the listener asks the supervisor whether this
+   node runs, or is starting, that pipeline. Its `Incremental.Service` meter for
+   collectors is not built; nor are queue-depth and watermark-lag gauges in the rings, or
+   the log writer's counters (`KafkaServiceBackend.Log` has them).
+7. **`AdvertisedAdminUrl` is not filled from the server's addresses.** A first leader
+   writes `node/leader` inside its `StartAsync`, before the web server has bound. The host
+   sets it.
+8. **Validate is a mutation** as far as the switches go (`PipelinePolicy`, refused when
+   read-only): it runs a definition's `Build`.
+9. **`ServiceAdminOptions.UiDirectory`** (not in the design) serves the UI's files from a
+   directory instead of the assembly, for working on them without rebuilding.
+10. **Not built:** the deploy form generated from a settings schema (the dialog is the
+    spec as JSON, with a template per definition and a dry run before the button unlocks);
+    a table declaration form (the API has `POST /tables`); `acceptSchemaChange` (there is
+    no schema-change detection to accept); the "time until cut loose" warning event; the
+    UI in a Kafka-backed browser pass — the API's Kafka-only fields (`leadership.kafka`,
+    heartbeat age, lease, the leadership's own takeover timings) are rendered when present
+    and were exercised only as far as the in-memory backend produces them, which is not
+    at all. That pass is still owed.
+
+**Tests** (`tests/Incremental.Service.Tests`: `AdminApiTests`, 18, and `SeamTests`, 5, in
+memory; `tests/Incremental.Tests/DescribeTests`, 3). The API tests run a real Kestrel on a
+free loopback port, because the loopback rule reads the connection's address: bounds and
+paging of every list and of row reads; the error shape of every kind of refusal; the
+loopback rule (forwarded headers, host names, `AllowedHosts`) and health outside it; an
+authorization policy for everything and one per area, with a header-driven test scheme;
+read-only refusing each of fifteen mutations and changing nothing; row data off (rows 403,
+messages, records and stacks withheld, and no response quoting the bad value); mutations
+(header, `confirm`, `If-Match` and 412, dry runs that do nothing, `state-choice-required`,
+deploy, validate, remove, audit); upload validation (switch, media type, empty, not a zip,
+too large, an entry named `../…`, no assembly, not an assembly, then a real plugin stored
+and deleted); the feed (ticks, events with ids, replay from `Last-Event-ID` without
+duplicates, a socket that never reads costing sixteen frames and then its connection, the
+stream cap, the feed ending when the application stops); two nodes (a standby's reads, its
+declared graph, `not-leader` with the leader's address, takeover through the API, the old
+leader `Fenced` and not ready); and the UI smoke — every file the page names is served
+with its type, a content security policy without `unsafe-inline` and a working ETag, no
+script or stylesheet names another origin, and every API path the scripts build is a route
+the server maps with that method, the read ones among them answering 200.
+
+Mutation checks, each a one-line break run against the test that should notice: 41, of
+which 40 killed — among them the forwarded-header and host checks off, `AllowedHosts`
+ignored, read-only off, the mutation header and `confirm` not required, `If-Match`
+ignored, `limit` not clamped, the row gate, the message gate and the event redaction off,
+a client queue a thousand times longer, no write timeout, no cap on streams, no replay, a
+replay that duplicates, a feed that outlives the application, upload switched on
+regardless, an area policy and the general one not applied, a refusal without the
+leader's address, a route renamed under the UI, no content security policy, no ETag, a
+second member in the error shape, dead letters not counted on the graph, a standby
+counting the leader's circuits, a removed pipeline's rings kept, a ring that forgets, a
+scan with no bound, a secret shown, dead letters paged from the wrong end, a sink slot
+not named on the graph (each of the three kinds), no history, `RowsBy` reading the latest
+version, and `Describe` misreporting an output's kind or a node's error policy. Two
+survived their first run and showed thin tests: nothing told apart the three sink-slot
+overloads (the test now describes one pipeline of each), and nothing sent an upload with
+no declared length. The second still survives and is equivalent: with the handler's own
+count removed, the server's request-size limit — which the handler sets to the same
+number — refuses the body instead.
+
+**Seen in a browser** (Chromium through Playwright, against the admin host): every view in
+light and dark at 1440 px and at 390 px, with no console error, no content-security-policy
+violation and no sideways page scroll in any of them; stop, start, restart, reset (the
+button stays disabled until the id is typed), replace with the state choice, plugin upload
+with a refused file and an accepted one, takeover on a two-node host and the fenced node's
+page afterwards; the feed cut by stopping the host (the banner, the dimmed page, recovery
+when it returns); read-only and row-data-off hosts (no action anywhere; the notices that
+say what is withheld); focus kept in a filter field across live updates; nodes of the
+topology reachable and selectable by keyboard. Screenshots are in `docs/images/admin/`.
+
+**Found while building.**
+
+- *Kestrel aborts a connection whose write is cancelled*, which cancels the request, so
+  "did the write time out" cannot be read from the request's token afterwards; the write
+  timeout has its own clock.
+- *A response under a strict style policy cannot carry `style` attributes*, and a DOM
+  patcher that copies attributes sets one. The UI's patcher writes `style` through the
+  CSSOM instead; the browser pass caught it as two console errors.
+- *Keeping state across a change of worker count faults the new generation.* The replace
+  dialog offers `keep` for it, the dry run accepts it, and the pipeline then goes to
+  `Backoff`: state is sharded by worker count. The design's pre-stop check (C3's store
+  names) would refuse it; until then the plan's line "state kept" is not a promise.
+
+**What S4 must know.**
+
+- Mount with `services.AddIncrementalAdmin(o => …)` and `app.MapIncrementalAdmin("/admin")`,
+  `app.MapIncrementalHealth("/health")`. The example should set `ExposeRowData`,
+  `AllowPluginUpload` and `AdvertisedAdminUrl`, and for `--nodes 2` give each node its own
+  port and `ExitOnLeadershipLoss = false` (`tests/Incremental.Service.AdminHost/DemoHost.cs`
+  does all of this and is small enough to copy from).
+- A `memory` log keeps every record: a generator that runs for hours should upsert over a
+  bounded key space into keyed inputs, as the admin host's does.
+- The UI shows `Unbuilt` pipelines and declared-edge graphs on a standby; that is the
+  alternative of *Open for James* 1 made visible, not a fault.
+

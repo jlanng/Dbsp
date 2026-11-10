@@ -1280,6 +1280,62 @@ What to know:
   delivery lease is held, how the last takeover's time was spent, the peer's answer, and
   on a standby how far its catalog, tables and state are behind.
 
+#### Looking at it: the admin API and UI
+
+`Incremental.Service.Admin` mounts a JSON API and a web UI over the node:
+
+```csharp
+builder.Services.AddIncrementalAdmin(o =>
+{
+    o.ExposeRowData = true;                 // rows, dead-letter records, exception messages
+    o.AllowPluginUpload = true;             // code over the API: off unless you say so
+    // o.AuthorizationPolicy = "admins";    // without one, loopback requests only
+});
+app.MapIncrementalAdmin("/admin");          // UI at /admin/, API under /admin/api
+app.MapIncrementalHealth("/health");        // /live, /ready, /status: for a load balancer
+```
+
+- **It is loopback-only until a policy is set.** With no `AuthorizationPolicy` a request
+  is refused unless it comes from a loopback address, names a loopback host (or one in
+  `AllowedHosts`) and carries no forwarding header. Behind a proxy, or across machines,
+  set a policy; `PipelinePolicy`, `TablePolicy`, `NodePolicy` and `PluginPolicy` then say
+  who may change what. `ReadOnly` refuses every mutation, and the UI shows no actions.
+- **Row data is a switch.** Off, the row endpoints answer 403, and faults, dead letters,
+  unreadable records and events come back with the exception's type and not its message:
+  a `FormatException` quotes the value it could not read.
+- **Mutations** carry the header `X-Incremental-Admin: 1`, take `dryRun=true` (the answer
+  is the plan and nothing happens), and — reset, remove, table and plugin deletion,
+  takeover, step-down — `confirm=<the id>`. A pipeline mutation may carry
+  `If-Match: "<generation>"` and gets 412 if the pipeline has moved. On a standby they are
+  refused with the leader's id and address, except takeover.
+- **Everything is bounded.** Lists are paged (`skip`, `limit`, at most `MaxRows`); a row
+  read scans at most `MaxScannedRows` and says when it stopped short (`truncated`) —
+  "not found" and "not reached" are different answers, and on a standby `lagVersions`
+  adds "not arrived here yet". The event feed (`GET api/events`, server-sent events with
+  ids, replayed from `Last-Event-ID`) queues 64 frames per client and drops the oldest.
+- **Durations are milliseconds; a spec comes back in the form it is sent in**, with any
+  property its connector declares secret replaced by `***`.
+
+| | Path | |
+|---|---|---|
+| GET | `info`, `node`, `node/metrics` | what the API allows; role, terms, health, readiness, peer, last takeover; the node's rates |
+| POST | `node/takeover`, `node/stepdown` | `force=`, `confirm=<node id>` |
+| GET | `tables`, `tables/{name}` | statistics, loader, readers and who holds the floor, unreadable records |
+| GET | `tables/{name}/rows` | `limit`, `skip`, `contains` — or `key`, or `index` and `key` |
+| POST | `tables`, `tables/{name}/loader/restart`, `tables/{name}/reopen`; DELETE `tables/{name}` | |
+| GET | `pipelines`, `pipelines/{id}` | `q=`, `state=`; detail adds the spec, sources, sinks, committed table versions, faults, history |
+| GET | `pipelines/{id}/graph`, `/metrics`, `/dead-letters` | the circuit; 60 one-second and 60 one-minute samples; the ring, newest first by `before=` |
+| PUT | `pipelines/{id}?state=keep\|reset` | deploy or replace |
+| POST | `pipelines/validate`, `pipelines/{id}/start`, `/stop`, `/restart`, `/reset`; DELETE `pipelines/{id}` | |
+| GET | `plugins`, `plugins/{name}` | versions, definitions and their settings, which pipelines use which |
+| POST | `plugins` (a zip), `plugins/rescan`; DELETE `plugins/{name}/{version}` | |
+| GET | `audit`, `events/recent`, `events` | who changed what; this node's event ring; the live feed |
+
+The UI is the same API in a browser — overview, pipelines (metrics, topology, config,
+faults, dead letters), tables (loader, readers, rows), plugins, cluster, audit — and is
+embedded in the package: nothing to build, nothing fetched from elsewhere.
+`dotnet run --project tests/Incremental.Service.AdminHost` runs it with data.
+
 What is built and what is not is in
 [design/enrichment-service.md](design/enrichment-service.md), *As built*.
 

@@ -126,6 +126,11 @@ public class SeamTests
         Assert.Contains(graph.Circuit.Nodes, n => n.Name == "joined");
         var output = Assert.Single(graph.Circuit.Outputs);
         Assert.Equal("out", graph.SinkSlots[output.Name]);
+        // Each kind of sink slot names its output: keyed rows, and an append sink.
+        var counts = (await service.Pipelines.DescribeAsync(Spec("g-counts", "counts", "g-in", "g-counts-out"), default)).Graph;
+        Assert.Equal("out", counts.SinkSlots[Assert.Single(counts.Circuit.Outputs).Name]);
+        var appends = (await service.Pipelines.DescribeAsync(Spec("g-wedge", "wedge", "g-in", "g-wedge-out"), default)).Graph;
+        Assert.Equal("out", appends.SinkSlots[Assert.Single(appends.Circuit.Outputs).Name]);
         Assert.Equal("ServiceException", (await Assert.ThrowsAsync<ServiceException>(() => service.Pipelines.DescribeAsync(spec with { Definition = "nope" }, default))).GetType().Name);
 
         await service.DeployAsync(spec);
