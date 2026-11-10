@@ -322,6 +322,25 @@ public sealed class SharedTable<TKey, TRow> : ITableNode, IAsyncDisposable
         ThrowIfRevoked(version);
     }
 
+    internal IReadOnlyList<KeyValuePair<TKey, TRow>> RowsBy<TIndexKey>(string index, TIndexKey indexKey, long version)
+        where TIndexKey : notnull
+    {
+        ArgumentException.ThrowIfNullOrEmpty(index);
+        if (!_indexesByName.TryGetValue(index, out var declared))
+            throw new ArgumentException($"Table '{Name}' has no index named '{index}'.", nameof(index));
+        if (declared is not TableIndex<TIndexKey, TKey, TRow> typed)
+            throw new ArgumentException(
+                $"Index '{index}' of table '{Name}' is keyed by {declared.GetType().GetGenericArguments()[0]}, not {typeof(TIndexKey)}.",
+                nameof(indexKey));
+        if (typed.Read(indexKey, version) is not { } keys)
+            return [];
+        var rows = new List<KeyValuePair<TKey, TRow>>(keys.Length);
+        foreach (var key in keys)
+            if (TryGet(key, version, out var row))
+                rows.Add(new KeyValuePair<TKey, TRow>(key, row));
+        return rows;
+    }
+
     internal int ReplaceChunkRows => _options.ReplaceChunkRows;
 
     // ── secondary indexes ──────────────────────────────────────────────────────────────
@@ -810,6 +829,14 @@ public readonly struct TableSnapshot<TKey, TRow> : IDisposable
     /// part-way (<see cref="SharedTableOptions.MaxRetainedVersions"/>) rather than end
     /// short.</summary>
     public IEnumerable<KeyValuePair<TKey, TRow>> Rows() => _table.RowsAt(Version);
+
+    /// <summary>The rows under <paramref name="indexKey"/> in the index declared as
+    /// <paramref name="index"/> (<see cref="SharedTable{TKey,TRow}.AddIndex"/>), as of
+    /// <see cref="Version"/>: one index read and one row read per row under the key.
+    /// Throws if no index of that name and key type is declared.</summary>
+    public IReadOnlyList<KeyValuePair<TKey, TRow>> RowsBy<TIndexKey>(string index, TIndexKey indexKey)
+        where TIndexKey : notnull =>
+        _table.RowsBy(index, indexKey, Version);
 
     public void Dispose() => _table.ReleasePin(Version);
 }

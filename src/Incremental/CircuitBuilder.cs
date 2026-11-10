@@ -56,6 +56,27 @@ internal sealed class LoopRegion
     public required int MaxIterations { get; init; }
 }
 
+/// <summary>One node of a circuit's graph, as <see cref="CircuitBuilder.Describe"/> reports
+/// it. <c>Kind</c> is the operator kind (<c>input[trades]</c>, <c>table[instruments]</c>,
+/// <c>where</c>, <c>join</c>, <c>exchange</c> …); <c>StateName</c> is the root of the names
+/// its state stores would get; <c>Name</c> is what pins that root (<c>.Named()</c>, or a keyed
+/// input's name), null when it is positional.</summary>
+public sealed record CircuitGraphNode(
+    int Id, string Kind, string StateName, IReadOnlyList<int> Inputs, bool IsExchange, string? Name, RecordErrorPolicy ErrorPolicy);
+
+public enum CircuitOutputKind { Stream, Acknowledged, Table }
+
+/// <summary>An output of the graph: the node it publishes and, for a derived table
+/// (<c>ToTable</c>), the table it writes.</summary>
+public sealed record CircuitGraphOutput(string Name, int NodeId, CircuitOutputKind Kind, string? Table);
+
+/// <summary>A <c>Recurse</c> region: nodes <c>Start</c>..<c>End</c> iterate, and
+/// <c>ResultNode</c> feeds <c>Start</c> across iterations — the one edge no node lists.</summary>
+public sealed record CircuitGraphLoop(int Start, int End, int ResultNode);
+
+public sealed record CircuitGraph(
+    IReadOnlyList<CircuitGraphNode> Nodes, IReadOnlyList<CircuitGraphOutput> Outputs, IReadOnlyList<CircuitGraphLoop> Loops);
+
 /// <summary>
 /// Declares the dataflow graph of a circuit: inputs, operators, and outputs. Streams are
 /// handles into the graph under construction; <see cref="Build"/> freezes it into a runnable
@@ -392,6 +413,39 @@ public sealed class CircuitBuilder
             _imports.TryGetValue(outerNode, out var import)
                 ? import
                 : _imports[outerNode] = builder.AddNodeCore("loopImport", [outerNode], _ => new LoopImportOperator(), isExchange: false);
+    }
+
+    /// <summary>
+    /// The graph as declared so far: every node with its kind and the nodes it reads, and
+    /// every output with the node it publishes. Reads nothing but the builder — no table is
+    /// claimed, no storage touched, no operator created — so it can be called on a builder
+    /// that is never built, and before or after <see cref="Build"/>. Node ids are creation
+    /// order, which is the topological order the workers execute.
+    /// </summary>
+    public CircuitGraph Describe()
+    {
+        var nodes = new CircuitGraphNode[_nodes.Count];
+        for (var i = 0; i < nodes.Length; i++)
+        {
+            var node = _nodes[i];
+            nodes[i] = new CircuitGraphNode(
+                node.Id, node.Kind, node.Name, [.. node.Inputs], node.IsExchange, node.StateId ?? node.InputStateOf,
+                node.ErrorPolicy ?? Options.ErrorPolicy);
+        }
+        var outputs = new CircuitGraphOutput[_outputs.Count];
+        for (var i = 0; i < outputs.Length; i++)
+        {
+            var output = _outputs[i];
+            outputs[i] = output is DerivedTableRegistration derived
+                ? new CircuitGraphOutput(output.Name, output.NodeId, CircuitOutputKind.Table, derived.Table.Name)
+                : new CircuitGraphOutput(
+                    output.Name, output.NodeId,
+                    output.GetType().IsGenericType && output.GetType().GetGenericTypeDefinition() == typeof(AcknowledgedOutputRegistration<>)
+                        ? CircuitOutputKind.Acknowledged
+                        : CircuitOutputKind.Stream,
+                    null);
+        }
+        return new CircuitGraph(nodes, outputs, _loopRegions.ConvertAll(l => new CircuitGraphLoop(l.Start, l.End, l.ResultNode)));
     }
 
     public Circuit Build()
