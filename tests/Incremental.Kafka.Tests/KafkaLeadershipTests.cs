@@ -44,9 +44,10 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         bool automatic = true,
         Func<Node, CancellationToken, Task>? prepare = null,
         Func<Node, long, Task>? start = null,
-        bool begin = true)
+        bool begin = true,
+        TimeSpan? beat = null)
     {
-        var node = new Node(await env.ConnectAsync(env.Options(nodeId: id, heartbeat: Beat)));
+        var node = new Node(await env.ConnectAsync(env.Options(nodeId: id, heartbeat: beat ?? Beat)));
         node.Leadership = new KafkaLeadership(node.Log, new KafkaLeadershipOptions
         {
             TakeoverAfter = after ?? After,
@@ -157,6 +158,25 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         var sequences = beats.Select(b => b.GetProperty("Sequence").GetInt64()).ToList();
         Assert.Equal(sequences.OrderBy(s => s), sequences);
         Assert.Equal(sequences.Count, sequences.Distinct().Count());
+    }
+
+    [Fact]
+    public async Task A_busy_writer_heartbeats_with_its_commits_alone()
+    {
+        // An interval too long to fire: every heartbeat here rode in a commit's transaction.
+        await using var env = KafkaEnv.Create();
+        var log = await env.ConnectAsync(env.Options(nodeId: "a", heartbeat: TimeSpan.FromHours(1)));
+        await log.AcquireWriterAsync().WaitAsync(Timeout);
+        for (var i = 0; i < 10; i++)
+            await CommitStateAsync(log, "p", "e" + i);
+
+        await KafkaEnv.EventuallyAsync(
+            async () => (await LeaderTopicAsync(log)).Count(r => r.Key == "heartbeat") >= 10, "each commit left a heartbeat");
+        var beats = (await LeaderTopicAsync(log)).Where(r => r.Key == "heartbeat").ToList();
+        Assert.Equal(Enumerable.Range(1, 10).Select(i => (long)i), beats.Select(b => b.Value.GetProperty("Sequence").GetInt64()));
+        Assert.Equal(0, log.IdleHeartbeats);
+        Assert.Equal(11, log.TransactionsCommitted);
+        Assert.InRange(log.SinceLastTransaction!.Value, TimeSpan.Zero, TimeSpan.FromSeconds(30));
     }
 
     [Fact]
@@ -374,6 +394,28 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public async Task A_deposed_leader_reads_the_higher_term_long_before_its_next_heartbeat()
+    {
+        // Heartbeats five seconds apart: only the leader topic can tell the old leader
+        // this quickly that it has been replaced.
+        await using var env = KafkaEnv.Create();
+        var (beat, after) = (TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(12));
+        await using var a = await StartAsync(env, "a", after: after, beat: beat);
+        await using var b = await StartAsync(env, "b", after: after, beat: beat, automatic: false);
+        await a.Leadership.TakeOverAsync().WaitAsync(Timeout);
+        Assert.Equal("manual", a.Leadership.Status.LastTakeover!.Reason);
+
+        var clock = Stopwatch.StartNew();
+        await b.Leadership.TakeOverAsync().WaitAsync(Timeout);
+        await a.Leadership.WhenFinished.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.True(clock.Elapsed < beat / 2);
+        Assert.Equal(NodeRole.Fenced, a.Role);
+        Assert.Equal(0, a.Log.IdleHeartbeats);
+        Assert.Contains("'b' has taken the log over under term 2", a.Leadership.Status.Fault!.Message);
+        Assert.False(a.Leadership.HoldsLease);
+    }
+
+    [Fact]
     public async Task Step_down_hands_over_without_waiting_for_the_timeout()
     {
         await using var env = KafkaEnv.Create();
@@ -562,6 +604,66 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         await Assert.ThrowsAnyAsync<Exception>(() => delivery.WaitAsync(Timeout));
         Assert.False(sink.Rows.ContainsKey(2));
         Assert.Contains(failures, f => f is KafkaLogFencedException);
+    }
+
+    [Fact]
+    public async Task A_leader_whose_commits_stall_loses_the_lease_before_a_standby_would_take_over()
+    {
+        await using var env = KafkaEnv.Create();
+        await using var a = await StartAsync(env, "a");
+        await LeadsAsync(a);
+        var lease = After - After / 3;
+        var sink = new InMemoryUpsertSink<int, Row>();
+        var leased = a.Leadership.Leased(sink);
+        var circuitBuilder = new CircuitBuilder(new CircuitOptions { AutoStep = false });
+        var input = circuitBuilder.Input<Row>("rows");
+        var acknowledged = input.ToAcknowledgedOutput();
+        await using var circuit = circuitBuilder.Build();
+        circuit.Start();
+        var delivery = circuit.Handle(acknowledged).DeliverToAsync(leased, r => r.Id);
+
+        // The writer stalls — Kafka is slow, the process is starved — without being fenced.
+        using var release = new ManualResetEventSlim();
+        a.Log.BeforeTransaction = release.Wait;
+        try
+        {
+            await StalledAsync();
+        }
+        finally
+        {
+            // Whatever the verdict, let the writer thread go, or nothing here can be disposed.
+            a.Log.BeforeTransaction = null;
+            release.Set();
+        }
+        await KafkaEnv.EventuallyAsync(() => Task.FromResult(sink.Rows.ContainsKey(1)), "the held delivery goes out once the lease is back");
+        Assert.True(a.Leadership.HoldsLease);
+        return;
+
+        async Task StalledAsync()
+        {
+            var stalled = Stopwatch.StartNew();
+            while (a.Leadership.HoldsLease)
+            {
+                Assert.True(stalled.Elapsed < After * 3, "the lease did not lapse although nothing has committed");
+                await Task.Delay(10);
+            }
+            var lapsedAfter = stalled.Elapsed;
+            Assert.True(a.Log.IsWriter);
+            Assert.Equal(NodeRole.Leader, a.Role);
+            Assert.False(a.Leadership.Status.HoldsLease);
+
+            // It lapsed within the lease of the last heartbeat, which is before any standby's
+            // silence can have reached the takeover timeout.
+            Assert.True(lapsedAfter < After, $"the lease lapsed only after {lapsedAfter}; a standby takes over after {After}");
+            Assert.True(a.Log.SinceLastTransaction >= lease);
+
+            // Nothing is delivered while it is lapsed.
+            await circuit.Handle(input).InsertAsync(new Row(1, "held"));
+            await circuit.StepAsync().WaitAsync(Timeout);
+            await Task.Delay(After);
+            Assert.Empty(sink.Rows);
+            Assert.False(delivery.IsCompleted);
+        }
     }
 
     [Fact]

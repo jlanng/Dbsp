@@ -9,8 +9,10 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   opted in by `global.json` — hence `--project`; Redis tests skip unless `docker compose up -d` has run)
 - Kafka tests: `dotnet test --project tests/Incremental.Kafka.Tests` — integration tests of
   `Incremental.Kafka` against the local broker; they skip unless the connector stack is up.
-  Each test uses its own topic prefix. About a minute. `INCREMENTAL_KAFKA_BOOTSTRAP`
-  points them at another broker.
+  Each test uses its own topic prefix. About a minute and a half. `INCREMENTAL_KAFKA_BOOTSTRAP`
+  points them at another broker. `KafkaFailoverProcessTests` launch
+  `tests/Incremental.Kafka.FailoverApp` as real processes and kill, stop and command them;
+  measured numbers go to `measurements.log` beside the test assembly.
 - Connector stack: `docker compose --profile connectors up -d` adds Kafka (`localhost:9092`), Postgres with
   logical decoding (`localhost:5432`, user/password/db `incremental`) and Debezium's Kafka
   Connect (`localhost:8083`). Plain `docker compose up -d` stays Redis-only.
@@ -100,6 +102,13 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   inside the writer loop, never reported. Readers are `read_committed`; "the end" is the
   last stable offset, and positions must pass transaction markers. Record values start
   with a format byte; keys must be byte-stable because compaction compares bytes.
+  Assign consumers at numeric offsets, never `Offset.Beginning`: a logical offset on a new
+  consumer costs 500 ms.
+- Leadership (`KafkaLeadership`) lives in Kafka only. The log writer heartbeats to
+  `{p}.leader` in every transaction and when idle; a standby takes over on silence. Safety
+  is fencing, never the election or the probe. Every node starts as a standby; `Fenced`
+  and `Resigned` are final (the process exits) — no demotion in place. Takeover order:
+  writer, tables, storage, circuits. A node that cannot lead must stop heartbeating.
 - Checkpointed state identity is covered by the state manifest (committed with every
   checkpoint, validated at `Start()`); store names are positional unless pinned with
   `.Named()` — changing store naming or the manifest format needs a format-version bump.

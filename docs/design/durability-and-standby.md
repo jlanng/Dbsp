@@ -1,12 +1,14 @@
 # Design: durability and warm standby
 
-> **Status:** agreed design, 2026-11-09. Build-order steps 1 to 4 are built: commit after
+> **Status:** agreed design, 2026-11-09. Build-order steps 1 to 5 are built: commit after
 > delivery (with the sink side of keyed upsert delivery and the per-record error policy; see
 > the two *As built* sections under *Commit after delivery*); the state changelog seam,
 > the changelog provider, the in-memory changelog and follower mode for stores and tables
-> (see *As built (step 2)* under *Warm standby*); and, in `Incremental.Kafka`, the log
+> (see *As built (step 2)* under *Warm standby*); in `Incremental.Kafka`, the log
 > writer, the state changelog and the table log on Kafka (see *As built:
-> `Incremental.Kafka`*). The leader protocol, the source adapter and the hosting roles are
+> `Incremental.Kafka`*); and the leader protocol — heartbeats, election, takeover, step
+> down, the delivery lease — with a kill -9 test between real processes (see *As built
+> (step 5)* under *Leadership and fencing*). The source adapter and the hosting roles are
 > not.
 > Sibling of [shared-tables.md](shared-tables.md); it fills the `ITableLog` seam that
 > design leaves open. Blocks marked **Decided** record a choice James made.
@@ -287,16 +289,19 @@ gets `ErrorCode.Local_Fenced` ("This instance has been fenced by a newer instanc
   fails. So `WhenFenced` completes on a zombie's next write, not before. Telling an idle
   zombie it has been deposed is the heartbeat topic's job (step 5).
 
-`InitTransactions` took about 0.5 s every time against the local broker, with or without
-an open transaction to abort. That is the floor of a takeover here; its cause was not
-investigated.
+`InitTransactions` takes 2 to 55 ms against the local broker. As first written this
+section said half a second and called it the floor of a takeover. That was wrong: the
+half second was the read of the last term that follows it (see *A logical start offset
+costs half a second* below). Acquiring the writer — initialise, read the term, commit the
+next — now takes 20 to 45 ms.
 
 **Terms.** `AcquireWriterAsync` reads `{p}.leader` (one partition, compacted) for the last
-term and commits the next under the key `term`, before it returns. Reading after
-`InitTransactions` makes the last term final; committing through the transactional
-producer makes the new one unique. This is the "write the new term" of takeover step 4,
-brought forward because `IStateChangelogWriter.Term` needs it. Heartbeats, the election
-and the delivery lease are still step 5.
+term and commits the next under the key `term`, with the node's id, before it returns.
+Reading after `InitTransactions` makes the last term final; committing through the
+transactional producer makes the new one unique. Terms never fall along the topic and
+every heartbeat carries one, so the read is of the topic's tail only. This is the "write
+the new term" of takeover step 4, brought forward because `IStateChangelogWriter.Term`
+needs it. Heartbeats, the election and the delivery lease are under *As built (step 5)*.
 
 **Reading to the end.** Two facts about Kafka shaped the readers:
 
@@ -316,6 +321,18 @@ and the delivery lease are still step 5.
   is one offset further; the end-of-partition event still covers the case where the tail
   is an aborted transaction. This took a caught-up standby's takeover from 2.0 s to
   0.55 s, and a follower now stands at the end 1 to 3 ms after the commit returns.
+
+- *A logical start offset costs half a second.* A consumer assigned at
+  `Offset.Beginning` must first ask the broker what that is, and a consumer created a
+  moment ago does not know the partition's leader yet; librdkafka then waits 500 ms
+  before asking again. A consumer assigned at a number starts fetching as soon as it has
+  metadata. Found in step 5 by timing the three parts of `AcquireWriterAsync` on the code
+  as it was (initialise 3 to 55 ms, read the term 503 to 507 ms, commit it 11 ms). Every
+  read now starts from a number: the term from the tail of the leader topic, a table
+  restore from each rows partition's start offset, a range read from the index or the
+  changes topic's start offset. An in-process takeover went from 550 ms to 30 to 50 ms,
+  and the Kafka test suite from about 60 s to about 35 s before the step 5 tests were
+  added.
 
 Each `ReadAsync` and each table `FollowAsync` runs its own consumer on its own thread, with
 a bounded channel of two batches to the caller. A storage therefore holds `P` consumers
@@ -402,9 +419,12 @@ strings, embedded as JSON strings. Departures from *Kafka-backed table log*:
 
 **Measured** (one machine, one local broker, Debug build unless said; indicative only):
 
-- Takeover by a caught-up standby, in process: about 0.55 s — 0.52 s to fence and commit
-  the term, 20 ms to promote two tables, 1 to 2 ms to promote the storage, under 1 ms to
-  start the circuit.
+- Takeover by a caught-up standby, in process, once the decision is made: 30 to 50 ms —
+  about 20 ms to fence and commit the term, 10 to 25 ms to promote two tables, 1 to 2 ms
+  to promote the storage, under 1 ms to start the circuit. (0.55 s as first measured;
+  see *A logical start offset costs half a second*.) Now and then a table promotion
+  takes 0.25 to 0.4 s instead: its follower stood one record short of the end and had to
+  wait for the client's end-of-partition event.
 - A 200,000-row table of wide reference rows (19 fields, about 410 bytes of JSON), four
   rows partitions: loaded in 2.0 s as 40 versions of 5,000 rows; restored by a new process
   in 2.5 s (80,000 rows/s).
@@ -456,8 +476,6 @@ table of tens of millions of rows whose cold restore must be fast.
 
 **Not built, or left open.**
 
-- Heartbeats, election, the leader term on deliveries, the delivery lease (step 5). The
-  writer commits nothing when idle.
 - Metrics: none yet (transactions, commits per transaction, commit latency, follower lag).
   `KafkaLog` exposes counters (`TransactionsCommitted`, `TransactionsAborted`,
   `CommitsCompleted`, `RecordsWritten`) but publishes nothing.
@@ -773,6 +791,243 @@ For a sink that can do neither, the residual risk is stated, not solved.
 restarts it as the standby. Demoting in place would save a cold restore but needs every
 staged layer and view unwound correctly, and is not worth it in the first version.
 
+### As built (step 5)
+
+Code: `src/Incremental.Kafka` — `KafkaLeadership.cs` (the coordinator, its options and
+status types), `LeadershipProbe.cs` (the TCP probe), and in `KafkaLog.cs` the heartbeat,
+`ResignAsync` and the lease clock. Test app: `tests/Incremental.Kafka.FailoverApp`. Tests:
+`KafkaLeadershipTests.cs` (one process, real broker) and `KafkaFailoverProcessTests.cs`
+(real processes).
+
+```csharp
+await using var log = await KafkaLog.ConnectAsync(new KafkaLogOptions { …, NodeId = "node-a" });
+
+var leadership = new KafkaLeadership(log, new KafkaLeadershipOptions
+{
+    ProbeLeader = LeadershipProbe.Tcp(peerHost, peerPort),      // optional hint
+    StartLeadingAsync = (term, ct) => { circuit.Start(); /* sources, sinks */ return Task.CompletedTask; },
+    StopLeadingAsync = async ct => await circuit.DisposeAsync(), // for StepDownAsync
+});
+await using var probe = LeadershipProbe.Listen(leadership, myEndpoint);
+
+// Every node builds itself as a standby, whatever it will become.
+var tableLog = await log.OpenTableLogAsync<int, Instrument>("instruments");
+var instruments = await SharedTable<int, Instrument>.FollowAsync("instruments", i => i.Id, tableLog);
+var storage = ChangelogStorage.Follow(log.State);
+leadership.Track(instruments, tableLog);
+leadership.Track(storage);
+var circuit = Build(storage.Pipeline("enrichment"), instruments);   // built, not started
+
+leadership.Changed += status => { if (status.Role is NodeRole.Fenced) Environment.Exit(3); };
+await leadership.StartAsync();
+```
+
+**Heartbeats are the log writer's.** Every transaction the writer thread commits carries a
+record under the key `heartbeat` in `{p}.leader`: `(term, node, at, sequence, resigned)`.
+When nothing has been committed for `KafkaLogOptions.HeartbeatInterval` (default 1 s) the
+thread commits a transaction holding only that record. So a readable heartbeat means what
+the design says — "the active can still commit" — and a writer that was fenced while idle
+finds out within one interval, because the heartbeat is a write. Idle heartbeats are
+counted in `KafkaLog.IdleHeartbeats`, not in `TransactionsCommitted`. The term record
+(key `term`) now carries the node id too. The topic is created with `segment.ms` of one
+hour, so the cleaner keeps it to two records plus the active segment; the watch and the
+term read start at its tail and never see the rest.
+
+**One coordinator per process: `KafkaLeadership`.** Roles: `Standby → Promoting → Leader`,
+ending in `Fenced` or `Resigned`. Both ends are final: the process exits and its
+supervisor starts it again as a standby, as *A fenced active exits* decided. The
+coordinator does not exit the process and does not depend on `Incremental.Hosting`; it
+raises `Changed`, completes `WhenFinished`, and reports `Status` (role, own term, leader
+node and term, heartbeat age, whether the lease is held, follower lag, the last
+takeover's timings, the fault). Step 7 wires those into the host.
+
+**Every node starts as a standby.** There is no "start as the leader". A node follows the
+logs and builds its circuits, and leads when the election says so; restore and follow
+were already one mechanism (step 2). A deployment's first start is the same path: nobody
+heartbeats, so after `TakeoverAfter` the node takes over. The one wrinkle is that a
+table's topics get their identity from the first writer, so on that first start
+`OpenTableLogAsync` cannot complete until the node is the writer. `PrepareAsync` exists
+for that: the takeover acquires the writer, then waits in `PrepareAsync` for the build
+the application started earlier, which can now finish. A node that should lead at once
+is sent `TakeOverAsync`.
+
+**The election**, as decided. A standby tails the leader topic and notes, in local
+elapsed time, when it last read a record. It takes over when:
+
+- the silence has reached `TakeoverAfter` (default 3 s) and there is no probe, or the
+  probe fails; or
+- the silence has reached `TakeoverCeiling` (default 30 s), whatever the probe says; or
+- the last record is a resignation; or
+- `TakeOverAsync` was called.
+
+Additions to the text:
+
+- *A last check against the broker.* Before acting on silence, the standby asks Kafka
+  for the leader topic's end offset. If the request fails, the standby is the one cut off
+  from Kafka; taking over would hang in `InitTransactions` and then depose a healthy
+  leader the moment the connection returned, so it does not. If the topic has records
+  the standby's watch has not delivered, the silence is the watch's. This is not covered
+  by a test.
+- *The probe answers with a role.* `LeadershipProbe` is one line over TCP — `role term
+  node` — written by the process on each connection. A probe is true only when the peer
+  answers as `Leader` or `Promoting`. A refused connection (the process is dead), a peer
+  that answers as a standby (it was restarted), and no answer within `ProbeTimeout` (it
+  is stopped: the kernel still accepts the connection, which is why a bare connect is not
+  enough) are all false.
+- *Startup counts as hearing the leader.* A standby's silence clock starts when its watch
+  does, so a node started beside a dead leader waits a full `TakeoverAfter`.
+- `AutomaticTakeover = false` leaves only the command.
+
+**The takeover**, in the order step 4 tested: `log.AcquireWriterAsync()` (fence, read the
+term, commit the next); `PrepareAsync`; `PromoteAsync` on each tracked table, in the order
+tracked; `PromoteAsync` on each tracked storage; `StartLeadingAsync(term)`. Then the node
+is the leader. If any of it fails — including losing the race for the transactional id —
+the node ends `Fenced`, and the coordinator closes the log's writer so that it stops
+heartbeating: a node that leads nothing must not look alive to its peer. The takeover's
+timings are kept in `Status.LastTakeover`.
+
+**What a deposed leader learns, and when.** Three ways, fastest first:
+
+1. Its own watch on the leader topic reads a term higher than its own. The coordinator
+   closes the log's writer at once (`KafkaLogFencedException`, "node 'b' has taken the
+   log over under term 2"). Measured: 30 to 110 ms after a manual takeover began.
+2. Its next write fails as fenced. A busy leader's next commit; an idle one's next
+   heartbeat, at most `HeartbeatInterval` later. Measured with nothing else running: 23
+   to 31 ms after the successor's `AcquireWriterAsync` returned, at 100 ms heartbeats.
+3. Its lease lapses (below), which needs no news at all.
+
+Either of the first two makes every later commit fail, so every circuit faults at its
+next commit point and none can commit; the role becomes `Fenced`. Circuits are not
+faulted from outside — there is no such call in the core, and nothing needs one.
+
+**The commands.** `leadership.TakeOverAsync()` is "take over now": the standby stops
+waiting, and the leader, if alive, is fenced under it and replays nothing of its own —
+the new leader replays what the old one had not committed. `leadership.StepDownAsync()`
+is the planned form, on the leader: it calls `StopLeadingAsync` (dispose the circuits, so
+their last commits land), commits a resignation — a heartbeat with `resigned` set — and
+closes the writer; a standby that reads the resignation takes over without waiting, and
+has nothing to replay. Both are method calls. Carrying them between nodes (an admin
+endpoint) is the host's, step 7.
+
+**The delivery lease** (*The sink gap*, first mitigation) is built.
+`leadership.HoldsLease` is true while the node is the writer and its last committed
+transaction *began* less than `TakeoverAfter − LeaseMargin` ago (margin: a third of
+`TakeoverAfter` unless set; so 2 s by default). The clock starts before the transaction
+begins because a standby cannot have seen that heartbeat any earlier, and a standby does
+not act until `TakeoverAfter` after it saw it; so the lease ends before the standby
+decides, by at least the margin, with no clocks compared. `leadership.Leased(sink)` wraps
+an `IUpsertSink` or `IAppendSink` so that every write first waits for the lease. A leader
+whose commits stall stops delivering and resumes with its next committed transaction; a
+deposed one gets `KafkaLogFencedException`, which the delivery reports like any failed
+write. What remains is what the design said remains: a process stopped between the check
+and the write. A manual takeover does not wait for the old leader's lease, so there the
+window is from the command to the old leader reading the new term.
+
+**The term on deliveries** (second mitigation) is not added to the core's batches. A sink
+that wants it reads `leadership.Term` when it writes; the test app's sink stamps term,
+step sequence and node on every record that way, and the tests read the sink both
+plainly and with the conditional rule ("refuse a row from an older term than the key
+holds").
+
+**Follower lag.** `leadership.MeasureLagAsync()` returns, for each partition of the state
+topic, the offsets between the tracked storage's position and the end of committed data
+(one `ListOffsets` request for all partitions), and for each tracked table the versions
+between the standby's view and the log's head (one short read per table).
+`Status.Lag` is that, sampled every `LagSampleInterval` (default 5 s) while the node is a
+standby. A caught-up standby reads 0 everywhere, because a follower's position moves past
+the transaction marker behind the last record. No metric is published yet.
+
+**Core change.** One: `ChangelogStorage.FollowedOffsets()` and `PartitionCount`, public,
+so that lag can be computed outside the core. No seam changed.
+
+**The kill -9 test.** `tests/Incremental.Kafka.FailoverApp` is a console program that is
+the wiring above and nothing else. Its pipeline: a keyed input of orders, joined to a
+shared `products` table (on Kafka, written by the leader), summed per customer; and the
+same records once more as facts, counted per bucket. Three keyed upsert sinks — the
+enriched orders, the totals, the counts — are written to one Kafka topic *outside* the
+transactional producer, so the sink is as unfenced as a database would be. The counts
+are there because upserts forgive: a record lost in mid-run is papered over by the next
+upsert of its key, and the final table would still match. A count is right only if every
+record was processed exactly once. (Found by a mutation: a successor that skipped 80
+records passed the kill -9 test until the counts were added.) The Kafka
+source adapter does not exist yet (step 6), so the input is a generator: record `i` is a
+pure function of `i`, and `i` is the offset the circuit checkpoints. A step is the next
+20 records, a checkpoint every 4 steps, and the table changes only before a step that
+begins a checkpoint interval, to a row that depends on the step alone. Those are the two
+conditions of step 2's failover test — replay cuts the same steps, and a replayed step
+reads the table it read the first time — met by construction rather than by a harness.
+The test computes the expected sinks from the same functions without running a circuit
+(`FailoverScenario.Expected`), and a run with no failure is checked against it first.
+
+The tests launch the program as real processes and talk to them over stdin and stdout:
+
+| Test | What is done to the leader | What is asserted |
+|---|---|---|
+| kill -9 | `SIGKILL` mid-stream, default timings, probe on | the standby leads under term 2 within the bound, resumes at a committed checkpoint at or past the last one the dead leader reported, finishes; the sink equals the model read either way; no term-1 record follows a term-2 record |
+| paused leader | `SIGSTOP` until the standby leads and has run 40 steps, then `SIGCONT` | the standby took over (the probe got no answer); the woken leader exits as fenced having committed nothing more; restarted, it is the new leader's standby; a third leadership on it starts at the last offset with nothing to do; the sink equals the model under the term rule; anything the zombie wrote late belongs to one step |
+| manual takeover, step down | `takeover` sent to the standby; later `stepdown` sent to the new leader | the old leader exits as fenced; the step down hands over in a fraction of `TakeoverAfter` (6 s here) and its successor resumes at exactly the next offset; the sink equals the model |
+| simultaneous start | two processes started together, no probe | exactly one finishes the work and leads; the other was fenced and exited (or stayed a standby); restarted, it follows the winner; the sink equals the model |
+
+**Measured failover** (one machine, one local broker, Debug build, three runs of the
+suite). kill -9 with the default timings — `TakeoverAfter` 3 s, heartbeat 1 s, the probe
+refused at once because the process is gone:
+
+| Part | Two runs | The third |
+|---|---|---|
+| Detection: kill to the standby deciding | 3.03 s, 3.07 s | 3.02 s |
+| Fence: `InitTransactions`, read the term, commit the next | 41 ms, 30 ms | 1.05 s |
+| Promote one table | 17 ms, 16 ms | 0.51 s |
+| Promote the storage (3 state partitions) | 5 ms | 2 ms |
+| Start the circuit and its sinks | 25 ms, 32 ms | 24 ms |
+| Decision to leading | 89 ms, 83 ms | 1.59 s |
+| Leading to the first sink write | 59 ms, 50 ms | 79 ms |
+| **Kill to the first sink write** | **3.18 s, 3.20 s** | **4.69 s** |
+
+Detection is nearly the whole of it: the leader was busy, so its last heartbeat was
+milliseconds old when it died, and the standby waited `TakeoverAfter` from there.
+Everything after the decision is about 0.15 s — unless the leader died with a transaction
+open, which is what the third run caught. Then `InitTransactions` waits about a second
+for the coordinator to abort it, and the table's follower, standing just short of an
+aborted tail, waits for the client's end-of-partition event (`fetch.wait.max.ms`, 0.5 s)
+before it knows it has reached the end. A lower `fetch.wait.max.ms` on the followers
+would buy that half second back for more idle fetches; it was left at the default. Other
+cases:
+
+- `SIGSTOP`, `TakeoverAfter` 1.5 s, heartbeat 0.3 s: 2.23 to 2.31 s from the stop to the
+  standby deciding — the timeout plus a probe that has to time out (0.75 s here) because
+  a stopped process accepts the connection and says nothing — and then as above, 2.39
+  to 2.45 s from the stop to the first sink write. The woken leader exited as fenced 7
+  to 16 ms after `SIGCONT`. In two runs it wrote nothing to the sink after its
+  successor's first record; in one it wrote 19 records, all of the one step it had in
+  flight when it was stopped. That is the gap the lease cannot close, seen once in
+  three; the term rule discarded them and the table was exact.
+- Manual takeover: 135 to 185 ms from the command to leading, 186 to 272 ms to the first
+  sink write; the old leader knew 88 to 110 ms after the command.
+- Step down: 173 to 243 ms from the command to the standby leading, which includes the
+  leader running to its next checkpoint and disposing its circuit.
+- Simultaneous start: in every run one node led under term 1 and the other was fenced on
+  its term commit and exited.
+
+**Deviations and limits.**
+
+- *Simultaneous cold start is settled by fencing, not avoided.* Two standbys with the
+  same timeout and no probe decide together; both initialise the transactional id; the
+  later wins and the earlier is fenced on its term commit and exits. That is the *Both
+  restart cold* row of *Failure modes*. With the TCP probe each sees the other as a
+  standby, so the probe does not prevent it either. No jitter was added. The loser may
+  have led for a moment — committed a term, even delivered — before reading the higher
+  term; the logs are safe by fencing and the sink by the term rule.
+- *A leader that is alive and leads nothing blocks failover.* Heartbeats come from the
+  log writer, not from the circuits. If every circuit has faulted for a reason of its
+  own and the process stays up, the standby hears a healthy leader. The host must step
+  down or exit when its circuits are gone (step 7).
+- *A Kafka outage longer than `transaction.timeout.ms` still ends the active* (steps 3
+  and 4): its heartbeat's transaction times out and reports as a fence.
+- *Lag sampling opens a consumer per table per sample* (the head read).
+- *The watch is a third consumer* on each node (one thread), beside the followers.
+- Not built: jitter or priority between standbys, more than one standby (nothing stops
+  it; nothing was tested), a published lag metric, an admin endpoint for the commands.
+
 ## Takeover sequence
 
 | # | Step | Waits for |
@@ -793,7 +1048,9 @@ committed before any circuit can pin it.
 **What dominates.** Detection: about 3 s when the process dies and the probe fails fast,
 up to probe timeout plus `TakeoverAfter` when the host vanishes. Steps 2 to 6 should total
 well under two seconds with a caught-up standby, but that is an estimate; nothing has been
-measured against MSK. Step 7 is under a second or two for Kafka sources. The exception is
+measured against MSK. (Measured locally in step 5: detection 3.05 s after a kill -9,
+steps 2 to 6 about 0.09 s, first sink write 0.06 s later. See *Measured failover* under
+*As built (step 5)*.) Step 7 is under a second or two for Kafka sources. The exception is
 a source that must re-snapshot (below): pipelines run immediately against the last
 committed table version, and the table catches up when the snapshot lands, which can take
 minutes.
@@ -1073,11 +1330,11 @@ step — on `Circuit.DeadLetters`.
 | Active dies mid-commit | The open transaction is aborted by the standby's `InitTransactions`, or completes if it had reached the coordinator's commit decision. Either way the standby reads a whole commit or none of it. |
 | Active dies mid-delivery | The checkpoint covering those steps was never taken. The new active replays and redelivers; sinks apply the upserts again. |
 | Network partition, both alive | The standby takes over only if it can reach Kafka, and doing so fences the old active's logs. The old active stops sink deliveries when its lease lapses and exits on its next commit. The sink gap above is the remaining exposure. |
-| Kafka unavailable | The active cannot commit: table versions stop publishing, pipelines stall at their commit point, inputs back up. The standby cannot fence, so it does not take over. Both recover when Kafka does. Nothing is lost; nothing progresses. |
+| Kafka unavailable | The active cannot commit: table versions stop publishing, pipelines stall at their commit point, inputs back up. The standby cannot fence, so it does not take over. Both recover when Kafka does. Nothing is lost; nothing progresses. (As built: the standby checks that it can reach the leader topic before it tries, so it does not sit in a takeover that would depose the leader on reconnect; and an outage longer than `transaction.timeout.ms` does end the active — see the two *As built* sections.) |
 | Kafka slow (broker election, patching) | Commits stall for seconds. The probe keeps the standby from taking over until `TakeoverCeiling`. |
 | Standby lagging | Takeover step 3 takes as long as the lag. Lag is a metric and an alert; a standby that cannot keep up is not a standby. |
 | Standby dies | No effect on the active. No failover cover until it has cold-restored, which takes minutes for large tables. |
-| Both restart cold | Whichever initialises the producer first becomes active after a full restore; the other is fenced on its first transaction if it also tried, exits, and returns as standby. Downtime is the cold restore. |
+| Both restart cold | Whichever initialises the producer first becomes active after a full restore; the other is fenced on its first transaction if it also tried, exits, and returns as standby. Downtime is the cold restore. (As built it is the one that initialises *last* that leads — that is what fencing means — and the test for it is the simultaneous start.) |
 | A pipeline's table version was truncated | That pipeline refuses to start and needs a new incarnation. Others are unaffected. |
 
 ## Tests
@@ -1119,7 +1376,18 @@ Against the local stack (`docker compose --profile connectors up -d`; tests skip
   final table equals a single-process reference run. It also asserts takeover time
   against a generous bound and that the killed process's term never appears after the
   new one. A variant pauses the active with `SIGSTOP` and resumes it after takeover, to
-  prove a zombie cannot commit.
+  prove a zombie cannot commit. *Built* (`KafkaFailoverProcessTests`, with
+  `tests/Incremental.Kafka.FailoverApp`), with two differences: the source is a
+  deterministic generator whose position is the checkpointed offset, because the Kafka
+  source adapter is step 6; and the reference is a model computed from the generator
+  rather than a second run, with a no-failure run checked against it. Also built: manual
+  takeover, step down, and two processes started together. See *As built (step 5)*.
+- **Leadership in one process** (`KafkaLeadershipTests`): heartbeats in every transaction
+  and when idle; a standby that waits while it hears the leader and takes over when it
+  does not; the probe holding it back until the ceiling; the TCP probe's answers; what a
+  deposed leader learns from the term and from its heartbeat; the promotion order; a
+  failed takeover that must stop heartbeating; lag figures; the lease lapsing under a
+  stalled writer and a leased sink refusing a deposed leader. *Built.*
 - **CDC**, through the Debezium container: Postgres changes reach a shared table, the
   connector is restarted to force duplicates, and the table matches the database.
 
@@ -1155,7 +1423,20 @@ soak run on a real cluster before the failover number is believed.
    has created it (`OpenTableLogAsync` waits); and the takeover order that is tested is
    `log.AcquireWriterAsync()`, each `table.PromoteAsync()`, `storage.PromoteAsync()`, each
    `circuit.Start()`.
-5. Leader topic heartbeats, the election, the takeover sequence; the kill -9 test.
+5. **Done.** Leader topic heartbeats, the election, the takeover sequence, the manual
+   commands, the delivery lease; the kill -9 test. See *As built (step 5)* under
+   *Leadership and fencing*. Steps 6 and 7 should know: every node starts as a standby
+   and `KafkaLeadership` calls `StartLeadingAsync(term)` when it leads — that is where a
+   source adapter connects, at `circuit.CommittedOffsets`; the failover app's generator
+   stands where the Kafka source will (`tests/Incremental.Kafka.FailoverApp/Program.cs`,
+   `RunAsync`), and swapping it for a real source topic is the test's next form; exact
+   sinks need replay to cut the same steps, which the generator gets by construction and
+   a real source will not (*A gap in "keyed upserts converge"*); `Fenced` and `Resigned`
+   end the process (the host should exit non-zero on `WhenFinished` and let its
+   supervisor restart it); the host must step down or exit when its circuits have
+   faulted, since heartbeats come from the log writer and not from them; the commands are
+   methods and need an endpoint; `Status` and `MeasureLagAsync` are what an admin page
+   reads; wrap external sinks in `leadership.Leased`.
 6. Kafka source adapter; resumption contracts for gRPC, files and CDC adapters.
 7. Active and standby roles in `Incremental.Hosting`.
 8. A soak on MSK to replace the estimates above with measurements.
@@ -1182,16 +1463,27 @@ soak run on a real cluster before the failover number is believed.
   found says compaction is unavailable, and nothing confirms it.
 - The exact conditions under which `InitProducerId` returns `CONCURRENT_TRANSACTIONS`,
   and so the worst-case duration of takeover step 2. KIP-98 states the abort-or-await
-  behaviour; the timing is unmeasured.
+  behaviour. Measured once locally (step 5): 1.05 s when the killed leader had a
+  transaction open, against 30 to 45 ms when it had not. The worst case, and the figure
+  on MSK, are still unknown.
 - ~~How `Confluent.Kafka` surfaces fencing.~~ Verified against the local broker:
   `Local_Fenced`, fatal from the transaction calls, not flagged fatal on a later
   `Produce`. See *Fencing, verified* under *As built: `Incremental.Kafka`*. Still not
   verified: that MSK's broker version reports it the same way, and what a producer sees
   when the broker itself aborts a timed-out transaction (the code treats any fatal error
   as a fence, which is safe either way).
-- Why `InitTransactions` takes about half a second against an idle local broker, and
-  whether it is shorter or longer on MSK. It is the largest part of a takeover measured
-  so far.
+- ~~Why `InitTransactions` takes about half a second.~~ It does not: it takes 2 to 55 ms
+  locally. The half second was a consumer assigned at a logical offset (*A logical start
+  offset costs half a second*). Still not verified: what it takes on MSK, across
+  availability zones, and when the old writer died with a transaction open.
+- That the probe and the last check against the broker behave on MSK during a broker
+  election or a rolling patch as intended: the leader's heartbeats stall, the probe
+  answers, the standby waits. Not exercised; it needs a broker that can be made to stall.
+- The standby's last check before a takeover (it asks for the leader topic's end offset
+  and stands down if it cannot, or if there are records it has not read) has no test.
+- Leadership timing under load on a small machine. A leader starved of CPU for longer
+  than `TakeoverAfter` is replaced; that is correct, but how often it happens on the
+  chosen instance size is unknown.
 - That the offset just below a last stable offset is always a transaction marker on MSK
   as it is on Kafka 3.9 (the readers finish a read to the end on that basis). If it were
   not, a read would fall back to the end-of-partition event and be slower, not wrong.

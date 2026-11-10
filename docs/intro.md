@@ -757,8 +757,68 @@ circuit.Start();
   it for you yet; the floor is the lowest `CommittedVersion(table)` of any pipeline that
   must still be able to restart.
 
-Leader election (who calls `AcquireWriterAsync`, and when) is not built yet; nor is a Kafka
-source adapter.
+**Who leads.** `KafkaLeadership` decides which of two nodes is the active, using Kafka and
+nothing else. The log's writer leaves a heartbeat in `{prefix}.leader` with every
+transaction, and commits one by itself each `HeartbeatInterval` (1 s) when idle. Every
+node starts as a standby and builds everything without starting it; the leadership takes
+over when it should:
+
+```csharp
+await using var log = await KafkaLog.ConnectAsync(new KafkaLogOptions { /* … */ NodeId = "node-a" });
+
+var leadership = new KafkaLeadership(log, new KafkaLeadershipOptions
+{
+    TakeoverAfter = TimeSpan.FromSeconds(3),                        // the default
+    ProbeLeader = LeadershipProbe.Tcp("node-b", 7100),              // optional: "is the leader still there?"
+    StartLeadingAsync = (term, ct) => { circuit.Start(); return Task.CompletedTask; },
+    StopLeadingAsync = async ct => await circuit.DisposeAsync(),    // used by StepDownAsync
+});
+await using var probe = LeadershipProbe.Listen(leadership, new IPEndPoint(IPAddress.Any, 7100));
+
+var tableLog = await log.OpenTableLogAsync<int, Instrument>("instruments");
+var instruments = await SharedTable<int, Instrument>.FollowAsync("instruments", i => i.Id, tableLog);
+var storage = ChangelogStorage.Follow(log.State);
+leadership.Track(instruments, tableLog);     // promoted first at takeover, in this order
+leadership.Track(storage);                   // then the storage; then StartLeadingAsync
+var circuit = Build(storage.Pipeline("enrichment"), instruments);
+
+leadership.Changed += status =>
+{
+    if (status.Role is NodeRole.Fenced or NodeRole.Resigned)
+        Environment.Exit(3);                 // the supervisor restarts it as a standby
+};
+await leadership.StartAsync();
+```
+
+- **Roles.** `Standby → Promoting → Leader`, ending in `Fenced` (replaced, or the takeover
+  failed) or `Resigned` (stepped down). Both ends are final for the process.
+- **When a standby takes over.** The leader topic has been silent for `TakeoverAfter` and
+  the probe, if there is one, does not answer as a leader; or silent for `TakeoverCeiling`
+  (30 s) whatever the probe says; or the leader resigned; or `TakeOverAsync()` was called.
+  The probe only prevents needless failovers when Kafka itself stalls. It never decides
+  who may write: that is the `transactional.id`. Two standbys that decide together both
+  try; one is fenced.
+- **A first start is a takeover.** Nobody heartbeats, so the node leads after
+  `TakeoverAfter`, or at once on `TakeOverAsync()`. A new table's log can only be opened
+  by the writer, so on that first start `OpenTableLogAsync` completes during the
+  takeover: start the build before `StartAsync` and await it in
+  `KafkaLeadershipOptions.PrepareAsync`.
+- **Commands.** `TakeOverAsync()` on a standby fences a live leader and replays what it
+  had not committed. `StepDownAsync()` on the leader stops its circuits, commits a
+  resignation and lets the standby take over at once with nothing to replay.
+- **Being replaced.** A leader reads the new term in the leader topic within milliseconds;
+  otherwise its next commit or heartbeat fails. Either way every later commit throws, so
+  its circuits fault, and the role becomes `Fenced`.
+- **Sinks.** Fencing covers what is written through the log, not an external sink.
+  `leadership.Leased(sink)` makes every write wait for the lease: the leader's last
+  committed transaction must have begun less than `TakeoverAfter` minus `LeaseMargin` ago,
+  which is before any standby can have decided to replace it. A sink that can compare
+  terms can also store `leadership.Term` with each row and refuse an older one.
+- **Status.** `leadership.Status` gives role, term, the leader's node id and term, the
+  heartbeat's age, whether the lease is held, and a standby's lag — offsets behind per
+  state partition, versions behind per table (`MeasureLagAsync()` measures it now).
+
+A Kafka source adapter is not built yet.
 
 A commit is due at the end of the step that reaches `CheckpointInterval`, or — with
 `CheckpointMaxDelay` set — of the first step that ends after the oldest uncommitted step has

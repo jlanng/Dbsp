@@ -489,6 +489,10 @@ public sealed class KafkaLog : IAsyncDisposable
         }
     }
 
+    /// <summary>Called on the writer thread before each transaction. For tests: blocking
+    /// here is a writer that has stalled without being fenced.</summary>
+    internal Action? BeforeTransaction { get; set; }
+
     private int HeartbeatWait()
     {
         var interval = (long)_options.HeartbeatInterval.TotalMilliseconds;
@@ -586,6 +590,7 @@ public sealed class KafkaLog : IAsyncDisposable
     {
         culprit = null;
         error = null;
+        BeforeTransaction?.Invoke();
         var began = Environment.TickCount64;
         try
         {

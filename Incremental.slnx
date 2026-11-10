@@ -18,6 +18,7 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Incremental.ClusterHost/Incremental.ClusterHost.csproj" />
+    <Project Path="tests/Incremental.Kafka.FailoverApp/Incremental.Kafka.FailoverApp.csproj" />
     <Project Path="tests/Incremental.Kafka.Tests/Incremental.Kafka.Tests.csproj" />
     <Project Path="tests/Incremental.Tests/Incremental.Tests.csproj" />
   </Folder>

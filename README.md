@@ -434,8 +434,40 @@ so implementations never see cross-thread access to one store.
   ```
 
   `KafkaLogOptions.ClientConfig` passes any librdkafka setting to every client (TLS and
-  SASL for MSK). Not built yet: the leader heartbeat and election, the Kafka source
-  adapter, hosting roles.
+  SASL for MSK).
+
+- `KafkaLeadership` decides which of two nodes is the active, in Kafka alone. The writer
+  leaves a heartbeat in `{prefix}.leader` with every transaction and once a second when
+  idle. Every node starts as a standby — followers, circuits built and not started — and
+  takes over when the topic has been silent for `TakeoverAfter` (3 s; an optional peer
+  probe can hold it back), when the leader resigns, or on `TakeOverAsync()`: it fences the
+  old leader, commits the next term, promotes the tracked tables, then the storage, then
+  calls `StartLeadingAsync`:
+
+  ```csharp
+  var leadership = new KafkaLeadership(log, new KafkaLeadershipOptions
+  {
+      ProbeLeader = LeadershipProbe.Tcp("node-b", 7100),               // a hint, optional
+      StartLeadingAsync = (term, ct) => { circuit.Start(); return Task.CompletedTask; },
+      StopLeadingAsync = async ct => await circuit.DisposeAsync(),     // for StepDownAsync
+  });
+  var tableLog = await log.OpenTableLogAsync<int, Instrument>("instruments");
+  var instruments = await SharedTable<int, Instrument>.FollowAsync("instruments", i => i.Id, tableLog);
+  var storage = ChangelogStorage.Follow(log.State);
+  leadership.Track(instruments, tableLog);
+  leadership.Track(storage);
+  leadership.Changed += status => { if (status.Role is NodeRole.Fenced) Environment.Exit(3); };
+  await leadership.StartAsync();
+  ```
+
+  A replaced leader ends `Fenced` (it reads the higher term, or its next write fails) and
+  the process is expected to exit and return as a standby. `StepDownAsync()` is the
+  planned handover. `leadership.Leased(sink)` holds sink deliveries back once the leader's
+  last commit is older than the lease, and `leadership.Status` reports role, term, leader,
+  heartbeat age and follower lag. Measured locally with real processes: 3.2 s from
+  `kill -9` to the standby's first output, 3.05 s of which is the timeout (4.7 s when the
+  leader died with a transaction open). Not built yet:
+  the Kafka source adapter, hosting roles.
 
 - Candidates that make sense next: RocksDB (large state, embedded, fast scans), SQLite.
 
@@ -542,12 +574,16 @@ src/Incremental                    core: Z-sets, builder API, operators, windows
                                        storage, cluster transports (TCP + in-memory)
 src/Incremental.Storage.Redis      Redis-backed IStorageProvider
 src/Incremental.Kafka              Kafka-backed state changelog and shared-table logs, written
-                                       through one transactional producer per process
+                                       through one transactional producer per process; leader
+                                       election and takeover (KafkaLeadership)
 tests/Incremental.Tests            xunit: Z-set algebra, per-step delta semantics, multi-worker runs,
                                        Redis integration (auto-skipped when Redis is down)
 tests/Incremental.Kafka.Tests      xunit, against the local broker (`docker compose --profile
                                        connectors up -d`; auto-skipped when it is down): the log
-                                       writer, fencing, restore, compaction, failover end to end
+                                       writer, fencing, restore, compaction, failover end to end,
+                                       leadership, and kill -9 failover between real processes
+tests/Incremental.Kafka.FailoverApp  the process those failover tests launch twice: one pipeline,
+                                       leader or standby as its KafkaLeadership decides
 examples/Incremental.Example       joined + aggregated order analytics with live retraction
 examples/Incremental.LogAnalytics  simulated clickstream → 5s tumbling windows → counts → live top-3
                                        per window, rendered as an in-place Spectre.Console dashboard
@@ -794,7 +830,9 @@ disclosed trade-offs (below), not missing semantics:
       far — commit after delivery, acknowledged outputs and sinks, the state changelog seam
       (`IStateChangelog`), `ChangelogStorage` with follower mode and promotion, table
       followers, and both logs on Kafka through one transactional producer with group
-      commit and `transactional.id` fencing (`Incremental.Kafka`); to come — the leader
-      heartbeat and election, source adapters, active/standby roles in `Incremental.Hosting`
+      commit and `transactional.id` fencing (`Incremental.Kafka`), and leader heartbeats,
+      election, takeover, step down and the delivery lease (`KafkaLeadership`), tested by
+      `kill -9` between real processes; to come — source adapters, active/standby roles in
+      `Incremental.Hosting`
 - [ ] Investigate off-heap in-process storage to reduce GC (RocksDB, SQLite candidates)
 - [ ] Cluster transport TLS/authentication
