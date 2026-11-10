@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Acme.Contracts\Acme.Contracts.csproj" />
+    <ProjectReference Include="..\Acme.RefData\Acme.RefData.csproj" />
+  </ItemGroup>
+
+</Project>

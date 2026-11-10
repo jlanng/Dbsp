@@ -26,6 +26,10 @@ jobs:
       # (SnapshotCutTests) run.
       - name: Test Kafka
         run: dotnet test --project tests/Incremental.Kafka.Tests -c Release --no-build
+      # In memory throughout: the service's tests need no broker. They load real plugin
+      # assemblies from the test plugin projects' output directories, which the build made.
+      - name: Test Service
+        run: dotnet test --project tests/Incremental.Service.Tests -c Release --no-build
       # Validates the NuGet packaging (metadata, XML docs, SourceLink, symbols) on every build.
       - name: Pack
         run: |
@@ -33,6 +37,7 @@ jobs:
           dotnet pack src/Incremental.Storage.Redis -c Release --no-build -o artifacts/packages
           dotnet pack src/Incremental.Hosting -c Release --no-build -o artifacts/packages
           dotnet pack src/Incremental.Kafka -c Release --no-build -o artifacts/packages
+          dotnet pack src/Incremental.Service -c Release --no-build -o artifacts/packages
       - name: Upload packages
         uses: actions/upload-artifact@v7
         with:
