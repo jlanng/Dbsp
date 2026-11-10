@@ -178,6 +178,12 @@ public sealed class SharedTable<TKey, TRow> : ITableNode, IAsyncDisposable
     /// <summary>Whether this table is following its log rather than writing it.</summary>
     public bool IsFollowing => Writer.Following;
 
+    /// <summary>Why this table stopped following its log, or null while it follows (or
+    /// writes). A follower that faults — its next version was trimmed from the log, say —
+    /// keeps serving the last version it applied and can never be promoted: dispose it and
+    /// follow the log again.</summary>
+    public Exception? FollowFault => _followFault;
+
     private async Task FollowLogAsync(CancellationToken stop)
     {
         try
@@ -798,6 +804,12 @@ public readonly struct TableSnapshot<TKey, TRow> : IDisposable
             into.Add(row);
         }
     }
+
+    /// <summary>Every row as of <see cref="Version"/>, in no particular order: one scan of
+    /// the table, for small tables and for sampling. Throws if the writer revokes the pin
+    /// part-way (<see cref="SharedTableOptions.MaxRetainedVersions"/>) rather than end
+    /// short.</summary>
+    public IEnumerable<KeyValuePair<TKey, TRow>> Rows() => _table.RowsAt(Version);
 
     public void Dispose() => _table.ReleasePin(Version);
 }

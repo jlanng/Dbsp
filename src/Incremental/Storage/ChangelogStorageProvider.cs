@@ -49,8 +49,10 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
 
     private readonly ChangelogStorage _storage;
     private readonly int _partition;
-    private readonly Utf8StateSerializer _serializer;
-    private readonly RecordEncoder _encoder;
+    // Replaced only by UseSerializer, under the lock, while no typed store exists.
+    private Utf8StateSerializer _serializer;
+    private RecordEncoder _encoder;
+    private readonly byte[] _pipelineUtf8;
 
     // Guards everything below. Taken by the follower per record, and by the circuit when
     // it creates a store, recovers and commits — never by a store operation: once the
@@ -80,8 +82,76 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         _storage = storage;
         _partition = partition;
         _serializer = new Utf8StateSerializer(serializer);
-        _encoder = new RecordEncoder(_serializer, Encoding.UTF8.GetBytes(pipelineId));
+        _pipelineUtf8 = Encoding.UTF8.GetBytes(pipelineId);
+        _encoder = new RecordEncoder(_serializer, _pipelineUtf8);
         PipelineId = pipelineId;
+    }
+
+    /// <summary>The offsets of the last commit — input positions, the step marker and the
+    /// versions of the tables the pipeline reads (<c>{table}#t</c>) and writes
+    /// (<c>{table}#w</c>) — as a copy. Readable in any role and with no circuit built: on a
+    /// follower it is the last commit applied. Empty before the first commit.</summary>
+    public IReadOnlyDictionary<string, long> CommittedOffsets
+    {
+        get
+        {
+            lock (_lock)
+                return new Dictionary<string, long>(_committedOffsets);
+        }
+    }
+
+    /// <summary>
+    /// Forgets the typed stores handed out so far and keeps what they held as the bytes the
+    /// changelog holds for them, exactly as if no circuit had been built on this provider
+    /// yet. The next circuit creates its stores from those bytes, with whatever key and
+    /// value types it declares — which is how a pipeline's state passes from one version
+    /// of its code to another (the types of two loads of an assembly are different types),
+    /// and what lets the first version's types be unloaded. Writes since the last commit
+    /// are undone first. No circuit may be running on this provider, and the circuits built
+    /// on it before the call must not be started afterwards. Valid in either role.
+    /// </summary>
+    public void ReleaseStores()
+    {
+        lock (_lock)
+        {
+            if (_stores.Count == 0)
+                return;
+            var collect = new ReleasingTransaction();
+            _encoder.Begin(collect, _partition, 0);
+            foreach (var (name, store) in _stores)
+            {
+                store.Rollback();
+                // Bytes that never reached the store (a failed Apply leaves them) stay.
+                if (!_pending.TryGetValue(name, out var entries))
+                    _pending[name] = entries = new Dictionary<byte[], byte[]>(ByteArrayComparer.Instance);
+                collect.Into = entries;
+                _encoder.Store(store.NameUtf8);
+                store.WriteEntries(_encoder);
+            }
+            _stores.Clear();
+            _lastStore = null;
+            _lastPending = null;
+            _lastStoreName = [];
+        }
+    }
+
+    /// <summary>Replaces the serializer the stores created from now on read and write
+    /// with. Allowed only while the provider holds no typed store (before the first
+    /// circuit, or after <see cref="ReleaseStores"/>): a serializer caches metadata for
+    /// every type it has seen, so giving each generation of a pipeline its own lets that
+    /// cache go with the generation. It must produce the format the changelog already
+    /// holds.</summary>
+    public void UseSerializer(IStateSerializer serializer)
+    {
+        ArgumentNullException.ThrowIfNull(serializer);
+        lock (_lock)
+        {
+            if (_stores.Count != 0)
+                throw new InvalidOperationException(
+                    $"Pipeline '{PipelineId}' has typed stores created with the current serializer; call ReleaseStores first.");
+            _serializer = new Utf8StateSerializer(serializer);
+            _encoder = new RecordEncoder(_serializer, _pipelineUtf8);
+        }
     }
 
     /// <summary>The pipeline's durable identity; see <see cref="ChangelogStorage.Pipeline"/>.</summary>
@@ -474,6 +544,25 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             lock (_lock)
                 return _stores.Values.Sum(s => (long)s.HeldCount);
         }
+    }
+
+    /// <summary>Takes the records <see cref="ReleaseStores"/> has a store write, keyed by
+    /// the entry part of the record key.</summary>
+    private sealed class ReleasingTransaction : IStateChangelogTransaction
+    {
+        public Dictionary<byte[], byte[]> Into = null!;
+
+        public void Append(int partition, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        {
+            // Past "pipeline NUL incarnation NUL store NUL".
+            var rest = key[(key.IndexOf((byte)0) + 1)..];
+            rest = rest[(rest.IndexOf((byte)0) + 1)..];
+            Into[rest[(rest.IndexOf((byte)0) + 1)..].ToArray()] = value.ToArray();
+        }
+
+        public void AppendTombstone(int partition, ReadOnlySpan<byte> key) => throw new NotSupportedException();
+        public ValueTask CommitAsync(CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public void Dispose() { }
     }
 
     /// <summary>Renders the records <see cref="DescribeState"/> has the stores write.</summary>
