@@ -296,6 +296,59 @@ public class SupervisorTests
         Assert.Equal(100, service.Pipelines.Get("counts").Sources.Single().Stats.Records);
     }
 
+    /// <summary>An upsert sink that takes its time, so a backlog stands between the
+    /// source and the sink when the pipeline is stopped.</summary>
+    private sealed class SlowSinkConnector(MemoryConnector memory, TimeSpan delay) : IUpsertSinkConnector
+    {
+        public ConnectorDescription Describe(System.Text.Json.JsonElement config) =>
+            config.TryGetProperty("name", out _) ? new("slow memory") : throw new ArgumentException("the slow connector needs a name");
+
+        public IUpsertSink<TKey, TRow> Create<TKey, TRow>(SinkContext context) where TKey : notnull =>
+            new Slow<TKey, TRow>(memory.UpsertSink<TKey, TRow>(context.Config.GetProperty("name").GetString()!), delay);
+
+        private sealed class Slow<TKey, TRow>(IUpsertSink<TKey, TRow> inner, TimeSpan delay) : IUpsertSink<TKey, TRow> where TKey : notnull
+        {
+            public async ValueTask WriteAsync(UpsertBatch<TKey, TRow> batch, CancellationToken cancellationToken)
+            {
+                await Task.Delay(delay, cancellationToken);
+                await inner.WriteAsync(batch, cancellationToken);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Stop_drains_what_the_circuit_has_taken_in_while_the_sink_still_reads()
+    {
+        var memory = new MemoryConnector();
+        await using var service = await StartAsync(memory: memory,
+            configure: b => b.AddSinkConnector("slow", _ => new SlowSinkConnector(memory, TimeSpan.FromMilliseconds(15))));
+        await service.DeployAsync(Spec("counts", "counts", "in", "out") with
+        {
+            Sinks = new Dictionary<string, System.Text.Json.JsonElement> { ["out"] = Json("""{ "connector": "slow", "name": "out" }""") },
+            Circuit = new PipelineCircuitOptions { MaxStepItemsPerInput = 10 },
+        });
+        var output = memory.UpsertSink<string, long>("out");
+        memory.Log<Trade>("in").AppendRange(Trades(0, 300));
+
+        // The source has handed everything to the circuit; the slow sink has seen little of it.
+        await Eventually(() => service.Pipelines.Get("counts").Sources.Single().Stats.Records == 300, "the source reading all three hundred");
+        Assert.True(output.Rows.Values.Sum() < 300, "the sink kept up; the test needs a backlog");
+
+        // Stop order: sources, then the circuit — which drains while the delivery still
+        // reads, and commits only what the sink acknowledged — then the delivery.
+        await service.Pipelines.StopAsync("counts", new ActionOptions(), default);
+        Assert.Equal(PipelineState.Stopped, service.Pipelines.Get("counts").State);
+        Assert.True(Same(output.Rows, Counts.Model(Trades(0, 300))));
+        Assert.Equal(299, service.Pipelines.Get("counts").CommittedOffsets["trades#p0"]);
+
+        // A kind the connector does not implement is refused at the dry run, both named.
+        var mismatch = await Assert.ThrowsAsync<ServiceException>(() => service.DeployAsync(Spec("p", "wedge", "in2", "o") with
+        {
+            Sinks = new Dictionary<string, System.Text.Json.JsonElement> { ["out"] = Json("""{ "connector": "slow", "name": "o" }""") },
+        }));
+        Assert.Contains(mismatch.Details, d => d.Contains("AppendSink") && d.Contains("'slow'"));
+    }
+
     [Fact]
     public async Task Reset_starts_a_new_incarnation_and_replays_the_source()
     {
@@ -418,9 +471,16 @@ public class SupervisorTests
         Assert.Equal(10, service.Pipelines.Pipelines.Count);
 
         // A value over the cap is refused before it is staged, and the writer survives it.
-        var huge = Spec("big", "counts", "in", "out") with { Settings = Json("{ \"blob\": \"" + new string('x', 300_000) + "\" }") };
+        var huge = Spec("big", "counts", "in", "out") with
+        {
+            Sinks = new Dictionary<string, System.Text.Json.JsonElement>
+            {
+                ["out"] = Json("{ \"connector\": \"memory\", \"name\": \"big-out\", \"note\": \"" + new string('x', 300_000) + "\" }"),
+            },
+        };
         var refused = await Assert.ThrowsAsync<ServiceException>(() => service.DeployAsync(huge));
-        Assert.True(refused.Status is 413 or 400);
+        Assert.Equal(("too-large", 413), (refused.Code, refused.Status));
+        Assert.DoesNotContain(service.Pipelines.Pipelines, p => p.Id == "big");
         await service.DeployAsync(Spec("after", "counts", "in-after", "out-after"));
         await service.Running("after");
     }

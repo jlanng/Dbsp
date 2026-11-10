@@ -89,6 +89,14 @@ public class NodeTests
             Assert.Equal(later.Count, second.Pipelines.Get(id).Sources.Single().Stats.Records);
         Assert.Equal(649, second.Pipelines.Get("counts").CommittedOffsets["trades#p0"]);
 
+        // The same spec, as a caller would format it rather than as the catalog stores it,
+        // is no change: it needs no state choice and replays nothing.
+        var again = await second.DeployAsync(Spec("counts", "counts", "trades", "counts"));
+        Assert.Contains(again.Plan.Steps, s => s.Contains("nothing that touches it changed"));
+        await second.Running("counts");
+        await SinksEqualModelAsync(memory, trades, instruments, "after redeploying an unchanged spec");
+        Assert.Equal(0, second.Pipelines.Get("counts").Sources.Single().Stats.Records);
+
         // A table change after the restart still corrects what was joined before it.
         instruments[3] = instruments[3] with { Symbol = "RENAMED" };
         var table = second.Tables.Get<int, Instrument>("instruments");
@@ -238,6 +246,46 @@ public class NodeTests
         memory.Log<Trade>("trades").AppendRange(trades);
         var counts = memory.UpsertSink<string, long>("counts");
         await Eventually(() => Same(counts.Rows, Counts.Model(trades)), "the good pipeline's output on the new leader");
+    }
+
+    [Fact]
+    public async Task A_successor_finishes_a_reset_and_a_removal_its_predecessor_only_recorded()
+    {
+        var cluster = new InMemoryServiceCluster();
+        var memory = new MemoryConnector();
+        var trades = Trades(0, 150);
+        memory.Log<Trade>("trades").AppendRange(trades);
+        await using (var first = await StartAsync(cluster, "a", memory))
+        {
+            await first.DeployAsync(Spec("to-reset", "counts", "trades", "reset-out"));
+            await first.DeployAsync(Spec("to-remove", "counts", "trades", "remove-out"));
+            var counted = memory.UpsertSink<string, long>("reset-out");
+            await Eventually(() => Same(counted.Rows, Counts.Model(trades)), "the first leader's output");
+            await first.Pipelines.StopAsync("to-reset", new ActionOptions(), default);
+            await first.Pipelines.StopAsync("to-remove", new ActionOptions(), default);
+
+            // The leader commits its intent and dies before acting on it.
+            using var write = await first.Node.Catalog.BeginAsync(default);
+            write.Put("pipeline/to-reset", first.Pipelines.Spec("to-reset") with { Desired = DesiredState.Running, Pending = "reset" });
+            write.Put("pipeline/to-remove", first.Pipelines.Spec("to-remove") with { Desired = DesiredState.Removed, Pending = "remove" });
+            await write.CommitAsync(default);
+        }
+        Assert.True(cluster.State.RecordCount > 2);
+
+        await using var second = await StartAsync(cluster, "a", memory);
+
+        // The removal is finished and the pipeline never started.
+        Assert.DoesNotContain(second.Pipelines.Pipelines, p => p.Id == "to-remove");
+        Assert.Null(second.Node.Catalog.Get("pipeline/to-remove"));
+        Assert.Empty(second.Node.Catalog.Get<PipelineSpec>("pipeline/to-reset")!.Pending ?? "");
+
+        // The reset is finished before the pipeline is built: a new incarnation, so its
+        // source replays from the start into a sink the connector cleared.
+        await second.Running("to-reset");
+        Assert.Null(second.Pipelines.Spec("to-reset").Pending);
+        var fresh = memory.UpsertSink<string, long>("reset-out");
+        await Eventually(() => Same(fresh.Rows, Counts.Model(trades)), "the reset pipeline's replayed output");
+        Assert.Equal(150, second.Pipelines.Get("to-reset").Sources.Single().Stats.Records);
     }
 
     [Fact]

@@ -412,6 +412,17 @@ so implementations never see cross-thread access to one store.
   what was built:
   [docs/design/durability-and-standby.md](docs/design/durability-and-standby.md).
 
+- `Incremental.Service` is what makes the set of tables and pipelines change while the
+  process runs: a registry that owns the shared tables and their loaders, a supervisor
+  that runs one circuit per pipeline and deploys, replaces, resets and removes them one at
+  a time, pipeline definitions loaded from plugin assemblies at runtime, and a catalog — a
+  shared table — recording what is deployed, which a standby follows and a restarted node
+  rebuilds from. It is written against one backend interface; the in-memory backend is
+  built (one or several nodes in a process, real fencing, no broker), the Kafka backend
+  and the admin UI are not yet. See *Running many pipelines* in
+  [docs/intro.md](docs/intro.md) and
+  [docs/design/enrichment-service.md](docs/design/enrichment-service.md), *As built*.
+
 - `Incremental.Kafka` puts both logs on Kafka. One `KafkaLog` per process owns one
   transactional producer; `log.State` is the `IStateChangelog` over the compacted topic
   `{prefix}.state`, and `log.OpenTableLogAsync<TKey, TRow>(name)` is a table's `ITableLog`
@@ -620,6 +631,10 @@ src/Incremental.Kafka              Kafka-backed state changelog and shared-table
                                        through one transactional producer per process; leader
                                        election and takeover (KafkaLeadership); sources into
                                        inputs and tables (KafkaSource), sinks, Debezium decoding
+src/Incremental.Service            the generic parts of an enrichment service: table registry,
+                                       pipeline supervisor (one circuit per pipeline), plugin
+                                       loading, catalog, service node; an in-memory backend
+                                       (Kafka backend and admin UI to come)
 tests/Incremental.Tests            xunit: Z-set algebra, per-step delta semantics, multi-worker runs,
                                        Redis integration (auto-skipped when Redis is down)
 tests/Incremental.Kafka.Tests      xunit, against the local broker (`docker compose --profile
@@ -629,6 +644,10 @@ tests/Incremental.Kafka.Tests      xunit, against the local broker (`docker comp
                                        sources and sinks, and Postgres → Debezium → table CDC
 tests/Incremental.Kafka.FailoverApp  the process those failover tests launch twice: one pipeline,
                                        leader or standby as its KafkaLeadership decides
+tests/Incremental.Service.Tests    xunit, in memory (no broker): registry, supervisor, plugins,
+                                       catalog, two-node takeover
+tests/Incremental.Service.TestPlugins  contract and pipeline assemblies those tests load at
+                                       runtime from their output directories; built, never referenced
 examples/Incremental.Example       joined + aggregated order analytics with live retraction
 examples/Incremental.LogAnalytics  simulated clickstream → 5s tumbling windows → counts → live top-3
                                        per window, rendered as an in-place Spectre.Console dashboard
@@ -738,9 +757,10 @@ its own project; `docs/intro.md` has them under *Running it fast*.
 
 ## Packaging
 
-MIT-licensed (see `LICENSE`). The four shipped libraries (`Incremental`,
-`Incremental.Storage.Redis`, `Incremental.Kafka`, and `Incremental.Hosting` — generic-host
-and DI integration, see *Hosting it* in `docs/intro.md`) multi-target **net8.0 and net10.0** and carry full NuGet
+MIT-licensed (see `LICENSE`). The five shipped libraries (`Incremental`,
+`Incremental.Storage.Redis`, `Incremental.Kafka`, `Incremental.Hosting` — generic-host
+and DI integration, see *Hosting it* in `docs/intro.md` — and `Incremental.Service`, see
+*Running many pipelines* there) multi-target **net8.0 and net10.0** and carry full NuGet
 metadata — `dotnet pack` produces consumable packages with XML docs, SourceLink, and
 symbol packages (not yet published to nuget.org; consume by project reference or a local
 feed). The only runtime dependency of the core library is

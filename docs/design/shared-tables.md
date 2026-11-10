@@ -873,3 +873,14 @@ rules as an adapter.
    and a stalled table commit is not ended by the host's shutdown timeout.
 7. Registration in `Incremental.Hosting`; the TradeEnrichment example moved onto tables as
    the worked example.
+
+## As built: seams for the enrichment service (2026-11-10)
+
+Two small public reads, made for `Incremental.Service` (enrichment-service.md, *As built*):
+
+- `TableSnapshot.Rows()`: every row as of the pinned version, the public form of the
+  internal scan (`RowsAt`). It throws rather than end short if the pin is revoked
+  part-way. The service's catalog — a small shared table — is read with it.
+- `SharedTable.FollowFault`: why a following table stopped following, or null. A follower
+  whose next version was trimmed keeps serving its last version and can never be
+  promoted; this makes that visible before a takeover fails on it.

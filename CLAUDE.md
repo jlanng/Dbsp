@@ -16,6 +16,9 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   `INCREMENTAL_KAFKA_BOOTSTRAP` points them at another broker. `KafkaFailoverProcessTests`
   launch `tests/Incremental.Kafka.FailoverApp` as real processes and kill, stop and
   command them; measured numbers go to `measurements.log` beside the test assembly.
+- Service tests: `dotnet test --project tests/Incremental.Service.Tests` — in memory, no
+  broker. They load real plugin assemblies from `tests/Incremental.Service.TestPlugins/*/bin`,
+  which a solution build produces (the test project references them build-order only).
 - Connector stack: `docker compose --profile connectors up -d` adds Kafka (`localhost:9092`), Postgres with
   logical decoding (`localhost:5432`, user/password/db `incremental`) and Debezium's Kafka
   Connect (`localhost:8083`). Plain `docker compose up -d` stays Redis-only.
@@ -161,6 +164,25 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   the host supervises on `Circuit.Completion`. Shutdown order is the invariant: drain the
   circuit first, with consumers and views still reading, and stop those after — an unread
   output blocks the drain. Clustered circuits are not hostable yet.
+- `Incremental.Service` (docs/design/enrichment-service.md, *As built*) is one circuit per
+  pipeline over shared tables held by a registry, with the catalog — itself a shared table —
+  as the only record of what exists. Its rules:
+  - Everything durable or about roles goes through `IServiceBackend`; nothing in the
+    service names Kafka or the in-memory logs directly. Only the leader writes the catalog,
+    one action per version, and commits intent before it acts.
+  - A table, plugin or pipeline that fails is that thing's failure: shown, retried, never
+    thrown out of a takeover callback. Only the catalog and the storage may fail a node.
+  - Nothing waits without a bound, and nothing holds another pipeline's queue: teardown is
+    `StopTimeout`, then abandon, then `Wedged`.
+  - Nothing of a plugin's may be reachable from a static or a process-wide cache, or its
+    load context never unloads. That includes `JsonSerializerOptions`: a pipeline's types
+    go only through the per-version options on its `PluginLease`, and those are built with
+    a resolver of their own, because System.Text.Json shares one metadata cache between
+    options instances it considers equivalent. `Validator` (DataAnnotations) is avoided
+    for the same reason. The unload test in `PluginTests` is the check.
+  - The state binding: a pipeline's typed stores belong to one plugin version. Changing
+    the version, or anything else that changes what the state means, goes through
+    `ChangelogStorageProvider.ReleaseStores()` first.
 - Public API is fluent delegates with LINQ-dialect names (`Select`/`Where`/`GroupBy`),
   intentionally not LINQ/expression trees. The 0.2 surface is specced in `docs/intro.md`:
   windows exist only on groupings of an `EventTimeStream`; grouping types are staging types

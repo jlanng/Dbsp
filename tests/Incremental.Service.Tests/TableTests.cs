@@ -262,6 +262,84 @@ public class TableTests
     }
 
     [Fact]
+    public async Task A_writer_fault_is_the_tables_failure_and_the_node_keeps_leading()
+    {
+        var feed = new SequenceFeed();
+        await using var service = await StartAsync(configure: b => b.AddTableSource("sequence", _ => feed));
+        var instruments = Instruments(3);
+        lock (feed.Rows)
+            feed.Rows.AddRange(instruments);
+        await service.Tables.DeclareAsync(new TableSpec
+        {
+            Name = "poisonable", Definition = typeof(PoisonableInstrumentsTable).FullName!, Loader = new TableLoaderSpec("sequence"),
+        }, default);
+        var table = service.Tables.Get<int, Instrument>("poisonable");
+        await Eventually(() => table.Count == 3 && service.Tables.Stats("poisonable").Loader!.Position == "0:2", "the good rows");
+
+        // A pipeline joined to that table, and one that has nothing to do with it.
+        await service.DeployAsync(Spec("reader", "enrich", "in", "out") with { Tables = new Dictionary<string, string> { ["instruments"] = "poisonable" } });
+        await service.DeployAsync(Spec("bystander", "counts", "in", "counts"));
+        var trades = Trades(0, 30, instruments: 3);
+        service.Memory.Log<Trade>("in").AppendRange(trades);
+        var output = service.Memory.UpsertSink<long, EnrichedTrade>("out");
+        var counts = service.Memory.UpsertSink<string, long>("counts");
+        await Eventually(() => Same(output.Rows, Enrich.Model(trades, instruments)), "the reader's output");
+
+        // A row whose index selector throws faults the writer for good. The cause is
+        // deterministic, so every reopen from the log meets it again at the same position.
+        lock (feed.Rows)
+            feed.Rows.Add(new Instrument(4, "POISON", "ISIN4", 1));
+        await Eventually(() => service.Tables.Stats("poisonable").State == TableState.Failed, "the table failing");
+        var failed = service.Tables.Stats("poisonable");
+        Assert.Contains("0:2", failed.Fault);
+        Assert.Contains(service.Node.RecentEvents(), e => e is { Kind: "table", Subject: "poisonable" } && e.Message.Contains("writer faulted"));
+        Assert.Contains(service.Node.RecentEvents(), e => e is { Kind: "table", Subject: "poisonable", Message: "reopened from its log" });
+
+        // That is the table's failure. The node leads, and says what is wrong.
+        Assert.True(service.Node.IsLeader);
+        Assert.Contains("table-faulted", service.Node.Health.Reasons);
+        Assert.Equal(HealthLevel.Degraded, service.Node.Health.Level);
+
+        // Readers keep the last good version, on the instance the last reopen made: the
+        // pipeline that held the old one was rebuilt, and still answers correctly.
+        Assert.Equal(3, service.Tables.Stats("poisonable").Rows);
+        Assert.NotSame(table, service.Tables.Get<int, Instrument>("poisonable"));
+        var more = Trades(30, 30, instruments: 3);
+        service.Memory.Log<Trade>("in").AppendRange(more);
+        await Eventually(() => service.Pipelines.Get("reader").State == PipelineState.Running, "the reader running on the reopened table");
+        await Eventually(() => Same(output.Rows, Enrich.Model(trades.Concat(more), instruments)), "the reader's output after the table failed");
+        await Eventually(() => Same(counts.Rows, Counts.Model(trades.Concat(more))), "the bystander's output");
+        Assert.Equal(0, service.Pipelines.Get("bystander").Restarts);
+        Assert.Empty(service.Pipelines.Get("bystander").Faults);
+    }
+
+    [Fact]
+    public async Task Reopening_a_table_rebuilds_the_pipelines_that_held_the_old_instance()
+    {
+        await using var service = await StartAsync();
+        var instruments = Instruments(3);
+        var table = await service.DeclareInstrumentsAsync(instruments);
+        await service.DeployAsync(Spec("reader", "enrich", "in", "out"));
+        var trades = Trades(0, 30, instruments: 3);
+        service.Memory.Log<Trade>("in").AppendRange(trades);
+        var output = service.Memory.UpsertSink<long, EnrichedTrade>("out");
+        await Eventually(() => Same(output.Rows, Enrich.Model(trades, instruments)), "the reader's output");
+
+        await service.Tables.ReopenAsync("instruments", default);
+        var reopened = service.Tables.Get<int, Instrument>("instruments");
+        Assert.NotSame(table, reopened);
+        Assert.Equal(3, reopened.Count);
+
+        // The old instance will never see this version; a circuit still built on it would
+        // never correct its output.
+        instruments[0] = instruments[0] with { Symbol = "AFTER" };
+        await reopened.Writer.UpsertAsync(instruments[0]);
+        await reopened.Writer.CommitAsync();
+        await Eventually(() => Same(output.Rows, Enrich.Model(trades, instruments)), "the reader following the reopened table");
+        Assert.Equal(0, service.Pipelines.Get("reader").Restarts); // a rebuild, not a fault
+    }
+
+    [Fact]
     public async Task A_derived_table_has_one_writing_pipeline_and_any_number_of_readers()
     {
         await using var service = await StartAsync();

@@ -1,7 +1,9 @@
 # Design: the enrichment service
 
-> **Status:** proposed design, 2026-11-10, revised once after two reviews. Nothing here is
-> built. Build steps S0 to S4 (see *Build order*) record what they change under *As built*.
+> **Status:** proposed design, 2026-11-10, revised once after two reviews. S1 is built on
+> the in-memory backend, with the part of S0 it needed; S2 to S4 are not. *As built*, at
+> the end, says what exists and where it departs from this text — read it before relying
+> on any section. Build steps S0 to S4 (see *Build order*) record what they change there.
 > Sits on [shared-tables.md](shared-tables.md) and
 > [durability-and-standby.md](durability-and-standby.md); it is the "step 7 (hosting)" both
 > leave open, and the "pipeline registry" the second one declares out of scope.
@@ -1677,5 +1679,213 @@ Each has a default this design is built on.
 
 ## As built
 
-Nothing yet. Each build step records here what it built and where it departs from the
-text above.
+Each build step records here what it built and where it departs from the text above.
+
+### S0 — not built as a step; the part S1 needed was built with it
+
+When S1 started, nothing of S0 was in the tree: no core change, no spike, no example. S1
+is written against the core, so the seams it could not do without were built first, in
+the core, with their tests (`tests/Incremental.Tests/ChangelogReleaseTests.cs`, 5 tests).
+The rest of S0 is still to do.
+
+| | Built | As |
+|---|---|---|
+| C1 | in part | `ChangelogStorageProvider.ReleaseStores()`: typed stores become held bytes again (uncommitted writes are undone first), in either role. **No `layout`**: no parameter, no member in the commit record, no `Layout` property, no marker, no follower halves, no untouched-bytes retention. |
+| C2 | yes | `ChangelogStorageProvider.CommittedOffsets` (a copy; any role). |
+| C3 | no | `CircuitBuilder.Describe` does not exist. |
+| C4 | in part | `TableSnapshot.Rows()`. `RowsBy` is not built. |
+| C5 | yes | `ChangelogStorageProvider.UseSerializer`, refused while a typed store exists. |
+| C6 | yes | `SharedTable.FollowFault`. |
+| C7 | no | A refused `Start()` is still an `InvalidOperationException`. |
+| example (a), decode timing | no | |
+
+**What releasing does not make safe.** A store finds an entry by `Equals` and the log
+finds its record by the key's bytes, and the provider relies on a key serializing to the
+bytes it was read from. That holds across two loads of one assembly (same shape, other
+`Type` objects). It does not hold when a type that is part of an entry's *key* gains or
+loses a member — the value of a weight store (`Distinct`), the value half of an indexed
+weight store (a grouping's records): the new generation writes the entry under new key
+bytes and the old record is never overwritten or tombstoned, so a later restore reads
+both. A value store's value may change shape freely. `Keep` across such a change is
+therefore wrong in a way nothing detects; C1's untouched-bytes half would not catch it
+either. The test file shows both cases. Until the provider rewrites or refuses, the
+honest rule for authors is in docs/intro.md: `Keep` only while the shapes of types in
+store keys are unchanged.
+
+**The unload question is answered: collectible contexts unload.**
+`PluginTests.Two_versions_of_one_plugin_run_side_by_side_and_one_unloads_after_its_last_use`
+loads two versions, runs circuits with typed stores on both, replaces one pipeline across
+versions keeping its state, and sees the first version's context collected. Two things
+beyond the design's list had to be true for that:
+
+- **Per-generation `JsonSerializerOptions` are not enough by themselves.**
+  System.Text.Json shares one metadata cache between options instances it finds
+  equivalent. Two versions' options, built the same way, shared theirs; and the state
+  options (`IncludeFields = true`, nothing else) shared the cache of the process-wide
+  `JsonStateSerializer.DefaultOptions`, for ever. Each options instance the service builds
+  for a plugin version now carries a `DefaultJsonTypeInfoResolver` of its own, which makes
+  it equivalent to no other. The mutation that removes this fails the unload test.
+- **`System.ComponentModel.DataAnnotations.Validator` keeps a process-wide store of type
+  metadata.** Settings are validated attribute by attribute instead
+  (`ValidationAttribute.IsValid`), which touches no store.
+
+So pipeline contexts are collectible, and `MaxLoadedPluginVersions` is the backstop it was
+designed as.
+
+### S1 — the service core on the in-memory backend
+
+`src/Incremental.Service` (net8.0; net10.0; packed in CI), `tests/Incremental.Service.Tests`
+(34 tests, in memory) and `tests/Incremental.Service.TestPlugins` (five small projects:
+two contract assemblies, two builds of one pipeline plugin under one assembly name, and a
+second pipeline plugin; built, never referenced, loaded from their output directories).
+
+| File | Holds |
+|---|---|
+| `Backend.cs` | `IServiceBackend`, `IBlobStore`, `INodeLeadership`, the status records, `LeadershipCallbacks`, `ICatalogMirror` |
+| `InMemoryBackend.cs` | `InMemoryServiceCluster`, `InMemoryServiceBackend`, `InMemoryBackendOptions` (with `CatalogDirectory`) |
+| `Catalog.cs` | `Catalog` over `svc.catalog`, the write lock, audit, the value cap; `ActionPlan`, `ActionOptions`, `ServiceException` |
+| `ObjectStore.cs` | `IObjectStore`, `LocalObjectStore` |
+| `Tables.cs`, `TableRegistry.cs` | `TableDefinition`, `IndexDefinition`, `TableSpec`, the table source contract, the registry, the `file` loader, retention, stats |
+| `Plugins.cs` | the contract and plugin load contexts, import and its validation, manifests, settings binding, leases |
+| `Pipelines.cs`, `Connectors.cs` | the definition contract, `PipelineBuilder`, `PipelineSpec`, the connector interfaces and contexts, the `memory` connector |
+| `PipelineSupervisor.cs` | generations, the per-pipeline queue, deploy/replace/start/stop/restart/reset/remove, faults, dead letters |
+| `ServiceNode.cs`, `ServiceOptions.cs`, `ServiceCollectionExtensions.cs` | the node, health, readiness, events, role changes, shutdown; options; DI |
+
+**Departures from the text above.**
+
+1. **A standby builds nothing; it holds pipeline state as bytes** (*Open for James* 1,
+   the alternative, taken because C1's follower halves do not exist). The provider already
+   keeps a followed pipeline's records as bytes until a circuit creates its stores, so a
+   takeover builds each circuit from them and pays the decode. With that go `layout`,
+   `confirmed` and `previous` in the spec, the layout marker, `PipelineState.Built` (the
+   enum member stays, unused), plugin code on a standby, and "pipelines rebuilt on a
+   reopened follower". A standby's pipelines show `Unbuilt`. `StandbyReadiness` is
+   catalog applied, no table faulted or still opening, state lag zero.
+2. **Replace.** `Keep` is: stop, `ReleaseStores()`, build the new generation on the bytes.
+   There is no store-name check before the stop (no C3) and **no rollback**: a `Keep`
+   whose new generation cannot read the state faults, backs off and ends `Failed`, with
+   the committed state untouched for a redeploy of the old spec or a reset. The spec
+   holds `generation` and `pending` only.
+3. **The dry run** runs the definition against a `CircuitBuilder` that is never built. Its
+   shape is the slots, their kinds and types, and the tables read and written; no node
+   graph, no store names, no unnamed-store warnings. A table must be declared and open for
+   a spec that names it to validate.
+4. **Seam additions.** `IServiceBackend.RetainedHistoryVersions` (the cap is the
+   backend's: heap in memory, disk on Kafka; the registry needs it for `VersionsUntilCutLoose`)
+   and the optional `ICatalogMirror`, which is how `CatalogDirectory` is implemented
+   without the service knowing the in-memory backend.
+5. **Locks.** One queue per pipeline, the catalog's write lock, a declare lock in the
+   registry and a role gate in the node around `PrepareAsync`/`StartLeadingAsync` and a
+   standby's reconcile. There is no node-wide shared/exclusive gate; nothing found needed
+   one.
+6. **Connectors.** `memory` only (append and keyed inputs, upsert and append sinks,
+   resettable). The `file` source and sink connectors, the `deadLetters` sink slot and
+   `AddKafkaConnection` are not built. `ITableSourceFactory.Create` takes the
+   `TableLoaderSpec`, not only its config, so a factory sees the connection name.
+7. **Plugins.** The name is the main assembly's simple name in lower case; the main
+   assembly is the one with a `.deps.json` beside it, else the only `.dll`, else the one
+   `plugin.json` names. `.pdb` files are not part of a package. A second version of a
+   loaded contract is stored and shown `pending`; the row-shape comparison and its 409 are
+   not built. The plugin directory is imported before the pipelines start, not after, so
+   that a seeded pipeline can name a plugin from it. The settings schema has no defaults.
+   The duplicate-definition refusal is written and not tested (it needs a sixth plugin
+   project).
+8. **Tables.** The 80% retention warning (event and `Degraded` reason) is not built;
+   `VersionsUntilCutLoose` and the stop plan's line are. A cut-loose pipeline is recognised
+   by the text of the core's refusal ("no longer retained"), there being no C7. A faulted
+   writer is recognised by committing nothing and reading the refusal ("has faulted");
+   the core should expose the writer's fault. The writer-fault path is tested (an index
+   selector that throws on one row: the table reopens under the restart policy, ends
+   `Failed` naming the loader's position, the node leads on and the pipelines that read
+   it are rebuilt); the follower-fault reopen on a standby is written and **not tested**.
+   `registry.Get` refuses only a table with no table object (opening, or unopenable): one
+   whose loader or writer has failed still serves its last version, so its readers are
+   not `Blocked`. A table object keeps a tail of
+   its own, so the history cap bites only when the table is opened from its log again (a
+   restart, a takeover) — the cut-loose test restarts the service for that reason.
+9. **Node.** Health has no "no ready standby" reason (a lone in-memory node would be
+   permanently degraded; S2 decides with a real peer). `BlockedOn` is backoff, table,
+   sink-ack and source-paused. Exit code 5 and the catalog-writer watchdog are not built.
+   Shutdown's stop budget is 60% of `StopTimeout`, not of the host's remaining time, and
+   the `ShutdownTimeout` warning is not logged. `ServiceMetrics` and `PipelineTestHarness`
+   are not built.
+10. **The in-memory leadership tells a deposed leader directly** that it is fenced, at the
+    moment the new one acquires the writer; there is no heartbeat for it to miss.
+    `Leased` passes sinks through, so two in-memory nodes give no protection against a
+    deposed leader's last sink write landing after its successor's.
+
+**Found while building.**
+
+- *A runtime crash, not understood.* With the four test classes starting a node each at
+  the same moment, the test process died with `Internal CLR error (0x80131506)` in about
+  one run in five, at about a second in; the crash report shows the crashing thread in
+  native runtime code and the other threads in a node's first `PrepareAsync`. It does not
+  depend on collectible contexts (it happens with them made non-collectible) or on tiered
+  compilation or concurrent GC; disabling W^X made it rarer. Starting one node alone
+  before the parallel ones (`TestService.WarmUp`) removed it in 40 runs of 40. A
+  production process starts one node, so it is not exposed in the same way; **an example
+  that runs two nodes in one process (S4's `--nodes 2`) should start them one after the
+  other.** The same error is known on this machine as a rare failure of `dotnet build`.
+- *A spec compared by its JSON text.* The first version of the state-choice check
+  compared slot configs and settings as raw text, so a spec read back from the catalog
+  (compact) and the same spec as a caller formats it differed, and an unchanged redeploy
+  after a restart was refused with `state-choice-required`. A mutation run found it (the
+  seed check could be removed with no test failing, because the redeploy it allowed was
+  being refused for this reason). Specs are now compared in a canonical form: no
+  insignificant whitespace, members in name order.
+- *`Tables` as the name of a contract's static class* collides with the namespace
+  `Incremental.Tables` for code inside an `Incremental.*` namespace (the tests alias it).
+  Plugin authors in their own namespaces are not affected.
+
+**Tests** (`dotnet test --project tests/Incremental.Service.Tests`, 34, about 4 s). The
+five the step was asked for by name: twelve pipelines sharing a 200,000-row table (results
+against a model, the delivered strings reference-equal to the table's rows, and heap
+growth under half of one copy of the table); a pipeline deployed, replaced by reset,
+changed by a neutral setting and removed while another is fed continuously and ends equal
+to its model with no restart; a stopped pipeline holding the retention floor, then
+catching up, then releasing it; a poison record driving one pipeline through two backoffs
+to `Failed` while its neighbour runs on; and a whole-service restart on the same storage
+reproducing five pipelines from the catalog, with sinks equal to a model and each source
+having read only what arrived while the service was down. The plugin tests use real
+assemblies: two versions side by side, state kept across them, unload seen through a weak
+reference, two plugins and a catalog-delivered contract joining one table, hostile zips,
+the context cap.
+
+Mutation checks, each a one-line break of the behaviour, run against the suite: 30 killed
+— among them trim ignoring readers, no follower margin, never `Failed`, no backoff, the
+dead-letter output unread, a plugin given its private copy of a contract, a leaked plugin
+lease, the shared JSON cache, no state choice, a neutral setting treated as a change,
+a reset that keeps state, a stop that abandons instead of draining, no catalog value cap,
+no table fencing at takeover, a source that replays instead of resuming, zip inflation
+uncounted, unsafe zip names, blobs not stored, seeds applied every time, a pending reset
+not finished by a successor, an unbounded wedge, an unreadable record that never faults,
+a second writer of a derived table, a stale generation accepted, an unguarded step-down,
+a writer fault unseen, a reopened table not announced to its pipelines. One was
+equivalent (dropping the explicit `Unload()`: an unreachable collectible context is
+collected anyway — what matters is that nothing reaches it, which the leaked-lease and
+shared-cache mutations test). One survives: the deploy path's own `ReleaseStores` on a
+layout change is redundant with the check at generation start when the plugin version
+changes, and the case where it is not — another definition of the same version, kept —
+has no test.
+
+**Not built in S1, in one list** (each is also in the departures above): `layout`,
+`confirmed`, `previous` and rollback of a `Keep`; warm circuits on a standby; the graph
+and store names of a dry run; `file` source and sink connectors; the `deadLetters` slot;
+`AddKafkaConnection`; contract schema-change detection; the 80% retention warning;
+`no-progress` and `lease` in `BlockedOn`; the catalog-writer watchdog and exit code 5;
+`ServiceMetrics`; `PipelineTestHarness`; the shutdown-timeout warning; C3, C7, `RowsBy`
+and the rest of C1; example (a).
+
+**What S2 must know.**
+
+- The seam is `Backend.cs`. A Kafka backend implements `IServiceBackend` and
+  `INodeLeadership` and nothing else in the service changes; `ICatalogMirror` is not for
+  it. `OpenTableLogAsync` on a standby must complete only once the log exists, and on a
+  node that holds the writer must create it — the catalog's first open depends on both.
+- The leadership must call `PrepareAsync` after the writer is acquired and before the
+  tracked storage is promoted, and `StartLeadingAsync` after. The service sets its own
+  "leading" flag at the start of `StartLeadingAsync`, not from `Status.Role`.
+- `Leased` is where a real lease goes; the supervisor wraps every sink it creates.
+- A standby runs no plugin code. If *Open for James* 1 goes the other way, the supervisor
+  needs a build-without-start path and the core needs the rest of C1 first.
+- Start two nodes in one process one after the other (see the runtime crash above).

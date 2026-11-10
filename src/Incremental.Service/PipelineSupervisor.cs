@@ -258,12 +258,48 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         return changes;
 
         static string? Raw(IReadOnlyDictionary<string, JsonElement> bindings, string slot) =>
-            bindings.TryGetValue(slot, out var element) ? element.GetRawText() : null;
+            bindings.TryGetValue(slot, out var element) ? Canonical(element) : null;
 
         static Dictionary<string, string> Properties(JsonElement? settings) =>
             settings is { ValueKind: JsonValueKind.Object } s
-                ? s.EnumerateObject().ToDictionary(p => p.Name, p => p.Value.GetRawText(), StringComparer.OrdinalIgnoreCase)
+                ? s.EnumerateObject().ToDictionary(p => p.Name, p => Canonical(p.Value), StringComparer.OrdinalIgnoreCase)
                 : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>A JSON value as text that does not depend on how it was written: no
+    /// insignificant whitespace, object members in name order. A spec read back from the
+    /// catalog and the same spec as a caller formats it must compare equal.</summary>
+    private static string Canonical(JsonElement element)
+    {
+        using var buffer = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(buffer))
+            Write(element, writer);
+        return System.Text.Encoding.UTF8.GetString(buffer.GetBuffer(), 0, (int)buffer.Length);
+
+        static void Write(JsonElement value, Utf8JsonWriter writer)
+        {
+            switch (value.ValueKind)
+            {
+                case JsonValueKind.Object:
+                    writer.WriteStartObject();
+                    foreach (var property in value.EnumerateObject().OrderBy(p => p.Name, StringComparer.Ordinal))
+                    {
+                        writer.WritePropertyName(property.Name);
+                        Write(property.Value, writer);
+                    }
+                    writer.WriteEndObject();
+                    break;
+                case JsonValueKind.Array:
+                    writer.WriteStartArray();
+                    foreach (var item in value.EnumerateArray())
+                        Write(item, writer);
+                    writer.WriteEndArray();
+                    break;
+                default:
+                    value.WriteTo(writer);
+                    break;
+            }
+        }
     }
 
     // ── actions ────────────────────────────────────────────────────────────────────────

@@ -1966,3 +1966,31 @@ soak run on a real cluster before the failover number is believed.
 - Confluent.Kafka `IProducer` (transactions) and `IAdminClient` (`DeleteRecordsAsync`) —
   <https://docs.confluent.io/platform/current/clients/confluent-kafka-dotnet/_site/api/Confluent.Kafka.IProducer-2.html>,
   <https://docs.confluent.io/platform/current/clients/confluent-kafka-dotnet/_site/api/Confluent.Kafka.IAdminClient.html>
+
+## As built: seams for the enrichment service (2026-11-10)
+
+Three additions to `ChangelogStorageProvider`, made for `Incremental.Service`
+(enrichment-service.md, *As built*), tested in `tests/Incremental.Tests/ChangelogReleaseTests.cs`:
+
+- `CommittedOffsets`: the last commit's offsets as a copy, in either role and with no
+  circuit built. A registry reads the table versions a stopped pipeline's checkpoint still
+  needs (`{table}#t`, `{table}#w`) from it.
+- `ReleaseStores()`: the typed stores handed out so far are forgotten and what they held
+  becomes held bytes again, as if no circuit had been built — after undoing writes since
+  the last commit. The next circuit creates its stores from those bytes with its own key
+  and value types. This is how state passes between two loads of an assembly, whose types
+  are different `Type` objects, and it is the way out the "already created with different
+  key/value types" refusal lacked. No circuit may be running on the provider. It writes
+  nothing to the log.
+- `UseSerializer(serializer)`: replaces the serializer for stores created from now on;
+  refused while a typed store exists. One serializer per load of a pipeline's code lets
+  its type-metadata cache go with that load.
+
+**A limit of releasing, not fixed.** An entry's record is found in the log by its key's
+bytes, and the provider depends on a key serializing back to the bytes it was read from.
+A type that is part of an entry key — a weight store's value, an indexed weight store's
+value — which gains or loses a member between the generation that wrote the state and the
+one that reads it serializes to other bytes: the new generation's writes go to new
+records and the old ones are never overwritten or tombstoned, so a restore after that
+reads both. A value store's value is not part of a key and may change shape. Nothing
+detects the unsafe case.

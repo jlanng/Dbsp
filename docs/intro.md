@@ -1106,6 +1106,111 @@ ordering. The definition class is plain: `new PageAnalytics(builder)` works just
 a console app with no container in sight. Clustered circuits are not hostable yet — they
 step in explicit lockstep across processes, which needs a host-side stepping protocol.
 
+### Running many pipelines
+
+`Incremental.Hosting` runs one circuit whose definition is a class you compiled in.
+`Incremental.Service` is for the other shape: many circuits, deployed and changed while
+the process runs, joining a few large tables they all share. Each pipeline is one circuit;
+the tables live outside them, once per process.
+
+```csharp
+builder.Services.AddIncrementalService(o => o.PluginDirectory = "plugins")
+    .UseInMemoryBackend()                                   // the default; Kafka is to come
+    .AddObjectStore("refdata", _ => new LocalObjectStore("/var/lib/refdata"))
+    .AddContracts(typeof(Instrument).Assembly)              // row types and table definitions
+    .AddPlugin(typeof(TradeEnrichment).Assembly)            // definitions compiled into the host
+    .AddTable(Tables.Instruments, new TableLoaderSpec("file", "refdata", config));
+```
+
+A **table** is declared once, in a *contract assembly* (`[assembly: IncrementalContract]`),
+as a `TableDefinition<TKey, TRow>`: its name, its key, its indexes. A **pipeline** is a
+definition class; `Build` describes one circuit against named slots:
+
+```csharp
+[Pipeline("trade-enrichment")]
+public sealed class TradeEnrichment : IPipelineDefinition<TradeEnrichment.Options>
+{
+    public sealed record Options
+    {
+        [Range(0, 1e12)] public decimal MinNotional { get; init; }
+        [StateNeutral] public string? Label { get; init; }     // changes no stored row
+    }
+
+    public void Build(PipelineBuilder p, Options o)
+    {
+        var instruments = p.Table(Tables.Instruments);          // a TableRef: Join, Lookup, By(index)
+        var enriched = p.Input<Trade>("trades")                 // the core's InputStream<Trade>
+            .Where(t => t.Notional >= o.MinNotional)
+            .GroupBy(t => t.InstrumentId)
+            .Join(instruments, (_, t, i) => new EnrichedTrade(t.Id, i.Symbol, t.Notional * i.Multiplier))
+            .Named("joined");
+        p.UpsertSink("enriched", enriched, e => e.TradeId);
+    }
+}
+```
+
+`p.Circuit` is the core's `CircuitBuilder`, so everything in this document is available
+inside a definition. What the service adds is at the edges: `Input`/`KeyedInput` and
+`UpsertSink`/`AppendSink` name *slots*, and `Table`/`ToTable` name declared tables. A
+**spec** binds them — which plugin version and definition, the settings, and a connector
+config per slot:
+
+```csharp
+await node.Pipelines.DeployAsync(new PipelineSpec
+{
+    Id = "trades-eu", Plugin = "acme.pipelines", Definition = "trade-enrichment",
+    Settings = Json("""{ "minNotional": 1000 }"""),
+    Tables = new Dictionary<string, string> { ["instruments"] = "instruments-eu" },   // slot → declared table
+    Inputs = new Dictionary<string, JsonElement> { ["trades"] = Json("""{ "connector": "memory", "name": "trades-eu" }""") },
+    Sinks = new Dictionary<string, JsonElement> { ["enriched"] = Json("""{ "connector": "memory", "name": "enriched-eu" }""") },
+}, new DeployOptions(), ct);
+```
+
+What to know before relying on it:
+
+- **A deploy is checked before anything is touched.** The settings are bound (camelCase,
+  unknown members refused, string enums, then DataAnnotations), the definition is run
+  against a builder that is never built, and every slot must be bound to a registered
+  connector that supports its kind. `DeployOptions.DryRun` returns the plan and stops.
+- **Keeping state across a change is never implicit.** Replacing a pipeline with another
+  plugin version, definition, worker count, input or table binding, or a settings value
+  not marked `[StateNeutral]`, is refused with `state-choice-required` until the caller
+  says `StateChoice.Keep` or `StateChoice.Reset`. A value captured by a delegate upstream
+  of a stateful operator is part of the state: after a filter threshold changes, `Keep`
+  leaves rows the new filter would not have produced. `Keep` across plugin versions reads
+  the old version's state as the new version's types, through JSON; it is safe while the
+  types that appear in a store's *key* (a grouping's records, a `Distinct`'s values) keep
+  their shape, and not otherwise.
+- **Pipelines do not disturb each other.** Each has its own queue of operations. One that
+  faults is torn down and restarted with a doubling backoff on its committed state; more
+  than `maxRestarts` faults within the window and it is `Failed` until an operator
+  restarts it. A stop has `StopTimeout` to drain; after that its outputs are abandoned,
+  and a circuit that still will not stop is `Wedged` — shown, counted, and not rebuilt on
+  that node.
+- **The dead-letter output is always read**, into a ring of the newest records per
+  pipeline, so a circuit under `RecordErrorPolicy.DeadLetter` cannot stall on it.
+- **Plugins are trusted code** loaded into a collectible `AssemblyLoadContext` per
+  version. A plugin gets the host's copy of `Incremental*` and of any contract assembly,
+  even if it ships its own, which is what lets two plugins join one table. Hold nothing
+  of a plugin's in a static, and never serialize a plugin's type with a process-wide
+  `JsonSerializerOptions` — use the one the slot context gives you — or its version can
+  never unload. A version unloads when no pipeline uses it.
+- **Table history is kept for whoever may need it**: every pipeline in the catalog that
+  has committed a version of the table, running or stopped, and — because the leader
+  cannot see a standby's position — everything newer than `FollowerRetention`. The
+  backend caps it (`RetainedHistoryVersions`); a stopped pipeline the cap passes needs a
+  reset, and the plan a `stop` returns says how many versions it has.
+- **The catalog is the only input to what exists.** It is a shared table (`svc.catalog`)
+  on the backend's log. A node that starts on storage that already holds one rebuilds
+  the same tables and pipelines and resumes each from its checkpoint; a standby follows
+  it, follows the tables, holds each pipeline's state as bytes, and builds the circuits
+  when it takes over.
+
+`InMemoryServiceCluster` gives several nodes in one process — `cluster.Node("a")`,
+`cluster.Node("b")` — with real fencing, which is how the takeover order is tested without
+a broker. What is built and what is not is in
+[design/enrichment-service.md](design/enrichment-service.md), *As built*.
+
 > **TODO:** cluster deployment (multi-process exchange over a transport), checkpoint
 > operations guide, observability/metrics reference. The engine supports all three today;
 > consumer-facing docs pending.

@@ -443,7 +443,9 @@ internal sealed class TableRegistry(ServiceContext context) : ITableRegistry
     {
         if (!_tables.TryGetValue(name, out var handle))
             throw new TableNotOpenException(name, "no table of that name is declared");
-        if (handle.Table is null || handle.State is TableState.Faulted or TableState.Failed)
+        // A table whose loader or writer has failed still serves its last version; only
+        // one with no table object at all — opening, or unopenable — blocks its readers.
+        if (handle.Table is null)
             throw new TableNotOpenException(name, handle.Fault ?? "it is still opening");
         return handle.Table as SharedTable<TKey, TRow>
             ?? throw new InvalidOperationException(
