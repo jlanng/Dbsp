@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The pipeline plugin. The host does not reference it: the build copies this project's
+       output directory to the host's plugins/enrichment.pipelines/, and the service imports
+       it from there at first lead. -->
+  <Import Project="..\Plugin.props" />
+
+  <ItemGroup>
+    <ProjectReference Include="..\Contracts\Enrichment.Contracts.csproj" Private="false" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The same sources and the same assembly name as Pipelines, compiled with V2 defined:
+       a second version of one plugin. The host's build zips its output to
+       plugin-packages/enrichment.pipelines-v2.zip, ready to upload. -->
+  <Import Project="..\Plugin.props" />
+
+  <PropertyGroup>
+    <AssemblyName>Enrichment.Pipelines</AssemblyName>
+    <RootNamespace>Enrichment.Pipelines</RootNamespace>
+    <DefineConstants>$(DefineConstants);V2</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Pipelines\*.cs" />
+    <ProjectReference Include="..\Contracts\Enrichment.Contracts.csproj" Private="false" />
+  </ItemGroup>
+
+</Project>
