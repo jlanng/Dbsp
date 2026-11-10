@@ -107,6 +107,16 @@ internal sealed class KafkaEnv : IAsyncDisposable
         }
     }
 
+    /// <summary>Writes a measured number to the test's output and to
+    /// <c>measurements.log</c> beside the test assembly, where it can be read after a run
+    /// whose console shows only pass and fail.</summary>
+    public static void Measured(ITestOutputHelper output, string line)
+    {
+        output.WriteLine(line);
+        lock (typeof(KafkaEnv))
+            File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "measurements.log"), $"{DateTime.UtcNow:O} {line}{Environment.NewLine}");
+    }
+
     public async ValueTask DisposeAsync()
     {
         foreach (var log in _logs)

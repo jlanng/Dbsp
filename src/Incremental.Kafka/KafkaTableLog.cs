@@ -376,8 +376,11 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
     {
         ArgumentNullException.ThrowIfNull(row);
         var asWriter = _log.IsWriter;
+        var ends = new long[_rows.Length];
+        for (var p = 0; p < ends.Length; p++)
+            ends[p] = await _log.EndOffsetAsync(_rows[p], cancellationToken).ConfigureAwait(false);
         var (rows, head) = await Task.Factory.StartNew(
-            () => ReadSnapshot(cancellationToken), cancellationToken, TaskCreationOptions.LongRunning, TaskScheduler.Default)
+            () => ReadSnapshot(ends, cancellationToken), cancellationToken, TaskCreationOptions.LongRunning, TaskScheduler.Default)
             .ConfigureAwait(false);
         foreach (var (key, current) in rows)
             row(key, current);
@@ -390,13 +393,14 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
     /// <summary>
     /// Reads the rows topic into a consistent snapshot. Each partition is read on its own
     /// clock, so "to the end of each" could mix versions when the writer is busy. Instead:
-    /// every version ends with its head in every partition. A partition is read to its end
-    /// at least once; from then on it is stopped (paused) whenever it stands right after a
-    /// head at the highest version seen anywhere, and let run again if another partition
-    /// shows a higher one. The snapshot is done when every partition has reached its end
-    /// and stands right after the head of the same version.
+    /// every version ends with its head in every partition. A partition is first read to
+    /// <paramref name="ends"/>, the end of its committed data when the restore began; from
+    /// then on it is stopped (paused) whenever it stands right after a head at the highest
+    /// version seen anywhere, and let run again if another partition shows a higher one.
+    /// The snapshot is done when every partition has passed its end and stands right after
+    /// the head of the same version.
     /// </summary>
-    private (Dictionary<TKey, TRow> Rows, Head Head) ReadSnapshot(CancellationToken cancellationToken)
+    private (Dictionary<TKey, TRow> Rows, Head Head) ReadSnapshot(long[] ends, CancellationToken cancellationToken)
     {
         var rows = new Dictionary<TKey, TRow>();
         var versions = new long[_rows.Length];
@@ -423,11 +427,17 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
             }
             idleSince = Environment.TickCount64;
             var p = result.Partition.Value;
+
+            // "Has read everything committed below ends[p]". The offset just below an end
+            // is always a transaction marker (every write here is transactional), so the
+            // last record that can be seen is two below it. When that one belongs to an
+            // aborted transaction it is never seen, and a later record or the end-of-
+            // partition event settles it instead. The event alone would not do: a busy
+            // writer keeps every fetch non-empty, and the client reports the end only on
+            // an empty one.
+            reachedEnd[p] |= result.IsPartitionEOF || result.Offset.Value >= ends[p] - 2;
             if (result.IsPartitionEOF)
             {
-                // The end of committed data, so a transaction boundary: the last record
-                // was a head.
-                reachedEnd[p] = true;
             }
             else if (result.Message.Key.AsSpan().SequenceEqual(HeadKey))
             {

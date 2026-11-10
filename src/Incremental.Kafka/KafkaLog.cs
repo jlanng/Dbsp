@@ -761,9 +761,19 @@ public sealed class KafkaLog : IAsyncDisposable
         return builder.Build();
     }
 
-    /// <summary>Reads an assigned single-partition consumer until its position reaches
-    /// <paramref name="end"/>, handing every record below it to <paramref name="onRecord"/>.
-    /// Blocking. Fails if nothing arrives for the operation timeout.</summary>
+    /// <summary>Reads an assigned single-partition consumer until it has seen every
+    /// committed record below <paramref name="end"/> (a last stable offset), handing each to
+    /// <paramref name="onRecord"/>. Blocking. Fails if nothing arrives for the operation
+    /// timeout.
+    /// <para>
+    /// The offset just below a last stable offset is always a transaction marker — every
+    /// write to these topics is transactional, and one producer's transactions do not
+    /// overlap — so the read is complete once the record two below the end has been seen.
+    /// Waiting for the client to report the end instead costs a whole empty fetch
+    /// (<c>fetch.wait.max.ms</c>, half a second), which a takeover cannot spare. When the
+    /// records before the end belong to an aborted transaction they are never seen, and the
+    /// end-of-partition event settles it after all.
+    /// </para></summary>
     internal void ReadTo(
         IConsumer<byte[], byte[]> consumer, long end, Action<ConsumeResult<byte[], byte[]>> onRecord, CancellationToken cancellationToken)
     {
@@ -771,7 +781,7 @@ public sealed class KafkaLog : IAsyncDisposable
             return; // nothing was ever committed here
         var position = -1L;
         var idleSince = Environment.TickCount64;
-        while (position < end)
+        while (position < end - 1)
         {
             cancellationToken.ThrowIfCancellationRequested();
             _stop.Token.ThrowIfCancellationRequested();
@@ -865,6 +875,14 @@ public sealed class KafkaLog : IAsyncDisposable
                         break;
                     result = consumer.Consume(TimeSpan.Zero);
                 }
+
+                // Caught up without being told so: when the only offset between the last
+                // record and the end of committed data (as the fetch that brought the
+                // record reported it) is one offset, that offset is the transaction's
+                // marker, and the position is the end. Otherwise the reader would stand one
+                // short of the end until an empty fetch said so, half a second later.
+                if (records.Count > 0 && consumer.GetWatermarkOffsets(partition).High.Value == next + 1)
+                    next++;
 
                 if (records.Count == 0 && next <= reported)
                     continue;
