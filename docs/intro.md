@@ -629,6 +629,13 @@ The rules:
   `DeadLetter` it is reported from `input[name]` with whatever the source passed as the
   record (a `KafkaSource` passes a `KafkaRecord`: topic, partition, offset, key and value
   bytes); under `Fault` it faults the circuit.
+- **Positions with no record.** `handle.AdvanceAsync(partition, offset)` — on an input, a
+  keyed input, and as `table.Writer.AdvanceAsync(partition, offset)` on a shared table —
+  says the source has read that far with nothing to hand on: an offset that holds no
+  record (a Kafka transaction's marker), a record that means nothing here. The position is
+  consumed and checkpointed like a record's, so a restart does not go back to offsets the
+  source may no longer hold. For a table the next `CommitAsync` records it as a version
+  with no changes.
 - **The dead-letter output is bounded and must be read.** It is one channel of
   `DeadLetterCapacity` (1024) entries, published after each step like any output. Nobody
   reading it stalls the circuit once it is full — backpressure, not unbounded memory.
@@ -804,7 +811,10 @@ await leadership.StartAsync();
   (30 s) whatever the probe says; or the leader resigned; or `TakeOverAsync()` was called.
   The probe only prevents needless failovers when Kafka itself stalls. It never decides
   who may write: that is the `transactional.id`. Two standbys that decide together both
-  try; one is fenced.
+  try; one is fenced. A leader in the middle of one long commit is not silent: it keeps
+  writing heartbeats into the open transaction, and a standby that sees the leader
+  topic's end move waits, as for a probe that answers — so one commit may take up to
+  `TakeoverCeiling`, not `TakeoverAfter`.
 - **A first start is a takeover.** Nobody heartbeats, so the node leads after
   `TakeoverAfter`, or at once on `TakeOverAsync()`. A new table's log can only be opened
   by the writer, so on that first start `OpenTableLogAsync` completes during the
@@ -812,15 +822,19 @@ await leadership.StartAsync();
   `KafkaLeadershipOptions.PrepareAsync`.
 - **Commands.** `TakeOverAsync()` on a standby fences a live leader and replays what it
   had not committed. `StepDownAsync()` on the leader stops its circuits, commits a
-  resignation and lets the standby take over at once with nothing to replay.
+  resignation and lets the standby take over at once with nothing to replay; calls made
+  together share one step-down. Disposing the leadership in the middle of a takeover
+  closes the log's writer and ends the node `Fenced`.
 - **Being replaced.** A leader reads the new term in the leader topic within milliseconds;
   otherwise its next commit or heartbeat fails. Either way every later commit throws, so
   its circuits fault, and the role becomes `Fenced`.
 - **Sinks.** Fencing covers what is written through the log, not an external sink.
   `leadership.Leased(sink)` makes every write wait for the lease: the leader's last
   committed transaction must have begun less than `TakeoverAfter` minus `LeaseMargin` ago,
-  which is before any standby can have decided to replace it. A sink that can compare
-  terms can also store `leadership.Term` with each row and refuse an older one.
+  which is before any standby can have decided to replace it. The lease is timed on a
+  clock that keeps counting through a host suspend (`CLOCK_BOOTTIME` on Linux); a paused
+  virtual machine whose clocks stop with it is beyond any local clock. A sink that can
+  compare terms can also store `leadership.Term` with each row and refuse an older one.
 - **Status.** `leadership.Status` gives role, term, the leader's node id and term, the
   heartbeat's age, whether the lease is held, and a standby's lag — offsets behind per
   state partition, versions behind per table (`MeasureLagAsync()` measures it now).
@@ -846,11 +860,17 @@ await using var loader = await KafkaSource.StartTableLoaderAsync(instruments, in
   offset. The source assigns every partition itself, one record after
   `circuit.CommittedOffsets(input)` — for a table, after `table.CommittedOffsets` — so a
   restart or a takeover re-reads exactly what the checkpoint does not cover. It joins no
-  consumer group and commits no offsets. A partition with no committed position starts at
-  `StartFrom` (`Earliest` by default). A committed position that is no longer in the topic
-  is `KafkaSourcePositionLostException`, never a silent jump: for a fact topic that is
-  lost data. A table loader can instead re-read a compacted topic from its start and
-  replace the table's rows (`ReloadTableWhenPositionLost`).
+  consumer group and commits no offsets. A topic never read before starts at `StartFrom`:
+  `Earliest` (the default), or `Latest` — the end as it was at the first start, which is
+  recorded, so later starts resume from it and never take "the end" again. A committed
+  position that is no longer in the topic is `KafkaSourcePositionLostException`, never a
+  silent jump: for a fact topic that is lost data. A table loader can instead re-read a
+  compacted topic from its start and replace the table's rows
+  (`ReloadTableWhenPositionLost`). Offsets that yield nothing — a transaction's marker, a
+  tombstone on a stream input, a record the decoder passes over, a table change that
+  changes nothing — move the position too: at once where there is a record, and for the
+  rest once the source has stood at the end for `CommitIdlePositionAfter` (30 s), so that
+  retention cannot overtake the position of an idle topic.
 - **Backpressure.** Records go into the input's bounded channel one at a time. When the
   circuit is slow the write waits, the source stops polling, and the client stops fetching
   once it holds `FetchBufferKilobytes` (16 MB). A wait longer than `PauseAfter` (1 s)

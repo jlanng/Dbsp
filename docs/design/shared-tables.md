@@ -495,6 +495,15 @@ nothing are not worth a version of their own; they ride with the next version th
 something, so `CommittedOffsets` can trail the last record accepted, and replaying those
 records after a crash changes nothing again.
 
+That holds only while the source still has those records. An adapter that has gone idle
+past the committed position — on records that changed nothing, or on offsets that hold no
+record, such as a Kafka transaction's marker — calls `Writer.AdvanceAsync(partition,
+offset)`: the next `CommitAsync` then records the position even with nothing to publish,
+as a version with no changes. It is the one case in which such a version is minted, and
+the caller chooses when it is worth one (the Kafka loader waits until its topic has been
+quiet for `CommitIdlePositionAfter`). Added for durability-and-standby.md, *Offsets that
+yield nothing are recorded too*.
+
 ## Snapshot sync
 
 `ReplaceAllAsync(rows)` is the "snapshot" half of a snapshot + delta source. The writer
@@ -513,10 +522,12 @@ memory proportional to the snapshot's key count. Three things to know:
 
 - **Offsets.** The optional `offsets` argument is the source position the snapshot is as
   of. It is staged with the last version, so it is recorded only if the snapshot
-  completes, and from then on delta records at or below it are dropped. Like any offsets,
-  it rides with the next version that changes something: after a sync whose last version
-  changed nothing, `CommittedOffsets` does not show it until a later change, and an adapter
-  that restarts in between takes the snapshot again, harmlessly.
+  completes, and from then on delta records at or below it are dropped. It is recorded
+  even when the sync's last version changed nothing — as a version with no changes, like
+  `AdvanceAsync` — because a snapshot is taken when the old position is no good, and an
+  unrecorded one would be taken again at every start. (As first built it rode with the
+  next version that changed something.) Without `offsets`, re-syncing an unchanged
+  snapshot still mints nothing.
 - **Stopping early.** If the sequence throws or the call is cancelled, the chunks already
   committed stay, nothing is deleted, and rows staged but not committed stay staged for
   the next commit. The table is a valid mix; the next sync finishes the job.

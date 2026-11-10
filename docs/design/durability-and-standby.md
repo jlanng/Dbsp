@@ -265,8 +265,18 @@ one transaction carries; a single larger commit is never split. Outcomes:
 | `CommitTransaction` succeeds | completes every commit in the batch |
 | `KafkaRetriableException` from commit or abort | calls again; the call resumes, the outcome is still open |
 | `KafkaTxnRequiresAbortException`, or any other non-fatal error from commit | aborts, then runs the same batch again, up to `MaxAbortRetries` (5) with a short backoff; then gives each commit a transaction of its own; a commit that still aborts fails with `KafkaLogException` |
-| `Produce` refuses one record (too large, say) | aborts; that commit alone fails with `KafkaLogException`; the rest of the batch runs again |
+| `Produce` refuses one record for a reason of the record's own (over the client's size limit, an unknown partition) | aborts; that commit alone fails with `KafkaLogException`; the rest of the batch runs again |
+| `Produce` fails for any other reason — above all `Local_State` | aborts and runs the same batch again, as for a failed commit: no commit is blamed |
 | fatal, `Local_Fenced`, or an abort that fails | the writer is finished: every waiting and later commit fails with `KafkaLogFencedException`, `WhenFenced` completes |
+
+The second `Produce` row was added after review. When the *broker* refuses a record
+(over the topic's `max.message.bytes`, under the client's limit) the news comes with the
+delivery report, while a later commit of the same transaction may still be producing;
+from then on every `Produce` throws `Local_State` ("erroneous state"). As first built the
+commit that happened to be producing was failed for it. Now it is not: the batch is
+retried, then split into single-commit transactions, and the commit with the refused
+record fails alone, with the broker's reason. Tested with a 500 KB record against a
+60 KB topic limit beside a 400,000-record neighbour.
 
 That is the seam's two failure meanings. `KafkaStateChangelog` rethrows the second as
 `ChangelogFencedException` and `KafkaTableLog` as `TableLogFencedException`, each with the
@@ -284,6 +294,10 @@ gets `ErrorCode.Local_Fenced` ("This instance has been fenced by a newer instanc
   with `Error.IsFatal == true`, and on the error handler, also fatal;
 - from a later `Produce` as a `ProduceException` with the same code but `IsFatal == false`.
   The writer therefore checks the code as well as the flag;
+- a producer fenced with a transaction's records in flight (seen in review, when a
+  standby took over under a long commit) gets the broker's own words on the error
+  handler, fatal: "Producer attempted an operation with an old epoch … transactional
+  producer fenced by newer producer instance". Fatal is what the writer checks;
 - a producer fenced while idle does not find out until it writes again. Its next
   `BeginTransaction` and `Produce` succeed locally; the fatal error reaches the error
   handler when that transaction first talks to the coordinator, and the commit then
@@ -340,6 +354,37 @@ a bounded channel of two batches to the caller. A storage therefore holds `P` co
 while it follows. One consumer for all partitions is the obvious saving and is not built.
 Consumers use `auto.offset.reset=error`, belong to no group and commit no offsets.
 
+*What a reader that is behind may hold* (added after review). On the managed side: the
+two batches in the channel, the one being written to it and the one in the caller's
+hand, 1,024 records each. On the native side: `KafkaLogOptions.FetchBufferKilobytes`
+(`queued.max.messages.kbytes`), default 8 MB a consumer. As first built it was the
+client's default of 64 MB, which for twelve state partitions is about 770 MB the GC
+cannot see while a restore or a lagging follower is behind. `fetch.queue.backoff.ms` is
+set to 10 ms with it, for the reason given under *As built (step 6)*. A test stalls a
+follower over an 18 MB partition with a 1 MB buffer and reads both bounds.
+
+*Short reads share one consumer* (added after review). Reading a table's head, the last
+term, the oldest retained version and the offset a trim cuts at are brief reads of a
+partition's tail. Each used to build a consumer of its own; a standby's lag sample
+(every 5 s) therefore built two clients per tracked table, each with its threads, its
+connections and, on MSK, its TLS and IAM handshakes. They now run one at a time on a
+single consumer the log keeps (`KafkaLog.ShortReadAsync`), which is rebuilt after a read
+that fails. The oldest retained version is read again only when the changes topic's
+start offset has moved. A test measures lag repeatedly and counts clients built: none.
+
+*Admin calls are retried through one helper* (`KafkaLog.RetryTransientAsync`), for up to
+`OperationTimeout`, on the errors that pass. After review the list includes
+`Local_NoEnt`: the client's own "Failed to query partition leaders: No leaders found",
+which `ListOffsets` and `DeleteRecords` throw as a plain `KafkaException` when the
+client's metadata has no leader for a partition yet. Reproduced on the local broker for
+just-created topics under load (hundreds of 400 create-then-`ListOffsets` rounds with 6
+partitions and 64 in parallel; none on a quiet broker). Unretried, it failed a start, and
+during a takeover — a table opened in `PrepareAsync` — it ended the node `Fenced`. Also
+added: `BrokerNotAvailable`, `ReplicaNotAvailable`, `KafkaStorageError`, the two leader
+epoch errors, `NotController` and `Local_WaitCoord`. Not verified: that a partition in
+the middle of a leader election on a multi-broker cluster reports one of these (one
+broker here).
+
 **Topics.** `ConnectAsync` creates `{p}.state` (`StatePartitions`, default 12,
 `cleanup.policy=compact`, `delete.retention.ms` from `DeleteRetention`, default 24 h) and
 `{p}.leader`; `OpenTableLogAsync` creates `{p}.table.{name}.changes` (one partition,
@@ -379,7 +424,12 @@ strings, embedded as JSON strings. Departures from *Kafka-backed table log*:
   `OpenTableLogAsync` rather than handled by remembering instances as the provider does.
 - **The epoch is written by the writer, the first time it opens the table,** as a version-0
   head in every rows partition. A reader that opens a table nobody has created waits until
-  the active has. So the active must open a new table before the standby can.
+  the active has. So the active must open a new table before the standby can. Two things
+  keep it to one epoch (added after review, when two concurrent opens of one new table on
+  the writer were found to mint two, leaving a rows topic no standby could open): opens
+  of one name in one process share a single open, and the writer reads the head again
+  *as the writer* before it mints — a head read made a moment earlier as a reader could
+  have missed a table the previous writer had just created.
 - **The head is found by reading the tail of rows partition 0,** not by reading the
   partition: every version ends with its head, so one short read gives the epoch and the
   last version. `LastVersionAsync` is that read (on a writer that has appended or looked
@@ -406,7 +456,12 @@ strings, embedded as JSON strings. Departures from *Kafka-backed table log*:
   Because that offset may have been trimmed since, a read never starts below the topic's
   current start.
 - **Retention is `TrimBeforeAsync` and nothing else.** It finds the first offset of the
-  version and calls `DeleteRecords`. Computing the floor from the pipelines' commit
+  version and calls `DeleteRecords`. The offset is always found by looking — the index,
+  or a read for the first record at or above the version. As first built a trim past the
+  last version took the topic's end offset instead, and a version committed between
+  reading "last" and reading "end" (appends are not serialised with trims, and the caller
+  may not be the writer) was deleted while the log reported it retained. Tested by
+  committing a version from inside the trim. Computing the floor from the pipelines' commit
   records, and the cap, are the host's and are not built.
   `OldestRetainedVersion` is what this process last saw: at open, after its own trim, on a
   reader's `LastVersionAsync`, and when a read runs into missing history.
@@ -486,7 +541,10 @@ table of tens of millions of rows whose cold restore must be fast.
   handler, but nothing has been run against MSK, IAM or TLS.
 - A commit larger than the client's queue (`queue.buffering.max.messages`, 100,000 by
   default) is handled by waiting for the queue to drain; one larger than the broker's
-  transaction can sensibly hold has no guard beyond `transaction.timeout.ms`.
+  transaction can sensibly hold has no guard beyond `transaction.timeout.ms`. A commit is
+  never split, so its duration is also bounded by leadership: see *A long commit is not
+  a dead leader* under *As built (step 5)* — a single commit must finish within
+  `TakeoverCeiling` (30 s) or the standby takes over under it.
 
 ## Warm standby
 
@@ -834,6 +892,42 @@ counted in `KafkaLog.IdleHeartbeats`, not in `TransactionsCommitted`. The term r
 hour, so the cleaner keeps it to two records plus the active segment; the watch and the
 term read start at its tail and never see the rest.
 
+**A long commit is not a dead leader** (added after review). A transaction's heartbeat
+is readable only when the transaction commits, and the writer thread cannot commit an
+idle heartbeat while a transaction is in flight. As first built, any single commit that
+took longer than `TakeoverAfter` less the age of the previous heartbeat therefore read
+as silence — and the standby's last check did not help, because the end offset it asks
+for is the last stable offset, which an open transaction pins. Reproduced with default
+timings: a healthy leader committing 3,000,000 records was fenced 2.5 s in, and its
+successor would have had to commit the same work. Two changes:
+
+- *The writer keeps beating inside the transaction.* While it produces a transaction's
+  records it adds another heartbeat record every half `HeartbeatInterval`, and it now
+  flushes the transaction itself, in slices, beating between them, before it calls
+  `CommitTransaction` — which is then one round trip. Nobody can read these records
+  until the commit; they are counted in `KafkaLog.InTransactionHeartbeats`. None is
+  written after a resignation in the same transaction, which must stay the last
+  heartbeat.
+- *The standby looks for them.* Once a heartbeat is late (1.25 intervals) it samples the
+  leader topic's end with uncommitted records counted (`ListOffsets`, read-uncommitted),
+  every quarter interval. An end that has moved since the previous sample is a sign of
+  life: only the current writer can append there — a fenced producer's records are
+  refused, a dead one writes nothing. It counts against the silence exactly as a probe
+  that answers does: the takeover on silence waits, and the ceiling still applies. The
+  first sample after a heartbeat is only a baseline, so a leader that died just after
+  beginning a transaction buys no time.
+
+So a single commit may now take up to `TakeoverCeiling` (30 s by default), with or
+without a probe, and `transaction.timeout.ms` (60 s) stays the broker's limit. Tested in
+one process: a commit slowed to 3 s under a 0.8 s timeout leaves the standby a standby
+(removing either half fails it), and a leader stopped mid-transaction is still replaced
+on time. Limits: the sampling is one small admin request every quarter interval while a
+heartbeat is late, and none otherwise; a `CommitTransaction` round trip that itself
+stalls is a Kafka stall, which is the probe's case as before; with `TakeoverAfter` at its
+minimum of two intervals there is little slack between the baseline sample and the next
+in-transaction heartbeat, so three or more is advised. Not run against a large real
+commit on MSK.
+
 **One coordinator per process: `KafkaLeadership`.** Roles: `Standby → Promoting → Leader`,
 ending in `Fenced` or `Resigned`. Both ends are final: the process exits and its
 supervisor starts it again as a standby, as *A fenced active exits* decided. The
@@ -875,6 +969,7 @@ Additions to the text:
   that answers as a standby (it was restarted), and no answer within `ProbeTimeout` (it
   is stopped: the kernel still accepts the connection, which is why a bare connect is not
   enough) are all false.
+- *Signs of life short of a heartbeat.* See *A long commit is not a dead leader* above.
 - *Startup counts as hearing the leader.* A standby's silence clock starts when its watch
   does, so a node started beside a dead leader waits a full `TakeoverAfter`.
 - `AutomaticTakeover = false` leaves only the command.
@@ -884,8 +979,12 @@ term, commit the next); `PrepareAsync`; `PromoteAsync` on each tracked table, in
 tracked; `PromoteAsync` on each tracked storage; `StartLeadingAsync(term)`. Then the node
 is the leader. If any of it fails — including losing the race for the transactional id —
 the node ends `Fenced`, and the coordinator closes the log's writer so that it stops
-heartbeating: a node that leads nothing must not look alive to its peer. The takeover's
-timings are kept in `Status.LastTakeover`.
+heartbeating: a node that leads nothing must not look alive to its peer. The same holds
+when the leadership is disposed in the middle of a takeover (added after review: it used
+to leave the node `Promoting` for ever with its log heartbeating as the writer, so that
+the peer waited on a leader that led nothing): if the log is already the writer it is
+closed and the node ends `Fenced`. Disposing a *leader's* leadership still leaves the
+log the writer, as before. The takeover's timings are kept in `Status.LastTakeover`.
 
 **What a deposed leader learns, and when.** Three ways, fastest first:
 
@@ -907,7 +1006,12 @@ the new leader replays what the old one had not committed. `leadership.StepDownA
 is the planned form, on the leader: it calls `StopLeadingAsync` (dispose the circuits, so
 their last commits land), commits a resignation — a heartbeat with `resigned` set — and
 closes the writer; a standby that reads the resignation takes over without waiting, and
-has nothing to replay. Both are method calls. Carrying them between nodes (an admin
+has nothing to replay. Calls to `StepDownAsync` made together, or after it has
+succeeded, share the one step-down: `StopLeadingAsync` runs once, one resignation is
+written, and every caller gets the same outcome (added after review; a second concurrent
+call used to run `StopLeadingAsync` again and could turn a clean resignation into
+`Fenced`). If `StopLeadingAsync` throws, nothing was resigned and the call can be made
+again. Both are method calls. Carrying them between nodes (an admin
 endpoint) is the host's, step 7.
 
 **The delivery lease** (*The sink gap*, first mitigation) is built.
@@ -923,6 +1027,19 @@ deposed one gets `KafkaLogFencedException`, which the delivery reports like any 
 write. What remains is what the design said remains: a process stopped between the check
 and the write. A manual takeover does not wait for the old leader's lease, so there the
 window is from the command to the old leader reading the new term.
+
+*The lease clock* (added after review). The lease is elapsed local time, and it only
+works if time the holder spends frozen counts against it. `Environment.TickCount64` is
+`CLOCK_MONOTONIC` on Linux, which stops while the machine is suspended; a leader that
+slept through its lease would have woken still holding it. The lease is now measured on
+`CLOCK_BOOTTIME` on Linux (`LeaseClock`), which keeps counting; on Windows `TickCount64`
+already does. What no local clock can cover is a hypervisor that pauses a guest *and*
+stops its clocks: the guest wakes believing no time has passed. There the lease is no
+protection and the window is from the wake-up to the old leader's watch reading the
+higher term (milliseconds) or its next heartbeat failing; the term on the delivery is
+the defence. This corrects *The sink gap* above, which names "a frozen VM" among the
+pauses the lease handles and says it fails only between the check and the write. Not
+testable here: neither a suspend nor a paused guest.
 
 **The term on deliveries** (second mitigation) is not added to the core's batches. A sink
 that wants it reads `leadership.Term` when it writes; the test app's sink stamps term,
@@ -1024,7 +1141,8 @@ cases:
   down or exit when its circuits are gone (step 7).
 - *A Kafka outage longer than `transaction.timeout.ms` still ends the active* (steps 3
   and 4): its heartbeat's transaction times out and reports as a fence.
-- *Lag sampling opens a consumer per table per sample* (the head read).
+- *Lag sampling builds no clients* (changed after review; it built two per table per
+  sample): the head is read on the log's shared short-read consumer.
 - *The watch is a third consumer* on each node (one thread), beside the followers.
 - Not built: jitter or priority between standbys, more than one standby (nothing stops
   it; nothing was tested), a published lag metric, an admin endpoint for the commands.
@@ -1362,8 +1480,21 @@ no group and commits nothing; `auto.offset.reset` is `error`. Particulars:
 
 - Starts are numbers (a logical offset costs half a second; steps 3 to 5). The source
   asks for each partition's first and last offsets once, at start.
-- A partition with no committed position starts at `StartFrom`: `Earliest` (default) or
-  `Latest`.
+- A topic the source has never read starts at `StartFrom`: `Earliest` (default) or
+  `Latest`. `Latest` means the end *as it was at the first start* — the start that finds
+  nothing committed for any partition. The ends found then are recorded as positions
+  (`AdvanceAsync`, below): a table loader commits them before it reports itself started,
+  a circuit input takes them through its channel and they are in the first checkpoint. A
+  later start resumes from them like any others, and a partition that still has no
+  position then — it was empty at the first start, or added since — is read from its
+  beginning, because everything in it is new. (Changed after review. As first built "the
+  end" was taken afresh at every start for every partition without a position, so a
+  partition that had been quiet, or whose records had been read and not yet checkpointed,
+  silently skipped whatever it held.) Two limits. Until the first checkpoint after the
+  first start nothing is recorded, so a crash in that window starts at the end again. And
+  a topic that was *entirely* empty at the first start leaves nothing to record (an
+  empty partition has no offset to stamp), so until some record is checkpointed a
+  restart is a first start.
 - A committed position below the partition's first retained offset is
   `KafkaSourcePositionLostException` at start. So is one past the partition's end, or
   one for a partition the topic does not have: that is another topic (recreated, or
@@ -1375,11 +1506,39 @@ no group and commits nothing; `auto.offset.reset` is `error`. Particulars:
   is not built for a keyed circuit input, whose replay check would drop the re-read
   records (keyed-input snapshot sync does not exist). And it cannot mend a recreated
   topic, whose offsets are below the table's position: that is refused.
-- Offsets with no record behind them (transaction markers, compacted-away records) need
-  nothing: the committed position is a real record's offset and the next read starts
-  after it.
+- *Offsets that yield nothing are recorded too* (changed after review; this bullet used
+  to say they "need nothing"). The committed position was the last record *stamped*: not
+  a transaction's marker, not a tombstone on a stream input, not a record the decoder
+  passes over, not a table change that changes nothing. On an idle topic those are the
+  last offsets, and when retention had removed them the next start compared "committed +
+  1" with the topic's new start, reported the position lost — and with
+  `ReloadTableWhenPositionLost` reloaded an empty topic and emptied the table. Now:
+  a tombstone or a passed-over record on a circuit input is sent as
+  `handle.AdvanceAsync(partition, offset)` in the record's place; and when a source has
+  stood at the end of a partition, past the last position on record, for
+  `CommitIdlePositionAfter` (default 30 s), it records where it stands — for a table,
+  `Writer.AdvanceAsync` and a commit, which mints one version with no changes. The delay
+  is there because behind every transaction of a busy topic is a marker, and recording
+  each would cost a table a second version, and a circuit a second step and commit, per
+  transaction. What remains: a process that stops within the delay of the last record
+  leaves the position at that record; if it then stays down until retention passes, the
+  start reports the position lost as before.
 - A source reads the partitions the topic has when it starts. New partitions are seen at
   the next start.
+
+**Core change: `AdvanceAsync`** (added after review, for the two bullets above). A source
+had no way to say "I have read up to here" where there was no record to stamp.
+`InputHandle<T>.AdvanceAsync(partition, offset)` and the same on `KeyedInputHandle` send
+an entry with a position and nothing else through the input's channel; the drain admits
+its offset and passes on. It costs the ordinary path nothing: the entry reuses the
+rejection's slot with a sentinel, checked only where a rejection already was.
+`TableWriter.AdvanceAsync(partition, offset)` stages a position and marks the batch, so
+the next `CommitAsync` records it even with no change to publish — the one case in which
+a version with no changes is minted. Nothing else about versions changed: followers,
+range reads and restores take it as any version. Alongside it,
+`ReplaceAllAsync(rows, offsets)` now records its offsets even when the snapshot changed
+nothing (a snapshot is taken because the old position was no good; it used to be taken
+again at every start until some row changed). shared-tables.md is updated.
 
 **Core change: `RejectAsync`.** "Poison records go through the error policy with their
 offset" needed a seam, because deserialization happens in the source, outside any
@@ -1393,6 +1552,20 @@ takes part in `IDeadLetteringInput` as `KeyedInputPort` did. A `KafkaSource` pas
 `KafkaRecord` (topic, partition, offset, key and value bytes, timestamp, headers) as the
 record. A table has no dead-letter output: its loader stops on an unreadable record
 unless `OnUnreadableTableRecord` is set.
+
+**Starting.** The source's first requests — the topic's partition count, each
+partition's first and last offsets — are made through an admin client that shares the
+consumer's connections, before the consumer has anything to poll for. Two things were
+wrong with that as first built (both found in review). A consumer serves its callbacks
+only when polled, the OAUTHBEARER token refresh among them, so with MSK IAM no token was
+ever set and the requests timed out: no source could start. The source now polls the
+(unassigned) consumer while it waits for each request; a test with an OAUTHBEARER
+handler sees it called within the first two seconds of a start that cannot succeed
+against the local PLAINTEXT broker. And the offset requests, like `MeasureLagAsync` and
+`WhenCaughtUpAsync`, had no retry: a partition between leaders ended the source, and a
+source started from `StartLeadingAsync` ended the takeover. They now go through the
+log's retry (`KafkaLog.RetryTransientAsync`) for up to `OperationTimeout`. Not verified:
+a real SASL/OAUTHBEARER broker, and a multi-broker leader election.
 
 **Backpressure, and two things librdkafka does.** The source writes one record at a time
 into the input's bounded channel and waits when it is full, so it stops polling; the
@@ -1424,9 +1597,11 @@ has committed. It is the table's writer, so it runs on the leader only:
 `StartTableLoaderAsync` refuses a following table, and the tested takeover is
 `AcquireWriterAsync`, `table.PromoteAsync()`, then the loader, which read exactly the
 records the followed table did not have. A deposed leader's loader ends at its next
-commit with the table log's fence. One consequence of shared-tables.md stands: offsets
-ride with versions, so a tail of records that changed nothing is read again after a
-restart, harmlessly.
+commit with the table log's fence. One consequence of shared-tables.md is softened:
+offsets ride with versions, so a tail of records that changed nothing is read again
+after a restart, harmlessly — but only until the loader has been idle for
+`CommitIdlePositionAfter`, when it records where it stands (*Offsets that yield nothing*
+above).
 
 **Sinks, and which producer.** `KafkaUpsertSink` (key → row, delete → tombstone) and
 `KafkaAppendSink` (one record each). Both stamp `incremental.step` on every record and
@@ -1613,6 +1788,23 @@ Against the local stack (`docker compose --profile connectors up -d`; tests skip
   loader's versions, lag, takeover by a standby and reload; an upsert sink's topic read
   back by a keyed source in a second circuit, through either producer; the append
   sink's headers; and sources resumed after six crashes against a model. *Built.*
+- **After review** (`KafkaSourcePositionTests` and additions to the others): a position
+  past markers, tombstones, passed-over records and no-op table changes survives the
+  topic losing everything; a busy transactional topic costs a table no extra versions; a
+  start at the end is taken once; a source hands on committed records only (an aborted
+  and an open transaction in its topic); a source overtaken by retention while it runs
+  stops with `KafkaSourcePositionLostException`; the token refresh handler is served
+  during start; the transient-error retry; a broker-refused record beside a large
+  neighbour; `MaxTransactionRecords`; a stalled follower's bounds; concurrent first
+  opens of a table; a trim racing an append; a long commit under a short takeover
+  timeout, and a leader stopped mid-transaction; disposal mid-takeover; concurrent
+  step-downs; lag sampling without clients. Each fix was checked by putting the defect
+  back and seeing its test fail: 22 mutations, 18 killed as the tests were first
+  written. Of the four that survived, two were stress tests of just-created topics
+  (tables, sources) that the local broker did not make fail on demand — kept as smoke
+  tests beside a unit test of the retry, which does fail — and two led to a tighter
+  test: a trailing tombstone that the end-of-partition rule had covered for, and a token
+  handler that a failed source's close also calls, now timed.
 
 Not testable locally: MSK-specific quotas and broker patching behaviour. Those need a
 soak run on a real cluster before the failover number is believed.
@@ -1716,21 +1908,34 @@ soak run on a real cluster before the failover number is believed.
   answers, the standby waits. Not exercised; it needs a broker that can be made to stall.
 - The standby's last check before a takeover (it asks for the leader topic's end offset
   and stands down if it cannot, or if there are records it has not read) has no test.
+- The long-commit protection (in-transaction heartbeats, the standby's uncommitted-end
+  samples) on MSK with a genuinely large commit: tested locally with a commit slowed by
+  a hook. Whether the leader topic's batch is sent promptly while the client's queue is
+  full of another partition's records is what a real large commit would show.
+- The lease on a suspended host (`CLOCK_BOOTTIME`) and on a paused guest whose clocks
+  stop. Neither can be produced here; the second is a stated limit.
+- `Local_NoEnt` and the other retried admin errors during a real leader election
+  (multi-broker). Seen here only for just-created topics.
 - Leadership timing under load on a small machine. A leader starved of CPU for longer
   than `TakeoverAfter` is replaced; that is correct, but how often it happens on the
   chosen instance size is unknown.
 - That the offset just below a last stable offset is always a transaction marker on MSK
   as it is on Kafka 3.9 (the readers finish a read to the end on that basis). If it were
   not, a read would fall back to the end-of-partition event and be slower, not wrong.
-- Behaviour of the group commit under a slow or failing broker: abort-and-retry, the
-  split into single-commit transactions and the retriable-commit loop are exercised only
-  by an oversized record. A fault-injection run (a proxy that drops or delays) is needed.
+- Behaviour of the group commit under a slow or failing broker: abort-and-retry and the
+  split into single-commit transactions are now exercised by a record the broker refuses
+  mid-transaction as well as by one the client refuses; the retriable-commit loop and a
+  transient abortable error (a message timeout) are still not. A fault-injection run (a
+  proxy that drops or delays) is needed.
 - Which Kafka version MSK must run to include the KIP-890 broker-side checks against
   writes from a stale epoch. The design does not rely on them for a well-behaved client.
 - KAFKA-13727 (cleaner removing abort markers too early) should be confirmed fixed in the
   chosen broker version, since both compacted topics carry transactional data.
 - Sources and sinks on MSK: IAM or TLS through `ClientConfig` and the builder hooks,
-  and a source through a broker election. Nothing was run against either.
+  and a source through a broker election. Nothing was run against either. Locally it is
+  shown only that a source serves its OAUTHBEARER refresh handler while it starts; a
+  source blocked on a full input for longer than a token's life is not polled meanwhile,
+  and what the client does when it is polled again was not looked at.
 - Whether `fetch.queue.backoff.ms` at 10 ms and a 16 MB fetch buffer are the right
   defaults at production record sizes and rates. They were chosen from one local
   measurement.

@@ -74,15 +74,17 @@ public sealed class KafkaSourceOptions
     /// which is right for a compacted reference topic and wrong for anything else.</summary>
     public bool ReloadTableWhenPositionLost { get; init; }
 
-    /// <summary>Table loader only: how long the loader may stand past the table's committed
-    /// position, with nothing more to read, before it records where it stands
-    /// (<see cref="TableWriter{TKey,TRow}.AdvanceAsync"/>, which costs a version with no
-    /// changes). A table's offsets ride with the versions that change something, so
-    /// offsets that changed nothing — a transaction's marker, a record passed over, an
-    /// upsert of the row already there — are otherwise not recorded, and once retention
-    /// has removed them a restart would find the committed position gone. A circuit input
-    /// needs no such delay: its position is recorded as soon as the source reaches the end.
-    /// Default 30 s.</summary>
+    /// <summary>How long the source may stand at the end of a partition, past the last
+    /// position on record, before it records where it stands. The offsets in between held
+    /// nothing to stamp: a transaction's marker — or, for a table, a record that changed
+    /// nothing, because a table's offsets ride with the versions that change something.
+    /// Left unrecorded they are read again after a restart, harmlessly, until retention
+    /// has removed them; then the restart would find its committed position gone though
+    /// nothing was lost. Recording costs a circuit one step with nothing in it
+    /// (<see cref="InputHandle{T}.AdvanceAsync"/>) and a table one version with no changes
+    /// (<see cref="TableWriter{TKey,TRow}.AdvanceAsync"/>), so it waits until the topic
+    /// has been quiet this long rather than follow every transaction. A process that stops
+    /// sooner after the last record leaves the position at that record. Default 30 s.</summary>
     public TimeSpan CommitIdlePositionAfter { get; init; } = TimeSpan.FromSeconds(30);
 
     /// <summary>How long start-up requests (metadata, offsets) may take, retries of a
@@ -668,16 +670,14 @@ public sealed class KafkaSource : IAsyncDisposable
                 continue;
             }
 
-            // A table pays for this with a version, so it waits to see that the topic has
-            // really gone quiet; an input pays with a channel entry and does not wait.
-            if (_target.Batches)
-            {
-                var now = Environment.TickCount64;
-                if (aheadSince[p] == 0)
-                    aheadSince[p] = now;
-                if (now - aheadSince[p] < (long)_options.CommitIdlePositionAfter.TotalMilliseconds)
-                    continue;
-            }
+            // Not at once: a table pays for this with a version and a circuit with a step
+            // and its commit, and behind every transaction of a busy topic there is a
+            // marker. It is only worth recording once the topic has gone quiet.
+            var now = Environment.TickCount64;
+            if (aheadSince[p] == 0)
+                aheadSince[p] = now;
+            if (now - aheadSince[p] < (long)_options.CommitIdlePositionAfter.TotalMilliseconds)
+                continue;
             (due ??= []).Add((p, staged[p] - 1));
         }
         if (due is null)

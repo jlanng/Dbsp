@@ -68,7 +68,7 @@ public class KafkaSourcePositionTests(ITestOutputHelper output)
         var table = new SharedTable<int, Product>("products", p => p.Id);
         var options = new KafkaSourceOptions
         {
-            BootstrapServers = KafkaEnv.Bootstrap, Topic = topic, CommitIdlePositionAfter = TimeSpan.FromMilliseconds(300),
+            BootstrapServers = KafkaEnv.Bootstrap, Topic = topic, CommitIdlePositionAfter = TimeSpan.FromSeconds(1),
             ReloadTableWhenPositionLost = reloadAllowed,
         };
         await using (var loader = await KafkaSource.StartTableLoaderAsync(table, options).WaitAsync(Timeout))
@@ -90,7 +90,7 @@ public class KafkaSourcePositionTests(ITestOutputHelper output)
             Assert.Equal(3, table.LatestVersion);
 
             // And then nothing more: standing at the recorded position mints no versions.
-            await Task.Delay(TimeSpan.FromSeconds(1));
+            await Task.Delay(TimeSpan.FromSeconds(2.5));
             Assert.Equal(3, table.LatestVersion);
         }
 
@@ -161,8 +161,9 @@ public class KafkaSourcePositionTests(ITestOutputHelper output)
             producer.CommitTransaction(Timeout);
         }
 
+        var quick = new KafkaSourceOptions { BootstrapServers = KafkaEnv.Bootstrap, Topic = topic, CommitIdlePositionAfter = TimeSpan.FromMilliseconds(300) };
         var first = SumCircuit(storage);
-        await using (var source = await KafkaSource.StartAsync(first.Circuit, first.Events, env.Source(topic)).WaitAsync(Timeout))
+        await using (var source = await KafkaSource.StartAsync(first.Circuit, first.Events, quick).WaitAsync(Timeout))
         {
             await TotalIsAsync(first, "k", 4, "the four events are summed");
             await KafkaEnv.EventuallyAsync(() => Task.FromResult(source.Positions[0] == 7), "the source stands at the end, past the marker");

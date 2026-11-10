@@ -434,7 +434,8 @@ so implementations never see cross-thread access to one store.
   ```
 
   `KafkaLogOptions.ClientConfig` passes any librdkafka setting to every client (TLS and
-  SASL for MSK).
+  SASL for MSK). `FetchBufferKilobytes` (8 MB) bounds what each follower or restore
+  consumer may hold fetched and not yet applied.
 
 - `KafkaLeadership` decides which of two nodes is the active, in Kafka alone. The writer
   leaves a heartbeat in `{prefix}.leader` with every transaction and once a second when
@@ -461,8 +462,10 @@ so implementations never see cross-thread access to one store.
   ```
 
   A replaced leader ends `Fenced` (it reads the higher term, or its next write fails) and
-  the process is expected to exit and return as a standby. `StepDownAsync()` is the
-  planned handover. `leadership.Leased(sink)` holds sink deliveries back once the leader's
+  the process is expected to exit and return as a standby. A leader inside one long
+  commit keeps writing heartbeats into the open transaction, which a standby sees as the
+  leader topic's end moving, so a commit may take up to `TakeoverCeiling` (30 s) without
+  costing the leader its place. `StepDownAsync()` is the planned handover. `leadership.Leased(sink)` holds sink deliveries back once the leader's
   last commit is older than the lease, and `leadership.Status` reports role, term, leader,
   heartbeat age and follower lag. Measured locally with real processes: 3.2 s from
   `kill -9` to the standby's first output, 3.05 s of which is the timeout (4.7 s when the
@@ -474,7 +477,11 @@ so implementations never see cross-thread access to one store.
   assigns each partition one record after `circuit.CommittedOffsets(...)` (or
   `table.CommittedOffsets`). The input's bounded channel is the backpressure. A record
   that does not deserialize goes through the circuit's error policy as a `KafkaRecord` —
-  topic, partition, offset, bytes — via `InputHandle.RejectAsync`.
+  topic, partition, offset, bytes — via `InputHandle.RejectAsync`. Offsets that yield
+  nothing (a transaction's marker, a tombstone on a stream, a record passed over) are
+  recorded through `AdvanceAsync`, so an idle topic's committed position stays at its end
+  and retention cannot overtake it. `StartFrom = Latest` takes the end once, at the first
+  start, and records it.
 
   ```csharp
   var source = new KafkaSourceOptions { BootstrapServers = "localhost:9092", Topic = "orders" };
