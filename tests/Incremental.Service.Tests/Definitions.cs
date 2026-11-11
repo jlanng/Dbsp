@@ -183,3 +183,45 @@ public sealed class TradeFills : IPipelineDefinition
 
     public static Dictionary<long, long> Counts(IEnumerable<Fill> fills) => fills.GroupBy(f => f.TradeId).ToDictionary(g => g.Key, g => g.LongCount());
 }
+
+/// <summary>An event with a time of its own, in milliseconds after <see cref="Epoch"/>.</summary>
+public sealed record Tick(long Id, string Trader, long AtMs, decimal Quantity)
+{
+    public static readonly DateTimeOffset Epoch = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+    public DateTimeOffset At() => Epoch.AddMilliseconds(AtMs);
+}
+
+public sealed record WindowTotal(string Trader, long WindowStartMs, decimal Quantity);
+
+/// <summary>Event-time state: a quantity per trader in tumbling windows, live and — once
+/// the watermark closes a window — as a final. A tick with a negative quantity throws.</summary>
+[Pipeline("windowed")]
+public sealed class WindowedTotals : IPipelineDefinition
+{
+    public const int WindowMs = 10_000;
+    public const int LatenessMs = 2_000;
+
+    public void Build(PipelineBuilder p)
+    {
+        var totals = p.Input<Tick>("ticks")
+            .Where(t => t.Quantity >= 0 ? true : throw new InvalidOperationException($"negative quantity on tick {t.Id}"))
+            .WithEventTime(t => t.At(), TimeSpan.FromMilliseconds(LatenessMs))
+            .GroupBy(t => t.Trader)
+            .TumblingWindow(TimeSpan.FromMilliseconds(WindowMs))
+            .Sum(t => t.Quantity).Named("totals");
+        p.UpsertSink("live", totals.Rows().Select(Row), Key);
+        p.UpsertSink("final", totals.OnClose().Named("finals").Rows().Select(Row), Key);
+    }
+
+    private static WindowTotal Row(WindowedValue<string, decimal> w) =>
+        new(w.Key, (long)(w.WindowStart - Tick.Epoch).TotalMilliseconds, w.Value);
+
+    public static string Key(WindowTotal total) => $"{total.Trader}@{total.WindowStartMs}";
+
+    /// <summary>What the live sink holds for <paramref name="ticks"/>, none of them late.</summary>
+    public static Dictionary<string, WindowTotal> Model(IEnumerable<Tick> ticks) =>
+        ticks.GroupBy(t => (t.Trader, Start: t.AtMs - t.AtMs % WindowMs))
+            .Select(g => new WindowTotal(g.Key.Trader, g.Key.Start, g.Sum(t => t.Quantity)))
+            .ToDictionary(Key);
+}

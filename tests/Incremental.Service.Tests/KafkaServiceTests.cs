@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using Acme.Contracts;
 using Incremental.Kafka;
+using Incremental.Storage;
 using Incremental.Tables;
 using Microsoft.Extensions.DependencyInjection;
 using static Incremental.Service.Tests.SupervisorTests;
@@ -581,5 +582,122 @@ public class KafkaServiceTests(ITestOutputHelper output)
         Assert.Equal(poison, all.Where(e => e.Source is null).Select(TradeId).Distinct().Order());
         Assert.Equal([$"{tradesTopic}[0]@241", $"{tradesTopic}[0]@60"], all.Where(e => e.Source is not null).Select(e => e.Source).Distinct().Order());
         Assert.True(all.Count <= poison.Count + 2 + 8, $"{all.Count} dead letters for {poison.Count + 2} dropped records");
+    }
+
+    [Fact]
+    public async Task A_takeover_in_the_middle_of_open_windows_reopens_none_and_still_closes_them_all()
+    {
+        await using var env = KafkaTestEnv.Create();
+        var ticksTopic = await env.CreateTopicAsync("ticks");
+        var liveTopic = await env.CreateTopicAsync("live", compacted: true);
+        var finalTopic = await env.CreateTopicAsync("final", compacted: true);
+        var aloneTicksTopic = await env.CreateTopicAsync("alone-ticks");
+        var aloneLiveTopic = await env.CreateTopicAsync("alone-live", compacted: true);
+        var aloneFinalTopic = await env.CreateTopicAsync("alone-final", compacted: true);
+
+        PipelineSpec Windowed(string id, string ticks, string live, string final) => Spec(id, "windowed") with
+        {
+            Inputs = new Dictionary<string, JsonElement> { ["ticks"] = KafkaBinding(ticks) },
+            Sinks = new Dictionary<string, JsonElement> { ["live"] = KafkaBinding(live), ["final"] = KafkaBinding(final) },
+        };
+        static ChangelogStorageProvider State(TestService node, string id) => node.Node.Context.Storage.Pipeline(id);
+        static long Writes(string topic, string key) =>
+            KafkaTestEnv.ReadTopic(topic).Count(r => JsonSerializer.Deserialize<string>(r.Message.Key, JsonSerializerOptions.Web) == key);
+
+        // Five traders, a tick every 100 ms of event time for 28 s, in order: nothing is
+        // late. Ten-second windows, so each trader has two closed and its third open.
+        var id = 0L;
+        var ticks = new List<Tick>();
+        for (var ms = 0; ms < 28_000; ms += 100)
+            ticks.Add(new Tick(++id, $"t{ms / 100 % 5}", ms, 1 + ms % 7));
+        // In two parts, because a close is announced by the step after the one that moved
+        // the watermark past it: once the first twenty seconds are through, any step that
+        // reads the rest announces every trader's first window.
+        foreach (var tick in ticks.Where(t => t.AtMs < 20_000))
+            env.ProduceJson(ticksTopic, tick.Id, tick);
+        await env.FlushAsync();
+
+        await using var a = await env.StartNodeAsync("a", lead: true);
+        await a.DeployAsync(Windowed("windowed", ticksTopic, liveTopic, finalTopic));
+        await KafkaTestEnv.TopicEqualsAsync(liveTopic, WindowedTotals.Model(ticks.Where(t => t.AtMs < 20_000)), "the first twenty seconds' windows");
+        foreach (var tick in ticks.Where(t => t.AtMs >= 20_000))
+            env.ProduceJson(ticksTopic, tick.Id, tick);
+        await env.FlushAsync();
+        await KafkaTestEnv.TopicEqualsAsync(liveTopic, WindowedTotals.Model(ticks), "the live windows before the takeover");
+        await Eventually(
+            () => Enumerable.Range(0, 5).All(t => KafkaTestEnv.ReadTable<string, WindowTotal>(finalTopic).ContainsKey($"t{t}@0")),
+            "the first window of every trader to be final");
+
+        // The checkpoint carries the clock: the watermark, and what the one source has seen.
+        var watermark = Tick.Epoch.AddMilliseconds(27_900 - WindowedTotals.LatenessMs).UtcTicks;
+        await Eventually(
+            () => State(a, "windowed").CommittedOffsets.GetValueOrDefault("ticks#p0", -1) == ticks.Count - 1,
+            "the leader to commit everything it read");
+        Assert.Equal(watermark, State(a, "windowed").CommittedOffsets["$watermark"]);
+        Assert.Equal(Tick.Epoch.AddMilliseconds(27_900).UtcTicks, State(a, "windowed").CommittedOffsets["$watermark#s0"]);
+
+        await using var b = await env.StartNodeAsync("b");
+        await WarmStandbyAsync(b);
+        await Eventually(() => b.Pipelines.Get("windowed").State == PipelineState.Built, "the standby to build the circuit");
+        await Eventually(() => State(b, "windowed").CommittedOffsets.GetValueOrDefault("$watermark") == watermark, "the standby to follow the clock");
+        var open = State(a, "windowed").CountEntries();
+        var closedWindow = "t0@0";
+        var writesBefore = Writes(liveTopic, closedWindow);
+        Assert.Equal(new WindowTotal("t0", 0, ticks.Where(t => t.Trader == "t0" && t.AtMs < 10_000).Sum(t => t.Quantity)),
+            KafkaTestEnv.ReadTable<string, WindowTotal>(finalTopic)[closedWindow]);
+
+        // Leadership moves with five windows open.
+        await b.Node.TakeOverAsync(new NodeActionOptions(), default).WaitAsync(Timeout);
+        await b.Running("windowed");
+
+        // The first record the new leader reads is twenty seconds behind the watermark, in
+        // a window that closed and was delivered as final. Then the clock moves far ahead
+        // on another trader: the five open windows are never touched again.
+        var late = new Tick(++id, "t0", 5_000, 1000);
+        var ahead = new Tick(++id, "z", 1_000_000, 3);
+        env.ProduceJson(ticksTopic, late.Id, late);
+        env.ProduceJson(ticksTopic, ahead.Id, ahead);
+        await env.FlushAsync();
+        await KafkaTestEnv.TopicEqualsAsync(liveTopic, WindowedTotals.Model(ticks.Append(ahead)), "the live windows after the takeover, the late record dropped");
+
+        // Closes are announced by the step after the one that moved the watermark.
+        var nudge = new Tick(++id, "z", 1_000_500, 4);
+        env.ProduceJson(ticksTopic, nudge.Id, nudge);
+        await env.FlushAsync();
+        var all = WindowedTotals.Model(ticks.Append(ahead).Append(nudge));
+        await KafkaTestEnv.TopicEqualsAsync(liveTopic, all, "every window live");
+        await KafkaTestEnv.TopicEqualsAsync(
+            finalTopic, all.Where(w => w.Value.Trader != "z").ToDictionary(), "every window final but the one still open");
+
+        // No reopened window: nothing was written for the closed one after the takeover,
+        // and its final is the one delivered before it.
+        Assert.Equal(writesBefore, Writes(liveTopic, closedWindow));
+
+        // And nothing left behind for the windows that were open at the takeover: the
+        // state is that of a pipeline which only ever saw the last two records.
+        env.ProduceJson(aloneTicksTopic, ahead.Id, ahead);
+        env.ProduceJson(aloneTicksTopic, nudge.Id, nudge);
+        await env.FlushAsync();
+        await b.DeployAsync(Windowed("alone", aloneTicksTopic, aloneLiveTopic, aloneFinalTopic));
+        await KafkaTestEnv.TopicEqualsAsync(aloneLiveTopic, WindowedTotals.Model([ahead, nudge]), "the reference pipeline's one window");
+        var alone = 0L;
+        var left = 0L;
+        await Eventually(
+            () =>
+            {
+                try
+                {
+                    alone = State(b, "alone").CountEntries();
+                    left = State(b, "windowed").CountEntries();
+                }
+                catch (InvalidOperationException)
+                {
+                    return false; // a store changed under the count: a step was running
+                }
+                return alone > 0 && left == alone;
+            },
+            $"the state to shrink to one open window (it held {open} entries at the takeover)");
+        Assert.True(left < open, $"{left} entries now, {open} with five windows open");
+        output.WriteLine($"state entries: {open} with five windows open at the takeover, {left} once they closed (a pipeline that saw only the last window: {alone})");
     }
 }

@@ -114,6 +114,31 @@ public class DeadLetterSinkTests
     }
 
     [Fact]
+    public async Task A_dead_letter_s_positions_are_the_inputs_and_not_the_circuit_s_clock()
+    {
+        // An event-time pipeline's checkpoint also carries its watermark, under keys of
+        // the circuit's own. They say nothing about where a dropped record came from.
+        await using var service = await StartAsync();
+        await service.DeployAsync(Spec("w", "windowed") with
+        {
+            Circuit = Lenient,
+            DeadLetters = MemoryBinding("dlq"),
+            Inputs = new Dictionary<string, JsonElement> { ["ticks"] = MemoryBinding("w-in") },
+            Sinks = new Dictionary<string, JsonElement> { ["live"] = MemoryBinding("w-live"), ["final"] = MemoryBinding("w-final") },
+        });
+        service.Memory.Log<Tick>("w-in").AppendRange([new Tick(1, "t", 1_000, 1), new Tick(2, "t", 2_000, 1)]);
+        await Eventually(() => service.Pipelines.Get("w").CommittedOffsets.ContainsKey("$watermark"), "a checkpoint with the watermark in it");
+
+        service.Memory.Log<Tick>("w-in").AppendRange([new Tick(3, "t", 3_000, -1)]);
+        var sink = service.Memory.AppendSink<DeadLetterEnvelope>("dlq");
+        await Eventually(() => sink.Records.Count == 1, "the dropped tick in the dead-letter sink");
+        var after = sink.Records[0].After;
+        Assert.NotNull(after);
+        Assert.NotEmpty(after);
+        Assert.All(after.Keys, key => Assert.StartsWith("ticks", key));
+    }
+
+    [Fact]
     public async Task The_checkpoint_waits_for_the_sink_so_a_takeover_delivers_what_the_old_leader_had_not_stored()
     {
         var cluster = new InMemoryServiceCluster();

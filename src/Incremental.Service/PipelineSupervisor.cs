@@ -1999,7 +1999,9 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             Dictionary<string, Dictionary<int, long>>? perSlot = null;
             foreach (var (key, offset) in committed)
             {
-                if (key == "$step")
+                // The step sequence and the event-time clock ($watermark…) are the
+                // circuit's own entries, not a position in any input.
+                if (key.StartsWith('$'))
                     continue;
                 var mark = key.LastIndexOf("#p", StringComparison.Ordinal);
                 if (mark > 0 && worded.Any(w => key.AsSpan(0, mark).SequenceEqual(w.Slot))
