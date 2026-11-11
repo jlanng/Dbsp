@@ -1276,6 +1276,18 @@ What to know:
   deployment both take over; one is fenced at once and exits.
 - **Give each node its own `CacheDirectory`**, and the plugin directory to whichever may
   lead first. Plugins reach the other through a compacted topic, `{prefix}.svc.blobs`.
+  A configured directory is kept between runs and pruned of versions the catalog no
+  longer holds; the default is a temporary directory that goes with the process.
+- **A reset or a removal is carried through once it is recorded.** The intent is
+  committed first; after that a caller that goes away cancels nothing, a failure leaves
+  the pipeline in `Backoff` with the act still pending and tried again, and no path —
+  start, restart, a backoff retry, a takeover — starts the pipeline around it.
+- **A connector's own calls are bounded** by `ServiceOptions.ConnectorTimeout` (30 s): a
+  source that does not start, or a sink that does not finish its reset, is that
+  pipeline's fault and holds up neither its queue nor a takeover.
+- **Seeds are applied once.** `AddTable`/`AddPipeline` are written to the catalog by the
+  first leader that finds them not yet applied, and the catalog records it: a seeded
+  pipeline or table that is removed stays removed.
 - `node.Status` has what a status page needs: role and terms, heartbeat age, whether the
   delivery lease is held, how the last takeover's time was spent, the peer's answer, and
   on a standby how far its catalog, tables and state are behind.
@@ -1297,8 +1309,10 @@ app.MapIncrementalHealth("/health");        // /live, /ready, /status: for a loa
 
 - **It is loopback-only until a policy is set.** With no `AuthorizationPolicy` a request
   is refused unless it comes from a loopback address, names a loopback host (or one in
-  `AllowedHosts`) and carries no forwarding header. Behind a proxy, or across machines,
-  set a policy; `PipelinePolicy`, `TablePolicy`, `NodePolicy` and `PluginPolicy` then say
+  `AllowedHosts`), carries no forwarding header and is not HTTP/1.0 (which is what nginx
+  speaks to its upstream by default). That is a default for a developer's machine, not
+  authentication: a proxy on the same machine that adds no header and speaks HTTP/1.1
+  cannot be told from a local client. Behind a proxy, or across machines, set a policy; `PipelinePolicy`, `TablePolicy`, `NodePolicy` and `PluginPolicy` then say
   who may change what. `ReadOnly` refuses every mutation, and the UI shows no actions.
 - **Row data is a switch.** Off, the row endpoints answer 403, and faults, dead letters,
   unreadable records and events come back with the exception's type and not its message:
@@ -1308,20 +1322,23 @@ app.MapIncrementalHealth("/health");        // /live, /ready, /status: for a loa
   takeover, step-down — `confirm=<the id>`. A pipeline mutation may carry
   `If-Match: "<generation>"` and gets 412 if the pipeline has moved. On a standby they are
   refused with the leader's id and address, except takeover.
-- **Everything is bounded.** Lists are paged (`skip`, `limit`, at most `MaxRows`); a row
-  read scans at most `MaxScannedRows` and says when it stopped short (`truncated`) —
-  "not found" and "not reached" are different answers, and on a standby `lagVersions`
-  adds "not arrived here yet". The event feed (`GET api/events`, server-sent events with
+- **Everything is bounded.** Lists are paged (`skip`, `limit`, at most `MaxRows`). A page
+  of a table's rows answers `next`, which is the `from` of the page after it, so every
+  row of a table of any size can be reached; a search (`contains`) looks at no more than
+  `MaxScannedRows` rows per request and says when it stopped short (`truncated`, with a
+  `next` to carry on from) — "not found" and "not reached" are different answers, and on
+  a standby `lagVersions` adds "not arrived here yet". The event feed (`GET api/events`, server-sent events with
   ids, replayed from `Last-Event-ID`) queues 64 frames per client and drops the oldest.
 - **Durations are milliseconds; a spec comes back in the form it is sent in**, with any
-  property its connector declares secret replaced by `***`.
+  property its connector declares secret replaced by `***`. Sent back so, `***` keeps the
+  stored value for that slot and connector, and is refused where none is stored.
 
 | | Path | |
 |---|---|---|
 | GET | `info`, `node`, `node/metrics` | what the API allows; role, terms, health, readiness, peer, last takeover; the node's rates |
 | POST | `node/takeover`, `node/stepdown` | `force=`, `confirm=<node id>` |
 | GET | `tables`, `tables/{name}` | statistics, loader, readers and who holds the floor, unreadable records |
-| GET | `tables/{name}/rows` | `limit`, `skip`, `contains` — or `key`, or `index` and `key` |
+| GET | `tables/{name}/rows` | `limit`, `from`, `contains` — or `key`, or `index`, `key` and `skip` |
 | POST | `tables`, `tables/{name}/loader/restart`, `tables/{name}/reopen`; DELETE `tables/{name}` | |
 | GET | `pipelines`, `pipelines/{id}` | `q=`, `state=`; detail adds the spec, sources, sinks, committed table versions, faults, history |
 | GET | `pipelines/{id}/graph`, `/metrics`, `/dead-letters` | the circuit; 60 one-second and 60 one-minute samples; the ring, newest first by `before=` |

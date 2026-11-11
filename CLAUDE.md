@@ -16,6 +16,8 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   `INCREMENTAL_KAFKA_BOOTSTRAP` points them at another broker. `KafkaFailoverProcessTests`
   launch `tests/Incremental.Kafka.FailoverApp` as real processes and kill, stop and
   command them; measured numbers go to `measurements.log` beside the test assembly.
+- After a mutation script has restored a source file, touch it (or the next build keeps
+  the mutated binary: the restored file is older than the output it produced).
 - Service tests: `dotnet test --project tests/Incremental.Service.Tests` — about a minute
   and a half with the connector stack up, a few seconds without it: the Kafka-backed classes
   (`KafkaService*Tests`) skip when the broker is unreachable, the CDC one also without
@@ -204,7 +206,21 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   - Everything durable or about roles goes through `IServiceBackend`; outside
     `InMemoryBackend.cs`, `KafkaBackend.cs` and `KafkaConnectors.cs` nothing in the service
     names Kafka or the in-memory logs. Only the leader writes the catalog,
-    one action per version, and commits intent before it acts.
+    one action per version, and commits intent before it acts. Once an intent is committed
+    the action takes no caller's token and is carried through; a catalog write looks at
+    its token once, before the first row reaches the table's writer.
+  - A pipeline's runtime is acted on only under its queue, and everything is checked
+    again once the queue is held (`EnterExistingAsync`): the runtime is still the one the
+    supervisor holds, it exists, and the node still runs pipelines. A runtime leaves the
+    dictionary only under its own queue.
+  - Every path that can start a generation goes through `ReconcileAsync`, which finishes
+    a pending reset or removal first and never starts a pipeline around one; a failure to
+    finish is `Backoff` and the act is retried. `StartCoreAsync` asks who leads again
+    before it publishes the generation, because a start can outlast a takeover.
+  - Naming a thing and removing it share one lock (`ServiceContext.LockReferencesAsync`):
+    a deploy checks its tables and plugin version and commits under it; a table removal
+    and a plugin delete hold it from their check of users to the end. It is taken after a
+    pipeline's queue, never before, and (for a plugin delete) after the import lock.
   - The service promotes its tables itself, inside the leadership's `PrepareAsync`,
     concurrently and each contained; it never calls `KafkaLeadership.Track(table, log)`,
     which would let one table end a takeover. Only the storage is tracked.
@@ -223,13 +239,23 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   - A table, plugin or pipeline that fails is that thing's failure: shown, retried, never
     thrown out of a takeover callback. Only the catalog and the storage may fail a node.
   - Nothing waits without a bound, and nothing holds another pipeline's queue: teardown is
-    `StopTimeout`, then abandon, then `Wedged`.
+    `StopTimeout`, then abandon, then `Wedged`; a connector's `StartAsync` and `ResetAsync`
+    are tenant code and get `ConnectorTimeout`.
+  - Seeds are applied once per deployment and recorded in `node/seeds`; never test "the
+    key is absent" to decide whether to seed — a removal makes that true again.
   - Nothing of a plugin's may be reachable from a static or a process-wide cache, or its
     load context never unloads. That includes `JsonSerializerOptions`: a pipeline's types
     go only through the per-version options on its `PluginLease`, and those are built with
     a resolver of their own, because System.Text.Json shares one metadata cache between
     options instances it considers equivalent. `Validator` (DataAnnotations) is avoided
-    for the same reason. The unload test in `PluginTests` is the check.
+    for the same reason. One cache cannot be avoided — System.Text.Json's accessor cache,
+    which drops an entry only when it is next used — so an unload is followed by a few
+    uses of it (`JsonAccessorCache.EvictSoon`). The unload test in `PluginTests` is the
+    check, and it must pass when run alone.
+  - A manifest's `MainAssembly` is a file within the package and `AssemblyName` the
+    assembly's simple name; they differ, so never derive one from the other. Which
+    reference goes to the host is `HostAssemblies.Provides`: contracts first, then the
+    assemblies whose types cross the boundary, then by version.
   - The state binding: a pipeline's typed stores belong to one plugin version. Changing
     the version, or anything else that changes what the state means, goes through
     `ChangelogStorageProvider.ReleaseStores()` first.

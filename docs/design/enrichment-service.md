@@ -263,8 +263,12 @@ Rules:
 lead. Tables and state are still new at every start, so this restores *what is deployed*,
 not its data: pipelines start empty and replay their sources.
 
-**Seeds.** `AddTable` and `AddPipeline` on the DI builder are written to the catalog by
-the first leader if their key is absent. After that the catalog wins.
+**Seeds.** `AddTable` and `AddPipeline` on the DI builder are written to the catalog
+once per deployment. The catalog records which seeds have been applied (`node/seeds`);
+a leader applies the seeds that record does not name, and an entry that is already there
+counts as applied. After that the catalog wins: a seeded table or pipeline that is
+removed stays removed. (As first built the test was "the key is absent", which a removal
+makes true again: see *As built*, S5.)
 
 ## Connections
 
@@ -537,17 +541,21 @@ because both become directory names.
   own collectible `AssemblyLoadContext`.
 
 **Type sharing, exactly.** A pipeline context resolves an assembly name in this order:
-(1) the host's own — `Incremental*`, `Microsoft.Extensions.*`, `Confluent.Kafka`, the
-framework — from the default context; (2) a loaded contract assembly, by simple name, from
-the contract context, *even if the plugin ships its own copy*; (3) anything else privately,
-through `AssemblyDependencyResolver`. So two plugins that both reference `Acme.Contracts`
+(1) a loaded contract assembly, by simple name, *even if the plugin ships its own copy*;
+(2) the host's own — `Incremental*`, `Microsoft.Extensions.*`, `Confluent.Kafka`, the
+framework — from the default context, whatever the plugin ships; (3) any other assembly
+the host carries, from the default context, if the host's version is at least the one
+referenced or the plugin ships none; (4) anything else privately, through
+`AssemblyDependencyResolver` and then by file name beside the main assembly. So two plugins that both reference `Acme.Contracts`
 get the same `Instrument` type, and it is the type the table was opened with. A row type
 of a shared table declared in a pipeline assembly cannot work, and `registry.Get` says so.
 A pipeline compiled against a newer contract than the one loaded fails at validation with
 the missing member.
 
 **Changing a contract.** A new version under the same assembly name is stored and
-reported as *pending*: it takes effect when a process starts. Roll it with the pair:
+reported as *pending*: it takes effect when a process starts — a starting process loads
+the version imported last (`PluginManifest.Sequence`), and the older one then reads
+*superseded*. Roll it with the pair:
 restart the standby, step the leader down, restart the old leader. Rows are JSON in the
 logs, so only additive changes survive this. The import compares the row shapes of every
 declared table and, if any changed, is refused with 409 listing the differences (table,
@@ -1729,6 +1737,16 @@ beyond the design's list had to be true for that:
 - **`System.ComponentModel.DataAnnotations.Validator` keeps a process-wide store of type
   metadata.** Settings are validated attribute by attribute instead
   (`ValidationAttribute.IsValid`), which touches no store.
+- **One process-wide cache is left, and it empties only when used** (found in review,
+  S5). System.Text.Json compiles the accessors of a type's constructor and members and
+  keeps them in a static cache keyed by the type; an entry is dropped about a second
+  after its last use, but only when the cache is next used by anyone. The unload test
+  passed in the full suite, where other tests use the cache, and failed when run alone:
+  on a quiet node an unloaded context stayed alive, and counted against
+  `MaxLoadedPluginVersions`, until unrelated JSON work happened. An unload is now
+  followed by four uses of that cache over about five seconds, with a type of the
+  service's own (`JsonAccessorCache.EvictSoon`). The test passes alone; with the call
+  removed it fails alone.
 
 So pipeline contexts are collectible, and `MaxLoadedPluginVersions` is the backstop it was
 designed as.
@@ -2367,3 +2385,188 @@ the pre-stop state check), C7, `PipelineTestHarness`, `file` connectors, the
 `deadLetters` slot, contract schema-change detection, the 80% retention warning, a
 deploy form generated from the settings schema. Nothing has been run against MSK; the
 guide lists what that leaves unverified.
+
+### S5 — the review's findings
+
+A review of S1–S4 confirmed 47 findings. This step fixes them. Each was reproduced with
+a failing test where that was feasible, fixed, and the test kept; the UI defects were
+reproduced and re-verified in Chromium. What changed in behaviour is below, by area;
+the departures from the design above are marked as such.
+
+**The supervisor: one action at a time on one pipeline, for real.**
+
+- *The queue is checked after it is taken.* Every action looked its runtime up, waited
+  for the queue and then carried on, whatever had happened meanwhile. A dry run or a
+  refused deploy dropped the placeholder of a new id while the real deploy waited on it,
+  and the real deploy then committed and started a pipeline no dictionary held; an
+  action queued behind a removal wrote the removed pipeline back into the catalog. Now
+  a deploy takes the runtime again until the one it holds is the one the supervisor
+  holds, the placeholder is dropped under the queue, and every other action checks, once
+  it has the queue, that the runtime is still held, still exists and that the node still
+  runs pipelines (`EnterExistingAsync`).
+- *A reset or a removal is finished, by whoever is there.* Their second halves ran on
+  the caller's token with nothing catching a failure, so a client that disconnected or
+  a sink store that was briefly unreachable left the pipeline in `Stopping` for good
+  with the act pending; `start` and `restart` then ran it around the pending act, and so
+  did the backoff retry after a failed finish at takeover — a pipeline pending removal
+  came back to life. Now nothing after the intent commit takes the caller's token, and
+  every path that can start a generation goes through `ReconcileAsync`, which finishes
+  the pending act first. A failure to finish is `Backoff` with the reason
+  (`reset not finished: …`), retried with the restart policy, and ends in `Failed` like
+  any other; `restart`, or the reset or removal sent again, retries it at once.
+  **Departure:** a reset or removal whose finish fails now returns its plan rather than
+  throwing — the intent is recorded and the act will be finished — and the pipeline's
+  state says what is outstanding.
+- *A cancellation is the pipeline's unless it is the takeover's.* An
+  `OperationCanceledException` out of a sink connector's `ResetAsync` (an HTTP timeout
+  is one) escaped the takeover, fenced the node and did the same to its successor.
+  Only a cancellation of the takeover's own token now leaves the takeover.
+- *A connector's own calls are bounded.* `IAppendSourceConnector.StartAsync`,
+  `IKeyedSourceConnector.StartAsync` and `IResettableSinkConnector.ResetAsync` run off
+  the supervisor's thread and get `ServiceOptions.ConnectorTimeout` (30 s, new). Past it
+  the generation is torn down and the pipeline faults; a source that starts late is
+  disposed. A takeover waits for every pipeline's start, so this bounds it.
+- *A start can outlast a takeover.* `AbandonAllAsync` looked at `Current`, which is set
+  only when a start has finished, so a generation that was starting when the node was
+  fenced was published afterwards and ran on a node that no longer led. The supervisor
+  now has a flag for "this node runs pipelines" (set at takeover, cleared by
+  `StopAllAsync` and `AbandonAllAsync`); a start asks again before it publishes its
+  generation and tears it down instead; abandoning cancels a start in flight and takes
+  each pipeline's queue (bounded by `StopTimeout`) before it tears a generation down,
+  like every other teardown. `DisposeAsync` waits for that before it disposes what the
+  circuits stand on.
+- *Naming a thing and removing it share a lock* (`ServiceContext.LockReferencesAsync`).
+  A table removal and a plugin delete checked their users and then wrote, with nothing
+  between them and a deploy that had already resolved the table or the version. A
+  deploy now checks its tables, the one-writer rule and its plugin version again under
+  that lock and commits there; a table removal and a plugin delete hold it from their
+  check to their end. It is held for a check and a catalog commit, never while a
+  pipeline starts or stops.
+- *A catalog write looks at its token once*, before the first row reaches the table's
+  writer. A commit cancelled while it waited left its rows staged in the writer, and
+  the next commit of anything — the leader's once-a-second writer probe — published an
+  action that had been reported as cancelled. `BeginAsync` also reads the table after
+  it has the write lock, so a write queued behind a reopen gets the reopened table.
+- *Seeds are recorded* (`node/seeds`, a `SeedRecord`): **departure from "if their key
+  is absent"**, which a removal makes true again. An entry already there counts as
+  applied, so a deployment older than the record gains it at its next takeover.
+- *A secret sent back as `***` keeps the stored value* for the same slot and connector,
+  and is refused where none is stored. The admin UI's *Edit spec…* seeds its editor with
+  the redacted spec, and replacing a pipeline from it had stored the mark.
+- *Readiness uses three samples.* A standby is `state-behind` only if it was behind at
+  each of its last three one-second samples (`StateLagWindow`).
+- Durations in reasons and plans are written for a reader (`26 min 31 s`), and hold no
+  colon: what follows the first colon of a reason is hidden where row data is, and a
+  `TimeSpan` put one inside the service's own text.
+- A node that no longer leads logs one warning; a pipeline that ends because of it is
+  logged as that, not as a fault with a stack, and its circuit's own errors are written
+  at Debug from the moment its outputs are abandoned on purpose (`GenerationLogs`).
+
+**Plugins.**
+
+- `PluginManifest` gains `AssemblyName` and `Sequence` (both optional when read).
+  `MainAssembly` is now the main assembly's *file* within the package, as the design
+  said, where it had been the assembly's name with `.dll`: a package whose main
+  assembly was named or placed otherwise imported and could never load. `Sequence` is
+  the audit sequence of the import and orders the versions of one contract: a starting
+  process loads the one imported last (the order had been that of the catalog's rows),
+  and the other reads `superseded`.
+- *Which references go to the host* is now the rule the design gives, with one addition
+  (**departure**): an assembly the host merely carries is shared only when the host's
+  version satisfies the reference or the plugin ships none; a plugin built against a
+  newer one, and shipping it, gets its own copy. Before, anything the host carried or
+  had loaded was the host's, whatever its version. Contracts are tried first.
+- A plugin context that resolved a name to its own copy before a contract of that name
+  arrived is retired when the contract loads: no new use gets it, and it unloads with
+  its last. Pipelines already on it keep their copy until restarted, and the log says so.
+- Delete takes the import lock and the references lock; it refuses a contract while a
+  declared table's definition is in it and in no other stored version; it looks at
+  whether the node still leads before each blob it deletes. Importing a stored version
+  again puts back any blob the store has lost. **Not closed:** the blob store's writes
+  are unfenced, so a leader replaced between that look and the delete can still delete
+  a blob its successor has stored again; the repair is the re-import. Fencing blob
+  deletes would mean writing them through the log's transactional producer, which the
+  blob topic's "plain idempotent producer" rule excludes; it is left as a known limit
+  and is in the guide.
+- A zip from a stream that cannot seek is spooled to a file in the cache directory and
+  refused past `MaxPluginBytes` before `ZipArchive` sees it (it would have buffered the
+  whole stream in memory first).
+- The cache directory: the default one is the process's and is deleted at dispose; a
+  starting node deletes those of processes that no longer run, and import leftovers. A
+  configured one is pruned of versions the catalog no longer holds, at takeover and
+  whenever a standby applies a catalog version; a delete removes the version's files.
+  Deleting a directory is best effort (`IOException`, `UnauthorizedAccessException`),
+  which is also what keeps a zip import on Windows from failing after its manifest is
+  committed. That last part is by reading: nothing was run on Windows.
+- The fingerprint also covers enum members and values and anonymous types' members,
+  and the text shown says what it is: `declared data shapes identical; shapes used only
+  inside delegates are not compared`.
+- A definition's constructor exception is reported as itself, not as
+  `TargetInvocationException`.
+- A plugin project copies its NuGet dependencies (`CopyLocalLockFileAssemblies=true`)
+  and excludes the host's with `ExcludeAssets="runtime;native"`: with `runtime` alone the
+  Kafka client's native libraries, about 100 MB, were copied as soon as copy-local was
+  on, and with copy-local off — what the guide prescribed — a plugin's own package
+  dependencies were not in the package at all. `Acme.Desks` now has one (LZ4) and calls
+  into it.
+
+**Admin.**
+
+- Row reads: a scan takes `from` and answers `next`; rows passed over are not counted
+  towards `MaxScannedRows` (they had been, so nothing past the bound could be browsed
+  and *Next* stayed enabled on empty pages); a search that stops at its bound says where,
+  and the UI offers *Keep scanning*. An index read is paged with `skip`, and reads only
+  the page.
+- The loopback rule also refuses `X-Real-IP`, `Via`, `X-Forwarded-Proto/-Port/-Server`
+  and HTTP/1.0, which is what nginx speaks to its upstream unless told otherwise. **It
+  remains a default, not authentication:** a proxy that rewrites the host, adds no
+  header and speaks HTTP/1.1 cannot be told from a local client, the option's
+  documentation and the guide now say so, and mounting the API without a policy logs it.
+- A node that no longer leads names the node that does, from its probe (`PeerInfo`
+  gains `AdminUrl`; the Kafka probe's detail token carries it as `;admin=…`), since its
+  own catalog still names itself. Nodes are probed in every role.
+- The event hub no longer measures the state lag: nothing read it.
+- UI: the nav shows the total and, beside it, how many need attention; a standby's
+  overview and dead-letter pages say that pipelines and dropped records are the
+  leader's to report; a refused feed says the node is serving its limit and retries
+  every five seconds; the replace dialog refuses another id; an unknown sort key sorts
+  by state; the lookup button enables as a key is typed. Screenshots retaken.
+
+**Changes outside the service** (the smallest that would do):
+
+- Core: `TableSnapshot.RowsBy(index, key, skip, take, out total)` — a page of an index
+  read. The existing overload materialises every row under the key.
+- `Incremental.Kafka`: `KafkaLeadership.StepDownCoreAsync` closes the writer and ends
+  `Fenced` when the resignation cannot be committed for a reason other than fencing. It
+  had left the role `Leader` with the writer heartbeating for a node whose circuits
+  were stopped. **Not tested:** it needs a resignation transaction aborted past the
+  retry limit, which nothing here can provoke; the existing step-down tests pass.
+- `Incremental.Kafka`: `KafkaConnectClient.ResetOffsetsAsync` (stop the connector,
+  delete its offsets). The example's `--clean` calls it: Connect keeps a deleted
+  connector's offsets, and the next connector of that name took no snapshot.
+- Example: the MSK snippet sets the token refresh on the admin client too; the `View`
+  sink's order is by key held, not by insertion ever made.
+
+**Tests.** `LifecycleTests` (new, 19), eleven more in `PluginTests`, more in `SeamTests`
+and `AdminApiTests`, one in `DebeziumCdcTests` (a connector removed with its offsets and
+created again under its name snapshots again — it times out without the reset), one in
+the core's `DescribeTests`. The races are run in rounds (a dry run against a first
+deploy 200 times, an action against a removal 60, a table removal against a deploy 150).
+`Incremental.Service.Tests` is 104 tests.
+
+**Mutation checks.** 34, all killed: the 33 listed in the scratch scripts (each
+re-check under the queue; the retry as a plain start, on a leader and at takeover; a
+tenant cancellation escaping the takeover; a start published without asking who leads;
+a source start with no bound; the catalog commit cancellable after staging; seeds by
+absent key; secrets not restored; the eviction after unload; the references re-checked
+under the lock, on both sides; the manifest's file; rows counted against the bound;
+index skip; a contract deleted from under its table; the blob repair; the unwrapped
+cause; the two cache deletions; the contract order; the host-version rule; the retired
+context; enum members in the fingerprint; the core's page), and the connector test
+without its reset. A mutation script that restores a file must touch it: the restored
+file is older than the binary the mutant produced, and the next build kept the mutant —
+which is how a stale core assembly was found during the browser pass.
+
+**Not done.** The step-down change has no test of its own. Blob deletes are still
+unfenced (above). Nothing was run on Windows or against MSK. The fingerprint still
+cannot see a tuple or a private dependency's type used only inside a delegate.

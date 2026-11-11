@@ -453,9 +453,12 @@ so implementations never see cross-thread access to one store.
   | ![A standby's cluster page: readiness and lag](docs/images/admin/cluster-standby.png) | ![Dead letters: the record, the error, the operator](docs/images/admin/dead-letters.png) |
 
   It is cautious until told otherwise. With no `AuthorizationPolicy` it answers loopback
-  requests only — it refuses another host name and anything a proxy forwarded — so
-  reaching it from another machine means setting a policy (`PipelinePolicy`,
-  `TablePolicy`, `NodePolicy` and `PluginPolicy` narrow the mutations further).
+  requests only — it refuses another host name and what it can tell a proxy forwarded
+  (a forwarding header, HTTP/1.0) — so reaching it from another machine means setting a
+  policy (`PipelinePolicy`, `TablePolicy`, `NodePolicy` and `PluginPolicy` narrow the
+  mutations further). The loopback rule is not authentication: a proxy on the same
+  machine that adds no header makes its callers loopback callers, so set a policy before
+  putting any proxy in front of it.
   `ReadOnly` refuses every mutation. Row data is off by default: without
   `ExposeRowData` the row endpoints answer 403 and faults, dead letters and events carry
   exception types, not messages, because a message can quote a row. Plugin upload and

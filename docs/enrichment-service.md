@@ -290,22 +290,42 @@ directory, or a zip of it, is the package.
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
-    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <!-- Copies the assemblies of the NuGet packages the plugin references: its private dependencies. -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
   <ItemGroup>
-    <!-- Provided by the host: compile against them, copy neither. -->
-    <ProjectReference Include="…/src/Incremental.Service/Incremental.Service.csproj" Private="false" ExcludeAssets="runtime" />
-    <ProjectReference Include="…/src/Incremental/Incremental.csproj" Private="false" ExcludeAssets="runtime" />
+    <!-- Provided by the host: compile against them, copy nothing of them. "native" matters:
+         without it the Kafka client's native libraries (about 100 MB) land in runtimes/. -->
+    <ProjectReference Include="…/src/Incremental.Service/Incremental.Service.csproj" Private="false" ExcludeAssets="runtime;native" />
+    <ProjectReference Include="…/src/Incremental/Incremental.csproj" Private="false" ExcludeAssets="runtime;native" />
     <ProjectReference Include="../Contracts/Enrichment.Contracts.csproj" Private="false" />
+    <!-- A private dependency: copied beside the plugin and loaded from there. -->
+    <PackageReference Include="Some.Library" Version="1.2.3" />
   </ItemGroup>
 </Project>
 ```
 
 The example's [`Plugin.props`](../examples/Incremental.EnrichmentService/Plugin.props)
-is this, shared by its three plugin projects. The plugin's name is its assembly's name in
-lower case (`enrichment.pipelines`); its version is a hash of its files, so the same
-build imported twice is one version. A plugin gets the host's copy of `Incremental*` and
-of every contract assembly even if it ships its own.
+is this, shared by its three plugin projects (which reference no package of their own).
+Look at the output directory before you ship it: it should hold your assembly, your
+dependencies and nothing named `Incremental*`, `Confluent*` or `runtimes/`.
+
+The plugin's name is its assembly's name in lower case (`enrichment.pipelines`); its
+version is a hash of its files, so the same build imported twice is one version. The
+main assembly is the one with a `.deps.json` beside it, or the only `.dll`, or the file
+a `plugin.json` names (`{ "assembly": "lib/My.Plugin.dll" }`).
+
+Where a plugin's references are loaded from:
+
+1. A **contract assembly** the process has loaded — always that one, even if the plugin
+   ships its own copy.
+2. The **host**, for the assemblies whose types cross between host and plugin —
+   `Incremental*`, `Microsoft.Extensions.*`, `Confluent.Kafka` and the framework —
+   whatever the plugin ships.
+3. The **host**, for any other assembly it happens to carry, if the host's version is at
+   least the one the plugin was built against. If the plugin was built against a newer
+   one and ships it, the plugin gets its own copy.
+4. The **plugin's own files**, for everything else.
 
 ### 4. A spec
 
@@ -358,8 +378,9 @@ interval, `errorPolicy`) and `restart` (how many faults in how long before the p
 is `Failed`).
 
 Deploy it from the host (`node.Pipelines.DeployAsync(spec, new DeployOptions(), ct)`),
-as a seed (`AddPipeline(spec)`, applied by the first leader if the catalog has no
-pipeline of that id), or over the admin API:
+as a seed (`AddPipeline(spec)`, applied once per deployment: the catalog records which
+seeds have been applied, so a seeded pipeline that is removed stays removed, and a seed
+added to the host later is applied by the next leader), or over the admin API:
 
 ```bash
 curl -X PUT http://127.0.0.1:5180/admin/api/pipelines/big-trades \
@@ -397,8 +418,9 @@ var service = builder.Services.AddIncrementalService(o =>
     .AddSinkConnector("view", _ => new ViewConnector(world.Views));
 ```
 
-Tables are seeded the same way pipelines are — written to the catalog by the first
-leader, and after that the catalog is the record:
+Tables are seeded the same way pipelines are — written to the catalog once, by the
+first leader that finds the seed not yet applied, and after that the catalog is the
+record (a seeded table that is removed is not declared again):
 
 <!-- snippet: examples/Incremental.EnrichmentService/Host/World.cs#tables -->
 ```csharp
@@ -826,14 +848,43 @@ log both take over, and one is fenced at once.
 
 **Takeover and step-down by hand.** `POST node/takeover` on the standby is refused
 unless it is warm; `POST node/stepdown` on the leader is refused unless the peer answers
-as a ready standby. Both take `dryRun=true` (the answer is the plan) and `force=true`.
-A node shutting down steps down by itself if a ready standby answers.
+as a ready standby. Both take `dryRun=true` (the answer is the plan) and `force=true`,
+and the real action needs `confirm=<node id>` — the id of the node the request is sent
+to, as for reset and remove:
+
+```bash
+curl -X POST 'http://127.0.0.1:5181/admin/api/node/takeover?confirm=b' -H 'X-Incremental-Admin: 1'
+```
+
+A node shutting down steps down by itself if a ready standby answers. A standby counts
+as behind on state (`state-behind`, not ready) only when it was behind at each of its
+last three one-second samples: a follower of a leader that commits all the time is a
+few records behind at most instants and caught up between them.
+
+A step-down whose resignation cannot be committed does not leave a leader that leads
+nothing: the node closes its writer and ends as fenced (exit code 3), and the standby
+takes over on the silence instead.
+
+**What a replaced node logs.** One warning: `Service node a is Fenced; it will not lead
+again in this process`. It abandons its circuits without draining them, since nothing of
+theirs can be committed any more. A circuit caught in the middle of a step reports that
+as a fault of its own; from the moment the node knows it no longer leads, those reports
+are written at Debug. A circuit can find out before its node does — its commit is
+refused by the fencing — and then `Circuit … faulted on step N` is logged at Error with
+a stack, followed by `Pipeline … ended because this node no longer leads`. Neither
+means the takeover failed: that is judged on the new leader, where every pipeline should
+be `Running`.
 
 **Failing pipelines never move leadership.** A pipeline that faults is torn down and
 restarted on its committed state with a doubling backoff; more than `maxRestarts`
 faults in the window and it is `Failed` until someone restarts it. `Failed` is not
 recorded in the catalog: a new leader tries again. A table whose loader faults keeps its
 last version for its readers while the loader is retried.
+
+**A connector that does not answer** is given `ConnectorTimeout` (30 s) — for a source's
+`StartAsync` and for a sink connector's `ResetAsync`. Past it the pipeline is treated as
+faulted and tried again like any other fault. A takeover waits for every pipeline's
+start, so this is also the longest one pipeline's connector can hold a takeover up.
 
 **Replace: keep or reset.** A replace that changes the plugin version, the definition,
 a setting not marked `[StateNeutral]`, an input or table binding, or the worker count is
@@ -853,6 +904,20 @@ after a reset that changes the keys a pipeline produces, a Kafka sink still hold
 keys. The smoke test's Kafka mode shows exactly this. Reset and remove need
 `confirm=<id>`.
 
+**A reset or a removal is recorded before it is carried out**, and from then on it is
+finished whatever becomes of the request: a caller that disconnects cancels nothing. If
+it cannot be finished — the state log or a resettable sink's store is unreachable — the
+pipeline stays down in `Backoff` with the reason (`reset not finished: …`), shows
+`unfinished reset`, and the act is tried again with the usual backoff; a new leader
+does the same. It is never started around a pending reset, and a pipeline pending
+removal is never started. `restart` retries the pending act at once; sending the reset
+or the removal again does too. A deploy is refused until it is finished.
+
+**Secrets in a spec.** A connector names the properties of its config that are secret,
+and the API returns those as `"***"`. A spec sent back with `"***"` in such a property
+keeps the stored value for that slot and connector, so a spec read from the API can be
+edited and deployed again; where nothing is stored to keep, `"***"` is refused.
+
 **Retention.** A table keeps the history its readers may still need: back to the oldest
 version any pipeline in the catalog has committed — a stopped pipeline counts — and, for
 the standby's sake, everything newer than `FollowerRetention` (10 min). The backend caps
@@ -868,9 +933,14 @@ the same record faults the pipeline, and since it is read again after the restar
 pipeline ends in `Failed`.
 
 **Security.** With no `AuthorizationPolicy` the admin API answers only loopback
-requests that name a loopback host and carry no forwarding header. Set a policy to use
-it across machines or behind a proxy; `PipelinePolicy`, `TablePolicy`, `NodePolicy` and
-`PluginPolicy` then say who may change what. Row data and exception messages are off
+requests that name a loopback host, carry no forwarding header (`Forwarded`,
+`X-Forwarded-*`, `X-Real-IP`, `Via`) and are not HTTP/1.0. That is a default for a
+developer's machine, not authentication. A reverse proxy on the same machine makes every
+caller a loopback caller; the checks catch the proxies that give themselves away — nginx
+by default speaks HTTP/1.0 to its upstream — and cannot catch one that rewrites the
+host, adds no header and speaks HTTP/1.1. **Behind any proxy, set a policy**;
+`PipelinePolicy`, `TablePolicy`, `NodePolicy` and `PluginPolicy` then say who may change
+what. Row data and exception messages are off
 unless `ExposeRowData` is set, and uploading code is off unless `AllowPluginUpload` is.
 Health (`/health/live`, `/ready`, `/status`) is outside all of this, for load balancers.
 A plugin is trusted code: it runs in the service's process with the service's rights.
@@ -878,7 +948,27 @@ A plugin is trusted code: it runs in the service's process with the service's ri
 **Each node needs** its own `CacheDirectory`; the plugin directory, if it has one, on
 whichever node may lead first (the other gets plugin files from the backend); and the
 host's `ShutdownTimeout` above `StopTimeout` + `AbandonTimeout` (25 s by default) if
-sinks are slow.
+sinks are slow. A configured cache directory is kept between runs (a restart loads
+plugins from disk) and pruned of versions the catalog no longer holds. Left unset, the
+cache is a directory under the system's temporary path that belongs to the process: it
+is deleted when the node is disposed, and a starting node deletes those of processes
+that no longer run.
+
+**Plugins and contracts.** Deleting a plugin version is refused while a pipeline names
+it, and deleting a contract is refused while a declared table's definition comes from it
+and from no other stored version — a node that started without it could not create the
+table. One version of a contract is loaded per process. Of the stored versions a
+starting process loads the one imported last; one imported while an older is loaded
+shows as `pending` and takes effect at the restart, and the older one then shows as
+`superseded`. To go back, delete the newer version and restart. Importing a version
+that is already stored changes nothing, except that any file the blob store has lost is
+put back — which is the repair if a version cannot be fetched.
+
+**Browsing rows.** A page of a table's rows carries `next`: pass it back as `from` for
+the page after it. Rows that are passed over are not looked at, so any row of a table of
+any size can be reached. A search (`contains=`) looks at no more than `MaxScannedRows`
+rows per request and then stops with `truncated` and a `next` to carry on from. The rows
+under an index key are paged with `skip`.
 
 ## On Amazon MSK
 
@@ -919,9 +1009,11 @@ public static void UseMsk(
             ["security.protocol"] = "SASL_SSL",
             ["sasl.mechanism"] = "OAUTHBEARER",
         },
-        // What a dictionary cannot carry: the token refresh, on every producer and consumer.
+        // What a dictionary cannot carry: the token refresh, on every client. The admin
+        // client is one of its own (it creates and describes the topics) and needs it too.
         ConfigureProducer = producer => producer.SetOAuthBearerTokenRefreshHandler(Refresh),
         ConfigureConsumer = consumer => consumer.SetOAuthBearerTokenRefreshHandler(Refresh),
+        ConfigureAdmin = admin => admin.SetOAuthBearerTokenRefreshHandler(Refresh),
     };
     service.UseKafkaBackend(new KafkaServiceBackendOptions { Log = log });      // also the connection "log"
 
@@ -972,8 +1064,16 @@ with no authentication. Specifically not verified:
 - **The standby builds no circuits.** It holds state as bytes and builds at takeover, so
   the takeover pays for decoding every pipeline's state. That is measured only for small
   state.
-- **`keep` is not verified before the pipeline stops**, and a store key that changes
-  shape between versions is not detected at all.
+- **`keep` is not verified before the pipeline stops.** What a replace reports about
+  the two versions (`declared data shapes identical` or `differ`) compares what the
+  plugin's own assembly declares: the public members of its types, its enums' members and
+  values, its anonymous types' members. A shape that exists only inside a delegate — a
+  tuple, a type from a private dependency — is not compared, so `identical` is evidence
+  and not proof.
+- **Plugin blobs are deleted by an unfenced writer.** A leader that is replaced in the
+  middle of deleting a plugin version looks at whether it still leads before each file
+  it deletes, which leaves a window of one call in which it can delete a file the new
+  leader has just stored again. Importing the version again puts the file back.
 - **No `file` source or sink connector, no durable dead-letter sink, no test harness
   for definitions** (`PipelineTestHarness` in the design). Test a definition by running
   a node in memory with the `memory` connector, as `tests/Incremental.Service.Tests` do.
