@@ -185,6 +185,11 @@ public class KafkaTableLogTests(ITestOutputHelper output)
         Assert.True(active.IsWriter);
         var small = changes.Where(c => c.Key != 7).ToList();
         await log.AppendAsync(new TableVersion<int, Instrument>(1, small, new Dictionary<int, long>()));
+
+        // A transaction's markers are written just after its commit returns, and on three
+        // brokers that is long enough for a read made at once to stop short of the
+        // version (this test failed that way there twice, in a handful of full runs).
+        await KafkaEnv.EventuallyAsync(async () => (await RestoreAsync(log)).Item2.Version == 1, "version 1 to be readable");
         var (rows, head) = await RestoreAsync(log);
         Assert.Equal(1, head.Version);
         Assert.Equal(19, rows.Count);
