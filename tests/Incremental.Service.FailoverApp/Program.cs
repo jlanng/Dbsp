@@ -15,9 +15,29 @@ using System.Text.Json.Serialization;
 using Acme.Contracts;
 using Incremental.Kafka;
 using Incremental.Service;
+using Incremental.Tools;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+
+Option[] known =
+[
+    new("--node", "id", "This node's id."),
+    new("--bootstrap", "host:port", "The Kafka bootstrap servers."),
+    new("--prefix", "name", "The topic prefix of the deployment."),
+    new("--plugins", "dir", "The plugin directory."),
+    new("--cache", "dir", "The plugin cache directory."),
+    new("--probe-port", "N", "Where this node answers its peer's probe (0: nowhere)."),
+    new("--peer-port", "N", "Where its peer answers (0: no probe)."),
+    new("--tables", "N", "Tables the fill command expects."),
+    new("--heartbeat-ms", "N", "The leader's heartbeat interval (1000)."),
+    new("--takeover-after-ms", "N", "Silence after which a standby takes over."),
+    new("--takeover-ceiling-ms", "N", "Silence after which it takes over whatever the probe says."),
+    new("--supervise", "0|1", "1: run the node as a child and start it again when it ends."),
+    new("--exit-plan", "file", "For the supervisor's tests: end as the file's first line says."),
+];
+if (CommandLine.Check("Incremental.Service.FailoverApp --node id --bootstrap host:port --prefix name [options]\n(commands on stdin: status, declare, deploy, fill, takeover, stepdown, quit)", known, args) is { } usageExit)
+    return usageExit;
 
 var arguments = new Dictionary<string, string>(StringComparer.Ordinal);
 for (var i = 0; i + 1 < args.Length; i += 2)

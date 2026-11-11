@@ -92,7 +92,7 @@ internal sealed class Rig(Arguments arguments)
             "--cache", cache ?? Path.Combine(_work, "cache-" + id),
             "--plugins", plugins ? Path.Combine(AppContext.BaseDirectory, "plugins") : "",
             "--log-level", arguments.Text("--log-level", "Warning"),
-            "--supervise", "true",
+            "--supervise",
         };
         args.AddRange(Security.Forward(arguments));
         var node = new NodeProcess(id, args, Path.Combine(_work, $"{id}-{_nodes.Count}.stderr.log"));

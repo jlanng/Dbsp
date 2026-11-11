@@ -17,4 +17,8 @@
     <ProjectReference Include="..\Incremental.Service.TestPlugins\Acme.Pipelines\Acme.Pipelines.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)../../tests/Shared/CommandLine.cs" Link="CommandLine.cs" />
+  </ItemGroup>
+
 </Project>

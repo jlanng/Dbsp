@@ -236,6 +236,22 @@ public sealed class Smoke(ExampleOptions options)
         foreach (var row in _world.Counterparties.Rows.Values)
             _model.Counterparties[row.Id] = row;
 
+        await Claim("the program refuses an option it does not have, and one without its value, instead of running with a default", () =>
+        {
+            foreach (var args in new string[][] { ["--kafak"], ["--nodes"], ["--rate", "fast"], ["--nodes", "3"], ["extra"] })
+            {
+                try
+                {
+                    ExampleOptions.Parse(args);
+                    return $"'{string.Join(' ', args)}' was accepted";
+                }
+                catch (ArgumentException)
+                {
+                }
+            }
+            return Unless(ExampleOptions.Usage.Contains("--no-supervise", StringComparison.Ordinal) && ExampleOptions.AsksForHelp(["--help"]), "--help does not list the options");
+        });
+
         var loaders = options.Kafka ? "three from Postgres through Debezium, one from a file" : "two custom sources and the file loader";
         await Claim(
             $"the tables are loaded ({loaders}): {_shape.Instruments} instruments, {_shape.Counterparties} counterparties, {_shape.Traders} traders, {_shape.Desks} desks",

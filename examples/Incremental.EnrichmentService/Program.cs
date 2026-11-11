@@ -16,11 +16,17 @@ using Incremental.Service;
 // because it lost the leadership — or is killed — it is started again and comes back as
 // the standby. --no-supervise runs the node alone, for a platform that restarts it.
 //
+// --help prints every option; an option the program does not have ends it with exit code 2.
 // Other flags: --port N, --rate N (trades per second), --poison N (one trade in N has no
 // quantity, which one definition refuses; 0 for none), --prefix name (Kafka topics and
 // Postgres tables), --no-generate, --no-pipelines, --verbose, --otlp (export the meters
 // over OTLP; the endpoint is OTEL_EXPORTER_OTLP_ENDPOINT). README.md beside this file
 // walks through all of it.
+if (ExampleOptions.AsksForHelp(args))
+{
+    Console.Out.Write(ExampleOptions.Usage);
+    return 0;
+}
 ExampleOptions options;
 try
 {

@@ -34,4 +34,8 @@
     <Copy SourceFiles="@(_Plugin)" DestinationFolder="$(OutDir)plugins\scale.pipelines" />
   </Target>
 
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)../../tests/Shared/CommandLine.cs" Link="CommandLine.cs" />
+  </ItemGroup>
+
 </Project>

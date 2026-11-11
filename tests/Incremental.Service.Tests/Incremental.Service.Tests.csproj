@@ -42,4 +42,8 @@
     <ProjectReference Include="..\Incremental.Service.FailoverApp\Incremental.Service.FailoverApp.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Include="../Shared/CommandLine.cs" Link="CommandLine.cs" />
+  </ItemGroup>
+
 </Project>

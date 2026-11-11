@@ -58,8 +58,76 @@ public sealed class ExampleOptions
     /// when it ends. Off with <c>--no-supervise</c>.</summary>
     public bool Supervise { get; init; } = true;
 
+    /// <summary>Every option the program has: its name, the name of its value (null for a
+    /// switch) and a line of help. <see cref="Parse"/> refuses anything else.</summary>
+    private static readonly (string Name, string? Value, string Help)[] Known =
+    [
+        ("--nodes", "N", "In memory: 1 (the default) or 2, a leader and a standby in one process (ports 5180, 5181)."),
+        ("--kafka", null, "Run on the local connector stack instead of in memory: one node per process."),
+        ("--node", "a|b", "With --kafka: which of the two nodes this process is (a)."),
+        ("--headless", null, "The smoke test: drive the admin API, check every sink against the model, exit 1 on a claim that does not hold."),
+        ("--clean", null, "With --kafka: remove the connector, the Postgres tables and the topics of the prefix, and exit."),
+        ("--port", "N", "The admin port (5180; 5181 for node b)."),
+        ("--rate", "N", "Generated trades per second (50)."),
+        ("--poison", "N", "One trade in N has no quantity, which one definition refuses (200; 0 for none)."),
+        ("--prefix", "name", "With --kafka: the prefix of the topics and Postgres tables (enrich)."),
+        ("--data", "dir", "Where the files live (a temporary directory)."),
+        ("--no-generate", null, "Do not generate trades."),
+        ("--no-pipelines", null, "Do not deploy the example's pipelines at first lead."),
+        ("--no-supervise", null, "With --kafka: run the node alone, for a platform that restarts it."),
+        ("--verbose", null, "Log at Information."),
+        ("--otlp", null, "Export the meters over OTLP (the endpoint is OTEL_EXPORTER_OTLP_ENDPOINT)."),
+        ("--ui-dir", "dir", "Serve the admin UI's files from this directory (src/Incremental.Service.Admin/wwwroot)."),
+        ("--bootstrap", "host:port", "With --kafka: the bootstrap servers (localhost:9092)."),
+        ("--postgres", "connection", "With --kafka: the Postgres connection string."),
+        ("--postgres-host-for-connect", "host", "With --kafka: the Postgres host as Kafka Connect reaches it (postgres)."),
+        ("--connect", "url", "With --kafka: Kafka Connect (http://localhost:8083)."),
+        ("--probe-port", "N", "With --kafka: where this node answers its peer's probe (5190; 5191 for b)."),
+        ("--peer-probe-port", "N", "With --kafka: where its peer answers."),
+        ("--no-prepare", null, "With --kafka: do not create the tables, the connector and the topics."),
+    ];
+
+    public static string Usage
+    {
+        get
+        {
+            var text = new System.Text.StringBuilder();
+            text.AppendLine("usage: Incremental.EnrichmentService [options]");
+            text.AppendLine();
+            text.AppendLine("  (no options)              one node, in memory, admin UI at http://127.0.0.1:5180/admin/");
+            text.AppendLine("  --nodes 2                 leader and standby in one process");
+            text.AppendLine("  --kafka --node a|b        two processes on the local connector stack; run both, then kill a");
+            text.AppendLine("  --headless [--nodes 2 | --kafka]     the smoke test");
+            text.AppendLine("  --kafka --clean           remove what the Kafka mode made");
+            text.AppendLine();
+            var width = Known.Max(o => o.Name.Length + (o.Value is null ? 0 : o.Value.Length + 1)) + 2;
+            foreach (var (name, value, help) in Known)
+                text.Append("  ").Append((value is null ? name : name + " " + value).PadRight(width)).AppendLine(help);
+            text.Append("  ").Append("--help".PadRight(width)).AppendLine("Print this and exit.");
+            return text.ToString();
+        }
+    }
+
+    public static bool AsksForHelp(string[] args) => args.Any(a => a is "--help" or "-h" or "-?" or "/?");
+
+    /// <summary>Throws <see cref="ArgumentException"/> for an option the program does not
+    /// have, one without its value, or a value that does not parse: the program then exits 2.
+    /// An example that ignores a misspelt option runs with a default nobody asked for.</summary>
     public static ExampleOptions Parse(string[] args)
     {
+        for (var at = 0; at < args.Length; at++)
+        {
+            var known = Array.Find(Known, o => o.Name == args[at]);
+            if (known.Name is null)
+                throw new ArgumentException($"Unknown option '{args[at]}'. --help lists the options.");
+            if (known.Value is not null && ++at >= args.Length)
+                throw new ArgumentException($"{known.Name} needs a value: {known.Name} {known.Value}. --help lists the options.");
+        }
+        int Number(string name, string fallback)
+        {
+            var text = Value(name) ?? fallback;
+            return int.TryParse(text, out var number) ? number : throw new ArgumentException($"{name} takes a number, not '{text}'.");
+        }
         string? Value(string name)
         {
             var i = Array.IndexOf(args, name);
@@ -69,18 +137,20 @@ public sealed class ExampleOptions
         var node = Value("--node") ?? "a";
         if (node is not ("a" or "b"))
             throw new ArgumentException("--node is a or b.");
+        if (Number("--nodes", "1") is not (1 or 2))
+            throw new ArgumentException("--nodes is 1 or 2.");
         var headless = args.Contains("--headless");
         return new ExampleOptions
         {
             Kafka = args.Contains("--kafka"),
             Headless = headless,
-            Nodes = int.Parse(Value("--nodes") ?? "1"),
+            Nodes = Number("--nodes", "1"),
             Node = node,
-            Port = int.Parse(Value("--port") ?? (node == "b" ? "5181" : "5180")),
-            ProbePort = int.Parse(Value("--probe-port") ?? (node == "b" ? "5191" : "5190")),
-            PeerProbePort = int.Parse(Value("--peer-probe-port") ?? (node == "b" ? "5190" : "5191")),
-            Rate = int.Parse(Value("--rate") ?? "50"),
-            Poison = int.Parse(Value("--poison") ?? "200"),
+            Port = Number("--port", node == "b" ? "5181" : "5180"),
+            ProbePort = Number("--probe-port", node == "b" ? "5191" : "5190"),
+            PeerProbePort = Number("--peer-probe-port", node == "b" ? "5190" : "5191"),
+            Rate = Number("--rate", "50"),
+            Poison = Number("--poison", "200"),
             Prefix = Value("--prefix") ?? defaults.Prefix,
             Bootstrap = Value("--bootstrap") ?? defaults.Bootstrap,
             Postgres = Value("--postgres") ?? defaults.Postgres,

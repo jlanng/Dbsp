@@ -18,7 +18,32 @@ using Incremental.Kafka;
 using Incremental.Kafka.FailoverApp;
 using Incremental.Storage;
 using Incremental.Tables;
+using Incremental.Tools;
 using static Incremental.Kafka.FailoverApp.FailoverScenario;
+
+Option[] known =
+[
+    new("--bootstrap", "host:port", "The Kafka bootstrap servers (required)."),
+    new("--prefix", "name", "The topic prefix of the run (required)."),
+    new("--node", "id", "This node's id (required)."),
+    new("--steps", "N", "Steps the scenario runs (required)."),
+    new("--step-delay-ms", "N", "Pause between steps (10)."),
+    new("--takeover-after-ms", "N", "Silence after which a standby takes over (3000)."),
+    new("--heartbeat-ms", "N", "The leader's heartbeat interval (1000)."),
+    new("--probe-port", "N", "Where this node answers its peer's probe (0: nowhere)."),
+    new("--peer-port", "N", "Where its peer answers (0: no probe)."),
+];
+const string Synopsis = "Incremental.Kafka.FailoverApp --bootstrap host:port --prefix name --node id --steps N [options]\n(commands on stdin: takeover, stepdown, status, quit)";
+if (CommandLine.Check(Synopsis, known, args) is { } usageExit)
+    return usageExit;
+foreach (var required in (string[])["--bootstrap", "--prefix", "--node", "--steps"])
+{
+    if (!args.Contains(required))
+    {
+        Console.Error.WriteLine($"{required} is required. --help lists the options.");
+        return 2;
+    }
+}
 
 var arguments = ParseArgs(args);
 var bootstrap = arguments["--bootstrap"];
@@ -291,6 +316,7 @@ catch (Exception ex)
     Emit("fault", new { error = ex.ToString() });
     Environment.Exit(5);
 }
+return 0;
 
 int Number(string name, int fallback) =>
     arguments.TryGetValue(name, out var text) ? int.Parse(text, CultureInfo.InvariantCulture) : fallback;

@@ -18,4 +18,8 @@
     <ProjectReference Include="..\Incremental.Service.TestPlugins\Acme.Contracts\Acme.Contracts.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)../../tests/Shared/CommandLine.cs" Link="CommandLine.cs" />
+  </ItemGroup>
+
 </Project>
