@@ -15,6 +15,9 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="Incremental.Kafka.Tests" />
+    <!-- The log's fault-injection seams (KafkaLog.WhileAcquiring): a takeover that is
+         lost, provoked under a whole service node. -->
+    <InternalsVisibleTo Include="Incremental.Service.Tests" />
   </ItemGroup>
 
 </Project>

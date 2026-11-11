@@ -13,7 +13,11 @@ public enum NodeRole
     Standby,
 
     /// <summary>Taking over: it has decided to lead and is fencing the previous leader,
-    /// promoting its tables and storage and starting its circuits.</summary>
+    /// promoting its tables and storage and starting its circuits. A takeover that is
+    /// given up or lost before the node is the log's writer — the leader was heard after
+    /// all, or another node took the log first — goes back to <see cref="Standby"/>;
+    /// once it is the writer the only ways on are <see cref="Leader"/> and
+    /// <see cref="Fenced"/>.</summary>
     Promoting,
 
     /// <summary>The active: the one process that can commit.</summary>
@@ -39,8 +43,11 @@ public sealed class KafkaLeadershipOptions
     public TimeSpan TakeoverAfter { get; init; } = TimeSpan.FromSeconds(3);
 
     /// <summary>How long a silence is tolerated while <see cref="ProbeLeader"/> keeps
-    /// saying the leader is alive. Past it the standby takes over whatever the probe says.
-    /// Default 30 s.</summary>
+    /// saying the leader is alive. Past it the standby takes over whatever the probe
+    /// says — unless the brokers say outright that nothing can be committed (a partition
+    /// of the log without a leader or with too few replicas in sync), in which case it
+    /// waits for them. Default 30 s, which leaves room for a leader's client to find a
+    /// broker that has stopped answering twice over (<see cref="KafkaClientDefaults"/>).</summary>
     public TimeSpan TakeoverCeiling { get; init; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
@@ -204,6 +211,18 @@ public sealed record TakeoverTimings(
 /// exits and comes back as a standby. Demotion in place is not built.
 /// </para>
 /// <para>
+/// A takeover is free to give up until this node is the log's writer, and three things
+/// make it: the leader is heard while the takeover is still on its way to fencing it (it
+/// was slow, not gone — its brokers were); another node, or the old leader's own client
+/// asking the coordinator for a new epoch, fences this one before its term is committed;
+/// the attempt fails for a reason of the brokers'. Nothing has been promoted then, so the
+/// node is a <see cref="NodeRole.Standby"/> again and decides afresh. And at
+/// <see cref="KafkaLeadershipOptions.TakeoverCeiling"/> a standby does not take over from
+/// a leader that still answers its probe while the brokers say that nobody can commit:
+/// it could do no better in the leader's place. <c>docs/design/durability-and-standby.md</c>,
+/// <i>As built: broker failures</i>, has what each of these was found by.
+/// </para>
+/// <para>
 /// What fencing does not cover is a sink outside Kafka. <see cref="HoldsLease"/> is the
 /// lease that narrows that gap, and <see cref="Leased{TKey,TRow}"/> applies it to a sink.
 /// </para>
@@ -236,6 +255,16 @@ public sealed class KafkaLeadership : IAsyncDisposable
     private long _progressTicks;
     private Task? _stepDown;
     private bool _manual;
+    private TaskCompletionSource? _manualLost;
+
+    // While this node is acquiring the writer: cancelled when the leader is heard after
+    // all (Heard), so that a takeover that is no longer needed is given up before it
+    // fences anybody.
+    private CancellationTokenSource? _abandon;
+    private long _notBeforeTicks;
+    private long _takeoversAbandoned;
+    private long _takeoversHeld;
+    private long _lastHeldLogTicks;
     private FollowerLag? _lag;
     private TakeoverTimings? _lastTakeover;
     private Exception? _fault;
@@ -272,6 +301,16 @@ public sealed class KafkaLeadership : IAsyncDisposable
 
     /// <summary>The term this node leads under; 0 unless it is or was the leader.</summary>
     public long Term => _log.Term;
+
+    /// <summary>Takeovers this node began and gave up before it was the writer, going back
+    /// to <see cref="NodeRole.Standby"/>: the leader was heard after all, or another node
+    /// initialised the transactional id first.</summary>
+    public long TakeoversAbandoned => Interlocked.Read(ref _takeoversAbandoned);
+
+    /// <summary>Times this node reached <see cref="KafkaLeadershipOptions.TakeoverCeiling"/>
+    /// with the leader still answering its probe and did not take over, because the
+    /// brokers said nothing could be committed by anyone.</summary>
+    public long TakeoversHeld => Interlocked.Read(ref _takeoversHeld);
 
     /// <summary>Raised after every change of role, and when the leader this node sees
     /// changes. Handlers run on a thread-pool thread, one at a time, in order; a handler
@@ -456,13 +495,22 @@ public sealed class KafkaLeadership : IAsyncDisposable
     {
         if (Volatile.Read(ref _started) == 0)
             throw new InvalidOperationException("Start the leadership before asking it to take over.");
+        TaskCompletionSource lost;
         lock (_lock)
         {
             if (_role is NodeRole.Fenced or NodeRole.Resigned)
                 throw new InvalidOperationException($"Node '{NodeId}' is {_role} and cannot take over; restart it as a standby.");
             _manual = true;
+            lost = _manualLost ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         }
-        var role = await WhenRoleAsync(r => r is not (NodeRole.Standby or NodeRole.Promoting), cancellationToken).ConfigureAwait(false);
+        var settled = WhenRoleAsync(r => r is not (NodeRole.Standby or NodeRole.Promoting), cancellationToken);
+
+        // A takeover that is lost before this node is the writer leaves it a standby: the
+        // request has failed, and the node can be asked again.
+        await Task.WhenAny(settled, lost.Task).ConfigureAwait(false);
+        if (!settled.IsCompleted)
+            await lost.Task.ConfigureAwait(false);
+        var role = await settled.ConfigureAwait(false);
         if (role is not NodeRole.Leader)
             throw new KafkaLogFencedException($"Node '{NodeId}' did not become the leader: it is {role}.", Status.Fault);
     }
@@ -667,6 +715,7 @@ public sealed class KafkaLeadership : IAsyncDisposable
     private void Heard(KafkaLog.LeaderRecord record)
     {
         bool leaderChanged;
+        CancellationTokenSource? abandon = null;
         lock (_lock)
         {
             if (record.Term < _leaderTerm)
@@ -679,6 +728,20 @@ public sealed class KafkaLeadership : IAsyncDisposable
             _leaderResigned = record.Resigned;
             _heardTicks = Environment.TickCount64;
             _uncommittedEnd = -1;
+
+            // Heard while this node is on its way to fencing it: the leader is alive and
+            // committing, so the takeover is given up while that is still free. Not a
+            // resignation, and not this node's own term record.
+            if (!record.Resigned && record.Node != NodeId)
+                abandon = _abandon;
+        }
+        try
+        {
+            abandon?.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // The acquisition ended a moment ago.
         }
 
         // A higher term than this node's own is another node's takeover: sooner news than
@@ -697,10 +760,16 @@ public sealed class KafkaLeadership : IAsyncDisposable
         var token = _stop.Token;
         try
         {
-            if (await WaitToTakeOverAsync(token).ConfigureAwait(false) is not { } decision)
-                return;
-            if (!await PromoteAsync(decision.Reason, decision.Silence, token).ConfigureAwait(false))
-                return;
+            while (true)
+            {
+                if (await WaitToTakeOverAsync(token).ConfigureAwait(false) is not { } decision)
+                    return;
+                var outcome = await PromoteAsync(decision.Reason, decision.Silence, token).ConfigureAwait(false);
+                if (outcome == Promotion.Failed)
+                    return;
+                if (outcome == Promotion.Led)
+                    break;
+            }
 
             // Leading. The only way out that this loop sees is the writer ending: fenced by
             // another node's InitTransactions, deposed by a higher term, or failed.
@@ -743,7 +812,7 @@ public sealed class KafkaLeadership : IAsyncDisposable
 
             if (manual)
                 return ("manual", silence);
-            if (_options.AutomaticTakeover)
+            if (_options.AutomaticTakeover && Environment.TickCount64 >= Interlocked.Read(ref _notBeforeTicks))
             {
                 // A heartbeat is late. Before the silence is long enough to act on, start
                 // watching for the other sign of life: a leader inside a long transaction.
@@ -771,6 +840,12 @@ public sealed class KafkaLeadership : IAsyncDisposable
                         nextProbe = Environment.TickCount64 + 250;
                     }
                 }
+
+                // At the ceiling the leader still answers its probe (or the probe would
+                // have decided long ago). If the brokers say that nobody can commit, its
+                // silence is theirs and this node could do no better in its place.
+                if (reason == "ceiling" && _options.ProbeLeader is not null && await HeldByBrokersAsync(silence, token).ConfigureAwait(false))
+                    reason = null;
 
                 if (reason is not null && await ConfirmSilenceAsync(resigned, token).ConfigureAwait(false))
                 {
@@ -826,6 +901,30 @@ public sealed class KafkaLeadership : IAsyncDisposable
         }
     }
 
+    /// <summary>Whether a takeover at the ceiling should wait: the leader answers its
+    /// probe as the leader, and the brokers say outright that the log cannot be written
+    /// (<see cref="KafkaLog.ProbeWritePathAsync"/>). Anything short of that — a leader that
+    /// no longer answers, brokers that cannot be asked or see nothing wrong — and the
+    /// ceiling stands.</summary>
+    private async Task<bool> HeldByBrokersAsync(TimeSpan silence, CancellationToken token)
+    {
+        if (!await ProbeAsync(token).ConfigureAwait(false))
+            return false;
+        var (path, why) = await _log.ProbeWritePathAsync(token).ConfigureAwait(false);
+        if (path != KafkaLog.WritePath.Unwritable)
+            return false;
+        Interlocked.Increment(ref _takeoversHeld);
+        var now = Environment.TickCount64;
+        if (now - Interlocked.Read(ref _lastHeldLogTicks) >= 10_000)
+        {
+            Interlocked.Exchange(ref _lastHeldLogTicks, now);
+            _logger?.LogWarning(
+                "Node {Node}: the leader has been silent for {Silence} and still answers its probe, and nothing can be committed ({Why}): not taking over, which could do no better.",
+                NodeId, silence, why);
+        }
+        return true;
+    }
+
     private async Task<bool> ProbeAsync(CancellationToken token)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -862,7 +961,21 @@ public sealed class KafkaLeadership : IAsyncDisposable
         }
     }
 
-    private async Task<bool> PromoteAsync(string reason, TimeSpan silence, CancellationToken token)
+    private enum Promotion
+    {
+        /// <summary>This node is the leader.</summary>
+        Led,
+
+        /// <summary>The takeover was given up or lost before this node was the writer:
+        /// it is a standby again.</summary>
+        Lost,
+
+        /// <summary>The takeover failed with this node the writer, or the node is being
+        /// disposed: final.</summary>
+        Failed,
+    }
+
+    private async Task<Promotion> PromoteAsync(string reason, TimeSpan silence, CancellationToken token)
     {
         SetRole(NodeRole.Promoting);
         _logger?.LogInformation("Node {Node} is taking over ({Reason}; leader silent for {Silence}).", NodeId, reason, silence);
@@ -870,7 +983,43 @@ public sealed class KafkaLeadership : IAsyncDisposable
         try
         {
             // Fences the previous leader and settles its last transaction; commits the term.
-            await _log.AcquireWriterAsync(token).ConfigureAwait(false);
+            // Until it has, the takeover costs nothing to give up, and it is given up when
+            // the leader is heard after all (a manual takeover is the operator's word
+            // against the leader's, and is not).
+            using (var abandon = CancellationTokenSource.CreateLinkedTokenSource(token))
+            {
+                lock (_lock)
+                    _abandon = reason == "manual" ? null : abandon;
+                Exception? lost = null;
+                try
+                {
+                    await _log.AcquireWriterAsync(abandon.Token).WaitAsync(abandon.Token).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (!token.IsCancellationRequested && ex is not ObjectDisposedException)
+                {
+                    lost = ex;
+                }
+                finally
+                {
+                    lock (_lock)
+                        _abandon = null;
+                }
+                if (lost is not null)
+                {
+                    // The acquisition's own task is waited for: a cancelled wait returns
+                    // before the log has put its client away.
+                    abandon.Cancel();
+                    await _log.WhenAcquisitionSettlesAsync().ConfigureAwait(false);
+
+                    // A reader that has promoted nothing can stand by again. Anything
+                    // else — it became the writer after all, or the log is finished —
+                    // is a takeover that failed.
+                    if (_log.IsWriter || _log.IsFenced)
+                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(lost).Throw();
+                    BackToStandby(reason, lost);
+                    return Promotion.Lost;
+                }
+            }
             var fence = clock.Elapsed;
 
             if (_options.PrepareAsync is { } prepare)
@@ -909,7 +1058,7 @@ public sealed class KafkaLeadership : IAsyncDisposable
             }
             SetRole(NodeRole.Leader);
             _logger?.LogInformation("Node {Node} leads under term {Term} after {Elapsed}.", NodeId, _log.Term, clock.Elapsed);
-            return true;
+            return Promotion.Led;
         }
         catch (OperationCanceledException ex) when (token.IsCancellationRequested)
         {
@@ -931,8 +1080,36 @@ public sealed class KafkaLeadership : IAsyncDisposable
             _logger?.LogError(ex, "Node {Node} could not complete its takeover.", NodeId);
             _log.Depose($"Node '{NodeId}' could not complete its takeover ({ex.Message}).");
             Finish(NodeRole.Fenced, ex);
-            return false;
+            return Promotion.Failed;
         }
+    }
+
+    /// <summary>
+    /// A takeover that ended before this node was the writer: nothing was promoted and
+    /// nothing of this node's was committed, so it stands by again instead of ending as
+    /// <see cref="NodeRole.Fenced"/>. If the leader it meant to replace was fenced on the
+    /// way, that node ends and this one takes over on its silence; the wait before it may
+    /// try again is the takeover timeout and a random part of it more, so that two nodes
+    /// that fenced each other do not do it again in step.
+    /// </summary>
+    private void BackToStandby(string reason, Exception why)
+    {
+        Interlocked.Increment(ref _takeoversAbandoned);
+        var wait = (long)(_options.TakeoverAfter.TotalMilliseconds * (1 + Random.Shared.NextDouble()));
+        TaskCompletionSource? manual;
+        lock (_lock)
+        {
+            _heardTicks = Environment.TickCount64;
+            _uncommittedEnd = -1;
+            manual = _manualLost;
+            _manualLost = null;
+            _manual = false;
+        }
+        Interlocked.Exchange(ref _notBeforeTicks, Environment.TickCount64 + wait);
+        _logger?.LogWarning(why, "Node {Node} gave its takeover ({Reason}) up before it was the writer and stands by again.", NodeId, reason);
+        SetRole(NodeRole.Standby);
+        manual?.TrySetException(new KafkaLogNotAcquiredException(
+            $"Node '{NodeId}' did not become the leader: its takeover was lost before it was the writer ({why.Message}). It stands by again.", why));
     }
 
     private void Finish(NodeRole role, Exception? fault)

@@ -22,7 +22,9 @@ namespace Incremental.Kafka;
 /// <see cref="AcquireWriterAsync"/> makes it the writer by initialising the shared
 /// <c>transactional.id</c>, which fences whichever process held it before — that process's
 /// next write fails with <see cref="KafkaLogFencedException"/> and it can never commit
-/// again. <see cref="ChangelogStorage.OpenAsync"/> and <see cref="ChangelogStorage.PromoteAsync"/>
+/// again. A log that is fenced while it is still becoming the writer has committed nothing
+/// and is not finished: it goes back to reading, with a new client, and may try again
+/// (<see cref="KafkaLogNotAcquiredException"/>). <see cref="ChangelogStorage.OpenAsync"/> and <see cref="ChangelogStorage.PromoteAsync"/>
 /// acquire the writer through <see cref="State"/>; a process that opens tables first calls
 /// <see cref="AcquireWriterAsync"/> itself.
 /// </para>
@@ -39,7 +41,12 @@ public sealed class KafkaLog : IAsyncDisposable
 
     private readonly KafkaLogOptions _options;
     private readonly IAdminClient _admin;
-    private readonly IProducer<byte[], byte[]> _producer;
+    // Replaced when an acquisition of the writer is lost (ResetWriter): a client that has
+    // been fenced, or has begun initialising its transactional id, cannot be used again.
+    private IProducer<byte[], byte[]> _producer;
+    private int _producerGeneration;
+    private long _writerResets;
+    private bool _acquiring;
     private readonly TopicPartition _leaderPartition;
 
     // The writer thread's inbox. Unbounded as a collection, bounded by its users: every
@@ -86,7 +93,7 @@ public sealed class KafkaLog : IAsyncDisposable
         _options = options;
         _leaderPartition = new TopicPartition(options.TopicPrefix + ".leader", 0);
 
-        var adminConfig = new AdminClientConfig { BootstrapServers = options.BootstrapServers };
+        var adminConfig = KafkaClientDefaults.Apply(new AdminClientConfig { BootstrapServers = options.BootstrapServers });
         Apply(adminConfig);
         var adminBuilder = new AdminClientBuilder(adminConfig)
             .SetLogHandler((_, message) => Log(message))
@@ -94,7 +101,16 @@ public sealed class KafkaLog : IAsyncDisposable
         options.ConfigureAdmin?.Invoke(adminBuilder);
         _admin = adminBuilder.Build();
 
-        var producerConfig = new ProducerConfig
+        _producer = CreateProducer();
+
+        State = new KafkaStateChangelog(this);
+    }
+
+    private IProducer<byte[], byte[]> CreateProducer()
+    {
+        var options = _options;
+        var generation = Volatile.Read(ref _producerGeneration);
+        var producerConfig = KafkaClientDefaults.Apply(new ProducerConfig
         {
             BootstrapServers = options.BootstrapServers,
             TransactionalId = options.EffectiveTransactionalId,
@@ -103,7 +119,7 @@ public sealed class KafkaLog : IAsyncDisposable
             // A transaction is flushed by its commit, so lingering only delays the first
             // batches of a large one; a little lets them fill.
             LingerMs = 1,
-        };
+        });
         Apply(producerConfig);
         var producerBuilder = new ProducerBuilder<byte[], byte[]>(producerConfig)
             .SetLogHandler((_, message) => Log(message))
@@ -111,14 +127,13 @@ public sealed class KafkaLog : IAsyncDisposable
             {
                 LogError("producer", error);
                 // A fence can arrive between transactions; say so at once instead of at the
-                // next commit.
-                if (error.IsFatal)
+                // next commit. Not for a client this log has already replaced: its end is
+                // not this writer's.
+                if (error.IsFatal && generation == Volatile.Read(ref _producerGeneration))
                     MarkFenced(new KafkaException(error));
             });
         options.ConfigureProducer?.Invoke(producerBuilder);
-        _producer = producerBuilder.Build();
-
-        State = new KafkaStateChangelog(this);
+        return producerBuilder.Build();
     }
 
     /// <summary>
@@ -308,6 +323,15 @@ public sealed class KafkaLog : IAsyncDisposable
     /// afterwards can commit. Then it reads the last leader term and commits the next one.
     /// Safe to call more than once; later calls return the first one's result. A failed or
     /// cancelled call leaves the log a reader and can be repeated.
+    /// <para>
+    /// A call that is fenced before it completes — another process initialised the
+    /// transactional id while this one was still reading the term or committing its own —
+    /// fails with <see cref="KafkaLogNotAcquiredException"/>, and so does a cancelled one
+    /// that had begun: the log is a reader again, with a new client, because the old one
+    /// is finished or would go on initialising behind the caller's back and fence a writer
+    /// later. Only a log that has been the writer ends as
+    /// <see cref="KafkaLogFencedException"/>.
+    /// </para>
     /// </summary>
     public Task AcquireWriterAsync(CancellationToken cancellationToken = default)
     {
@@ -322,12 +346,94 @@ public sealed class KafkaLog : IAsyncDisposable
         }
     }
 
+    /// <summary>Completes when no acquisition of the writer is running: at once if none
+    /// is. It starts none and never faults.</summary>
+    internal Task WhenAcquisitionSettlesAsync()
+    {
+        Task? acquire;
+        lock (_gate)
+            acquire = _acquire;
+        return acquire is null ? Task.CompletedTask : acquire.ContinueWith(static _ => { }, TaskScheduler.Default);
+    }
+
+    /// <summary>How many times an acquisition of the writer was lost and the log went back
+    /// to being a reader with a new client.</summary>
+    public long WriterResets => Interlocked.Read(ref _writerResets);
+
+    /// <summary>Called at points of an acquisition, with the point's name (<c>begin</c>:
+    /// nothing has been asked of the brokers yet; <c>initialised</c>: the transactional id
+    /// is this process's; <c>term-read</c>: the last term is known and this process's is
+    /// about to be committed). For tests:
+    /// throwing here, or fencing the log from another, is an acquisition that is lost
+    /// where a real one can be.</summary>
+    internal Action<string>? WhileAcquiring { get; set; }
+
     private async Task AcquireAsync(CancellationToken cancellationToken)
     {
         ThrowIfFenced();
+        var began = false;
+        lock (_gate)
+            _acquiring = true;
+        try
+        {
+            await AcquireCoreAsync(() => began = true, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (!_isWriter && began && Volatile.Read(ref _disposed) == 0
+            && (ex is KafkaLogFencedException || (ex is OperationCanceledException && !_stop.IsCancellationRequested)))
+        {
+            // Nothing of this process's was committed, so nothing has to be given up: the
+            // log goes back to reading. The client does not: fenced, it is finished; and
+            // cancelled part-way, it would carry on initialising the transactional id by
+            // itself and fence whoever leads when it gets there.
+            ResetWriter();
+            _options.Logger?.LogWarning(ex, "Kafka log {Prefix}: the writer was not acquired; the log reads on with a new client.", _options.TopicPrefix);
+            throw new KafkaLogNotAcquiredException(
+                ex is KafkaLogFencedException
+                    ? $"The writer was not acquired: another process initialised transactional.id '{_options.EffectiveTransactionalId}' first ({ex.Message}). This log is a reader again."
+                    : "The writer was not acquired: the attempt was abandoned. This log is a reader again.",
+                ex);
+        }
+        finally
+        {
+            lock (_gate)
+                _acquiring = false;
+        }
+    }
+
+    /// <summary>Back to a reader after a lost acquisition: a new client, nothing marked.</summary>
+    private void ResetWriter()
+    {
+        IProducer<byte[], byte[]> old;
+        lock (_gate)
+        {
+            old = _producer;
+            Interlocked.Increment(ref _producerGeneration);
+            _producer = CreateProducer();
+            _initialised = false;
+            _fenced = null;
+        }
+        Interlocked.Increment(ref _writerResets);
+
+        // Disposing a transactional client can wait on its brokers; nobody waits for it.
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                old.Dispose();
+            }
+            catch (Exception)
+            {
+            }
+        });
+    }
+
+    private async Task AcquireCoreAsync(Action begun, CancellationToken cancellationToken)
+    {
         var clock = System.Diagnostics.Stopwatch.StartNew();
         if (!_initialised)
         {
+            begun();
+            WhileAcquiring?.Invoke("begin");
             while (true)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -335,8 +441,8 @@ public sealed class KafkaLog : IAsyncDisposable
                 try
                 {
                     // Resumable: a call that times out is retried and carries on where the
-                    // last one stopped.
-                    _producer.InitTransactions(TimeSpan.FromSeconds(5));
+                    // last one stopped. In slices, so that an abandoned takeover stops soon.
+                    _producer.InitTransactions(TimeSpan.FromSeconds(1));
                     break;
                 }
                 catch (KafkaRetriableException)
@@ -354,6 +460,8 @@ public sealed class KafkaLog : IAsyncDisposable
             }
             _initialised = true;
         }
+        begun();
+        WhileAcquiring?.Invoke("initialised");
 
         // Every earlier writer's transactions are decided now, so the leader topic's last
         // term is final.
@@ -388,22 +496,28 @@ public sealed class KafkaLog : IAsyncDisposable
         }
         var term = last + 1;
         var termRead = clock.Elapsed;
-        lock (_gate)
-        {
-            ObjectDisposedException.ThrowIf(_closed, this);
-            if (_writerThread is null)
-            {
-                _writerThread = new Thread(WriterLoop) { IsBackground = true, Name = "incremental-kafka-writer" };
-                _writerThread.Start();
-            }
-        }
+        WhileAcquiring?.Invoke("term-read");
+        cancellationToken.ThrowIfCancellationRequested();
+        ThrowIfFenced();
 
+        // The term is committed here and not by the writer thread, which does not exist
+        // until this process is the writer: an acquisition that is lost has then nothing
+        // to stop and nothing queued.
         var commit = new LogCommit();
         commit.Add(_leaderPartition, TermKey,
             JsonSerializer.SerializeToUtf8Bytes(new LeaderRecord(term, NodeId, DateTimeOffset.UtcNow)).Prefixed(JsonFormat));
-        await EnqueueAsync(commit, acquiring: true).ConfigureAwait(false);
-        Interlocked.Exchange(ref _term, term);
-        _isWriter = true;
+        Execute([commit]);
+        await commit.Completion.Task.ConfigureAwait(false);
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_closed, this);
+            if (_fenced is { } fenced)
+                throw new KafkaLogFencedException(fenced.Message, fenced.InnerException);
+            Interlocked.Exchange(ref _term, term);
+            _isWriter = true;
+            _writerThread = new Thread(WriterLoop) { IsBackground = true, Name = "incremental-kafka-writer" };
+            _writerThread.Start();
+        }
         _options.Logger?.LogInformation(
             "Kafka log {Prefix}: writer acquired as term {Term}: transactional.id initialised in {InitMs} ms, last term read in {ReadMs} ms, term committed in {CommitMs} ms",
             _options.TopicPrefix, term, (long)initialised.TotalMilliseconds, (long)(termRead - initialised).TotalMilliseconds,
@@ -471,7 +585,7 @@ public sealed class KafkaLog : IAsyncDisposable
             throw new InvalidOperationException("This Kafka log is not the writer, so it has nothing to resign.");
         var commit = new LogCommit { Resigns = true };
         commit.Add(_leaderPartition, HeartbeatKey, HeartbeatValue(resigned: true));
-        await EnqueueAsync(commit, acquiring: false).ConfigureAwait(false);
+        await EnqueueAsync(commit).ConfigureAwait(false);
     }
 
     /// <summary>Ends the writer because this process has learnt, from something other than
@@ -489,9 +603,9 @@ public sealed class KafkaLog : IAsyncDisposable
     /// <see cref="KafkaLogFencedException"/> (the writer is finished) or as
     /// <see cref="KafkaLogException"/> (aborted; nothing of it is readable; the writer
     /// carries on) and in no other way.</summary>
-    internal Task CommitAsync(LogCommit commit) => EnqueueAsync(commit, acquiring: false);
+    internal Task CommitAsync(LogCommit commit) => EnqueueAsync(commit);
 
-    private Task EnqueueAsync(LogCommit commit, bool acquiring)
+    private Task EnqueueAsync(LogCommit commit)
     {
         lock (_gate)
         {
@@ -499,7 +613,7 @@ public sealed class KafkaLog : IAsyncDisposable
                 return Task.FromException(new KafkaLogFencedException(fenced.Message, fenced.InnerException));
             if (_closed)
                 return Task.FromException(new KafkaLogFencedException("The Kafka log has been disposed; nothing more can be written through it."));
-            if (!acquiring && !_isWriter)
+            if (!_isWriter)
                 return Task.FromException(new InvalidOperationException(
                     "This Kafka log is not the writer: it is a reader (a standby). Call KafkaLog.AcquireWriterAsync, or promote " +
                     "the ChangelogStorage over it, before writing."));
@@ -765,6 +879,13 @@ public sealed class KafkaLog : IAsyncDisposable
             return false;
         }
 
+        if (FailTransaction?.Invoke(batch) == true)
+        {
+            error = new KafkaException(new Error(ErrorCode.Local_Fail, "The transaction was aborted by the test's fault injection."));
+            Abort();
+            return false;
+        }
+
         var committing = System.Diagnostics.Stopwatch.StartNew();
         while (true)
         {
@@ -815,6 +936,12 @@ public sealed class KafkaLog : IAsyncDisposable
         Interlocked.Exchange(ref _lastTransactionTicks, began);
         return true;
     }
+
+    /// <summary>Called on the writer thread with a transaction's commits once its records
+    /// are with the brokers. For tests: returning true aborts the transaction, as a broker
+    /// that refuses it would — the writer stays usable and the commits go again or fail
+    /// as aborted.</summary>
+    internal Func<IReadOnlyList<LogCommit>, bool>? FailTransaction { get; set; }
 
     /// <summary>Called on the writer thread after every 256 records of a transaction. For
     /// tests: sleeping here is a commit that takes long to produce.</summary>
@@ -898,8 +1025,11 @@ public sealed class KafkaLog : IAsyncDisposable
 
     private KafkaLogFencedException MarkFenced(Exception cause, string? message = null)
     {
+        bool completes;
+        KafkaLogFencedException fencedNow;
         lock (_gate)
         {
+            completes = _isWriter || !_acquiring;
             if (_fenced is null)
             {
                 var taken = cause is KafkaException { Error.Code: ErrorCode.Local_Fenced or ErrorCode.ProducerFenced };
@@ -910,9 +1040,13 @@ public sealed class KafkaLog : IAsyncDisposable
                         : $"The Kafka log's producer has failed and cannot write again ({reason})."),
                     cause);
             }
+            fencedNow = _fenced;
         }
-        _whenFenced.TrySetResult();
-        return _fenced!;
+        // A fence met while acquiring is not the end of a writer: there was none yet
+        // (AcquireAsync puts the log back to reading).
+        if (completes)
+            _whenFenced.TrySetResult();
+        return fencedNow;
     }
 
     private void ThrowIfFenced()
@@ -1096,6 +1230,111 @@ public sealed class KafkaLog : IAsyncDisposable
         return answer.Offset.Value;
     }
 
+    // ── can anything be committed at all ───────────────────────────────────────────────
+
+    /// <summary>What the brokers say about writing to this log's topics.</summary>
+    internal enum WritePath
+    {
+        /// <summary>It could not be asked, or the answer says nothing either way.</summary>
+        Unknown,
+
+        /// <summary>The leader topic's partition, and the partition that holds this
+        /// log's transactional id, have a leader and enough replicas in sync.</summary>
+        Writable,
+
+        /// <summary>One of them has no leader, or fewer replicas in sync than
+        /// <c>min.insync.replicas</c>: no process can commit through this log now.</summary>
+        Unwritable,
+    }
+
+    /// <summary>For tests: answers <see cref="ProbeWritePathAsync"/> instead of the brokers.</summary>
+    internal Func<(WritePath Path, string? Why)>? WritePathOverride { get; set; }
+
+    private readonly Dictionary<string, int> _minInSync = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Asks the brokers whether a commit through this log could succeed right now, by any
+    /// process: whether the leader topic's partition and the transaction coordinator's
+    /// partition for this log's transactional id each have a leader and at least
+    /// <c>min.insync.replicas</c> replicas in sync. A standby asks before it takes over
+    /// from a leader that is alive and silent (<see cref="KafkaLeadership"/>): if the
+    /// answer is <see cref="WritePath.Unwritable"/> the leader's silence is the brokers',
+    /// and a takeover would only wait in the same place. It is the controller's view, so
+    /// it is as stale as the controller is: a broker that died less than its session
+    /// timeout ago still counts, and with no controller quorum nothing changes at all —
+    /// those read as <see cref="WritePath.Writable"/>. Never throws.
+    /// </summary>
+    internal async Task<(WritePath Path, string? Why)> ProbeWritePathAsync(CancellationToken cancellationToken)
+    {
+        if (WritePathOverride is { } injected)
+            return injected();
+        try
+        {
+            if (await UnwritableAsync(_leaderPartition.Topic, _ => 0, cancellationToken).ConfigureAwait(false) is { } why)
+                return (WritePath.Unwritable, why);
+        }
+        catch (Exception ex) when (ex is KafkaException or TimeoutException or OperationCanceledException or InvalidOperationException)
+        {
+            return (WritePath.Unknown, ex.Message);
+        }
+
+        try
+        {
+            // The coordinator of a transactional id is the leader of one partition of
+            // __transaction_state, chosen as the Java client chooses it. A node that may
+            // not describe that topic learns nothing here, which is not a "no".
+            if (await UnwritableAsync(
+                    "__transaction_state", count => (JavaHash(_options.EffectiveTransactionalId) & 0x7fffffff) % count, cancellationToken)
+                .ConfigureAwait(false) is { } why)
+                return (WritePath.Unwritable, why);
+        }
+        catch (Exception ex) when (ex is KafkaException or TimeoutException or OperationCanceledException or InvalidOperationException)
+        {
+        }
+        return (WritePath.Writable, null);
+    }
+
+    /// <summary>Why one partition of <paramref name="topic"/> cannot be written; null if it can.</summary>
+    private async Task<string?> UnwritableAsync(string topic, Func<int, int> partitionOf, CancellationToken cancellationToken)
+    {
+        var timeout = TimeSpan.FromSeconds(2);
+        var described = await _admin.DescribeTopicsAsync(
+            TopicCollection.OfTopicNames([topic]), new DescribeTopicsOptions { RequestTimeout = timeout })
+            .WaitAsync(timeout * 2, cancellationToken).ConfigureAwait(false);
+        var partitions = described.TopicDescriptions[0].Partitions;
+        if (partitions.Count == 0)
+            throw new InvalidOperationException($"Topic '{topic}' was described without partitions.");
+        var partition = partitions[partitionOf(partitions.Count)];
+        if (partition.Leader is null || partition.Leader.Id < 0)
+            return $"{topic} [{partition.Partition}] has no leader";
+
+        int minimum;
+        lock (_minInSync)
+            minimum = _minInSync.GetValueOrDefault(topic);
+        if (minimum == 0)
+        {
+            var configs = await _admin.DescribeConfigsAsync(
+                [new ConfigResource { Type = ResourceType.Topic, Name = topic }], new DescribeConfigsOptions { RequestTimeout = timeout })
+                .WaitAsync(timeout * 2, cancellationToken).ConfigureAwait(false);
+            minimum = configs[0].Entries.TryGetValue("min.insync.replicas", out var entry) && int.TryParse(entry.Value, out var parsed) ? parsed : 1;
+            lock (_minInSync)
+                _minInSync[topic] = minimum;
+        }
+        return partition.ISR.Count < minimum
+            ? $"{topic} [{partition.Partition}] has {partition.ISR.Count} replica(s) in sync and needs {minimum}"
+            : null;
+    }
+
+    /// <summary><c>String.hashCode</c> as Java computes it: what the brokers place a
+    /// transactional id by.</summary>
+    internal static int JavaHash(string text)
+    {
+        var hash = 0;
+        foreach (var c in text)
+            hash = unchecked(31 * hash + c);
+        return hash;
+    }
+
     internal Task DeleteRecordsBeforeAsync(TopicPartition partition, long offset, CancellationToken cancellationToken) =>
         RetryAsync(async attempt =>
         {
@@ -1241,6 +1480,7 @@ public sealed class KafkaLog : IAsyncDisposable
         // reader therefore polls briefly; it is assigned only while a read runs.
         if (forShortReads)
             config.FetchWaitMaxMs = 5;
+        KafkaClientDefaults.Apply(config);
         Apply(config);
         var builder = new ConsumerBuilder<byte[], byte[]>(config)
             .SetLogHandler((_, message) => Log(message))

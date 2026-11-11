@@ -176,3 +176,13 @@ public class KafkaLogException(string message, Exception? innerException = null)
 /// </summary>
 public sealed class KafkaLogFencedException(string message, Exception? innerException = null)
     : KafkaLogException(message, innerException);
+
+/// <summary>
+/// <see cref="KafkaLog.AcquireWriterAsync"/> did not make this log the writer, and the log
+/// is a reader again: another process initialised the <c>transactional.id</c> before this
+/// one had committed its term, or the attempt was cancelled. Nothing of this process's was
+/// committed. Unlike <see cref="KafkaLogFencedException"/> it is not final: the call can be
+/// made again.
+/// </summary>
+public sealed class KafkaLogNotAcquiredException(string message, Exception? innerException = null)
+    : KafkaLogException(message, innerException);

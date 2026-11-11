@@ -681,6 +681,258 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         Assert.Equal(NodeRole.Fenced, a.Role);
     }
 
+    // ── takeovers that are lost, given up or held back ─────────────────────────────────
+    //
+    // What a broker fault does to a takeover, provoked here without one: the log's
+    // internal seams fence an acquisition, stall a writer or answer for the brokers. The
+    // real faults are KafkaServiceProcessTests' broker tests, on the kafka3 profile.
+
+    /// <summary>Stops a leader's heartbeats without ending it: its writer thread waits
+    /// before its next transaction until the returned gate is set.</summary>
+    private static ManualResetEventSlim Stall(Node node)
+    {
+        var gate = new ManualResetEventSlim();
+        node.Log.BeforeTransaction = () => gate.Wait(Timeout);
+        return gate;
+    }
+
+    /// <summary>
+    /// The outcome that once left a deployment with no node at all: the standby fences the
+    /// leader and is itself fenced before its term is committed. Both used to end as
+    /// Fenced. The standby has promoted nothing, so it stands by again, with a new client,
+    /// and leads when nobody else does.
+    /// </summary>
+    [Fact]
+    public async Task A_standby_fenced_in_the_middle_of_its_takeover_stands_by_again_and_then_leads()
+    {
+        await using var env = KafkaEnv.Create();
+        await using var a = await StartAsync(env, "a");
+        await LeadsAsync(a);
+        await using var b = await StartAsync(env, "b");
+        await Task.Delay(After);
+        Assert.Equal(NodeRole.Standby, b.Role);
+
+        // A third process takes the transactional id while b holds it and has not yet
+        // committed its term — then dies, having led nothing.
+        var intruded = 0;
+        b.Log.WhileAcquiring = point =>
+        {
+            if (point != "term-read" || Interlocked.Exchange(ref intruded, 1) != 0)
+                return;
+            var c = KafkaLog.ConnectAsync(env.Options(nodeId: "c", heartbeat: Beat)).GetAwaiter().GetResult();
+            c.AcquireWriterAsync().WaitAsync(Timeout).GetAwaiter().GetResult();
+            c.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        };
+        await a.Log.DisposeAsync();   // the leader goes silent
+
+        await KafkaEnv.EventuallyAsync(() => Task.FromResult(b.Leadership.TakeoversAbandoned == 1), "b's first takeover to be lost");
+        Assert.Equal(1, b.Log.WriterResets);
+        Assert.False(b.Log.IsFenced);
+        Assert.False(b.Log.WhenFenced.IsCompleted);
+        Assert.False(b.Leadership.WhenFinished.IsCompleted);
+
+        // c took term 2 and is gone; nobody leads; b does, by itself, under the next term.
+        await LeadsAsync(b);
+        Assert.Equal(3, b.Leadership.Term);
+        Assert.Equal(["prepare", "start 3"], b.Calls);
+        List<NodeRole> roles;
+        lock (b.Changes)
+            roles = [.. b.Changes.Select(c => c.Role)];
+        var collapsed = roles.Where((role, i) => i == 0 || roles[i - 1] != role).ToList();
+        Assert.Equal([NodeRole.Standby, NodeRole.Promoting, NodeRole.Standby, NodeRole.Promoting, NodeRole.Leader], collapsed.SkipWhile(r => r != NodeRole.Standby).ToList());
+        await CommitStateAsync(b.Log, "p", "after");
+    }
+
+    [Fact]
+    public async Task A_log_fenced_while_it_acquires_is_a_reader_again_and_can_acquire_later()
+    {
+        await using var env = KafkaEnv.Create();
+        var first = await env.ConnectAsync(env.Options(nodeId: "first", heartbeat: Beat));
+        var second = await env.ConnectAsync(env.Options(nodeId: "second", heartbeat: Beat));
+        foreach (var point in new[] { "initialised", "term-read" })
+        {
+            var resets = first.WriterResets;
+            var term = second.Term;
+            first.WhileAcquiring = at =>
+            {
+                if (at == point)
+                    second.AcquireWriterAsync().WaitAsync(Timeout).GetAwaiter().GetResult();
+            };
+            if (second.IsWriter)
+            {
+                // Round two: the second log must take the id again to fence the first, so
+                // it is a new connection.
+                second = await env.ConnectAsync(env.Options(nodeId: "second", heartbeat: Beat));
+            }
+            var lost = await Assert.ThrowsAsync<KafkaLogNotAcquiredException>(() => first.AcquireWriterAsync()).WaitAsync(Timeout);
+            Assert.IsType<KafkaLogFencedException>(lost.InnerException);
+            Assert.Equal(resets + 1, first.WriterResets);
+            Assert.False(first.IsWriter);
+            Assert.False(first.IsFenced);
+            Assert.False(first.WhenFenced.IsCompleted);
+            Assert.Equal(0, first.Term);
+            Assert.True(second.IsWriter);
+            await CommitStateAsync(second, "p", point);
+        }
+
+        // Nothing of the first log's was ever committed: the terms in the topic are the second's.
+        var terms = (await LeaderTopicAsync(second)).Where(r => r.Key == "term").Select(r => r.Value.GetProperty("Node").GetString()).ToList();
+        Assert.Equal(["second", "second"], terms);
+
+        // And it is still good for what a reader may become.
+        first.WhileAcquiring = null;
+        await first.AcquireWriterAsync().WaitAsync(Timeout);
+        Assert.True(first.IsWriter);
+        Assert.Equal(3, first.Term);
+        await CommitStateAsync(first, "p", "mine");
+        await Assert.ThrowsAsync<ChangelogFencedException>(() => CommitStateAsync(second, "p", "late")).WaitAsync(Timeout);
+    }
+
+    /// <summary>A leader that was only slow — its brokers were — and commits again while
+    /// its standby is on the way to replacing it: the standby hears it and stops, and
+    /// nobody is fenced.</summary>
+    [Fact]
+    public async Task A_takeover_is_given_up_when_the_leader_is_heard_before_it_is_fenced()
+    {
+        await using var env = KafkaEnv.Create();
+        await using var a = await StartAsync(env, "a");
+        await LeadsAsync(a);
+        await using var b = await StartAsync(env, "b");
+        await Task.Delay(After);
+
+        using var stall = Stall(a);
+        var met = 0;
+        b.Log.WhileAcquiring = point =>
+        {
+            if (point != "begin" || Interlocked.Exchange(ref met, 1) != 0)
+                return;
+
+            // The standby has decided and has asked nothing of the brokers yet. The leader
+            // comes back to life; the standby's watch hears it.
+            var beats = a.Log.IdleHeartbeats;
+            stall.Set();
+            SpinWait.SpinUntil(() => a.Log.IdleHeartbeats >= beats + 2, Timeout);
+            SpinWait.SpinUntil(() => b.Leadership.Status.HeartbeatAge < Beat * 2, Timeout);
+        };
+
+        await KafkaEnv.EventuallyAsync(() => Task.FromResult(b.Leadership.TakeoversAbandoned == 1), "b's takeover to be given up");
+        Assert.Equal(NodeRole.Standby, b.Role);
+        Assert.Equal(1, b.Log.WriterResets);
+
+        // The leader was never touched, and stays untouched: the client the standby put
+        // away does not finish the takeover behind its back.
+        await Task.Delay(After * 3);
+        Assert.Equal(NodeRole.Leader, a.Role);
+        Assert.True(a.Log.IsWriter);
+        Assert.Equal(NodeRole.Standby, b.Role);
+        Assert.Equal(1, b.Leadership.Status.LeaderTerm);
+        await CommitStateAsync(a.Log, "p", "still mine");
+        Assert.Empty(b.Calls);
+    }
+
+    /// <summary>At the ceiling a standby takes over from a leader that still answers —
+    /// unless the brokers say that nothing can be committed by anybody, in which case the
+    /// leader's place is no better than its own.</summary>
+    [Fact]
+    public async Task At_the_ceiling_a_standby_does_not_take_over_while_the_brokers_can_commit_nothing()
+    {
+        await using var env = KafkaEnv.Create();
+        await using var a = await StartAsync(env, "a");
+        await LeadsAsync(a);
+        var ceiling = TimeSpan.FromSeconds(2);
+        await using var b = await StartAsync(env, "b", ceiling: ceiling, probe: _ => ValueTask.FromResult(true));
+        await Task.Delay(After);
+        b.Log.WritePathOverride = () => (KafkaLog.WritePath.Unwritable, "the test says so");
+
+        using var stall = Stall(a);
+        await Task.Delay(ceiling * 2.5);
+        Assert.Equal(NodeRole.Standby, b.Role);
+        Assert.True(b.Leadership.TakeoversHeld > 0);
+        Assert.True(a.Log.IsWriter);
+
+        // The brokers are back and the leader is still silent: now it is the leader's fault.
+        b.Log.WritePathOverride = () => (KafkaLog.WritePath.Writable, null);
+        await LeadsAsync(b);
+        Assert.Equal("ceiling", b.Leadership.Status.LastTakeover!.Reason);
+        Assert.Equal(2, b.Leadership.Term);
+    }
+
+    [Fact]
+    public async Task What_the_brokers_say_about_writing_is_asked_of_them_and_the_coordinator_is_placed_as_they_place_it()
+    {
+        await using var env = KafkaEnv.Create();
+        var log = await env.ConnectWriterAsync(env.Options(nodeId: "a"));
+        var (path, why) = await log.ProbeWritePathAsync(default).WaitAsync(Timeout);
+        Assert.Equal(KafkaLog.WritePath.Writable, path);
+        Assert.Null(why);
+
+        // Java's String.hashCode, which is what places a transactional id on a partition
+        // of __transaction_state: values from a JVM.
+        Assert.Equal(0, KafkaLog.JavaHash(""));
+        Assert.Equal(96354, KafkaLog.JavaHash("abc"));
+        Assert.Equal(984754439, KafkaLog.JavaHash("incremental.writer"));
+    }
+
+    /// <summary>A step-down whose resignation the brokers will not take. The circuits are
+    /// already stopped, so a writer that went on heartbeating would hold the standby off a
+    /// leader that leads nothing: the writer is closed and the standby takes over on the
+    /// silence.</summary>
+    [Fact]
+    public async Task A_step_down_whose_resignation_cannot_commit_closes_the_writer_and_the_standby_takes_over_on_silence()
+    {
+        await using var env = KafkaEnv.Create();
+        var a = await env.ConnectAsync(env.Options(nodeId: "a", heartbeat: Beat, maxAbortRetries: 1));
+        await using var leadershipA = new KafkaLeadership(a, new KafkaLeadershipOptions
+        {
+            TakeoverAfter = After,
+            StartLeadingAsync = (_, _) => Task.CompletedTask,
+        });
+        await leadershipA.StartAsync().WaitAsync(Timeout);
+        await leadershipA.WhenRoleAsync(NodeRole.Leader).WaitAsync(Timeout);
+        await using var b = await StartAsync(env, "b");
+        await Task.Delay(After);
+
+        a.FailTransaction = commits => commits.Any(c => c.Resigns);
+        var failure = await Assert.ThrowsAsync<KafkaLogException>(() => leadershipA.StepDownAsync()).WaitAsync(Timeout);
+        Assert.IsNotType<KafkaLogFencedException>(failure);
+        Assert.Equal(NodeRole.Fenced, leadershipA.Role);
+        Assert.True(leadershipA.WhenFinished.IsCompleted);
+        Assert.False(a.IsWriter);
+        Assert.True(a.IsFenced);
+        var beats = a.IdleHeartbeats;
+
+        await LeadsAsync(b);
+        Assert.Equal("silence", b.Leadership.Status.LastTakeover!.Reason);
+        Assert.Equal(beats, a.IdleHeartbeats);
+        Assert.DoesNotContain(await LeaderTopicAsync(b.Log), r => r.Value.TryGetProperty("Resigned", out var resigned) && resigned.GetBoolean());
+    }
+
+    /// <summary>Terms never fall. A takeover whose read of the last term comes back lower
+    /// than a term this process has already read — the answer of a partition whose leader
+    /// was elected a moment ago with a broker down — must not announce a used term.</summary>
+    [Fact]
+    public async Task A_takeover_does_not_announce_a_term_below_one_it_has_read()
+    {
+        await using var env = KafkaEnv.Create();
+        var first = await env.ConnectWriterAsync(env.Options(nodeId: "first", heartbeat: Beat));
+        Assert.Equal(1, first.Term);
+
+        var second = await env.ConnectAsync(env.Options(nodeId: "second", heartbeat: Beat, operationTimeout: TimeSpan.FromSeconds(2)));
+        second.NoteTermSeen(7);   // as if it had followed the topic to term 7 and the topic now gave 1
+        var refused = await Assert.ThrowsAsync<KafkaLogException>(() => second.AcquireWriterAsync()).WaitAsync(Timeout);
+        Assert.IsNotType<KafkaLogFencedException>(refused);
+        Assert.Contains("has read term 7", refused.Message);
+        Assert.False(second.IsWriter);
+        Assert.Equal(0, second.Term);
+        Assert.DoesNotContain(await LeaderTopicAsync(second), r => r.Key == "term" && r.Value.GetProperty("Node").GetString() == "second");
+
+        // With the floor at what the topic really holds, the same log takes over.
+        var third = await env.ConnectAsync(env.Options(nodeId: "third", heartbeat: Beat));
+        third.NoteTermSeen(1);
+        await third.AcquireWriterAsync().WaitAsync(Timeout);
+        Assert.Equal(2, third.Term);
+    }
+
     // ── stopping part-way, stepping down twice ─────────────────────────────────────────
 
     [Fact]

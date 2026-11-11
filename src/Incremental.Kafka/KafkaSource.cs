@@ -435,6 +435,7 @@ public sealed class KafkaSource : IAsyncDisposable
             // faster than once a second would be held to one buffer a second.
             FetchQueueBackoffMs = 10,
         };
+        KafkaClientDefaults.Apply(config);
         foreach (var (key, value) in _options.ClientConfig)
             config.Set(key, value);
         var builder = new ConsumerBuilder<byte[], byte[]>(config)

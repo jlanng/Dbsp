@@ -507,7 +507,15 @@ public class KafkaFailoverProcessTests(ITestOutputHelper output)
         var fenced = await a.WaitForRoleAsync("Fenced");
         KafkaEnv.Measured(output, $"SIGSTOP failover: the resumed leader exited as fenced {resumedAt.ElapsedMilliseconds} ms after SIGCONT");
         Assert.False(string.IsNullOrEmpty(fenced.GetProperty("fault").GetString()));
-        Assert.Equal(eventsBefore, a.Events("progress").Count);   // it committed nothing after waking
+
+        // It committed nothing after waking. A commit that was durable when it was stopped
+        // and announced only when it woke is not one: the signal can land between the two,
+        // and then the line it prints is for an offset its successor had already resumed
+        // from (seen once in some hundred runs, as one event too many).
+        var resumedFrom = (await b.WaitAsync("leading")).GetProperty("resumedAt").GetInt64();
+        Assert.All(a.Events("progress").Skip(eventsBefore), late =>
+            Assert.True(late.GetProperty("committed").GetInt64() < resumedFrom,
+                $"the zombie committed offset {late.GetProperty("committed").GetInt64()} after waking; its successor had resumed from {resumedFrom}"));
 
         // Its supervisor restarts it; it comes back as a standby of the node that replaced it.
         using var a2 = new AppNode(env.Prefix, "a", steps, takeoverAfter, heartbeat, probePort: ports[0], peerPort: ports[1]);
