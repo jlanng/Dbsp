@@ -272,11 +272,21 @@ public class SharedTableTests
         var failures = new System.Collections.Concurrent.ConcurrentQueue<string>();
         long probes = 0;
 
-        var readers = Enumerable.Range(0, 4).Select(seed => Task.Run(() =>
+        // Readers get threads of their own and the writer waits for each to have probed
+        // once: on a busy thread pool (the suite runs in parallel) a pool task may not
+        // start before 3,000 versions are written, and then nothing was tested.
+        using var probing = new CountdownEvent(4);
+        var readers = Enumerable.Range(0, 4).Select(seed => Task.Factory.StartNew(() =>
         {
             var random = new Random(seed);
+            var signalled = false;
             while (!stop.IsCancellationRequested && failures.IsEmpty)
             {
+                if (!signalled && Interlocked.Read(ref probes) > 0)
+                {
+                    signalled = true;
+                    probing.Signal();
+                }
                 using var snapshot = table.Snapshot();
                 var v = snapshot.Version;
                 for (var i = 0; i < 64; i++)
@@ -291,7 +301,8 @@ public class SharedTableTests
                     Interlocked.Increment(ref probes);
                 }
             }
-        })).ToArray();
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)).ToArray();
+        Assert.True(probing.Wait(TimeSpan.FromSeconds(30)), "the readers did not start");
 
         for (var v = 1; v <= versions && failures.IsEmpty; v++)
         {
