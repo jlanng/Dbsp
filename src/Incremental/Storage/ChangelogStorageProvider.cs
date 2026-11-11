@@ -14,8 +14,9 @@ namespace Incremental.Storage;
 /// state can be rebuilt by another process, or kept warm by one that follows the log.
 /// <para>
 /// Record layout (see <c>docs/design/durability-and-standby.md</c>). Keys are NUL-separated
-/// UTF-8 segments; values start with a format byte (1 = the serializer's output); a
-/// tombstone removes the key.
+/// UTF-8 segments; values start with a format byte — 1: the serializer's output; 2: a
+/// length byte, that many bytes of layout tag (<see cref="UseLayout"/>), then the
+/// serializer's output; a tombstone removes the key.
 /// </para>
 /// <code>
 /// pipeline NUL incarnation NUL store NUL entry        entry of a store:
@@ -45,6 +46,7 @@ namespace Incremental.Storage;
 public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
 {
     internal const byte FormatSerializer = 1;
+    internal const byte FormatTagged = 2;
     private static ReadOnlySpan<byte> CommitKey => "$commit"u8;
 
     private readonly ChangelogStorage _storage;
@@ -78,6 +80,21 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
     private long _incarnation; // 0: the changelog holds nothing for this pipeline yet
     private long _commitSequence;
     private long _commitTerm;
+
+    // The layout: whose types the typed stores are (UseLayout), carried as a tag in front
+    // of every value those types write. _committedLayout is the tag of the last commit
+    // record written or followed; _committedProven that it was a checkpoint and not only
+    // the announcement CommitLayoutAsync writes. _typedRefused: the follower met a record
+    // of another layout and turned the typed stores back into bytes — no typed store is
+    // created on a follower again until UseLayout is called. _storeEpoch counts the times
+    // the typed stores were given up: a circuit built before the last one holds stores
+    // nothing reads or follows any more.
+    private string? _layout;
+    private byte[] _tag = [];
+    private string? _committedLayout;
+    private bool _committedProven;
+    private bool _typedRefused;
+    private long _storeEpoch;
 
     // The store the follower last applied a record to, found again by comparing bytes.
     private byte[] _lastStoreName = [];
@@ -127,32 +144,37 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
     public void ReleaseStores()
     {
         lock (_lock)
+            ReleaseStoresLocked();
+    }
+
+    /// <summary><see cref="ReleaseStores"/>; the caller holds the lock.</summary>
+    private void ReleaseStoresLocked()
+    {
+        if (_stores.Count == 0)
+            return;
+        _storeEpoch++;
+        var collect = new ReleasingTransaction();
+        _encoder.Begin(collect, _partition, 0);
+        foreach (var (name, store) in _stores)
         {
-            if (_stores.Count == 0)
-                return;
-            var collect = new ReleasingTransaction();
-            _encoder.Begin(collect, _partition, 0);
-            foreach (var (name, store) in _stores)
+            if (_origins.Remove(name, out var origin))
             {
-                if (_origins.Remove(name, out var origin))
-                {
-                    _pending[name] = origin;
-                    continue;
-                }
-                store.Rollback();
-                // Bytes that never reached the store (a failed Apply leaves them) stay.
-                if (!_pending.TryGetValue(name, out var entries))
-                    _pending[name] = entries = new Dictionary<byte[], byte[]>(ByteArrayComparer.Instance);
-                collect.Into = entries;
-                _encoder.Store(store.NameUtf8);
-                store.WriteEntries(_encoder);
+                _pending[name] = origin;
+                continue;
             }
-            _stores.Clear();
-            _origins.Clear();
-            _lastStore = null;
-            _lastPending = null;
-            _lastStoreName = [];
+            store.Rollback();
+            // Bytes that never reached the store (a failed Apply leaves them) stay.
+            if (!_pending.TryGetValue(name, out var entries))
+                _pending[name] = entries = new Dictionary<byte[], byte[]>(ByteArrayComparer.Instance);
+            collect.Into = entries;
+            _encoder.Store(store.NameUtf8);
+            store.WriteEntries(_encoder);
         }
+        _stores.Clear();
+        _origins.Clear();
+        _lastStore = null;
+        _lastPending = null;
+        _lastStoreName = [];
     }
 
     /// <summary>Replaces the serializer the stores created from now on read and write
@@ -170,7 +192,123 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
                 throw new InvalidOperationException(
                     $"Pipeline '{PipelineId}' has typed stores created with the current serializer; call ReleaseStores first.");
             _serializer = new Utf8StateSerializer(serializer);
-            _encoder = new RecordEncoder(_serializer, _pipelineUtf8);
+            _encoder = new RecordEncoder(_serializer, _pipelineUtf8) { Tag = _tag };
+        }
+    }
+
+    /// <summary>
+    /// Names whose types the stores created from now on have: an opaque, short identity of
+    /// everything that decides them (for a service, the plugin version, the definition and
+    /// its settings). Allowed only while the provider holds no typed store, like
+    /// <see cref="UseSerializer"/>. Every value those stores write carries the layout in
+    /// front, and that is what lets a follower hold typed stores safely: the moment it
+    /// reads a record of another layout it turns its typed stores back into bytes
+    /// (<see cref="ReleaseStores"/>) before applying it, and refuses to create typed stores
+    /// until this is called again. So a follower's typed stores only ever hold what their
+    /// own types wrote or what the leader's same types read. Null (the default): values
+    /// are untagged, and a follower's typed stores are the caller's to keep right.
+    /// </summary>
+    public void UseLayout(string? layout)
+    {
+        var tag = layout is null ? [] : Encoding.UTF8.GetBytes(layout);
+        if (layout is { Length: 0 } || tag.Length > 255 || tag.AsSpan().Contains((byte)0))
+            throw new ArgumentException("A layout is 1 to 255 bytes of UTF-8 without a NUL character.", nameof(layout));
+        lock (_lock)
+        {
+            if (_stores.Count != 0)
+                throw new InvalidOperationException(
+                    $"Pipeline '{PipelineId}' has typed stores of layout '{_layout}'; call ReleaseStores first.");
+            _layout = layout;
+            _tag = tag;
+            _encoder.Tag = tag;
+            _typedRefused = false;
+        }
+    }
+
+    /// <summary>The layout given to <see cref="UseLayout"/>.</summary>
+    public string? Layout
+    {
+        get
+        {
+            lock (_lock)
+                return _layout;
+        }
+    }
+
+    /// <summary>The layout of the last commit record written or, on a follower, applied:
+    /// whose types last wrote this pipeline's state. Null before the first commit and for
+    /// state written without a layout.</summary>
+    public string? CommittedLayout
+    {
+        get
+        {
+            lock (_lock)
+                return _committedLayout;
+        }
+    }
+
+    /// <summary>How many times the typed stores have been given up — by
+    /// <see cref="ReleaseStores"/>, or by a follower that met another layout. A circuit
+    /// built on this provider is only good to start while this is what it was before the
+    /// circuit was built.</summary>
+    public long StoreEpoch
+    {
+        get
+        {
+            lock (_lock)
+                return _storeEpoch;
+        }
+    }
+
+    /// <summary>
+    /// Records, durably, that the pipeline's state is now under <see cref="Layout"/>: one
+    /// transaction holding only a commit record — the last checkpoint again, tagged with
+    /// the layout and marked as an announcement. A follower that reads it gives up typed
+    /// stores of any other layout, and can build this layout's before the first checkpoint
+    /// under it. Does nothing when the last commit record already carries the layout.
+    /// Leader only; no circuit may be running on the provider.
+    /// </summary>
+    public async Task CommitLayoutAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var writer = _storage.RequireWriter(PipelineId);
+        lock (_lock)
+        {
+            if (string.Equals(_layout, _committedLayout, StringComparison.Ordinal))
+                return;
+        }
+        var transaction = writer.BeginTransaction();
+        long incarnation;
+        string? layout;
+        try
+        {
+            lock (_lock)
+            {
+                layout = _layout;
+                incarnation = Math.Max(_incarnation, 1);
+                _encoder.Begin(transaction, _partition, incarnation);
+                _encoder.Commit(_commitSequence, writer.Term, _committedOffsets, _committedManifests, staged: null, announcement: true);
+            }
+            try
+            {
+                await transaction.CommitAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (ChangelogFencedException ex)
+            {
+                _storage.MarkFenced(ex);
+                throw;
+            }
+        }
+        finally
+        {
+            transaction.Dispose();
+        }
+        lock (_lock)
+        {
+            _incarnation = incarnation;
+            _commitTerm = writer.Term;
+            _committedLayout = layout;
+            _committedProven = false;
         }
     }
 
@@ -233,6 +371,10 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             if (_stores.TryGetValue(name, out var existing))
                 return existing as TStore
                     ?? throw new InvalidOperationException($"Store '{name}' was already created with different key/value types.");
+            if (_typedRefused && !_storage.HoldsWriter)
+                throw new InvalidOperationException(
+                    $"Pipeline '{PipelineId}': the changelog has moved from layout '{_layout}' to '{_committedLayout}', so no store of " +
+                    "the old layout can be created on this follower. Call UseLayout with the layout the state is now under.");
 
             var store = factory();
             store.NameUtf8 = Encoding.UTF8.GetBytes(name);
@@ -257,7 +399,13 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
                         "whose stores have the types that wrote it can still be built on it.", ex);
                 }
                 _pending.Remove(name);
-                _origins[name] = pending;
+
+                // A follower whose leader has checkpointed under this very layout needs
+                // no way back: its types have written, and what they would make of these
+                // bytes is what the leader holds.
+                if (!(_layout is not null && _committedProven && !_storage.HoldsWriter
+                        && string.Equals(_layout, _committedLayout, StringComparison.Ordinal)))
+                    _origins[name] = pending;
             }
 
             _stores[name] = store;
@@ -311,6 +459,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         var writer = _storage.RequireWriter(PipelineId);
         var transaction = writer.BeginTransaction();
         long incarnation, sequence;
+        string? layout;
         try
         {
             // The circuit runs no step while a commit is pending, so nothing touches the
@@ -329,6 +478,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
                     store.WriteChanges(_encoder);
                 }
                 _encoder.Commit(sequence, writer.Term, inputOffsets, _committedManifests, _stagedManifests);
+                layout = _layout;
             }
 
             try
@@ -360,6 +510,8 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             _incarnation = incarnation;
             _commitSequence = sequence;
             _commitTerm = writer.Term;
+            _committedLayout = layout;
+            _committedProven = true;
         }
     }
 
@@ -438,6 +590,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         {
             ResetTo(next);
             _commitTerm = writer.Term;
+            _committedLayout = _layout;
         }
     }
 
@@ -453,6 +606,8 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         _committedOffsets = new Dictionary<string, long>();
         _commitSequence = 0;
         _commitTerm = 0;
+        _committedLayout = null;
+        _committedProven = false;
         _incarnation = incarnation;
         _lastStore = null;
         _lastPending = null;
@@ -497,12 +652,35 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
 
             if (_lastStore is { } store)
             {
-                // A typed store that is followed has moved on from the bytes it was made of.
-                if (_origins.Count != 0)
-                    _origins.Clear();
-                store.Apply(_serializer, entry, record.Value.Span, record.IsTombstone);
+                // A value of another layout was written by other types: the typed stores
+                // go back to bytes before it is applied, and the record joins them.
+                var foreign = !record.IsTombstone && !LayoutTag(record.Value.Span).SequenceEqual(_tag);
+                if (!foreign)
+                {
+                    try
+                    {
+                        store.Apply(_serializer, entry, record.Value.Span, record.IsTombstone);
+
+                        // A typed store that is followed has moved on from the bytes it was made of.
+                        if (_origins.Count != 0)
+                            _origins.Clear();
+                        return;
+                    }
+                    // A tombstone carries no layout. One these types cannot read the key
+                    // of was written by others, ahead of anything that says so.
+                    catch (Exception ex) when (record.IsTombstone && _layout is not null && ex is not InvalidDataException)
+                    {
+                    }
+                }
+                ReleaseStoresLocked();
+                _typedRefused = true;
+                var name = Encoding.UTF8.GetString(storeName);
+                _lastStoreName = storeName.ToArray();
+                if (!_pending.TryGetValue(name, out _lastPending))
+                    _pending[name] = _lastPending = new Dictionary<byte[], byte[]>(ByteArrayComparer.Instance);
             }
-            else if (record.IsTombstone)
+
+            if (record.IsTombstone)
                 _lastPending!.Remove(entry.ToArray());
             else
                 _lastPending![entry.ToArray()] = record.Value.ToArray();
@@ -530,18 +708,40 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         _committedOffsets = offsets;
         _commitSequence = commit.GetProperty("sequence").GetInt64();
         _commitTerm = commit.GetProperty("term").GetInt64();
+
+        var tag = LayoutTag(record.Value.Span);
+        _committedLayout = tag.IsEmpty ? null : tag.SequenceEqual(_tag) ? _layout : Encoding.UTF8.GetString(tag);
+        _committedProven = !(commit.TryGetProperty("announcement", out var announcement) && announcement.ValueKind == JsonValueKind.True);
+        if (_stores.Count == 0)
+            return;
+        if (!tag.SequenceEqual(_tag))
+        {
+            // The state is under another layout now: these types hold it no longer.
+            ReleaseStoresLocked();
+            _typedRefused = true;
+        }
+        else if (_committedProven && _layout is not null && _origins.Count != 0)
+            _origins.Clear(); // the leader's same types have checkpointed
     }
 
-    /// <summary>A record value without its format byte.</summary>
+    /// <summary>A record value without its format byte and, in format 2, its layout tag.</summary>
     internal static ReadOnlySpan<byte> Payload(ReadOnlySpan<byte> value)
     {
-        if (value.Length == 0 || value[0] != FormatSerializer)
-            throw new InvalidDataException(
-                value.Length == 0
-                    ? "A changelog record has an empty value: every value starts with a format byte."
-                    : $"A changelog record has format byte {value[0]}, which this version cannot read (it reads {FormatSerializer}).");
-        return value[1..];
+        if (value.Length > 0 && value[0] == FormatSerializer)
+            return value[1..];
+        if (value.Length >= 2 && value[0] == FormatTagged && value.Length >= 2 + value[1])
+            return value[(2 + value[1])..];
+        throw new InvalidDataException(
+            value.Length == 0
+                ? "A changelog record has an empty value: every value starts with a format byte."
+                : value[0] == FormatTagged
+                    ? "A changelog record of format 2 is shorter than its layout tag says."
+                    : $"A changelog record has format byte {value[0]}, which this version cannot read (it reads {FormatSerializer} and {FormatTagged}).");
     }
+
+    /// <summary>The layout tag of a record value; empty for an untagged one.</summary>
+    internal static ReadOnlySpan<byte> LayoutTag(ReadOnlySpan<byte> value) =>
+        value.Length >= 2 && value[0] == FormatTagged && value.Length >= 2 + value[1] ? value.Slice(2, value[1]) : default;
 
     // ── test and diagnostics hooks ─────────────────────────────────────────────────────
 
@@ -749,6 +949,23 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         private int _incarnationLength; // of "pipeline NUL incarnation NUL"
         private int _storeLength;       // of that plus "store NUL"
 
+        /// <summary>The layout every value is written under; empty for none.</summary>
+        public byte[] Tag { get; set; } = [];
+
+        /// <summary>Starts a value: the format byte and, with a layout, its tag.</summary>
+        private void Header()
+        {
+            _value.Length = 0;
+            if (Tag.Length == 0)
+            {
+                _value.Append(FormatSerializer);
+                return;
+            }
+            _value.Append(FormatTagged);
+            _value.Append((byte)Tag.Length);
+            _value.Append(Tag);
+        }
+
         public void Begin(IStateChangelogTransaction transaction, int partition, long incarnation)
         {
             _transaction = transaction;
@@ -798,8 +1015,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
                 Tombstone();
                 return;
             }
-            _value.Length = 0;
-            _value.Append(FormatSerializer);
+            Header();
             Utf8Formatter.TryFormat(weight, _value.GetSpan(20), out var written);
             _value.Advance(written);
             _transaction.Append(_partition, _key.Written, _value.Written);
@@ -807,8 +1023,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
 
         public void Value<T>(T value)
         {
-            _value.Length = 0;
-            _value.Append(FormatSerializer);
+            Header();
             serializer.Write(_value, value);
             _transaction.Append(_partition, _key.Written, _value.Written);
         }
@@ -841,11 +1056,11 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             long term,
             IReadOnlyDictionary<string, long>? offsets,
             Dictionary<string, string>? committed,
-            Dictionary<string, string>? staged)
+            Dictionary<string, string>? staged,
+            bool announcement = false)
         {
             CommitRecordKey();
-            _value.Length = 0;
-            _value.Append(FormatSerializer);
+            Header();
             if (_commitWriter is null)
                 _commitWriter = new Utf8JsonWriter(_value, new JsonWriterOptions { SkipValidation = true });
             else
@@ -868,6 +1083,8 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
                 foreach (var (scope, manifest) in staged)
                     json.WriteString(scope, manifest);
             json.WriteEndObject();
+            if (announcement)
+                json.WriteBoolean("announcement"u8, true);
             json.WriteEndObject();
             json.Flush();
             _transaction.Append(_partition, _key.Written, _value.Written);

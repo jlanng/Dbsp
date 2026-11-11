@@ -100,6 +100,10 @@ public sealed class ChangelogStorage : IAsyncDisposable
     /// <summary>Whether this storage holds the changelog's writer and has not lost it.</summary>
     public bool IsLeader => _writer is not null && _fenced is null;
 
+    /// <summary>Whether this storage has the changelog's writer, fenced or not: it reads
+    /// the changelog no more.</summary>
+    internal bool HoldsWriter => _writer is not null;
+
     /// <summary>Whether any partition is still being read: true for a follower, false once
     /// promoted or disposed.</summary>
     internal bool IsReading => _followers.Any(f => !f.IsCompleted);
