@@ -51,7 +51,7 @@ public sealed class Circuit : IAsyncDisposable
 
     // The dead-letter output, when any operator (or the circuit) has the DeadLetter policy;
     // it is also the last of _outputs, and is staged and published with them.
-    private readonly DeadLetterPort? _deadLetters;
+    private readonly DeadLetterPortBase? _deadLetters;
     private readonly Worker[] _workers;
     private readonly SpinBarrier _barrier;
     private readonly WatermarkClock? _watermarkClock;
@@ -193,7 +193,9 @@ public sealed class Circuit : IAsyncDisposable
         // OperatorContext.StateName — so by the end of this loop the collected names are the
         // complete state layout of this process's slice of the circuit.
         var manifestStores = _checkpoint is null ? null : new SortedSet<string>(StringComparer.Ordinal);
-        _deadLetters = builder.DeadLetters ? new DeadLetterPort(options.Workers, options.DeadLetterCapacity, _diag) : null;
+        _deadLetters = !builder.DeadLetters ? null
+            : options.AcknowledgeDeadLetters ? new AcknowledgedDeadLetterPort(options.Workers, options.OutputChannelCapacity, _diag)
+            : new DeadLetterPort(options.Workers, options.DeadLetterCapacity, _diag);
         _workers = new Worker[options.Workers];
         for (var w = 0; w < options.Workers; w++)
         {
@@ -246,7 +248,7 @@ public sealed class Circuit : IAsyncDisposable
                 (input as IDeadLetteringInput)?.DeadLetterInto(
                     new RecordErrors($"input[{input.Name}]", _deadLetters.CoordinatorSink));
         _outputs = outputRegistrations.Select(r => r.CreatePort(options))
-            .Concat(_deadLetters is null ? [] : new IOutputPort[] { _deadLetters })
+            .Concat(_deadLetters is null ? [] : new[] { (IOutputPort)_deadLetters })
             .ToArray();
         _acknowledgedOutputs = _outputs.OfType<IAcknowledgedOutputPort>().ToArray();
         _derivedTables = _outputs.OfType<IDerivedTablePort>().ToArray();
@@ -467,10 +469,41 @@ public sealed class Circuit : IAsyncDisposable
     /// if neither the circuit nor any of its operators has the <c>DeadLetter</c> policy.
     /// </summary>
     public System.Threading.Channels.ChannelReader<DeadLetter> DeadLetters =>
-        _deadLetters?.Reader
-        ?? throw new InvalidOperationException(
-            "This circuit has no dead-letter output: set CircuitOptions.ErrorPolicy to DeadLetter, or OnError(DeadLetter) " +
-            "on an operator.");
+        _deadLetters switch
+        {
+            DeadLetterPort plain => plain.Reader,
+            null => throw NoDeadLetters(),
+            _ => throw new InvalidOperationException(
+                "This circuit's dead letters are acknowledged (CircuitOptions.AcknowledgeDeadLetters): read DeadLetterBatches."),
+        };
+
+    /// <summary>
+    /// The dead letters of a circuit built with <see cref="CircuitOptions.AcknowledgeDeadLetters"/>:
+    /// one batch per step that dropped something, in step order, to be acknowledged
+    /// (<see cref="DeadLetterBatch.Acknowledge"/>) once it is durable wherever the reader
+    /// keeps them. With a checkpoint store the commit waits for that, exactly as it waits
+    /// for a sink (<c>ToAcknowledgedOutput</c>): a dropped record is in the reader's store
+    /// before the checkpoint that passes it, and is dropped and reported again after a
+    /// crash before that — at-least-once. It must be read and acknowledged, or the circuit
+    /// stops at its next commit.
+    /// </summary>
+    public System.Threading.Channels.ChannelReader<DeadLetterBatch> DeadLetterBatches =>
+        _deadLetters switch
+        {
+            AcknowledgedDeadLetterPort acknowledged => acknowledged.Reader,
+            null => throw NoDeadLetters(),
+            _ => throw new InvalidOperationException(
+                "This circuit's dead letters are not acknowledged: set CircuitOptions.AcknowledgeDeadLetters, or read DeadLetters."),
+        };
+
+    /// <summary>Says that nothing will read <see cref="DeadLetterBatches"/> any more —
+    /// <paramref name="cause"/> is why, when the reader's store failed. The circuit faults
+    /// at its next publish or commit instead of waiting for acknowledgements that cannot come.</summary>
+    public void AbandonDeadLetters(Exception? cause = null) => (_deadLetters as AcknowledgedDeadLetterPort)?.Abandon(cause);
+
+    private static InvalidOperationException NoDeadLetters() => new(
+        "This circuit has no dead-letter output: set CircuitOptions.ErrorPolicy to DeadLetter, or OnError(DeadLetter) " +
+        "on an operator.");
 
     private void RequireOwnDefinition(CircuitBuilder source)
     {

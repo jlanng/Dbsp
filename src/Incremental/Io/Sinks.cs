@@ -227,6 +227,65 @@ public static class SinkDelivery
         return new AppendDelivery<T>(sink, Validated(options)).DeliverAsync;
     }
 
+    /// <summary>
+    /// Delivers the circuit's dead letters to <paramref name="sink"/> until the circuit
+    /// ends: at-least-once, a step's dropped records as one batch under the step's sequence
+    /// number, each turned into what the sink stores by <paramref name="envelope"/>. The
+    /// circuit must have <see cref="CircuitOptions.AcknowledgeDeadLetters"/>: a batch is
+    /// acknowledged when the sink has it, and the checkpoint waits for that. A write that
+    /// throws is retried as for any sink; when the retries run out the dead letters are
+    /// abandoned, so the circuit faults without committing past the batch and a restart
+    /// drops and delivers those records again. <paramref name="observe"/> sees each batch
+    /// before it is written.
+    /// </summary>
+    public static async Task DeliverDeadLettersToAsync<T>(
+        this Circuit circuit,
+        IAppendSink<T> sink,
+        Func<DeadLetter, T> envelope,
+        SinkDeliveryOptions? options = null,
+        Action<DeadLetterBatch>? observe = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(circuit);
+        ArgumentNullException.ThrowIfNull(sink);
+        ArgumentNullException.ThrowIfNull(envelope);
+        options = Validated(options);
+        var reader = circuit.DeadLetterBatches;
+        var records = new List<T>();
+        Func<AppendBatch<T>, CancellationToken, ValueTask> write = sink.WriteAsync;
+        while (true)
+        {
+            try
+            {
+                if (!await reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+                    return;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // The circuit faulted and completed the output with its fault: that is the
+                // circuit's news, which it carries itself.
+                return;
+            }
+            while (reader.TryRead(out var batch))
+            {
+                observe?.Invoke(batch);
+                records.Clear();
+                foreach (var letter in batch.Letters)
+                    records.Add(envelope(letter));
+                try
+                {
+                    await WriteWithRetriesAsync(new AppendBatch<T>(batch.Sequence, records), write, options, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    circuit.AbandonDeadLetters(ex);
+                    throw;
+                }
+                batch.Acknowledge();
+            }
+        }
+    }
+
     private static SinkDeliveryOptions Validated(SinkDeliveryOptions? options)
     {
         options ??= SinkDeliveryOptions.Default;

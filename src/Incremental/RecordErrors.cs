@@ -175,32 +175,21 @@ internal static class KeySelectors
             : kv => new KeyedValue<TKey, TOut>(kv.Key, selector(kv.Value));
 }
 
-/// <summary>
-/// The circuit's dead-letter output: an output port whose "node" is every operator at once.
-/// After each step it collects what the workers' operators (and the keyed inputs' drains)
-/// dropped and publishes it to one bounded channel, like any other output — so an unread
-/// dead-letter queue is backpressure, never unbounded memory.
-/// </summary>
-internal sealed class DeadLetterPort : IOutputPort
+/// <summary>The lists the operators of a circuit report dropped records to, one per worker
+/// and one for the coordinator, and their collection between steps. Shared by the two
+/// dead-letter ports.</summary>
+internal abstract class DeadLetterPortBase(int workers, CircuitDiagnostics diag)
 {
     public const string PortName = "deadLetters";
 
-    private readonly Channel<DeadLetter> _channel;
-    private readonly List<DeadLetter>[] _sources; // one per worker, then the coordinator's
-    private readonly CircuitDiagnostics _diag;
-    private List<DeadLetter>? _staged;
+    private readonly List<DeadLetter>[] _sources = Sources(workers); // one per worker, then the coordinator's
 
-    public DeadLetterPort(int workers, int capacity, CircuitDiagnostics diag)
+    private static List<DeadLetter>[] Sources(int workers)
     {
-        _diag = diag;
-        _sources = new List<DeadLetter>[workers + 1];
-        for (var i = 0; i < _sources.Length; i++)
-            _sources[i] = [];
-        _channel = Channel.CreateBounded<DeadLetter>(new BoundedChannelOptions(capacity)
-        {
-            SingleWriter = true,
-            FullMode = BoundedChannelFullMode.Wait,
-        });
+        var sources = new List<DeadLetter>[workers + 1];
+        for (var i = 0; i < sources.Length; i++)
+            sources[i] = [];
+        return sources;
     }
 
     /// <summary>The list worker <paramref name="worker"/>'s operators append to.</summary>
@@ -209,25 +198,15 @@ internal sealed class DeadLetterPort : IOutputPort
     /// <summary>The list the coordinator appends to while draining inputs.</summary>
     public List<DeadLetter> CoordinatorSink => _sources[^1];
 
-    public ChannelReader<DeadLetter> Reader => _channel.Reader;
-
     public string Name => PortName;
-    public object Handle => _channel.Reader;
-    public int BufferedCount => _channel.Reader.Count;
 
     public void BindSnapshot(Circuit circuit)
     {
     }
 
-    public async ValueTask PublishAsync(Worker[] workers, long step, CancellationToken cancellationToken)
-    {
-        if (Stage(workers, step))
-            await FlushStagedAsync(cancellationToken).ConfigureAwait(false);
-    }
-
     /// <summary>Runs on the coordinator once every worker has left the step, so the lists
     /// are quiescent. Allocates only when something was dropped.</summary>
-    public bool Stage(Worker[] workers, long step)
+    protected List<DeadLetter>? Collect(long step)
     {
         List<DeadLetter>? staged = null;
         foreach (var source in _sources)
@@ -239,12 +218,49 @@ internal sealed class DeadLetterPort : IOutputPort
             {
                 letter.Step = step;
                 staged.Add(letter);
-                _diag.RecordDeadLettered(letter.Operator);
+                diag.RecordDeadLettered(letter.Operator);
             }
             source.Clear();
         }
-        _staged = staged;
-        return staged is not null;
+        return staged;
+    }
+}
+
+/// <summary>
+/// The circuit's dead-letter output: an output port whose "node" is every operator at once.
+/// After each step it collects what the workers' operators (and the keyed inputs' drains)
+/// dropped and publishes it to one bounded channel, like any other output — so an unread
+/// dead-letter queue is backpressure, never unbounded memory.
+/// </summary>
+internal sealed class DeadLetterPort : DeadLetterPortBase, IOutputPort
+{
+    private readonly Channel<DeadLetter> _channel;
+    private List<DeadLetter>? _staged;
+
+    public DeadLetterPort(int workers, int capacity, CircuitDiagnostics diag) : base(workers, diag)
+    {
+        _channel = Channel.CreateBounded<DeadLetter>(new BoundedChannelOptions(capacity)
+        {
+            SingleWriter = true,
+            FullMode = BoundedChannelFullMode.Wait,
+        });
+    }
+
+    public ChannelReader<DeadLetter> Reader => _channel.Reader;
+
+    public object Handle => _channel.Reader;
+    public int BufferedCount => _channel.Reader.Count;
+
+    public async ValueTask PublishAsync(Worker[] workers, long step, CancellationToken cancellationToken)
+    {
+        if (Stage(workers, step))
+            await FlushStagedAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public bool Stage(Worker[] workers, long step)
+    {
+        _staged = Collect(step);
+        return _staged is not null;
     }
 
     public async ValueTask FlushStagedAsync(CancellationToken cancellationToken)
@@ -257,4 +273,163 @@ internal sealed class DeadLetterPort : IOutputPort
     }
 
     public void Complete(Exception? error) => _channel.Writer.TryComplete(error);
+}
+
+/// <summary>One step's dead letters on an acknowledged dead-letter output
+/// (<see cref="CircuitOptions.AcknowledgeDeadLetters"/>).</summary>
+public readonly struct DeadLetterBatch
+{
+    private readonly AcknowledgedDeadLetterPort _owner;
+
+    internal DeadLetterBatch(AcknowledgedDeadLetterPort owner, long sequence, IReadOnlyList<DeadLetter> letters)
+    {
+        _owner = owner;
+        Sequence = sequence;
+        Letters = letters;
+    }
+
+    /// <summary>The sequence number of the step that dropped the records; see
+    /// <see cref="OutputBatch{T}.Sequence"/>. A step re-run after a crash reports its dead
+    /// letters again; an auto-stepping circuit may cut the replayed input into other steps.</summary>
+    public long Sequence { get; }
+
+    /// <summary>Every record the step dropped, in no particular order.</summary>
+    public IReadOnlyList<DeadLetter> Letters { get; }
+
+    /// <summary>Confirms that this batch, and every one before it, is durable wherever the
+    /// reader puts dead letters. The circuit's checkpoint does not pass a batch until then.</summary>
+    public void Acknowledge() => _owner.Acknowledge(Sequence);
+}
+
+/// <summary>
+/// The dead-letter output as an acknowledged output: one batch per step that dropped
+/// something, and the circuit's checkpoint waits for the reader to acknowledge each — so a
+/// record dropped by a step the checkpoint covers has reached the reader's store, and one
+/// dropped by a step it does not cover is dropped and reported again after a restart.
+/// At-least-once, like a sink.
+/// </summary>
+internal sealed class AcknowledgedDeadLetterPort : DeadLetterPortBase, IAcknowledgedOutputPort
+{
+    private readonly Channel<DeadLetterBatch> _channel;
+    private readonly object _ackLock = new();
+    private long _published;
+    private long _acknowledged;
+    private TaskCompletionSource? _waiter;
+    private Exception? _failure;
+    private Exception? _abandonment;
+    private List<DeadLetter>? _staged;
+    private long _stagedStep;
+
+    public AcknowledgedDeadLetterPort(int workers, int capacity, CircuitDiagnostics diag) : base(workers, diag)
+    {
+        _channel = Channel.CreateBounded<DeadLetterBatch>(new BoundedChannelOptions(Math.Max(1, capacity))
+        {
+            SingleWriter = true,
+            FullMode = BoundedChannelFullMode.Wait,
+        });
+    }
+
+    public ChannelReader<DeadLetterBatch> Reader => _channel.Reader;
+
+    public object Handle => _channel.Reader;
+    public int BufferedCount => _channel.Reader.Count;
+
+    public async ValueTask PublishAsync(Worker[] workers, long step, CancellationToken cancellationToken)
+    {
+        if (Stage(workers, step))
+            await FlushStagedAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>The batch counts as published from here: the commit gate waits for it
+    /// whether or not the flush has landed.</summary>
+    public bool Stage(Worker[] workers, long step)
+    {
+        _staged = Collect(step);
+        if (_staged is null)
+            return false;
+        _stagedStep = step;
+        lock (_ackLock)
+            _published = step;
+        return true;
+    }
+
+    public async ValueTask FlushStagedAsync(CancellationToken cancellationToken)
+    {
+        if (_staged is not { } staged)
+            return;
+        _staged = null;
+        try
+        {
+            await _channel.Writer.WriteAsync(new DeadLetterBatch(this, _stagedStep, staged), cancellationToken).ConfigureAwait(false);
+        }
+        catch (ChannelClosedException) when (Volatile.Read(ref _abandonment) is { } abandoned)
+        {
+            throw abandoned;
+        }
+    }
+
+    public Task WaitAcknowledgedAsync()
+    {
+        lock (_ackLock)
+        {
+            if (_failure is { } failure)
+                return Task.FromException(failure);
+            if (_acknowledged >= _published)
+                return Task.CompletedTask;
+            return (_waiter ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+        }
+    }
+
+    public void Acknowledge(long sequence)
+    {
+        TaskCompletionSource? release = null;
+        lock (_ackLock)
+        {
+            if (sequence <= _acknowledged)
+                return;
+            _acknowledged = Math.Min(sequence, _published);
+            if (_acknowledged >= _published)
+                (release, _waiter) = (_waiter, null);
+        }
+        release?.TrySetResult();
+    }
+
+    /// <summary>The reader stopped before the output completed: the publish in flight and
+    /// the commit gate fail, which faults the circuit instead of leaving it stalled.</summary>
+    public void Abandon(Exception? cause)
+    {
+        // The sink's own failure, where the delivery gave up on it after its retries.
+        var root = cause is SinkDeliveryException { InnerException: { } last } ? last : cause;
+        var failure = new InvalidOperationException(
+            (root is null
+                ? "The reader of the acknowledged dead-letter output stopped before the output completed, so the records " +
+                  "dropped since can no longer be stored or acknowledged."
+                : $"The circuit's dead letters could not be stored ({root.GetType().Name}: {root.Message}), so the circuit stops " +
+                  "rather than commit past records it dropped with no trace.") +
+            " The checkpoint does not advance past them: rebuild the circuit from the last committed checkpoint and they " +
+            "are dropped and reported again.",
+            cause);
+        if (Interlocked.CompareExchange(ref _abandonment, failure, null) is not null)
+            return;
+        Fail(failure);
+        _channel.Writer.TryComplete(failure);
+    }
+
+    private void Fail(Exception failure)
+    {
+        TaskCompletionSource? release;
+        lock (_ackLock)
+        {
+            _failure ??= failure;
+            (release, _waiter) = (_waiter, null);
+        }
+        release?.TrySetException(failure);
+    }
+
+    public void Complete(Exception? error)
+    {
+        if (error is not null)
+            Fail(error);
+        _channel.Writer.TryComplete(error);
+    }
 }

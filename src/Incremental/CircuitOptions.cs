@@ -83,6 +83,15 @@ public sealed class CircuitOptions
     /// unbounded memory.</summary>
     public int DeadLetterCapacity { get; init; } = 1024;
 
+    /// <summary>Makes the dead-letter output an acknowledged one: dropped records are
+    /// published a step at a time on <see cref="Circuit.DeadLetterBatches"/> (instead of
+    /// one by one on <see cref="Circuit.DeadLetters"/>), and a checkpoint is committed only
+    /// once the reader has acknowledged every batch published so far — commit after
+    /// delivery, as for <c>ToAcknowledgedOutput</c>. Use it when dead letters are stored
+    /// somewhere durable and must not be lost to a crash between the checkpoint and the
+    /// store. Its channel holds <see cref="OutputChannelCapacity"/> batches. Default false.</summary>
+    public bool AcknowledgeDeadLetters { get; init; }
+
     /// <summary>Runs this circuit as one process of a cluster: the same circuit definition
     /// runs on every process, each hosting a contiguous slice of the global worker set, and
     /// exchange operators shuffle across all of them. Null (default) — single process.</summary>
