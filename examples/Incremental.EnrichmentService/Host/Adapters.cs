@@ -238,12 +238,16 @@ public sealed class Views
 }
 
 /// <summary>One view. It is a demonstration, not a store: past <see cref="Capacity"/> keys
-/// it forgets the keys written longest ago, so a host left running for days stays small.</summary>
+/// it forgets the keys inserted longest ago, so a host left running for days stays small.</summary>
 public sealed class View
 {
     public const int Capacity = 100_000;
-    private readonly Dictionary<string, string> _rows = new(StringComparer.Ordinal);
-    private readonly Queue<string> _order = new();
+
+    // Each key the view holds, with its place in the order of insertion. A deleted key
+    // leaves the order with its row, so the order's length is the number of keys held —
+    // not the number ever inserted — and nothing is forgotten below the capacity.
+    private readonly Dictionary<string, (string Row, LinkedListNode<string> Place)> _rows = new(StringComparer.Ordinal);
+    private readonly LinkedList<string> _order = new();
 
     public long Writes { get; private set; }
 
@@ -252,13 +256,17 @@ public sealed class View
         lock (_rows)
         {
             Writes++;
-            if (!_rows.ContainsKey(key))
+            if (_rows.TryGetValue(key, out var held))
             {
-                _order.Enqueue(key);
-                while (_order.Count > Capacity)
-                    _rows.Remove(_order.Dequeue());
+                _rows[key] = (row, held.Place);
+                return;
             }
-            _rows[key] = row;
+            _rows[key] = (row, _order.AddLast(key));
+            while (_order.Count > Capacity)
+            {
+                _rows.Remove(_order.First!.Value);
+                _order.RemoveFirst();
+            }
         }
     }
 
@@ -267,7 +275,8 @@ public sealed class View
         lock (_rows)
         {
             Writes++;
-            _rows.Remove(key);
+            if (_rows.Remove(key, out var held))
+                _order.Remove(held.Place);
         }
     }
 
@@ -292,12 +301,13 @@ public sealed class View
     public Dictionary<string, string> Rows()
     {
         lock (_rows)
-            return new Dictionary<string, string>(_rows, StringComparer.Ordinal);
+            return _rows.ToDictionary(r => r.Key, r => r.Value.Row, StringComparer.Ordinal);
     }
 
     public List<KeyValuePair<string, string>> Page(int limit)
     {
         lock (_rows)
-            return _rows.OrderBy(r => r.Key, StringComparer.Ordinal).Take(limit).ToList();
+            return _rows.OrderBy(r => r.Key, StringComparer.Ordinal).Take(limit)
+                .Select(r => new KeyValuePair<string, string>(r.Key, r.Value.Row)).ToList();
     }
 }

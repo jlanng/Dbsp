@@ -5,20 +5,28 @@
     Incremental and Incremental.Service, so a plugin compiles against them and copies
     neither: its output directory holds the plugin, its .deps.json and its private
     dependencies — and that directory (or a zip of it) is what the service imports.
+
+    A NuGet package the plugin references is a private dependency: CopyLocalLockFileAssemblies
+    copies its assemblies beside the plugin. What Incremental.Service brings with it must
+    not be copied — the host has it — and that takes both halves of ExcludeAssets: "runtime"
+    for the assemblies and "native" for the native libraries of its Kafka client, which
+    are about a hundred megabytes across every platform and would otherwise land in
+    runtimes/ and in every stored version of the plugin.
+
     Outside this repository the two ProjectReferences are PackageReferences with
-    PrivateAssets="all" ExcludeAssets="runtime".
+    PrivateAssets="all" ExcludeAssets="runtime;native".
   -->
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
-    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <DisableTransitiveProjectReferences>true</DisableTransitiveProjectReferences>
     <DebugType>none</DebugType>
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="$(MSBuildThisFileDirectory)..\..\src\Incremental.Service\Incremental.Service.csproj" Private="false" ExcludeAssets="runtime" />
-    <ProjectReference Include="$(MSBuildThisFileDirectory)..\..\src\Incremental\Incremental.csproj" Private="false" ExcludeAssets="runtime" />
+    <ProjectReference Include="$(MSBuildThisFileDirectory)..\..\src\Incremental.Service\Incremental.Service.csproj" Private="false" ExcludeAssets="runtime;native" />
+    <ProjectReference Include="$(MSBuildThisFileDirectory)..\..\src\Incremental\Incremental.csproj" Private="false" ExcludeAssets="runtime;native" />
   </ItemGroup>
 
 </Project>

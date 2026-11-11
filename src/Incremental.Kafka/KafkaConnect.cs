@@ -151,9 +151,43 @@ public sealed class KafkaConnectClient : IDisposable
         await EnsureAsync(response, $"restarting connector '{name}'", cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Stops the connector and forgets the source offsets Kafka Connect keeps for it
+    /// (<c>PUT /connectors/{name}/stop</c>, then <c>DELETE /connectors/{name}/offsets</c>;
+    /// Kafka Connect 3.6 and later). Connect keeps a connector's offsets after the connector
+    /// is deleted: a Debezium connector created again under the same name then finds "a
+    /// previous offset indicating a completed snapshot", takes no snapshot and — if its
+    /// replication slot or tables were dropped meanwhile — reads nothing. Call this before
+    /// <see cref="DeleteConnectorAsync"/> when the name is to be reused from scratch. A
+    /// connector that does not exist is not an error.
+    /// </summary>
+    public async Task ResetOffsetsAsync(string name, CancellationToken cancellationToken = default)
+    {
+        var connector = new Uri(BaseAddress, $"connectors/{Uri.EscapeDataString(name)}/");
+        using (var stop = await _http.PutAsync(new Uri(connector, "stop"), null, cancellationToken).ConfigureAwait(false))
+        {
+            if (stop.StatusCode == HttpStatusCode.NotFound)
+                return;
+            await EnsureAsync(stop, $"stopping connector '{name}'", cancellationToken).ConfigureAwait(false);
+        }
+
+        // Offsets can be reset only once the connector's tasks have stopped; until then
+        // Connect answers 400.
+        for (var attempt = 0; ; attempt++)
+        {
+            using var reset = await _http.DeleteAsync(new Uri(connector, "offsets"), cancellationToken).ConfigureAwait(false);
+            if (reset.IsSuccessStatusCode || reset.StatusCode == HttpStatusCode.NotFound)
+                return;
+            if (reset.StatusCode != HttpStatusCode.BadRequest || attempt >= 100)
+                await EnsureAsync(reset, $"resetting the offsets of connector '{name}'", cancellationToken).ConfigureAwait(false);
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
     /// <summary>Removes the connector. Removing one that does not exist is not an error.
     /// A Debezium Postgres connector's replication slot and publication stay in the
-    /// database: drop them there.</summary>
+    /// database: drop them there. Kafka Connect keeps the connector's source offsets:
+    /// see <see cref="ResetOffsetsAsync"/>.</summary>
     public async Task DeleteConnectorAsync(string name, CancellationToken cancellationToken = default)
     {
         using var response = await _http.DeleteAsync(

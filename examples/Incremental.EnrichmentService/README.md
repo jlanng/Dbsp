@@ -56,6 +56,12 @@ In memory the tables are loaded by the two custom table sources and the built-in
 loader, trades come from the custom source connector, and the sinks are in-process views
 at `http://127.0.0.1:5180/views` and `/views/{name}`.
 
+With `--nodes 2`, take over from the standby's *Cluster* page (or
+`curl -X POST 'http://127.0.0.1:5181/admin/api/node/takeover?confirm=b' -H 'X-Incremental-Admin: 1'`).
+The terminal then shows one warning — `Service node a is Fenced; it will not lead again
+in this process` — and b's page shows every pipeline Running; a's page says it is fenced
+and links to b.
+
 ### Two nodes on Kafka
 
 ```bash
@@ -131,7 +137,7 @@ var service = builder.Services.AddIncrementalService(o =>
 | `--nodes 2` | in memory: a standby beside the leader |
 | `--kafka`, `--node a\|b` | the Kafka backend; which node this process is (ports 5180/5190 or 5181/5191) |
 | `--headless` | the smoke test |
-| `--clean` | with `--kafka`: remove the connector, the Postgres tables and every topic under the prefix |
+| `--clean` | with `--kafka`: remove the connector and the offsets Kafka Connect keeps for it, the replication slot, the Postgres tables and every topic under the prefix; the prefix can then be used again from scratch |
 | `--prefix name` | Kafka topic prefix and Postgres table prefix (lower-case letters and digits) |
 | `--port N`, `--probe-port N`, `--peer-probe-port N` | |
 | `--rate N` | trades per second (50) |

@@ -517,6 +517,19 @@ public sealed class KafkaLeadership : IAsyncDisposable
             Finish(NodeRole.Fenced, ex);
             throw;
         }
+        catch (Exception ex)
+        {
+            // The resignation did not commit (its transaction was aborted past the retry
+            // limit) and the writer is still usable — so it would go on heartbeating for
+            // a node whose circuits are already stopped, and the standby would wait on a
+            // leader that leads nothing. A node that cannot lead must stop heartbeating:
+            // the writer is closed, as for a failed takeover, and the standby takes over
+            // on the silence instead of on the resignation.
+            _logger?.LogError(ex, "Node {Node} stopped its circuits but could not commit its resignation; closing its writer.", NodeId);
+            _log.Depose($"Node '{NodeId}' stepped down but could not commit its resignation ({ex.Message}).");
+            Finish(NodeRole.Fenced, ex);
+            throw;
+        }
         Finish(NodeRole.Resigned, null);
     }
 

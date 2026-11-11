@@ -344,4 +344,62 @@ public class DebeziumCdcTests(ITestOutputHelper output)
         stepping.Cancel();
         await stepper;
     }
+
+    /// <summary>How many records the topic holds, over all its partitions.</summary>
+    private static long RecordsIn(string topic)
+    {
+        using var consumer = new ConsumerBuilder<byte[], byte[]>(new ConsumerConfig { BootstrapServers = KafkaEnv.Bootstrap, GroupId = "count-" + Guid.NewGuid().ToString("N") }).Build();
+        using var admin = new AdminClientBuilder(new AdminClientConfig { BootstrapServers = KafkaEnv.Bootstrap }).Build();
+        var partitions = admin.GetMetadata(topic, TimeSpan.FromSeconds(10)).Topics.Single().Partitions;
+        return partitions.Sum(p =>
+        {
+            var marks = consumer.QueryWatermarkOffsets(new TopicPartition(topic, p.PartitionId), TimeSpan.FromSeconds(10));
+            return marks.High.Value - marks.Low.Value;
+        });
+    }
+
+    [Fact]
+    public async Task AConnectorRemovedWithItsOffsets_AndCreatedAgainUnderItsName_SnapshotsAgain()
+    {
+        await using var cdc = await Cdc.CreateAsync();
+        var topic = cdc.Topic(cdc.Customers);
+        for (var id = 0; id < 5; id++)
+            await cdc.ExecuteAsync($"insert into {cdc.Customers} values ({id}, 'c{id}', 'EU', 10, now())");
+        var name = await cdc.RegisterAsync(cdc.Kafka.Prefix + "-refdata", embedSchemas: false);
+        await cdc.WaitForTopicAsync(topic);
+        await KafkaEnv.EventuallyAsync(() => Task.FromResult(RecordsIn(topic) == 5), "the first snapshot");
+
+        // What a clean-up of a deployment does: the connector, its slot and publication
+        // and its topics go — and the offsets Connect keeps for the connector's name,
+        // without which the next connector of that name believes its snapshot is done.
+        await cdc.Client.ResetOffsetsAsync(name);
+        await cdc.Client.DeleteConnectorAsync(name);
+        await cdc.Client.ResetOffsetsAsync(name); // a connector that is not there is not an error
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                await cdc.ExecuteAsync($"select pg_drop_replication_slot(slot_name) from pg_replication_slots where slot_name = '{cdc.Slot}'");
+                break;
+            }
+            catch (PostgresException) when (attempt < 100)
+            {
+                await Task.Delay(100); // the slot is released a moment after its connector stops
+            }
+        }
+        await cdc.ExecuteAsync($"drop publication if exists {cdc.Kafka.Prefix}_publication");
+        using (var admin = new AdminClientBuilder(new AdminClientConfig { BootstrapServers = KafkaEnv.Bootstrap }).Build())
+        {
+            await admin.DeleteTopicsAsync([topic]);
+            await KafkaEnv.EventuallyAsync(
+                () => Task.FromResult(admin.GetMetadata(TimeSpan.FromSeconds(10)).Topics.All(t => t.Topic != topic)), "the change topic is deleted");
+        }
+
+        // The same name again, from scratch: it snapshots, so the change topic is back
+        // with every row.
+        await cdc.ExecuteAsync($"insert into {cdc.Customers} values (5, 'c5', 'EU', 10, now())");
+        Assert.Equal(name, await cdc.RegisterAsync(name, embedSchemas: false));
+        await cdc.WaitForTopicAsync(topic);
+        await KafkaEnv.EventuallyAsync(() => Task.FromResult(RecordsIn(topic) == 6), "the second snapshot");
+    }
 }

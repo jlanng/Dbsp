@@ -85,8 +85,9 @@ public sealed class ExampleNode : IAsyncDisposable
         else
             service.UseInMemoryBackend(nodeId: nodeId);
 
-        // Seeds: written to the catalog by the first leader, if the catalog has nothing of
-        // that name. After that the catalog is the record and these lines do nothing.
+        // Seeds: written to the catalog once, by the first leader that finds them not yet
+        // applied. The catalog records that, so after it these lines do nothing — also
+        // for a seeded table or pipeline that an operator has since removed.
         specs.AddTables(service);
         if (options.SeedPipelines)
         {
@@ -171,9 +172,11 @@ public static class MskConfiguration
                 ["security.protocol"] = "SASL_SSL",
                 ["sasl.mechanism"] = "OAUTHBEARER",
             },
-            // What a dictionary cannot carry: the token refresh, on every producer and consumer.
+            // What a dictionary cannot carry: the token refresh, on every client. The admin
+            // client is one of its own (it creates and describes the topics) and needs it too.
             ConfigureProducer = producer => producer.SetOAuthBearerTokenRefreshHandler(Refresh),
             ConfigureConsumer = consumer => consumer.SetOAuthBearerTokenRefreshHandler(Refresh),
+            ConfigureAdmin = admin => admin.SetOAuthBearerTokenRefreshHandler(Refresh),
         };
         service.UseKafkaBackend(new KafkaServiceBackendOptions { Log = log });      // also the connection "log"
 

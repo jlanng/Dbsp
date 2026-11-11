@@ -194,7 +194,11 @@ public sealed partial class KafkaStack : IAsyncDisposable
     {
         try
         {
+            // Connect keeps a deleted connector's offsets. Left there, the connector this
+            // prefix gets next time would find its snapshot already "done", take none, and
+            // never create the change topics: so the offsets go before the connector does.
             using var connect = new KafkaConnectClient(new Uri(_options.Connect));
+            await connect.ResetOffsetsAsync(Connector);
             await connect.DeleteConnectorAsync(Connector);
             var config = DebeziumPostgres.ConnectorConfig(Debezium);
             for (var attempt = 0; attempt < 100; attempt++)
