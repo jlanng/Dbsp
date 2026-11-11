@@ -187,6 +187,11 @@
           sp.inputs = pick(sp.inputs, from.inputs, described.inputs.map(x => x.name));
           sp.sinks = pick(sp.sinks, from.sinks, described.sinks.map(x => x.name));
           sp.tables = pick(sp.tables, from.tables, [...new Set(described.tables.map(x => x.slot))]);
+          // The template names a memory log after the id it was made for, which is not
+          // this pipeline's: left out, the connector names it after the pipeline itself.
+          for (const [mine, theirs] of [[sp.inputs, from.inputs || {}], [sp.sinks, from.sinks || {}]])
+            for (const [slot, binding] of Object.entries(mine || {}))
+              if (binding === theirs[slot] && binding.connector === 'memory' && binding.name === `${from.id}/${slot}`) delete binding.name;
           st.notes = template.notes || [];
         }
         st.described = described;

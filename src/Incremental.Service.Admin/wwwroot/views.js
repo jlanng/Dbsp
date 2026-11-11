@@ -1285,7 +1285,10 @@
               h('table', { class: 'data' }, h('tbody', null,
                 stages.map(([k, v, what], i) => h('tr', { key: k }, h('td', null, h('span', { class: 'swatch stage-' + (i + 1) }), ' ', k, h('span', { class: 'sub' }, what)), h('td', { class: 'r' }, fmtMs(v)))),
                 h('tr', { class: 'total' }, h('td', null, h('strong', null, 'The service’s part'), h('span', { class: 'sub' }, 'the stages above, measured end to end on one clock')), h('td', { class: 'r' }, h('strong', null, fmtMs(stageTotal)))),
-                kafka && kafka.lastTakeover && h('tr', null, h('td', null, 'Whole takeover, as the leadership timed it', h('span', { class: 'sub' }, 'with the silence it waited out, the fencing and the storage’s promotion')), h('td', { class: 'r' }, fmtMs(kafka.lastTakeover.total ?? null))))))
+                kafka && kafka.lastTakeover && h('tr', null, h('td', null, 'Whole takeover, as the leadership timed it',
+                  h('span', { class: 'sub' }, `the service’s part, and around it fencing the old writer (${fmtMs(kafka.lastTakeover.fence ?? null)}) and promoting the storage (${fmtMs(kafka.lastTakeover.storage ?? null)})`)), h('td', { class: 'r' }, fmtMs(kafka.lastTakeover.total ?? null))),
+                kafka && kafka.lastTakeover && kafka.lastTakeover.silence != null && h('tr', null, h('td', null, 'Before it began',
+                  h('span', { class: 'sub' }, kafka.lastTakeover.reason === 'silence' ? 'how long the leader had been silent when this node moved' : `why this node moved: ${kafka.lastTakeover.reason || 'not recorded'}`)), h('td', { class: 'r' }, fmtMs(kafka.lastTakeover.silence))))))
               : empty('This node has not led', 'Timings of its takeover appear here once it has.'), { flush: !take }),
           card('Backend', st.backend.kind, kv([
             ...Object.entries(st.backend.settings).map(([k, v]) => [k, h('span', { class: 'mono' }, v || '–')]),
