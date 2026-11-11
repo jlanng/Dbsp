@@ -89,7 +89,7 @@ jobs:
           dotnet test --project tests/Incremental.Service.Tests -c Release --no-build | tee service-tests.log
           grep -Eq '^\s*skipped: 0\s*$' service-tests.log
       - name: Smoke, enrichment service on Kafka with a killed leader
-        run: dotnet run -c Release --no-build --project examples/Incremental.EnrichmentService -- --headless --kafka --prefix "ci-${{ github.run_id }}-${{ github.run_attempt }}"
+        run: dotnet run -c Release --no-build --project examples/Incremental.EnrichmentService -- --headless --kafka
       - name: Measured failover times
         if: always()
         run: |

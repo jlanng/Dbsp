@@ -42,7 +42,20 @@ public class KafkaLogTests(ITestOutputHelper output)
         Assert.Equal(env.Prefix + ".state", log.State.Topic);
 
         using var admin = new AdminClientBuilder(new AdminClientConfig { BootstrapServers = KafkaEnv.Bootstrap }).Build();
-        var described = await admin.DescribeTopicsAsync(TopicCollection.OfTopicNames([log.State.Topic, env.Prefix + ".leader"]));
+        // A topic created a moment ago can be unknown to the broker this client asks,
+        // on a busy broker for a second or two: the test is about what is created, not when.
+        DescribeTopicsResult? described = null;
+        for (var deadline = DateTime.UtcNow + Timeout; described is null;)
+        {
+            try
+            {
+                described = await admin.DescribeTopicsAsync(TopicCollection.OfTopicNames([log.State.Topic, env.Prefix + ".leader"]));
+            }
+            catch (DescribeTopicsException) when (DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(100);
+            }
+        }
         Assert.Equal(5, described.TopicDescriptions[0].Partitions.Count);
         Assert.Single(described.TopicDescriptions[1].Partitions);
         var configs = await admin.DescribeConfigsAsync([new ConfigResource { Type = ResourceType.Topic, Name = log.State.Topic }]);
