@@ -431,10 +431,12 @@ internal sealed class TableHandle<TKey, TRow>(TableRegistry registry, TableDefin
                     $"Table '{Spec.Name}' has no index named '{indexName}' (declared: {string.Join(", ", _configured.Indexes.Select(i => i.Name))}).");
             if (query.Key is not { Length: > 0 } indexKey)
                 throw ServiceException.Invalid("A read by index needs a key.");
-            var found = index.ReadBy(snapshot, indexKey);
-            foreach (var (key, row) in found.Take(limit))
+            var offset = Math.Max(0, query.Skip);
+            var found = index.ReadBy(snapshot, indexKey, offset, limit, out var under);
+            foreach (var (key, row) in found)
                 rows.Add(Data(key, row));
-            return new TableRowPage(snapshot.Version, count, found.Count, false, found.Count > limit, rows);
+            var beyond = offset + limit < under;
+            return new TableRowPage(snapshot.Version, count, under, false, beyond, rows, beyond ? offset + limit : null);
         }
 
         if (query.Key is { Length: > 0 } keyText)
@@ -446,35 +448,54 @@ internal sealed class TableHandle<TKey, TRow>(TableRegistry registry, TableDefin
 
         // One scan, in the table's own order: stable while the table does not change, and
         // a sample rather than a cursor when it does — the version says which it was.
+        // Rows passed over are stepped past, not looked at, and do not count towards the
+        // bound: the bound is on the rows serialized to be searched.
+        var from = Math.Max(0, query.From);
         var skip = Math.Max(0, query.Skip);
         var contains = string.IsNullOrEmpty(query.Contains) ? null : query.Contains;
-        long scanned = 0, matched = 0;
+        long position = 0, scanned = 0, matched = 0;
         var truncated = false;
         var more = false;
         foreach (var (key, row) in snapshot.Rows())
         {
-            if (scanned >= query.MaxScanned)
+            if (position < from)
             {
-                truncated = true;
-                break;
+                position++;
+                continue;
             }
-            scanned++;
             if (contains is not null)
             {
+                if (scanned >= query.MaxScanned)
+                {
+                    truncated = true;
+                    break;
+                }
                 var text = JsonSerializer.Serialize(row, RowJson);
                 if (!text.Contains(contains, StringComparison.OrdinalIgnoreCase))
+                {
+                    scanned++;
+                    position++;
                     continue;
+                }
             }
-            if (matched++ < skip)
+            if (matched < skip)
+            {
+                matched++;
+                if (contains is not null)
+                    scanned++;
+                position++;
                 continue;
+            }
             if (rows.Count == limit)
             {
-                more = true;
+                more = true; // this row starts the next page
                 break;
             }
             rows.Add(Data(key, row));
+            scanned++;
+            position++;
         }
-        return new TableRowPage(snapshot.Version, count, scanned, truncated, more || truncated, rows);
+        return new TableRowPage(snapshot.Version, count, scanned, truncated, more || truncated, rows, more || truncated ? position : null);
     }
 
     public async ValueTask DisposeAsync()
@@ -724,9 +745,13 @@ internal sealed class TableRegistry(ServiceContext context) : ITableRegistry
     {
         context.RequireLeader();
         var handle = Require(name);
-        var users = context.PipelineSpecs().Where(p => p.Reads.Contains(name) || p.Writes.Contains(name)).Select(p => p.Id).Order(StringComparer.Ordinal).ToList();
-        if (users.Count > 0)
-            throw ServiceException.Conflict($"Table '{name}' is named by pipeline(s) {string.Join(", ", users)}; remove them first.");
+        void RequireNoUsers()
+        {
+            var users = context.PipelineSpecs().Where(p => p.Reads.Contains(name) || p.Writes.Contains(name)).Select(p => p.Id).Order(StringComparer.Ordinal).ToList();
+            if (users.Count > 0)
+                throw ServiceException.Conflict($"Table '{name}' is named by pipeline(s) {string.Join(", ", users)}; remove them first.");
+        }
+        RequireNoUsers();
         var plan = new ActionPlan("table.remove", name, options.DryRun,
         [
             handle.Spec.Loader is null ? "no loader to stop" : $"stop the {handle.Spec.Loader.Kind} loader",
@@ -737,8 +762,15 @@ internal sealed class TableRegistry(ServiceContext context) : ITableRegistry
             return plan;
 
         await _declare.WaitAsync(cancellationToken).ConfigureAwait(false);
+        IDisposable? references = null;
         try
         {
+            // Checked again under the lock a deploy commits its spec under: from here to
+            // the end of the removal no pipeline can come to name the table.
+            references = await context.LockReferencesAsync(cancellationToken).ConfigureAwait(false);
+            if (!_tables.ContainsKey(name))
+                throw ServiceException.NotFound($"Table '{name}'");
+            RequireNoUsers();
             using (var write = await context.Catalog.BeginAsync(cancellationToken).ConfigureAwait(false))
             {
                 write.Delete("table/" + name);
@@ -751,6 +783,7 @@ internal sealed class TableRegistry(ServiceContext context) : ITableRegistry
         }
         finally
         {
+            references?.Dispose();
             _declare.Release();
         }
         return plan;

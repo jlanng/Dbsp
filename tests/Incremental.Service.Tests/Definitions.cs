@@ -101,6 +101,15 @@ public sealed class ByIsin : IPipelineDefinition
             a => a.Isin);
 }
 
+/// <summary>A definition whose constructor throws.</summary>
+[Pipeline("broken-constructor")]
+public sealed class BrokenConstructor : IPipelineDefinition
+{
+    public BrokenConstructor() => throw new NotSupportedException("the constructor's own message");
+
+    public void Build(PipelineBuilder p) => p.AppendSink("out", p.Input<Trade>("trades"));
+}
+
 public sealed record IsinRequest(string Isin);
 
 public sealed record IsinAnswer(string Isin, string Symbol);

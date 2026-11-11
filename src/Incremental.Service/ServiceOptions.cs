@@ -29,7 +29,11 @@ public sealed class ServiceOptions
     public string? PluginDirectory { get; set; }
 
     /// <summary>Where plugin files are materialised from the blob store before loading.
-    /// Defaults to a directory under the system's temporary path.</summary>
+    /// Defaults to a directory under the system's temporary path that belongs to this
+    /// process: it is deleted when the node is disposed, and a node that starts deletes the
+    /// ones left by processes that no longer run. A directory set here is kept between
+    /// runs, so a restart loads from disk; versions the catalog no longer holds are pruned
+    /// from it.</summary>
     public string? CacheDirectory { get; set; }
 
     /// <summary>What <c>node/leader</c> publishes as this node's admin address.</summary>
@@ -49,6 +53,12 @@ public sealed class ServiceOptions
     /// is <c>Wedged</c>.</summary>
     public TimeSpan AbandonTimeout { get; set; } = TimeSpan.FromSeconds(5);
     public TimeSpan StepDownTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>What a connector's own call is given — a source's <c>StartAsync</c>, a
+    /// sink connector's <c>ResetAsync</c> — before the pipeline is treated as faulted and
+    /// tried again. These run inside a takeover, which waits for every pipeline's start, so
+    /// a connector that connects without a deadline of its own is bounded by this one.</summary>
+    public TimeSpan ConnectorTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>A sink write in flight for longer than this shows as <c>sink-ack</c>.</summary>
     public TimeSpan StallAfter { get; set; } = TimeSpan.FromSeconds(10);
@@ -161,6 +171,29 @@ internal sealed class Ring<T>(int capacity)
             lock (_items)
                 return _items.Count == 0 ? 0 : _items.Peek().Sequence;
         }
+    }
+}
+
+/// <summary>A length of time as an operator reads it: <c>26 min 31 s</c>, not
+/// <c>0:26:31.4842111</c>. No colons, so it can stand in front of the colon that separates a
+/// reason from an exception's message.</summary>
+internal static class Durations
+{
+    public static string Text(TimeSpan time)
+    {
+        if (time < TimeSpan.Zero)
+            time = TimeSpan.Zero;
+        if (time < TimeSpan.FromSeconds(1))
+            return $"{(long)time.TotalMilliseconds} ms";
+        if (time < TimeSpan.FromMinutes(1))
+            return time.Milliseconds == 0 || time.TotalSeconds >= 10
+                ? $"{(long)time.TotalSeconds} s"
+                : string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{time.TotalSeconds:0.#} s");
+        if (time < TimeSpan.FromHours(1))
+            return time.Seconds == 0 ? $"{time.Minutes} min" : $"{time.Minutes} min {time.Seconds} s";
+        if (time < TimeSpan.FromDays(1))
+            return time.Minutes == 0 ? $"{time.Hours} h" : $"{time.Hours} h {time.Minutes} min";
+        return time.Hours == 0 ? $"{(long)time.TotalDays} d" : $"{(long)time.TotalDays} d {time.Hours} h";
     }
 }
 

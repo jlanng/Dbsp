@@ -82,14 +82,45 @@ public class SeamTests
         }
         Assert.Equal(100, keys.Count);
 
-        // The scan stops at its bound and says so.
-        var bounded = service.Tables.ReadRows("instruments", new TableRowQuery(Limit: 50, MaxScanned: 20));
-        Assert.Equal(20, bounded.Rows.Count);
-        Assert.Equal(20, bounded.Scanned);
-        Assert.True(bounded.Truncated);
+        // The bound is on the rows a search looks at. Rows that are only passed over do
+        // not count towards it: a table larger than the bound is browsed to its last row.
+        var deep = service.Tables.ReadRows("instruments", new TableRowQuery(Limit: 30, Skip: 90, MaxScanned: 20));
+        Assert.Equal(10, deep.Rows.Count);
+        Assert.False(deep.Truncated);
+        Assert.False(deep.More);
+        Assert.Null(deep.Next);
+        Assert.Empty(service.Tables.ReadRows("instruments", new TableRowQuery(Limit: 30, Skip: 100, MaxScanned: 20)).Rows);
+        var browsed = new HashSet<int>();
+        for (long? from = 0; from is not null;)
+        {
+            var page = service.Tables.ReadRows("instruments", new TableRowQuery(Limit: 7, MaxScanned: 20, From: from.Value));
+            Assert.False(page.Truncated);
+            Assert.Equal(page.More, page.Next is not null);
+            foreach (var row in page.Rows)
+                Assert.True(browsed.Add(row.Key.GetInt32()));
+            from = page.Next;
+        }
+        Assert.Equal(100, browsed.Count);
+
+        // A search stops at its bound and says so — and says where, so the next read
+        // carries on from there: every match is reached, however far into the table.
         var filtered = service.Tables.ReadRows("instruments", new TableRowQuery(Limit: 50, Contains: "\"symbol\":\"s77\""));
         Assert.Equal(77, Assert.Single(filtered.Rows).Key.GetInt32());
         Assert.Equal(100, filtered.Scanned);
+        Assert.Null(filtered.Next);
+        var found = new HashSet<int>();
+        var reads = 0;
+        for (long? from = 0; from is not null; reads++)
+        {
+            var page = service.Tables.ReadRows("instruments", new TableRowQuery(Limit: 3, Contains: "\"multiplier\":2", MaxScanned: 20, From: from.Value));
+            Assert.True(page.Scanned <= 20);
+            Assert.Equal(page.Truncated || page.More, page.Next is not null);
+            foreach (var row in page.Rows)
+                Assert.True(found.Add(row.Key.GetInt32()));
+            from = page.Next;
+        }
+        Assert.Equal(Instruments(100).Where(i => i.Multiplier == 2).Select(i => i.Id).Order(), found.Order());
+        Assert.True(reads >= 5, $"the search took {reads} reads: its bound did not stop it");
 
         var byKey = service.Tables.ReadRows("instruments", new TableRowQuery(Key: "42"));
         Assert.Equal("S42", Assert.Single(byKey.Rows).Row.GetProperty("symbol").GetString());
@@ -102,7 +133,20 @@ public class SeamTests
         Assert.True(byIndex.More);
         Assert.Equal(10, byIndex.Scanned);
         Assert.All(byIndex.Rows, r => Assert.Equal("ISIN7", r.Row.GetProperty("isin").GetString()));
+        Assert.Equal(4, byIndex.Next);
         Assert.Equal(10, service.Tables.ReadRows("instruments", new TableRowQuery(Index: "isin", Key: "\"ISIN7\"")).Rows.Count);
+
+        // The rows under an index key are paged like any other read.
+        var under = new HashSet<int>();
+        for (long? skip = 0; skip is not null;)
+        {
+            var page = service.Tables.ReadRows("instruments", new TableRowQuery(Limit: 4, Skip: (int)skip.Value, Index: "isin", Key: "ISIN7"));
+            Assert.True(page.Rows.Count <= 4);
+            foreach (var row in page.Rows)
+                Assert.True(under.Add(row.Key.GetInt32()));
+            skip = page.Next;
+        }
+        Assert.Equal(10, under.Count);
         Assert.Equal("invalid", Assert.Throws<ServiceException>(() => service.Tables.ReadRows("instruments", new TableRowQuery(Index: "nope", Key: "x"))).Code);
         Assert.Equal(404, Assert.Throws<ServiceException>(() => service.Tables.ReadRows("nope", new TableRowQuery())).Status);
 

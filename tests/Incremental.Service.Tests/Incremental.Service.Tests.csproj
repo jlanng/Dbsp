@@ -37,6 +37,7 @@
     <ProjectReference Include="..\Incremental.Service.TestPlugins\Acme.Pipelines\Acme.Pipelines.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\Incremental.Service.TestPlugins\Acme.Pipelines.V2\Acme.Pipelines.V2.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\Incremental.Service.TestPlugins\Acme.Desks\Acme.Desks.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\Incremental.Service.TestPlugins\Acme.Venues\Acme.Venues.csproj" ReferenceOutputAssembly="false" />
     <!-- The node the kill -9 tests run twice, as real processes. -->
     <ProjectReference Include="..\Incremental.Service.FailoverApp\Incremental.Service.FailoverApp.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>

@@ -341,6 +341,34 @@ public sealed class SharedTable<TKey, TRow> : ITableNode, IAsyncDisposable
         return rows;
     }
 
+    /// <summary>A window of <see cref="RowsBy{TIndexKey}(string,TIndexKey,long)"/>: the
+    /// keys under the index key are passed over up to <paramref name="skip"/> and at most
+    /// <paramref name="take"/> rows are read, so a page of a key that holds a great many
+    /// rows costs a page. <paramref name="total"/> is how many keys the index holds under
+    /// the key.</summary>
+    internal IReadOnlyList<KeyValuePair<TKey, TRow>> RowsBy<TIndexKey>(string index, TIndexKey indexKey, long version, int skip, int take, out int total)
+        where TIndexKey : notnull
+    {
+        ArgumentException.ThrowIfNullOrEmpty(index);
+        ArgumentOutOfRangeException.ThrowIfNegative(skip);
+        ArgumentOutOfRangeException.ThrowIfNegative(take);
+        if (!_indexesByName.TryGetValue(index, out var declared))
+            throw new ArgumentException($"Table '{Name}' has no index named '{index}'.", nameof(index));
+        if (declared is not TableIndex<TIndexKey, TKey, TRow> typed)
+            throw new ArgumentException(
+                $"Index '{index}' of table '{Name}' is keyed by {declared.GetType().GetGenericArguments()[0]}, not {typeof(TIndexKey)}.",
+                nameof(indexKey));
+        total = 0;
+        if (typed.Read(indexKey, version) is not { } keys)
+            return [];
+        total = keys.Length;
+        var rows = new List<KeyValuePair<TKey, TRow>>(Math.Min(take, Math.Max(0, keys.Length - skip)));
+        for (var i = skip; i < keys.Length && rows.Count < take; i++)
+            if (TryGet(keys[i], version, out var row))
+                rows.Add(new KeyValuePair<TKey, TRow>(keys[i], row));
+        return rows;
+    }
+
     internal int ReplaceChunkRows => _options.ReplaceChunkRows;
 
     // ── secondary indexes ──────────────────────────────────────────────────────────────
@@ -837,6 +865,15 @@ public readonly struct TableSnapshot<TKey, TRow> : IDisposable
     public IReadOnlyList<KeyValuePair<TKey, TRow>> RowsBy<TIndexKey>(string index, TIndexKey indexKey)
         where TIndexKey : notnull =>
         _table.RowsBy(index, indexKey, Version);
+
+    /// <summary>A page of <see cref="RowsBy{TIndexKey}(string,TIndexKey)"/>: the keys under
+    /// <paramref name="indexKey"/> are passed over up to <paramref name="skip"/> and at
+    /// most <paramref name="take"/> rows are read. <paramref name="total"/> is how many
+    /// keys the index holds under the key. The order is the index's own: stable for one
+    /// version, so pages of one snapshot neither overlap nor miss a row.</summary>
+    public IReadOnlyList<KeyValuePair<TKey, TRow>> RowsBy<TIndexKey>(string index, TIndexKey indexKey, int skip, int take, out int total)
+        where TIndexKey : notnull =>
+        _table.RowsBy(index, indexKey, Version, skip, take, out total);
 
     public void Dispose() => _table.ReleasePin(Version);
 }

@@ -187,8 +187,15 @@ public sealed class Catalog : IAsyncDisposable
     /// committing writes nothing.</summary>
     internal async Task<CatalogWrite> BeginAsync(CancellationToken cancellationToken)
     {
-        var table = _table ?? throw new ServiceException("not-ready", "The catalog is not open on this node.", 503);
         await _write.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        // Read under the lock: a write that waited behind ReopenAsync must get the table
+        // that was opened, not the one that was disposed.
+        if (_table is not { } table)
+        {
+            _write.Release();
+            throw new ServiceException("not-ready", "The catalog is not open on this node.", 503);
+        }
         if (_auditSequence < 0)
         {
             var last = 0L;
@@ -226,7 +233,8 @@ public sealed class Catalog : IAsyncDisposable
 
         public void Delete(string key) => _staged.Add((key, null));
 
-        public void Audit(string node, long term, string? caller, string action, string target,
+        /// <summary>Returns the entry's sequence, which only grows, whoever leads.</summary>
+        public long Audit(string node, long term, string? caller, string action, string target,
             long? generationBefore, long? generationAfter, IReadOnlyList<string>? plan = null)
         {
             var sequence = ++catalog._auditSequence;
@@ -235,12 +243,20 @@ public sealed class Catalog : IAsyncDisposable
                 generationBefore, generationAfter, plan ?? []));
             if (sequence > catalog._options.AuditEntries)
                 Delete($"audit/{sequence - catalog._options.AuditEntries:D12}");
+            return sequence;
         }
 
+        /// <summary>
+        /// The token is looked at once, before anything reaches the table's writer. A
+        /// writer's commit that is cancelled while it waits leaves its rows staged, and
+        /// the next commit of anything would then publish an action that was reported as
+        /// cancelled; so from the first staged row the write runs to its end.
+        /// </summary>
         public async Task<long> CommitAsync(CancellationToken cancellationToken)
         {
             if (_staged.Count == 0)
                 return table.LatestVersion;
+            cancellationToken.ThrowIfCancellationRequested();
             foreach (var (key, value) in _staged)
             {
                 if (value is null)
@@ -249,7 +265,7 @@ public sealed class Catalog : IAsyncDisposable
                     await table.Writer.UpsertAsync(new CatalogEntry(key, value)).ConfigureAwait(false);
             }
             _staged.Clear();
-            return await table.Writer.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return await table.Writer.CommitAsync(CancellationToken.None).ConfigureAwait(false);
         }
 
         public void Dispose()

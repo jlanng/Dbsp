@@ -41,11 +41,22 @@ public sealed record PluginDefinitionInfo(
 /// <summary>A stored plugin version, as the catalog holds it under
 /// <c>plugin/{name}/{version}</c>. The version is a hash of the files, so the same bytes
 /// are the same version on every node.</summary>
+/// <remarks><c>MainAssembly</c> is the main assembly's file, as a path within the package;
+/// <c>AssemblyName</c> is that assembly's simple name, which need not be the file's
+/// (null in a manifest stored before the two were told apart: the file's name then).
+/// <c>Sequence</c> orders the versions of one name by when they were imported — it is the
+/// audit sequence of the import, which only grows, whoever leads — and is what decides
+/// which stored version of a contract a starting process loads: the newest.</remarks>
 public sealed record PluginManifest(
     string Name, string Version, PluginKind Kind, string MainAssembly, IReadOnlyList<PluginFile> Files,
-    IReadOnlyList<PluginDefinitionInfo> Definitions, IReadOnlyList<string> TableDefinitions, string Fingerprint)
+    IReadOnlyList<PluginDefinitionInfo> Definitions, IReadOnlyList<string> TableDefinitions, string Fingerprint,
+    string? AssemblyName = null, long Sequence = 0)
 {
     public long Bytes => Files.Sum(f => f.Size);
+
+    /// <summary>The simple name of the main assembly.</summary>
+    [JsonIgnore]
+    public string MainAssemblyName => AssemblyName ?? Path.GetFileNameWithoutExtension(MainAssembly);
 }
 
 public sealed record PluginInfo(
@@ -66,7 +77,8 @@ public interface IPluginCatalog
     Task<PluginManifest> ImportDirectoryAsync(string directory, CancellationToken cancellationToken, string? caller = null);
 
     /// <summary>Leader: as <see cref="ImportDirectoryAsync"/>, from a zip, which is
-    /// validated while it is unpacked.</summary>
+    /// validated while it is unpacked. A stream that cannot seek is first copied to a
+    /// file in the cache directory, and refused past <see cref="ServiceOptions.MaxPluginBytes"/>.</summary>
     Task<PluginManifest> ImportZipAsync(Stream zip, CancellationToken cancellationToken, string? caller = null);
 
     /// <summary>Leader: imports every package in <see cref="ServiceOptions.PluginDirectory"/>
@@ -77,7 +89,9 @@ public interface IPluginCatalog
     /// <summary>The stored manifest of a plugin version: its files and definitions.</summary>
     PluginManifest? Manifest(string name, string version);
 
-    /// <summary>Leader: refused while a pipeline spec names the version.</summary>
+    /// <summary>Leader: refused while a pipeline spec names the version, and for a
+    /// contract while a declared table's definition comes from it and from no other stored
+    /// version.</summary>
     Task DeleteAsync(string name, string version, CancellationToken cancellationToken, string? caller = null);
 }
 
@@ -94,19 +108,83 @@ internal static class ServiceNames
     }
 }
 
-/// <summary>What the default load context provides: the host's own assemblies. A plugin
-/// never gets a private copy of one of these.</summary>
+/// <summary>
+/// What the default load context provides: the host's own assemblies. Two rules decide
+/// whether a plugin's reference goes there.
+/// <para>
+/// The assemblies whose types cross between the host and a plugin are always the host's,
+/// whatever the plugin ships: <c>Incremental*</c>, <c>Microsoft.Extensions.*</c>,
+/// <c>Confluent.Kafka</c> and the framework (<c>System.*</c> and its kin). Two copies of
+/// one of those would be two sets of types, and a definition could not be handed a builder.
+/// </para>
+/// <para>
+/// Any other assembly the host happens to carry is shared when the host's version
+/// satisfies the reference (it is at least the version asked for). When the plugin was
+/// built against a newer one and ships it, the plugin gets its own copy: the default
+/// context would refuse the higher version, and the package holds one that works.
+/// </para>
+/// </summary>
 internal static class HostAssemblies
 {
-    private static readonly HashSet<string> Trusted = new(
-        ((AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES") as string) ?? "")
-            .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
-            .Select(p => Path.GetFileNameWithoutExtension(p)!),
-        StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, string> Trusted = TrustedPaths();
+    private static readonly ConcurrentDictionary<string, Version?> TrustedVersions = new(StringComparer.OrdinalIgnoreCase);
 
-    public static bool Contains(string name) =>
-        Trusted.Contains(name)
-        || AssemblyLoadContext.Default.Assemblies.Any(a => string.Equals(a.GetName().Name, name, StringComparison.OrdinalIgnoreCase));
+    private static Dictionary<string, string> TrustedPaths()
+    {
+        var paths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in ((AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES") as string) ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+            paths.TryAdd(Path.GetFileNameWithoutExtension(path), path);
+        return paths;
+    }
+
+    public static bool Contains(string name) => TryVersion(name, out _);
+
+    /// <summary>Whether the host carries an assembly of that name, and at what version
+    /// (null when it cannot be read).</summary>
+    public static bool TryVersion(string name, out Version? version)
+    {
+        if (AssemblyLoadContext.Default.Assemblies.FirstOrDefault(a => string.Equals(a.GetName().Name, name, StringComparison.OrdinalIgnoreCase)) is { } loaded)
+        {
+            version = loaded.GetName().Version;
+            return true;
+        }
+        if (Trusted.TryGetValue(name, out var path))
+        {
+            version = TrustedVersions.GetOrAdd(name, static (_, file) =>
+            {
+                try
+                {
+                    return AssemblyName.GetAssemblyName(file).Version;
+                }
+                catch
+                {
+                    return null;
+                }
+            }, path);
+            return true;
+        }
+        version = null;
+        return false;
+    }
+
+    /// <summary>The assemblies whose types cross the boundary between host and plugin.</summary>
+    public static bool AlwaysShared(string name) =>
+        name.Equals("Incremental", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("Incremental.", StringComparison.OrdinalIgnoreCase) && Contains(name)
+        || name.StartsWith("Microsoft.Extensions.", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("Confluent.Kafka", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("System", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("System.", StringComparison.OrdinalIgnoreCase)
+        || name is "mscorlib" or "netstandard" or "WindowsBase" or "Microsoft.CSharp" or "Microsoft.VisualBasic" or "Microsoft.VisualBasic.Core"
+        || name.StartsWith("Microsoft.Win32.", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Whether a reference goes to the host rather than to the plugin's own files.</summary>
+    public static bool Provides(AssemblyName name, bool pluginShipsIt)
+    {
+        if (name.Name is not { } simple || !TryVersion(simple, out var hosted))
+            return false;
+        return AlwaysShared(simple) || !pluginShipsIt || name.Version is null || hosted is null || hosted >= name.Version;
+    }
 }
 
 /// <summary>
@@ -142,6 +220,14 @@ internal static class ContractAssemblies
     private static readonly Dictionary<string, (Assembly Assembly, string Version)> Loaded = new(StringComparer.OrdinalIgnoreCase);
     private static readonly List<string> Directories = [];
 
+    /// <summary>Whether a loaded contract came from that directory: its files are in use
+    /// for the life of the process.</summary>
+    public static bool Uses(string directory)
+    {
+        lock (Loaded)
+            return Directories.Any(d => d.StartsWith(directory, StringComparison.Ordinal));
+    }
+
     public static Assembly? Find(string name)
     {
         lock (Loaded)
@@ -170,50 +256,77 @@ internal static class ContractAssemblies
     }
 
     /// <summary>Loads the contract unless one of that name is already loaded; returns
-    /// whether this version is the one in use.</summary>
-    public static bool Load(string directory, string mainAssembly, string version)
+    /// whether this version is the one in use. <paramref name="mainAssembly"/> is the
+    /// file within <paramref name="directory"/>; <paramref name="name"/> the assembly's
+    /// simple name, which the file's need not be.</summary>
+    public static bool Load(string directory, string mainAssembly, string name, string version)
     {
-        var name = Path.GetFileNameWithoutExtension(mainAssembly);
         lock (Loaded)
         {
             if (Loaded.TryGetValue(name, out var loaded))
                 return loaded.Version == version;
-            Directories.Add(directory);
-            Loaded[name] = (Shared.LoadFromAssemblyPath(Path.Combine(directory, mainAssembly)), version);
+            var path = Path.Combine(directory, mainAssembly.Replace('/', Path.DirectorySeparatorChar));
+            Directories.Add(Path.GetDirectoryName(path)!);
+            if (!Directories.Contains(directory))
+                Directories.Add(directory);
+            Loaded[name] = (Shared.LoadFromAssemblyPath(path), version);
             return true;
         }
     }
 }
 
 /// <summary>A pipeline plugin's load context. An assembly name resolves, in order, to the
-/// host's own (default context), to a loaded contract assembly even if the plugin ships
-/// its own copy, and otherwise privately from the plugin's directory.</summary>
+/// host's own (default context) by the rules of <see cref="HostAssemblies"/>, to a loaded
+/// contract assembly even if the plugin ships its own copy, and otherwise privately from
+/// the plugin's files: beside its main assembly, then the package's root.</summary>
 internal sealed class PluginLoadContext : AssemblyLoadContext
 {
-    private readonly string _directory;
+    private readonly string[] _directories;
     private readonly AssemblyDependencyResolver? _resolver;
+    private readonly HashSet<string> _private = new(StringComparer.OrdinalIgnoreCase);
 
     public PluginLoadContext(string name, string directory, string mainAssemblyPath)
         : base(name, isCollectible: true)
     {
-        _directory = directory;
+        var beside = Path.GetDirectoryName(mainAssemblyPath)!;
+        _directories = string.Equals(beside, directory, StringComparison.Ordinal) ? [directory] : [beside, directory];
         if (File.Exists(Path.ChangeExtension(mainAssemblyPath, ".deps.json")))
             _resolver = new AssemblyDependencyResolver(mainAssemblyPath);
     }
 
+    /// <summary>Whether this context resolved that name to a file of the plugin's own.</summary>
+    public bool LoadedPrivately(string name)
+    {
+        lock (_private)
+            return _private.Contains(name);
+    }
+
     protected override Assembly? Load(AssemblyName name)
     {
-        if (name.Name is null || HostAssemblies.Contains(name.Name))
+        if (name.Name is null)
             return null;
-        if (ContractAssemblies.Find(name.Name) is { } contract)
-            return contract;
         var path = _resolver?.ResolveAssemblyToPath(name);
         if (path is null)
         {
-            var probe = Path.Combine(_directory, name.Name + ".dll");
-            path = File.Exists(probe) ? probe : null;
+            foreach (var directory in _directories)
+            {
+                var probe = Path.Combine(directory, name.Name + ".dll");
+                if (File.Exists(probe))
+                {
+                    path = probe;
+                    break;
+                }
+            }
         }
-        return path is null ? null : LoadFromAssemblyPath(path);
+        if (ContractAssemblies.Find(name.Name) is { } contract)
+            return contract;
+        if (HostAssemblies.Provides(name, pluginShipsIt: path is not null))
+            return null;
+        if (path is null)
+            return null;
+        lock (_private)
+            _private.Add(name.Name);
+        return LoadFromAssemblyPath(path);
     }
 
     protected override IntPtr LoadUnmanagedDll(string unmanagedDllName) =>
@@ -297,20 +410,31 @@ internal sealed class DefinitionBinding(string name, Type type, Type? settingsTy
         return bound;
     }
 
+    /// <summary>What a reflective call threw, without the wrappers reflection puts round
+    /// it: a constructor's or a static initializer's own exception is the one to report.</summary>
+    public static Exception Cause(Exception ex)
+    {
+        while (ex is TargetInvocationException or TypeInitializationException && ex.InnerException is { } inner)
+            ex = inner;
+        return ex;
+    }
+
     public void Build(PipelineBuilder pipeline, object? settings)
     {
-        var instance = Activator.CreateInstance(type)
-            ?? throw new InvalidOperationException($"Definition class {type} could not be constructed.");
         try
         {
+            var instance = Activator.CreateInstance(type)
+                ?? throw new InvalidOperationException($"Definition class {type} could not be constructed.");
             if (settingsType is null)
                 ((IPipelineDefinition)instance).Build(pipeline);
             else
                 typeof(IPipelineDefinition<>).MakeGenericType(settingsType).GetMethod("Build")!.Invoke(instance, [pipeline, settings]);
         }
-        catch (TargetInvocationException ex) when (ex.InnerException is not null)
+        catch (Exception ex) when (ex is TargetInvocationException or TypeInitializationException && ex.InnerException is not null)
         {
-            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
+            // The constructor's, the static initializer's or the Build method's own
+            // exception, not reflection's wrapper round it.
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(Cause(ex)).Throw();
         }
     }
 
@@ -376,6 +500,10 @@ internal sealed class LoadedPlugin(
     public Dictionary<string, DefinitionBinding> Definitions { get; set; } = definitions;
     public int Users;
 
+    /// <summary>Set when a contract arrived that this context had already resolved to a
+    /// copy of its own: no new use is given this context, and it unloads with its last.</summary>
+    public bool Superseded;
+
     public JsonSerializerOptions Json { get; set; } = NewJson();
     public JsonSerializerOptions StateJson { get; set; } = NewStateJson();
 
@@ -405,16 +533,128 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
     private readonly Dictionary<(string Name, string Version), LoadedPlugin> _loaded = [];
     private readonly Dictionary<string, PluginManifest> _builtIn = new(StringComparer.Ordinal);
     private readonly List<WeakReference> _contexts = [];
+    private readonly List<WeakReference> _inspections = [];
     private readonly SemaphoreSlim _import = new(1, 1);
     private readonly ConcurrentDictionary<string, string> _pendingContracts = new(StringComparer.Ordinal);
 
+    private static string DefaultCacheBase => Path.Combine(Path.GetTempPath(), "incremental-service");
+
     private string CacheRoot =>
-        context.Options.CacheDirectory ?? Path.Combine(Path.GetTempPath(), "incremental-service", Environment.ProcessId.ToString(), context.NodeId);
+        context.Options.CacheDirectory ?? Path.Combine(DefaultCacheBase, Environment.ProcessId.ToString(), context.NodeId);
+
+    // ── the cache directory ────────────────────────────────────────────────────────────
+
+    /// <summary>At start: what earlier runs left. Under the default location that is the
+    /// whole directory of every process that no longer runs; under any location, imports
+    /// that were cut short.</summary>
+    private void CleanCacheAtStart()
+    {
+        if (context.Options.CacheDirectory is null && Directory.Exists(DefaultCacheBase))
+        {
+            foreach (var directory in Directory.EnumerateDirectories(DefaultCacheBase))
+            {
+                if (!int.TryParse(Path.GetFileName(directory), out var pid) || pid == Environment.ProcessId)
+                    continue;
+                try
+                {
+                    using var process = System.Diagnostics.Process.GetProcessById(pid);
+                    if (!process.HasExited)
+                        continue; // a live process: its own to delete
+                }
+                catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+                {
+                    // No such process.
+                }
+                TryDeleteDirectory(directory);
+            }
+        }
+        TryDeleteDirectory(Path.Combine(CacheRoot, "import"));
+    }
+
+    /// <summary>At dispose: the default location belongs to this process and goes with it.
+    /// A configured directory is kept, so that the next run loads from disk.</summary>
+    internal void DeleteOwnCache()
+    {
+        if (context.Options.CacheDirectory is not null)
+            return;
+        TryDeleteDirectory(CacheRoot);
+        try
+        {
+            var parent = Path.GetDirectoryName(CacheRoot)!;
+            if (Directory.Exists(parent) && !Directory.EnumerateFileSystemEntries(parent).Any())
+                Directory.Delete(parent);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+        }
+    }
+
+    /// <summary>Best effort: a loaded assembly's file cannot be deleted on Windows, and what
+    /// stays is deleted by a later prune or the next start.</summary>
+    private static void TryDeleteDirectory(string directory)
+    {
+        try
+        {
+            if (Directory.Exists(directory))
+                Directory.Delete(directory, recursive: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+        }
+    }
+
+    /// <summary>
+    /// Deletes the cached files of plugin versions the catalog no longer holds and this
+    /// process has not loaded. With no <paramref name="catalog"/> (the leader) the catalog
+    /// is read under the import lock, so no version can be stored between that read and
+    /// the deletes; a standby passes the entries it has just fetched from.
+    /// </summary>
+    internal async Task PruneCacheAsync(IReadOnlyDictionary<string, string>? catalog, CancellationToken cancellationToken)
+    {
+        var root = Path.Combine(CacheRoot, "plugins");
+        if (!Directory.Exists(root))
+            return;
+        await _import.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            catalog ??= context.Catalog.Read();
+            var stored = catalog.Keys.Where(k => k.StartsWith("plugin/", StringComparison.Ordinal)).ToHashSet(StringComparer.Ordinal);
+            foreach (var plugin in Directory.EnumerateDirectories(root))
+            {
+                foreach (var version in Directory.EnumerateDirectories(plugin))
+                {
+                    var key = (Name: Path.GetFileName(plugin), Version: Path.GetFileName(version));
+                    if (stored.Contains($"plugin/{key.Name}/{key.Version}") || ContractAssemblies.Uses(version))
+                        continue;
+                    lock (_lock)
+                    {
+                        if (_loaded.ContainsKey(key))
+                            continue;
+                        _prefetched.Remove(key);
+                    }
+                    TryDeleteDirectory(version);
+                }
+                try
+                {
+                    if (!Directory.EnumerateFileSystemEntries(plugin).Any())
+                        Directory.Delete(plugin);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                }
+            }
+        }
+        finally
+        {
+            _import.Release();
+        }
+    }
 
     // ── built in ───────────────────────────────────────────────────────────────────────
 
     internal void LoadBuiltIns()
     {
+        CleanCacheAtStart();
         foreach (var assembly in context.Registrations.Contracts)
         {
             ContractAssemblies.RegisterBuiltIn(assembly);
@@ -432,27 +672,48 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
         }
     }
 
-    private static PluginManifest Describe(Assembly assembly, PluginKind kind, IEnumerable<DefinitionBinding> definitions, string version, IReadOnlyList<PluginFile>? files = null)
+    // mainFile: the main assembly's file within the package; null for an assembly
+    // compiled into the host, which has no package.
+    private static PluginManifest Describe(
+        Assembly assembly, PluginKind kind, IEnumerable<DefinitionBinding> definitions, string version,
+        IReadOnlyList<PluginFile>? files = null, string? mainFile = null)
     {
         var name = assembly.GetName().Name!;
         return new PluginManifest(
-            name.ToLowerInvariant(), version, kind, name + ".dll", files ?? [],
+            name.ToLowerInvariant(), version, kind, mainFile ?? name + ".dll", files ?? [],
             definitions.Select(d => d.Describe()).OrderBy(d => d.Name, StringComparer.Ordinal).ToList(),
             assembly.GetTypes().Where(t => !t.IsAbstract && typeof(ITableDefinition).IsAssignableFrom(t)).Select(t => t.FullName!).Order().ToList(),
-            Fingerprint(assembly));
+            Fingerprint(assembly), name);
     }
 
-    /// <summary>A hash over the public fields and properties of every type the assembly
-    /// defines that is not compiler-generated: it informs a keep-or-reset choice.</summary>
-    private static string Fingerprint(Assembly assembly)
+    /// <summary>
+    /// A hash over the data shapes the assembly declares: the public fields and
+    /// properties of its types, the members and values of its enums (state stores an enum
+    /// as its number), and the members of its anonymous types (the natural key of a
+    /// <c>Distinct</c> or a <c>GroupBy</c>). It informs a keep-or-reset choice and proves
+    /// nothing: a shape built only inside a delegate from types of other assemblies — a
+    /// tuple, a type of a private dependency — is not in it.
+    /// </summary>
+    internal static string Fingerprint(Assembly assembly)
     {
         var text = new StringBuilder();
-        foreach (var type in assembly.GetTypes().Where(t => t.GetCustomAttribute<CompilerGeneratedAttribute>() is null).OrderBy(t => t.FullName, StringComparer.Ordinal))
+        static bool Anonymous(Type type) => type.Name.Contains("AnonymousType", StringComparison.Ordinal);
+        foreach (var type in assembly.GetTypes()
+                     .Where(t => t.GetCustomAttribute<CompilerGeneratedAttribute>() is null || Anonymous(t))
+                     .OrderBy(t => t.FullName, StringComparer.Ordinal))
         {
             text.Append(type.FullName).Append('{');
+            if (type.IsEnum)
+            {
+                foreach (var field in type.GetFields(BindingFlags.Public | BindingFlags.Static).OrderBy(f => f.Name, StringComparer.Ordinal))
+                    text.Append(field.Name).Append('=').Append(Convert.ToString(field.GetRawConstantValue(), System.Globalization.CultureInfo.InvariantCulture)).Append(';');
+            }
             foreach (var member in type.GetMembers(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
                          .Where(m => m is PropertyInfo or FieldInfo).OrderBy(m => m.Name, StringComparer.Ordinal))
-                text.Append(member.Name).Append(':').Append((member as PropertyInfo)?.PropertyType.FullName ?? ((FieldInfo)member).FieldType.FullName).Append(';');
+            {
+                var memberType = (member as PropertyInfo)?.PropertyType ?? ((FieldInfo)member).FieldType;
+                text.Append(member.Name).Append(':').Append(memberType.FullName ?? memberType.Name).Append(';');
+            }
             text.Append('}');
         }
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text.ToString())))[..16].ToLowerInvariant();
@@ -500,7 +761,8 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
             lock (_lock)
             {
                 _contexts.RemoveAll(c => !c.IsAlive);
-                return _contexts.Count;
+                _inspections.RemoveAll(c => !c.IsAlive);
+                return _contexts.Count + _inspections.Count;
             }
         }
     }
@@ -514,11 +776,22 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
             foreach (var manifest in _builtIn.Values)
                 infos.Add(new PluginInfo(manifest.Name, manifest.Version, manifest.Kind, true, manifest.Definitions, manifest.TableDefinitions,
                     "built-in", users.GetValueOrDefault((manifest.Name, manifest.Version))));
-            foreach (var manifest in Stored())
+            var stored = Stored().ToList();
+            foreach (var manifest in stored)
             {
                 string state;
                 if (manifest.Kind == PluginKind.Contract)
-                    state = ContractAssemblies.VersionOf(Path.GetFileNameWithoutExtension(manifest.MainAssembly)) == manifest.Version ? "loaded" : "pending";
+                {
+                    // One version of a contract is loaded per process. A stored version
+                    // imported after it is pending (a restart loads it); one imported
+                    // before it is superseded (no restart will).
+                    var inUse = ContractAssemblies.VersionOf(manifest.MainAssemblyName);
+                    state = inUse == manifest.Version ? "loaded"
+                        : inUse is not null && stored.FirstOrDefault(m => m.Kind == PluginKind.Contract && m.Version == inUse
+                            && string.Equals(m.MainAssemblyName, manifest.MainAssemblyName, StringComparison.OrdinalIgnoreCase)) is { } loaded
+                            && loaded.Sequence > manifest.Sequence ? "superseded"
+                        : "pending";
+                }
                 else
                     lock (_lock)
                         state = _loaded.ContainsKey((manifest.Name, manifest.Version)) ? "loaded" : "stored";
@@ -531,27 +804,33 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
 
     // ── contracts and table definitions ────────────────────────────────────────────────
 
-    /// <summary>Loads every stored contract this process has not loaded. A second version
-    /// of a loaded contract stays pending until the process restarts.</summary>
+    /// <summary>Loads every stored contract this process has not loaded: of the versions
+    /// of one assembly, the one imported last (<see cref="PluginManifest.Sequence"/>), so a
+    /// restart always picks the newest. A version imported after the loaded one stays
+    /// pending until the process restarts.</summary>
     internal async Task LoadContractsAsync(IReadOnlyDictionary<string, string> catalog, CancellationToken cancellationToken)
     {
-        foreach (var manifest in catalog.Where(e => e.Key.StartsWith("plugin/", StringComparison.Ordinal))
-                     .Select(e => ServiceJson.Read<PluginManifest>(e.Value)).Where(m => m.Kind == PluginKind.Contract))
+        var contracts = ContractLoadOrder(
+            catalog.Where(e => e.Key.StartsWith("plugin/", StringComparison.Ordinal)).Select(e => ServiceJson.Read<PluginManifest>(e.Value)));
+        foreach (var manifest in contracts)
         {
             try
             {
-                var assemblyName = Path.GetFileNameWithoutExtension(manifest.MainAssembly);
+                var assemblyName = manifest.MainAssemblyName;
                 if (ContractAssemblies.VersionOf(assemblyName) is { } loaded)
                 {
-                    if (loaded != manifest.Version && _pendingContracts.TryAdd(manifest.Name, manifest.Version))
+                    var inUse = contracts.FirstOrDefault(m => m.Version == loaded && string.Equals(m.MainAssemblyName, assemblyName, StringComparison.OrdinalIgnoreCase));
+                    if (loaded != manifest.Version && manifest.Sequence > (inUse?.Sequence ?? long.MaxValue)
+                        && _pendingContracts.TryAdd(manifest.Name, manifest.Version))
                         _logger.LogWarning(
                             "Contract {Contract} version {Version} is stored but version {Loaded} is loaded; it takes effect when this process restarts",
                             manifest.Name, manifest.Version, loaded);
                     continue;
                 }
                 var directory = await MaterializeAsync(manifest, cancellationToken).ConfigureAwait(false);
-                ContractAssemblies.Load(directory, manifest.MainAssembly, manifest.Version);
+                ContractAssemblies.Load(directory, manifest.MainAssembly, assemblyName, manifest.Version);
                 _logger.LogInformation("Contract {Contract} version {Version} loaded", manifest.Name, manifest.Version);
+                SupersedePrivateCopies(assemblyName);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -559,6 +838,38 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
             }
         }
     }
+
+    /// <summary>
+    /// A contract has just been loaded. A plugin context that resolved that name earlier
+    /// did so to the plugin's own copy, and keeps it for its life: its row types are not
+    /// the contract's. Such a context is given to no new use — the next acquire of the
+    /// version loads a fresh one, which gets the contract — and unloads with its last
+    /// lease. The pipelines that run on it keep their private copy until they are restarted.
+    /// </summary>
+    internal void SupersedePrivateCopies(string assemblyName)
+    {
+        lock (_lock)
+        {
+            foreach (var (key, plugin) in _loaded.ToList())
+            {
+                if (plugin.Context is not { } loadContext || !loadContext.LoadedPrivately(assemblyName))
+                    continue;
+                plugin.Superseded = true;
+                _loaded.Remove(key);
+                _logger.LogWarning(
+                    "Plugin {Plugin} version {Version} was loaded before contract {Contract} and holds its own copy of it. Pipelines already running " +
+                    "on it keep that copy until they are restarted; anything loaded from now on gets the contract",
+                    plugin.Name, plugin.Version, assemblyName);
+            }
+        }
+    }
+
+    /// <summary>The stored contracts in the order they are tried: the version imported
+    /// last first, so that it is the one a process loads, whatever order the catalog's
+    /// rows come in.</summary>
+    internal static List<PluginManifest> ContractLoadOrder(IEnumerable<PluginManifest> stored) =>
+        stored.Where(m => m.Kind == PluginKind.Contract)
+            .OrderByDescending(m => m.Sequence).ThenBy(m => m.Version, StringComparer.Ordinal).ToList();
 
     internal ITableDefinition ResolveTableDefinition(TableSpec spec)
     {
@@ -643,7 +954,7 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
                     "too-many-plugin-versions",
                     $"{_contexts.Count} plugin load contexts are alive on this node (the cap is {context.Options.MaxLoadedPluginVersions}), counting " +
                     "versions asked to unload and not yet collected. Restart this node to reclaim them.", 503);
-            var plugin = Load(name, version, directory, manifest.MainAssembly);
+            var plugin = Load(name, version, directory, manifest.MainAssembly.Replace('/', Path.DirectorySeparatorChar));
             _loaded[(name, version)] = plugin;
             _logger.LogInformation("Plugin {Plugin} version {Version} loaded", name, version);
             return Lease(plugin);
@@ -681,7 +992,8 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
         {
             if (--plugin.Users > 0 || plugin.Context is not { } loadContext)
                 return;
-            _loaded.Remove((plugin.Name, plugin.Version));
+            if (_loaded.TryGetValue((plugin.Name, plugin.Version), out var held) && ReferenceEquals(held, plugin))
+                _loaded.Remove((plugin.Name, plugin.Version));
 
             // Nothing of the plugin's may stay reachable from here: the definitions and
             // the serializer options hold its types.
@@ -690,8 +1002,58 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
             plugin.Json = LoadedPlugin.NewJson();
             plugin.StateJson = LoadedPlugin.NewStateJson();
             loadContext.Unload();
+            JsonAccessorCache.EvictSoon();
             _logger.LogInformation("Plugin {Plugin} version {Version} unloaded: nothing uses it", plugin.Name, plugin.Version);
         }
+    }
+
+    /// <summary>
+    /// Per-version <see cref="JsonSerializerOptions"/> with a resolver of their own keep a
+    /// plugin's types out of every metadata cache but one: System.Text.Json compiles the
+    /// accessors of a type's constructor and members and keeps them in a process-wide
+    /// cache, keyed by the type. An entry there is dropped about a second after its last
+    /// use — but only when the cache is next used, by anyone. On a quiet node nothing uses
+    /// it, and the unloaded context stays alive, counted against
+    /// <see cref="ServiceOptions.MaxLoadedPluginVersions"/>, until something does. So after
+    /// an unload the cache is used on purpose, a few times over the next seconds, with a
+    /// type of the service's own.
+    /// </summary>
+    private static class JsonAccessorCache
+    {
+        private sealed class Probe
+        {
+            public int Value { get; set; }
+        }
+
+        private static int _pending;
+
+        public static void EvictSoon()
+        {
+            if (Interlocked.Exchange(ref _pending, 1) != 0)
+                return;
+            Task.Run(async () =>
+            {
+                try
+                {
+                    for (var pass = 0; pass < 4; pass++)
+                    {
+                        await Task.Delay(TimeSpan.FromMilliseconds(1200)).ConfigureAwait(false);
+                        if (pass == 0)
+                            Interlocked.Exchange(ref _pending, 0); // an unload from here on asks again
+                        Touch();
+                    }
+                }
+                catch
+                {
+                    // Best effort: the cap on live contexts is what catches a context that stays.
+                }
+            }).Forget();
+        }
+
+        // New options with a new resolver each time: metadata for Probe is built again,
+        // which is a use of the accessor cache and so a pass of its eviction.
+        private static void Touch() =>
+            JsonSerializer.Serialize(new Probe(), new JsonSerializerOptions { TypeInfoResolver = new DefaultJsonTypeInfoResolver() });
     }
 
     /// <summary>The plugin's files, from the blob store, in the cache directory, each
@@ -744,11 +1106,31 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
 
     public async Task<PluginManifest> ImportZipAsync(Stream zip, CancellationToken cancellationToken, string? caller = null)
     {
+        ArgumentNullException.ThrowIfNull(zip);
         context.RequireLeader();
         var temporary = Path.Combine(CacheRoot, "import", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(temporary);
+        FileStream? spooled = null;
         try
         {
+            // ZipArchive reads a stream that cannot seek by copying all of it into memory
+            // first, before any limit here applies. Such a stream is copied to a file
+            // instead, and refused once it is larger than a plugin may inflate to.
+            if (!zip.CanSeek)
+            {
+                spooled = new FileStream(
+                    temporary + ".zip", FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 81920, FileOptions.DeleteOnClose | FileOptions.Asynchronous);
+                var chunk = new byte[81920];
+                int got;
+                while ((got = await zip.ReadAsync(chunk, cancellationToken).ConfigureAwait(false)) > 0)
+                {
+                    if (spooled.Length + got > context.Options.MaxPluginBytes)
+                        throw ServiceException.Invalid($"The zip is larger than {context.Options.MaxPluginBytes} bytes.");
+                    await spooled.WriteAsync(chunk.AsMemory(0, got), cancellationToken).ConfigureAwait(false);
+                }
+                spooled.Position = 0;
+                zip = spooled;
+            }
             using (var archive = new ZipArchive(zip, ZipArchiveMode.Read, leaveOpen: true))
             {
                 var files = archive.Entries.Where(e => !e.FullName.EndsWith('/')).ToList();
@@ -780,13 +1162,13 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
         }
         finally
         {
-            try
-            {
-                Directory.Delete(temporary, recursive: true);
-            }
-            catch (IOException)
-            {
-            }
+            if (spooled is not null)
+                await spooled.DisposeAsync().ConfigureAwait(false);
+
+            // Best effort, and never the import's outcome: on Windows a file of the
+            // package that the inspection loaded is still mapped until its context is
+            // collected, and deleting it is refused. What stays is deleted at the next start.
+            TryDeleteDirectory(temporary);
         }
     }
 
@@ -820,11 +1202,30 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
         var manifest = Inspect(directory, main, version, files);
         ServiceNames.Validate(manifest.Name, "plugin name");
 
+        async Task PutMissingBlobsAsync()
+        {
+            foreach (var file in files)
+            {
+                if (await context.Backend.Blobs.ExistsAsync(file.Sha256, cancellationToken).ConfigureAwait(false))
+                    continue;
+                await using var stream = File.OpenRead(Path.Combine(directory, file.Path.Replace('/', Path.DirectorySeparatorChar)));
+                await context.Backend.Blobs.PutAsync(file.Sha256, stream, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        // The lock a delete holds too: a delete works out which blobs no stored version
+        // needs, and must not do that between this import's look at a blob and its manifest.
         await _import.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             if (Manifest(manifest.Name, version) is { } existing)
+            {
+                // The same bytes again. Any blob the store has lost is put back, so
+                // importing a version again is what repairs it.
+                if (existing.Files.Count > 0)
+                    await PutMissingBlobsAsync().ConfigureAwait(false);
                 return existing;
+            }
             if (_builtIn.ContainsKey(manifest.Name))
                 throw ServiceException.Conflict($"Plugin '{manifest.Name}' is compiled into this host; a stored plugin cannot take its name.");
             var stored = Stored().ToList();
@@ -834,18 +1235,15 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
                 throw ServiceException.Conflict($"Plugin '{manifest.Name}' is stored as a {other.Kind} plugin; this one is a {manifest.Kind} plugin.");
 
             // Blobs before the manifest: content-addressed, harmless if interrupted.
-            foreach (var file in files)
-            {
-                if (await context.Backend.Blobs.ExistsAsync(file.Sha256, cancellationToken).ConfigureAwait(false))
-                    continue;
-                await using var stream = File.OpenRead(Path.Combine(directory, file.Path.Replace('/', Path.DirectorySeparatorChar)));
-                await context.Backend.Blobs.PutAsync(file.Sha256, stream, cancellationToken).ConfigureAwait(false);
-            }
+            await PutMissingBlobsAsync().ConfigureAwait(false);
 
             using (var write = await context.Catalog.BeginAsync(cancellationToken).ConfigureAwait(false))
             {
+                // The audit entry's sequence is the version's place among the versions of
+                // its name: later imports sort after it on every node.
+                var sequence = write.Audit(context.NodeId, context.Term, caller, "plugin.import", $"{manifest.Name}/{version}", null, null);
+                manifest = manifest with { Sequence = sequence };
                 write.Put($"plugin/{manifest.Name}/{version}", manifest);
-                write.Audit(context.NodeId, context.Term, caller, "plugin.import", $"{manifest.Name}/{version}", null, null);
                 await write.CommitAsync(cancellationToken).ConfigureAwait(false);
             }
             _logger.LogInformation("Plugin {Plugin} version {Version} imported ({Kind}, {Files} files)", manifest.Name, version, manifest.Kind, files.Count);
@@ -886,10 +1284,12 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
 
     /// <summary>Loads the plugin into a throwaway context, reads what it defines, unloads.</summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private static PluginManifest Inspect(string directory, string main, string version, List<PluginFile> files)
+    private PluginManifest Inspect(string directory, string main, string version, List<PluginFile> files)
     {
-        var path = Path.Combine(directory, main);
+        var path = Path.Combine(directory, main.Replace('/', Path.DirectorySeparatorChar));
         var throwaway = new PluginLoadContext("inspect", directory, path);
+        lock (_lock)
+            _inspections.Add(new WeakReference(throwaway));
         try
         {
             // From a stream, so the file is not held and a contract inspected here is not
@@ -900,7 +1300,7 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
             var definitions = DefinitionBinding.Discover(assembly);
             if (kind == PluginKind.Contract && definitions.Count > 0)
                 throw ServiceException.Invalid("A contract assembly cannot hold pipeline definitions: it is never unloaded.");
-            return Describe(assembly, kind, definitions.Values, version, files);
+            return Describe(assembly, kind, definitions.Values, version, files, main);
         }
         catch (ReflectionTypeLoadException ex)
         {
@@ -957,20 +1357,84 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
     public async Task DeleteAsync(string name, string version, CancellationToken cancellationToken, string? caller = null)
     {
         context.RequireLeader();
-        var manifest = context.Catalog.Get<PluginManifest>($"plugin/{name}/{version}")
-            ?? throw ServiceException.NotFound($"Plugin '{name}' version {version}");
-        if (context.PipelineSpecs().FirstOrDefault(p => p.Plugin == name && p.Version == version) is { } user)
-            throw ServiceException.Conflict($"Plugin '{name}' version {version} is named by pipeline '{user.Id}'.");
 
-        using (var write = await context.Catalog.BeginAsync(cancellationToken).ConfigureAwait(false))
+        // Two locks, in this order. The import lock: which blobs a delete may take is
+        // worked out from the stored manifests, and an import must not be between its look
+        // at a shared blob and its manifest while that happens. The references lock: a
+        // deploy commits a spec naming a version under it, so from the check of who names
+        // this one to the end of the delete no pipeline can come to name it.
+        await _import.WaitAsync(cancellationToken).ConfigureAwait(false);
+        IDisposable? references = null;
+        try
         {
-            write.Delete($"plugin/{name}/{version}");
-            write.Audit(context.NodeId, context.Term, caller, "plugin.delete", $"{name}/{version}", null, null);
-            await write.CommitAsync(cancellationToken).ConfigureAwait(false);
+            references = await context.LockReferencesAsync(cancellationToken).ConfigureAwait(false);
+            var manifest = context.Catalog.Get<PluginManifest>($"plugin/{name}/{version}")
+                ?? throw ServiceException.NotFound($"Plugin '{name}' version {version}");
+            RequireUnused(manifest);
+
+            using (var write = await context.Catalog.BeginAsync(cancellationToken).ConfigureAwait(false))
+            {
+                write.Delete($"plugin/{name}/{version}");
+                write.Audit(context.NodeId, context.Term, caller, "plugin.delete", $"{name}/{version}", null, null);
+                await write.CommitAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            // The blob store's writes are not fenced. A node that has been replaced must
+            // not go on to delete what the new leader may have stored again, so each
+            // deletion is preceded by a look at whether this node still leads. That narrows
+            // the window to one call; a blob lost in it is put back by importing the
+            // version again.
+            var kept = Stored().SelectMany(m => m.Files).Select(f => f.Sha256).ToHashSet();
+            foreach (var file in manifest.Files.Where(f => !kept.Contains(f.Sha256)))
+            {
+                if (!context.IsLeader)
+                    break;
+                await context.Backend.Blobs.DeleteAsync(file.Sha256, cancellationToken).ConfigureAwait(false);
+            }
+
+            var cached = Path.Combine(CacheRoot, "plugins", manifest.Name, manifest.Version);
+            bool loaded;
+            lock (_lock)
+            {
+                loaded = _loaded.ContainsKey((name, version));
+                _prefetched.Remove((name, version));
+            }
+            if (!loaded && !ContractAssemblies.Uses(cached))
+                TryDeleteDirectory(cached);
+            _pendingContracts.TryRemove(new KeyValuePair<string, string>(name, version));
+            context.Events.Publish("plugin", name, $"version {version} deleted");
         }
-        var kept = Stored().SelectMany(m => m.Files).Select(f => f.Sha256).ToHashSet();
-        foreach (var file in manifest.Files.Where(f => !kept.Contains(f.Sha256)))
-            await context.Backend.Blobs.DeleteAsync(file.Sha256, cancellationToken).ConfigureAwait(false);
-        context.Events.Publish("plugin", name, $"version {version} deleted");
+        finally
+        {
+            references?.Dispose();
+            _import.Release();
+        }
     }
+
+    /// <summary>Why a stored version cannot be deleted, as a refusal; nothing when it can.
+    /// A pipeline names its plugin version. A table names a definition, which a contract
+    /// provides: a contract is in use while a declared table's definition is in it and in
+    /// no other stored version of the same assembly, because a process that starts later
+    /// could not create that table.</summary>
+    internal void RequireUnused(PluginManifest manifest)
+    {
+        if (context.PipelineSpecs().FirstOrDefault(p => p.Plugin == manifest.Name && p.Version == manifest.Version) is { } user)
+            throw ServiceException.Conflict($"Plugin '{manifest.Name}' version {manifest.Version} is named by pipeline '{user.Id}'.");
+        if (manifest.Kind != PluginKind.Contract)
+            return;
+        var assembly = manifest.MainAssemblyName;
+        var elsewhere = Stored()
+            .Where(m => m.Kind == PluginKind.Contract && m.Version != manifest.Version
+                && string.Equals(m.MainAssemblyName, assembly, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(m => m.TableDefinitions).ToHashSet(StringComparer.Ordinal);
+        var tables = context.Tables.Handles.Select(h => h.Spec)
+            .Where(t => (t.Contract is null || string.Equals(t.Contract, assembly, StringComparison.OrdinalIgnoreCase))
+                && manifest.TableDefinitions.Contains(t.Definition) && !elsewhere.Contains(t.Definition))
+            .Select(t => t.Name).Order(StringComparer.Ordinal).ToList();
+        if (tables.Count > 0)
+            throw ServiceException.Conflict(
+                $"Contract '{manifest.Name}' version {manifest.Version} defines table(s) {string.Join(", ", tables)} and no other stored version does; " +
+                "a node that starts without it could not create them. Remove the tables first, or import the version that replaces it.");
+    }
+
 }

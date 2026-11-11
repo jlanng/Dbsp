@@ -5,18 +5,21 @@
   <!-- Plugin and contract assemblies the service tests load at runtime from these projects'
        output directories. The host provides Incremental*, so nothing of it is copied here:
        an output directory holds the plugin, its .deps.json and its private dependencies,
-       which is what a plugin package is. -->
+       which is what a plugin package is. A package the plugin references is a private
+       dependency and is copied (CopyLocalLockFileAssemblies); what Incremental.Service
+       brings with it is not, neither its assemblies (ExcludeAssets runtime) nor the native
+       libraries of its Kafka client (native), which are some hundred megabytes. -->
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
-    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <DisableTransitiveProjectReferences>true</DisableTransitiveProjectReferences>
     <DebugType>none</DebugType>
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="$(MSBuildThisFileDirectory)..\..\src\Incremental.Service\Incremental.Service.csproj" Private="false" ExcludeAssets="runtime" />
-    <ProjectReference Include="$(MSBuildThisFileDirectory)..\..\src\Incremental\Incremental.csproj" Private="false" ExcludeAssets="runtime" />
+    <ProjectReference Include="$(MSBuildThisFileDirectory)..\..\src\Incremental.Service\Incremental.Service.csproj" Private="false" ExcludeAssets="runtime;native" />
+    <ProjectReference Include="$(MSBuildThisFileDirectory)..\..\src\Incremental\Incremental.csproj" Private="false" ExcludeAssets="runtime;native" />
   </ItemGroup>
 
 </Project>

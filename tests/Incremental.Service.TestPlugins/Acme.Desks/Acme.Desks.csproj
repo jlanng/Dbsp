@@ -5,4 +5,10 @@
     <ProjectReference Include="..\Acme.RefData\Acme.RefData.csproj" />
   </ItemGroup>
 
+  <!-- A private dependency from NuGet that the test host does not carry: it has to be in
+       the package and be loaded from it. -->
+  <ItemGroup>
+    <PackageReference Include="K4os.Compression.LZ4" Version="1.3.8" />
+  </ItemGroup>
+
 </Project>

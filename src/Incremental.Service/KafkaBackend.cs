@@ -219,9 +219,11 @@ public sealed class KafkaServiceBackend : IServiceBackend
             await inner.StartAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        // The probe line's fourth token: no spaces, so the reason is escaped.
+        // The probe line's fourth token: no spaces, so the reason and the address are
+        // escaped. "ready" or "notready:{reason}", then ";admin={url}" when there is one.
         private static string Detail(PeerInfo self) =>
-            self.Ready ? "ready" : "notready:" + Uri.EscapeDataString(self.NotReadyReason ?? "");
+            (self.Ready ? "ready" : "notready:" + Uri.EscapeDataString(self.NotReadyReason ?? ""))
+            + (self.AdminUrl is { Length: > 0 } url ? ";admin=" + Uri.EscapeDataString(url) : "");
 
         private KafkaLeadership Started => Inner ?? throw new InvalidOperationException("The leadership has not been started.");
 
@@ -254,13 +256,16 @@ public sealed class KafkaServiceBackend : IServiceBackend
             }
             if (answer is null)
                 return null;
-            var ready = answer.Detail == "ready";
+            var parts = (answer.Detail ?? "").Split(';');
+            var ready = parts[0] == "ready";
             string? reason = null;
             if (!ready)
-                reason = answer.Detail is { } detail && detail.StartsWith("notready:", StringComparison.Ordinal)
-                    ? Uri.UnescapeDataString(detail["notready:".Length..])
+                reason = parts[0].StartsWith("notready:", StringComparison.Ordinal)
+                    ? Uri.UnescapeDataString(parts[0]["notready:".Length..])
                     : "the node gave no readiness";
-            return new PeerInfo(answer.NodeId, answer.Role, answer.Term, ready, reason);
+            var admin = parts.Skip(1).FirstOrDefault(p => p.StartsWith("admin=", StringComparison.Ordinal));
+            return new PeerInfo(
+                answer.NodeId, answer.Role, answer.Term, ready, reason, admin is null ? null : Uri.UnescapeDataString(admin["admin=".Length..]));
         }
 
         public IUpsertSink<TKey, TRow> Leased<TKey, TRow>(IUpsertSink<TKey, TRow> sink) where TKey : notnull => Started.Leased(sink);

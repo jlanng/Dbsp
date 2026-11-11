@@ -67,6 +67,33 @@ internal sealed class ServiceContext
 
     public IReadOnlyList<PipelineSpec> PipelineSpecs() => Supervisor.Specs;
 
+    private readonly SemaphoreSlim _references = new(1, 1);
+
+    /// <summary>
+    /// The lock between naming a thing and removing it. A deploy holds it while it checks
+    /// that the tables and the plugin version its spec names are there and commits the
+    /// spec; removing a table and deleting or importing a plugin version hold it from their
+    /// check of who names the thing to the end of the removal. Held for a check and a
+    /// catalog commit (a plugin delete: its blob deletions too), never while a pipeline
+    /// starts or stops; taken after a pipeline's queue, never before one.
+    /// </summary>
+    public async Task<IDisposable> LockReferencesAsync(CancellationToken cancellationToken)
+    {
+        await _references.WaitAsync(cancellationToken).ConfigureAwait(false);
+        return new Unlock(_references);
+    }
+
+    private sealed class Unlock(SemaphoreSlim gate) : IDisposable
+    {
+        private int _released;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _released, 1) == 0)
+                gate.Release();
+        }
+    }
+
     public IConnector Connector(JsonElement config)
     {
         if (config.ValueKind != JsonValueKind.Object || !config.TryGetProperty("connector", out var kind) || kind.GetString() is not { Length: > 0 } name)
@@ -125,6 +152,34 @@ public sealed record NodeStatus(
 
 public sealed record NodeActionOptions(bool Force = false, bool DryRun = false, string? Caller = null);
 
+/// <summary>The seeds that have been applied, under <c>node/seeds</c>. A seed is written
+/// once per deployment; one that was applied and then removed stays removed.</summary>
+public sealed record SeedRecord(IReadOnlyList<string> Tables, IReadOnlyList<string> Pipelines);
+
+/// <summary>
+/// The last few samples of a standby's state lag, and what they say together. A follower
+/// of a leader that commits all the time is a few records behind at most instants and
+/// caught up between commits; one sample a second cannot tell that from a standby that is
+/// behind. So a standby is called behind only if it was behind at every one of the last
+/// <see cref="Samples"/> samples — a standby that is really catching up is behind at all
+/// of them, and one that keeps up is caught up at one of them.
+/// </summary>
+internal sealed class StateLagWindow
+{
+    public const int Samples = 3;
+    private readonly long[] _samples = new long[Samples];
+    private int _next;
+    private volatile bool _behind;
+
+    public bool Behind => _behind;
+
+    public void Add(long lag)
+    {
+        _samples[_next++ % Samples] = lag;
+        _behind = _samples.Min() > 0;
+    }
+}
+
 /// <summary>What the leader publishes of itself under <c>node/leader</c>.</summary>
 public sealed record LeaderRecord(string NodeId, long Term, string? AdminUrl, IReadOnlyDictionary<string, string> Contracts);
 
@@ -149,6 +204,8 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
     private Task _finished = Task.CompletedTask;
     private long _catalogApplied = -1;
     private long _stateLag;
+
+    private readonly StateLagWindow _stateLagWindow = new();
     private int _pluginsPending;
     private volatile PeerInfo? _peer;
     private volatile bool _peerSampled;
@@ -331,11 +388,23 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
                 await write.CommitAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            await Contained("importing the plugin directory", () => _context.Plugins.ImportPluginDirectoryAsync(cancellationToken)).ConfigureAwait(false);
+            await Contained("importing the plugin directory", () => _context.Plugins.ImportPluginDirectoryAsync(cancellationToken), cancellationToken).ConfigureAwait(false);
+
+            // A seed is applied once per deployment, and the catalog records that it was:
+            // a key that is absent is otherwise the same for a seed never applied and for
+            // one an operator removed, and the removed one would come back at every
+            // takeover. An entry that is there already (a deployment older than the
+            // record, or a leader that died between the two writes) counts as applied.
+            var seeded = catalog.Get<SeedRecord>("node/seeds") ?? new SeedRecord([], []);
+            var seededTables = seeded.Tables.ToHashSet(StringComparer.Ordinal);
+            var seededPipelines = seeded.Pipelines.ToHashSet(StringComparer.Ordinal);
             foreach (var seed in _context.Registrations.Tables)
             {
-                if (catalog.Get("table/" + seed.Name) is null)
-                    await Contained($"seeding table '{seed.Name}'", () => _context.Tables.DeclareAsync(seed, cancellationToken, "seed")).ConfigureAwait(false);
+                if (seededTables.Contains(seed.Name))
+                    continue;
+                if (catalog.Get("table/" + seed.Name) is not null
+                    || await Contained($"seeding table '{seed.Name}'", () => _context.Tables.DeclareAsync(seed, cancellationToken, "seed"), cancellationToken).ConfigureAwait(false))
+                    seededTables.Add(seed.Name);
             }
 
             var beforePipelines = clock.Elapsed;
@@ -344,10 +413,24 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
             var pipelineCount = _context.Supervisor.Specs.Count;
             foreach (var seed in _context.Registrations.Pipelines)
             {
-                if (catalog.Get("pipeline/" + seed.Id) is null)
-                    await Contained($"seeding pipeline '{seed.Id}'",
-                        () => _context.Supervisor.DeployAsync(seed, new DeployOptions(Caller: "seed"), cancellationToken)).ConfigureAwait(false);
+                if (seededPipelines.Contains(seed.Id))
+                    continue;
+                if (catalog.Get("pipeline/" + seed.Id) is not null
+                    || await Contained($"seeding pipeline '{seed.Id}'",
+                        () => _context.Supervisor.DeployAsync(seed, new DeployOptions(Caller: "seed"), cancellationToken), cancellationToken).ConfigureAwait(false))
+                    seededPipelines.Add(seed.Id);
             }
+            if (seededTables.Count != seeded.Tables.Count || seededPipelines.Count != seeded.Pipelines.Count)
+            {
+                await Contained("recording the seeds", async () =>
+                {
+                    using var write = await catalog.BeginAsync(cancellationToken).ConfigureAwait(false);
+                    write.Put("node/seeds", new SeedRecord(
+                        [.. seededTables.Order(StringComparer.Ordinal)], [.. seededPipelines.Order(StringComparer.Ordinal)]));
+                    await write.CommitAsync(cancellationToken).ConfigureAwait(false);
+                }, cancellationToken).ConfigureAwait(false);
+            }
+            await Contained("pruning the plugin cache", () => _context.Plugins.PruneCacheAsync(null, cancellationToken), cancellationToken).ConfigureAwait(false);
             _context.Tables.StartLoaders();
             _catalogApplied = catalog.Version;
             _lastTakeover = new ServiceTakeoverTimings(
@@ -363,16 +446,22 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         }
     }
 
-    private async Task Contained(string what, Func<Task> action)
+    /// <summary>Runs one contained part of a takeover or a shutdown; false when it failed.
+    /// Only a cancellation of <paramref name="cancellationToken"/> itself leaves this
+    /// method: an <see cref="OperationCanceledException"/> from anywhere else — a timeout
+    /// inside tenant code — is a failure like any other, not the end of the takeover.</summary>
+    private async Task<bool> Contained(string what, Func<Task> action, CancellationToken cancellationToken = default)
     {
         try
         {
             await action().ConfigureAwait(false);
+            return true;
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
             _logger.LogError(ex, "Service node {Node}: {What} failed", NodeId, what);
             _context.Events.Publish("node", NodeId, $"{what} failed: {ex.Message}");
+            return false;
         }
     }
 
@@ -390,10 +479,12 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
     private PeerInfo DescribeSelf()
     {
         var status = _context.Backend.Leadership.Status;
+        var admin = _context.Options.AdvertisedAdminUrl;
         if (status.Role != NodeRole.Standby)
-            return new PeerInfo(NodeId, status.Role, status.Term, status.Role == NodeRole.Leader, status.Role == NodeRole.Leader ? null : status.Role.ToString());
+            return new PeerInfo(
+                NodeId, status.Role, status.Term, status.Role == NodeRole.Leader, status.Role == NodeRole.Leader ? null : status.Role.ToString(), admin);
         var readiness = Readiness();
-        return new PeerInfo(NodeId, status.Role, status.Term, readiness.TakeoverWouldBeWarm, readiness.NotWarmBecause.FirstOrDefault());
+        return new PeerInfo(NodeId, status.Role, status.Term, readiness.TakeoverWouldBeWarm, readiness.NotWarmBecause.FirstOrDefault(), admin);
     }
 
     // ── the loop: reconcile on a standby, trim and mirror on the leader ────────────────
@@ -437,6 +528,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
                                 // No plugin code runs on a standby, but its files are fetched
                                 // now, so that a takeover loads them from this node's disk.
                                 Volatile.Write(ref _pluginsPending, await _context.Plugins.PrefetchAsync(entries, stop).ConfigureAwait(false));
+                                await _context.Plugins.PruneCacheAsync(entries, stop).ConfigureAwait(false);
                                 if (version != _catalogApplied)
                                     _context.Events.Publish("catalog", NodeId, $"version {version} applied");
                                 _catalogApplied = version;
@@ -453,17 +545,19 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
                 if (role == NodeRole.Standby && now - lastLag >= TimeSpan.FromSeconds(1))
                 {
                     lastLag = now;
-                    _stateLag = (await _context.Backend.Leadership.MeasureStateLagAsync(stop).ConfigureAwait(false))?.Sum() ?? 0;
+                    var lag = (await _context.Backend.Leadership.MeasureStateLagAsync(stop).ConfigureAwait(false))?.Sum() ?? 0;
+                    Interlocked.Exchange(ref _stateLag, lag);
+                    _stateLagWindow.Add(lag);
                 }
 
                 if (now - lastWatch >= TimeSpan.FromSeconds(1))
                 {
                     lastWatch = now;
-                    if (role is NodeRole.Standby or NodeRole.Leader)
-                    {
-                        _peer = await ProbePeerAsync(stop).ConfigureAwait(false);
-                        _peerSampled = true;
-                    }
+                    // In every role: a node that has been fenced or has resigned still
+                    // serves its admin surface, and what it shows of the other node must
+                    // be what that node is now, not what it was when this one last led.
+                    _peer = await ProbePeerAsync(stop).ConfigureAwait(false);
+                    _peerSampled = true;
                     if (role == NodeRole.Leader && _context.IsLeader)
                         await WatchCatalogWriterAsync(stop).ConfigureAwait(false);
                 }
@@ -622,7 +716,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
             reasons.Add("table-faulted");
         if (opening > 0)
             reasons.Add("table-opening");
-        if (Interlocked.Read(ref _stateLag) > 0)
+        if (_stateLagWindow.Behind)
             reasons.Add("state-behind");
         var pending = Volatile.Read(ref _pluginsPending);
         if (pending > 0)
@@ -739,7 +833,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
                     : $"Node '{peer.NodeId}' is {peer.Role} and not ready ({peer.NotReadyReason ?? "no reason given"}); pass force to step down anyway.");
         var plan = new ActionPlan("node.stepdown", NodeId, options.DryRun,
         [
-            $"node '{NodeId}' stops its loaders and pipelines (at most {_context.Options.StepDownTimeout:g}), resigns and ends",
+            $"node '{NodeId}' stops its loaders and pipelines (at most {Durations.Text(_context.Options.StepDownTimeout)}), resigns and ends",
             ready ? $"node '{peer!.NodeId}' takes over" : "nothing takes over: the service stops until a node is started",
         ]);
         if (options.DryRun)
@@ -811,6 +905,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         if (leadership.Status.Role == NodeRole.Leader)
         {
             await Contained("mirroring the catalog", () => MirrorAsync(CancellationToken.None)).ConfigureAwait(false);
+
             PeerInfo? peer = null;
             try
             {
@@ -842,11 +937,17 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         {
             await StopAsync(CancellationToken.None).ConfigureAwait(false);
             _catalogFollow?.Cancel();
+
+            // A node that was fenced or resigned is abandoning its circuits on another
+            // thread: that ends before what they stand on is disposed.
+            if (_context.Backend.Leadership.WhenFinished.IsCompleted)
+                await _finished.CompletesWithin(_context.Options.StopTimeout + _context.Options.AbandonTimeout).ConfigureAwait(false);
             _context.Supervisor.ReleaseAll();
             await _context.Tables.DisposeAsync().ConfigureAwait(false);
             await _context.Catalog.DisposeAsync().ConfigureAwait(false);
             await _context.Storage.DisposeAsync().ConfigureAwait(false);
         }
         await _context.Backend.DisposeAsync().ConfigureAwait(false);
+        _context.Plugins.DeleteOwnCache();
     }
 }

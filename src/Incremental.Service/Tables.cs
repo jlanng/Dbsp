@@ -65,7 +65,12 @@ public sealed class TableBuilder<TKey, TRow>
     /// that arrives as JSON (the admin API's row lookup).</summary>
     internal sealed record DeclaredIndex(
         string Name, Type KeyType, Action<SharedTable<TKey, TRow>> Declare,
-        Func<TableSnapshot<TKey, TRow>, string, IReadOnlyList<KeyValuePair<TKey, TRow>>> ReadBy);
+        ReadIndexPage ReadBy);
+
+    /// <summary>A page of the rows under an index key given as text, and how many keys the
+    /// index holds under it.</summary>
+    internal delegate IReadOnlyList<KeyValuePair<TKey, TRow>> ReadIndexPage(
+        TableSnapshot<TKey, TRow> snapshot, string key, int skip, int take, out int total);
 
     public SharedTableOptions Options { get; set; } = new();
 
@@ -74,7 +79,8 @@ public sealed class TableBuilder<TKey, TRow>
         ArgumentNullException.ThrowIfNull(index);
         Indexes.Add(new DeclaredIndex(
             index.Name, typeof(TIndexKey), table => table.AddIndex(index.Name, index.Selector),
-            (snapshot, key) => snapshot.RowsBy(index.Name, TableKeys.Parse<TIndexKey>(key))));
+            (TableSnapshot<TKey, TRow> snapshot, string key, int skip, int take, out int total) =>
+                snapshot.RowsBy(index.Name, TableKeys.Parse<TIndexKey>(key), skip, take, out total)));
         return this;
     }
 }
@@ -243,13 +249,18 @@ public sealed record TableStats(
     string? FloorHeldBy,
     IReadOnlyDictionary<string, string>? IndexKeyTypes = null);
 
-/// <summary>What to read of a table's rows: one row by <see cref="Key"/>; the rows under
-/// one key of <see cref="Index"/>; or, with neither, a page of one scan — <see cref="Skip"/>
-/// rows passed over, then up to <see cref="Limit"/>, keeping only rows whose JSON text
-/// contains <see cref="Contains"/>. The scan stops after <see cref="MaxScanned"/> rows
-/// whatever it has found.</summary>
+/// <summary>What to read of a table's rows: one row by <see cref="Key"/>; a page of the
+/// rows under one key of <see cref="Index"/> (<see cref="Skip"/> passed over, then up to
+/// <see cref="Limit"/>); or, with neither, a page of one scan. A scan passes over the first
+/// <see cref="From"/> rows of the table without looking at them, then keeps the rows whose
+/// JSON text contains <see cref="Contains"/>, passes over <see cref="Skip"/> of those and
+/// returns up to <see cref="Limit"/>. Only a row that is looked at for
+/// <see cref="Contains"/> counts towards <see cref="MaxScanned"/>, where the scan stops
+/// whatever it has found; the page's <c>Next</c> is the <see cref="From"/> that carries on
+/// from there, so every row of a table of any size can be reached.</summary>
 public sealed record TableRowQuery(
-    int Limit = 50, int Skip = 0, string? Contains = null, string? Key = null, string? Index = null, int MaxScanned = 100_000);
+    int Limit = 50, int Skip = 0, string? Contains = null, string? Key = null, string? Index = null, int MaxScanned = 100_000,
+    long From = 0);
 
 /// <summary>One row: its key and the row, both as JSON.</summary>
 public sealed record TableRowData(JsonElement Key, JsonElement Row);
@@ -257,9 +268,13 @@ public sealed record TableRowData(JsonElement Key, JsonElement Row);
 /// <summary>Rows read from one pinned snapshot. <c>Version</c> is the snapshot;
 /// <c>Scanned</c> how many rows the read looked at; <c>Truncated</c> that the scan stopped
 /// at its bound before the end of the table, so "not found" means "not reached";
-/// <c>More</c> that another page follows.</summary>
+/// <c>More</c> that another page follows; <c>Next</c> where it starts — a scan's
+/// <see cref="TableRowQuery.From"/>, an index read's <see cref="TableRowQuery.Skip"/> —
+/// and null when this page reached the end. A scan's <c>Next</c> is a position in the
+/// table's own order, which holds for one version: across versions it is a sample, not a
+/// cursor.</summary>
 public sealed record TableRowPage(
-    long Version, long TableRows, long Scanned, bool Truncated, bool More, IReadOnlyList<TableRowData> Rows);
+    long Version, long TableRows, long Scanned, bool Truncated, bool More, IReadOnlyList<TableRowData> Rows, long? Next = null);
 
 public interface ITableRegistry
 {

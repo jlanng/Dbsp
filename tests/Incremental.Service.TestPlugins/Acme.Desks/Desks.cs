@@ -13,6 +13,10 @@ public sealed class DeskNotional : IPipelineDefinition
 {
     public void Build(PipelineBuilder p)
     {
+        // A call into the plugin's private NuGet dependency: the definition cannot be
+        // described, let alone run, unless the package holds that assembly.
+        if (K4os.Compression.LZ4.LZ4Codec.MaximumOutputSize(16) < 16)
+            throw new InvalidOperationException("LZ4 bounds an output below its input.");
         var instruments = p.Table(Tables.Instruments);
         var desks = p.Table(RefTables.Desks);
         var lines = p.Input<Trade>("trades")

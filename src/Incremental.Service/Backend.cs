@@ -117,7 +117,10 @@ public sealed record KafkaLeadershipDetail(
     TimeSpan HeartbeatAge, DateTimeOffset? LeaderHeartbeatAt, bool LeaderResigned, bool HoldsLease,
     TakeoverTimings? LastTakeover, string? Fault = null);
 
-public sealed record PeerInfo(string NodeId, NodeRole Role, long Term, bool Ready, string? NotReadyReason);
+/// <summary>What a node answers a probe with. <c>AdminUrl</c> is its
+/// <see cref="ServiceOptions.AdvertisedAdminUrl"/>: a node that has been fenced no longer
+/// follows the catalog, so the probe is how it learns where the node that replaced it is.</summary>
+public sealed record PeerInfo(string NodeId, NodeRole Role, long Term, bool Ready, string? NotReadyReason, string? AdminUrl = null);
 
 public sealed record LeadershipCallbacks(
     Func<CancellationToken, Task> PrepareAsync,

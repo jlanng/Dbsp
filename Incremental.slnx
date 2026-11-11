@@ -30,6 +30,7 @@
     <Project Path="tests/Incremental.Service.TestPlugins/Acme.Pipelines.V2/Acme.Pipelines.V2.csproj" />
     <Project Path="tests/Incremental.Service.TestPlugins/Acme.Pipelines/Acme.Pipelines.csproj" />
     <Project Path="tests/Incremental.Service.TestPlugins/Acme.RefData/Acme.RefData.csproj" />
+    <Project Path="tests/Incremental.Service.TestPlugins/Acme.Venues/Acme.Venues.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Incremental.ClusterHost/Incremental.ClusterHost.csproj" />

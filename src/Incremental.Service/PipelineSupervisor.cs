@@ -22,6 +22,10 @@ internal sealed class Generation
     public CancellationTokenSource Stop { get; } = new();
     public volatile bool Stopping;
 
+    /// <summary>The circuit's logger factory: quiet once the generation is abandoned
+    /// because its node no longer leads.</summary>
+    public GenerationLogs? Logs { get; init; }
+
     /// <summary>The first failure of the circuit, a source or a delivery; null when the
     /// generation was stopped on purpose.</summary>
     public TaskCompletionSource<Exception?> Faulted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -30,6 +34,45 @@ internal sealed class Generation
         task.ContinueWith(
             (t, state) => ((Generation)state!).Faulted.TrySetResult(t.Exception!.GetBaseException()),
             this, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+}
+
+/// <summary>
+/// What a circuit logs through. A node that has been replaced abandons its circuits'
+/// outputs without draining them, and a circuit that is in the middle of a step then
+/// reports that as a fault of its own, at Error and with a stack: true of the circuit, and
+/// alarming to read beside a takeover that went well. From the moment a generation is
+/// abandoned for that reason its circuit's warnings and errors are written at Debug.
+/// A generation abandoned because it would not drain keeps its voice.
+/// </summary>
+internal sealed class GenerationLogs(ILoggerFactory inner) : ILoggerFactory
+{
+    private volatile bool _noLongerLeading;
+
+    public void NoLongerLeading() => _noLongerLeading = true;
+
+    public ILogger CreateLogger(string categoryName) => new Logger(inner.CreateLogger(categoryName), this);
+
+    public void AddProvider(ILoggerProvider provider) => inner.AddProvider(provider);
+
+    public void Dispose()
+    {
+        // The factory is the host's.
+    }
+
+    private sealed class Logger(ILogger logger, GenerationLogs owner) : ILogger
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => logger.BeginScope(state);
+
+        public bool IsEnabled(LogLevel logLevel) => logger.IsEnabled(owner._noLongerLeading && logLevel >= LogLevel.Warning ? LogLevel.Debug : logLevel);
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (owner._noLongerLeading && logLevel >= LogLevel.Warning)
+                logLevel = LogLevel.Debug;
+            if (logger.IsEnabled(logLevel))
+                logger.Log(logLevel, eventId, state, exception, formatter);
+        }
+    }
 }
 
 internal sealed class PipelineRuntime(PipelineSpec spec, ServiceOptions options)
@@ -49,9 +92,10 @@ internal sealed class PipelineRuntime(PipelineSpec spec, ServiceOptions options)
     public PluginLease? Lease;
     public volatile PipelineShape? Shape;
 
-    /// <summary>A generation of this pipeline is being started here: its circuit runs
-    /// before <see cref="Current"/> names it.</summary>
-    public volatile bool Starting;
+    /// <summary>The generation of this pipeline that is being started here: its circuit
+    /// runs before <see cref="Current"/> names it. Its <see cref="Generation.Stop"/> is what
+    /// a node that stops leading cancels to end the start.</summary>
+    public volatile Generation? Starting;
     public volatile PipelineGraph? Graph;
     public Ring<PipelineTransition> History { get; } = new(32);
     public Queue<PipelineFault> Faults { get; } = new();
@@ -74,6 +118,29 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
 {
     private readonly ConcurrentDictionary<string, PipelineRuntime> _pipelines = new(StringComparer.Ordinal);
     private readonly ILogger _logger = context.LoggerFactory.CreateLogger("Incremental.Service.Pipelines");
+
+    /// <summary>What a secret property of a slot's config is shown as, and what a spec may
+    /// send back to mean "the value that is stored".</summary>
+    internal const string RedactedMark = "***";
+
+    /// <summary>True from this node's takeover until it stops or abandons its pipelines.
+    /// Read under a pipeline's queue, it is what keeps an action that was waiting for that
+    /// queue from starting a generation on a node that has stopped running them.</summary>
+    private volatile bool _accepting;
+
+    private bool Leads => _accepting && context.IsLeader;
+
+    private void RequireLeading()
+    {
+        context.RequireLeader();
+        if (!_accepting)
+            throw new ServiceException("not-leader", $"Node '{context.NodeId}' is not running pipelines: it is taking over or stopping.", 409);
+    }
+
+    /// <summary>Whether the runtime is the one the supervisor holds for its id. A runtime
+    /// leaves the dictionary only under its own queue, so under the queue this is stable.</summary>
+    private bool Attached(PipelineRuntime runtime) =>
+        _pipelines.TryGetValue(runtime.Id, out var held) && ReferenceEquals(held, runtime);
 
     internal IReadOnlyList<PipelineSpec> Specs => _pipelines.Values.Where(p => p.Exists).Select(p => p.Spec).ToList();
 
@@ -150,16 +217,69 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 continue;
             var copy = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
             foreach (var property in config.EnumerateObject())
-                copy[property.Name] = secret.Contains(property.Name) ? JsonSerializer.SerializeToElement("***") : property.Value;
+                copy[property.Name] = secret.Contains(property.Name) ? JsonSerializer.SerializeToElement(RedactedMark) : property.Value;
             (redacted ??= new Dictionary<string, JsonElement>(bindings, StringComparer.Ordinal))[slot] = JsonSerializer.SerializeToElement(copy);
         }
         return redacted ?? bindings;
     }
 
+    /// <summary>The other direction: a spec that was read through <see cref="RedactedSpec"/>
+    /// and sent back carries <c>***</c> where a secret was. Each is replaced by the value
+    /// the stored spec holds for that slot and connector; with none to restore the spec is
+    /// refused, so the mark is never stored as a secret.</summary>
+    private PipelineSpec RestoreSecrets(PipelineSpec spec, PipelineSpec? stored) =>
+        spec with
+        {
+            Inputs = RestoreSecrets(spec.Inputs, stored?.Inputs, "input"),
+            Sinks = RestoreSecrets(spec.Sinks, stored?.Sinks, "sink"),
+        };
+
+    private IReadOnlyDictionary<string, JsonElement> RestoreSecrets(
+        IReadOnlyDictionary<string, JsonElement> bindings, IReadOnlyDictionary<string, JsonElement>? stored, string what)
+    {
+        Dictionary<string, JsonElement>? restored = null;
+        foreach (var (slot, config) in bindings)
+        {
+            if (config.ValueKind != JsonValueKind.Object)
+                continue;
+            IReadOnlyList<string>? secret = null;
+            try
+            {
+                secret = TryConnector(config)?.Describe(config).SecretProperties;
+            }
+            catch
+            {
+                // The dry run refuses a config its connector refuses.
+            }
+            if (secret is not { Count: > 0 }
+                || !config.EnumerateObject().Any(p => secret.Contains(p.Name) && p.Value.ValueKind == JsonValueKind.String && p.Value.GetString() == RedactedMark))
+                continue;
+
+            JsonElement old = default;
+            var comparable = stored is not null && stored.TryGetValue(slot, out old) && old.ValueKind == JsonValueKind.Object
+                && ConnectorName(old) == ConnectorName(config);
+            var copy = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+            foreach (var property in config.EnumerateObject())
+            {
+                var marked = secret.Contains(property.Name) && property.Value.ValueKind == JsonValueKind.String && property.Value.GetString() == RedactedMark;
+                if (!marked)
+                    copy[property.Name] = property.Value;
+                else if (comparable && old.TryGetProperty(property.Name, out var kept))
+                    copy[property.Name] = kept;
+                else
+                    throw ServiceException.Invalid(
+                        $"The {what} slot '{slot}' gives '{property.Name}' as \"{RedactedMark}\", which is how a stored secret is shown; " +
+                        "no value is stored for that slot and connector to keep, so the spec must give the value.");
+            }
+            (restored ??= new Dictionary<string, JsonElement>(bindings, StringComparer.Ordinal))[slot] = JsonSerializer.SerializeToElement(copy);
+        }
+        return restored ?? bindings;
+    }
+
     /// <summary>Whether this node runs, or is starting, the circuit of that pipeline: whose
     /// measurements this node's metrics count.</summary>
     internal bool RunsHere(string id) =>
-        _pipelines.TryGetValue(id, out var runtime) && runtime.Exists && (runtime.Starting || runtime.Current is not null);
+        _pipelines.TryGetValue(id, out var runtime) && runtime.Exists && (runtime.Starting is not null || runtime.Current is not null);
 
     /// <summary>What the metrics sampler reads once a second: cheap, no copies of offsets.</summary>
     internal void SampleInto(List<PipelineSampleInput> into)
@@ -257,6 +377,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         }
         catch (Exception ex) when (ex is not ServiceException)
         {
+            ex = DefinitionBinding.Cause(ex);
             throw ServiceException.Invalid($"Definition '{spec.Definition}' threw while describing its circuit: {ex.GetType().Name}: {ex.Message}");
         }
         CheckBindings(spec, pipeline);
@@ -321,7 +442,12 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         {
             var was = context.Plugins.Manifest(old.Plugin, old.Version)?.Fingerprint;
             var now = context.Plugins.Manifest(next.Plugin, next.Version)?.Fingerprint;
-            changes.Add($"version: {old.Version} → {next.Version} (data shapes {(was == now ? "identical" : "differ")})");
+            // The fingerprint covers what the plugin's own assembly declares. A shape that
+            // exists only inside a delegate — a tuple, a type of a private dependency — is
+            // not in it, so "identical" is said of the declared shapes and no more.
+            changes.Add($"version: {old.Version} → {next.Version} ({(was == now
+                ? "declared data shapes identical; shapes used only inside delegates are not compared"
+                : "declared data shapes differ")})");
         }
         if (old.Definition != next.Definition)
             changes.Add($"definition: {old.Definition} → {next.Definition}");
@@ -390,17 +516,45 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
 
     // ── actions ────────────────────────────────────────────────────────────────────────
 
-    private async Task<IDisposable> EnterAsync(PipelineRuntime runtime, string operation, CancellationToken cancellationToken)
+    private async Task<Exit> EnterAsync(PipelineRuntime runtime, string operation, CancellationToken cancellationToken)
     {
         await runtime.Queue.WaitAsync(cancellationToken).ConfigureAwait(false);
         runtime.Operation = operation;
         return new Exit(runtime);
     }
 
+    /// <summary>The queue of a pipeline that exists, for an action. Everything is checked
+    /// again once the queue is held: while this call waited the pipeline may have been
+    /// removed and the node may have stopped leading, and an action that carried on then
+    /// would write a removed pipeline back into the catalog or start a circuit nothing
+    /// holds.</summary>
+    private async Task<(PipelineRuntime Runtime, Exit Exit)> EnterExistingAsync(string id, string operation, CancellationToken cancellationToken)
+    {
+        RequireLeading();
+        var runtime = Require(id);
+        var exit = await EnterAsync(runtime, operation, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            RequireLeading();
+            if (!Attached(runtime) || !runtime.Exists)
+                throw ServiceException.NotFound($"Pipeline '{id}'");
+            return (runtime, exit);
+        }
+        catch
+        {
+            exit.Dispose();
+            throw;
+        }
+    }
+
     private sealed class Exit(PipelineRuntime runtime) : IDisposable
     {
+        private int _disposed;
+
         public void Dispose()
         {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
             runtime.Operation = null;
             runtime.Queue.Release();
         }
@@ -411,6 +565,12 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         if (expected is { } generation && generation != runtime.Spec.Generation)
             throw new ServiceException(
                 "precondition-failed", $"Pipeline '{runtime.Id}' is at generation {runtime.Spec.Generation}, not {generation}.", 412);
+    }
+
+    private static void RefuseWhileRemoving(PipelineRuntime runtime)
+    {
+        if (runtime.Spec.Pending == "remove")
+            throw ServiceException.Conflict($"Pipeline '{runtime.Id}' is being removed; remove it again, or restart it, to finish that.");
     }
 
     private async Task CommitAsync(
@@ -433,20 +593,37 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
 
     public async Task<DeployResult> DeployAsync(PipelineSpec spec, DeployOptions options, CancellationToken cancellationToken)
     {
-        context.RequireLeader();
+        RequireLeading();
         ServiceNames.Validate(spec.Id, "pipeline id");
         if (spec.Desired == DesiredState.Removed)
             throw ServiceException.Invalid("A spec cannot be deployed as Removed; remove the pipeline instead.");
-        var runtime = _pipelines.GetOrAdd(spec.Id, _ => new PipelineRuntime(spec, context.Options));
+
+        // A placeholder holds the id until the first deploy commits. Another call can hold
+        // the same placeholder and drop it (a dry run, a refused deploy) while this one
+        // waits for its queue, so the runtime is taken again until it is the one held.
+        PipelineRuntime runtime;
+        Exit exit;
+        while (true)
+        {
+            var id = spec.Id;
+            runtime = _pipelines.GetOrAdd(id, _ => new PipelineRuntime(spec, context.Options));
+            exit = await EnterAsync(runtime, "deploy", cancellationToken).ConfigureAwait(false);
+            if (Attached(runtime))
+                break;
+            exit.Dispose();
+        }
+
         PluginLease? lease = null;
         try
         {
-            using var exit = await EnterAsync(runtime, "deploy", cancellationToken).ConfigureAwait(false);
+            RequireLeading();
             var existing = runtime.Exists ? runtime.Spec : null;
             RequireGeneration(runtime, existing is null && options.ExpectedGeneration is 0 ? null : options.ExpectedGeneration);
             if (existing?.Pending is not null)
-                throw ServiceException.Conflict($"Pipeline '{spec.Id}' has an unfinished {existing.Pending}.");
+                throw ServiceException.Conflict(
+                    $"Pipeline '{spec.Id}' has an unfinished {existing.Pending}; it is retried by itself, and restarting the pipeline retries it now.");
 
+            spec = RestoreSecrets(spec, existing);
             (spec, lease) = await ResolveAsync(spec, cancellationToken).ConfigureAwait(false);
             var changes = existing is null ? [] : StateChanges(existing, spec);
             if (changes.Count > 0 && options.State == StateChoice.Unspecified)
@@ -455,13 +632,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                     $"This change to pipeline '{spec.Id}' can change what its state means; say whether to keep the state or reset it.", 409, changes);
 
             var (shape, graph) = DryRun(spec, lease);
-            foreach (var table in shape.TablesWritten)
-            {
-                if (_pipelines.Values.FirstOrDefault(p => p.Exists && p.Id != spec.Id && p.Spec.Writes.Contains(table)) is { } other)
-                    throw ServiceException.Conflict($"Table '{table}' is already written by pipeline '{other.Id}'; a table has one writer.");
-                if (context.Tables.Find(table)?.Spec.Loader is { } loader)
-                    throw ServiceException.Conflict($"Table '{table}' has a {loader.Kind} loader; a pipeline cannot also write it.");
-            }
+            RequireReferences(spec, shape);
 
             var reset = existing is not null && options.State == StateChoice.Reset;
             var steps = new List<string>();
@@ -480,7 +651,9 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             if (options.DryRun)
                 return new DeployResult(spec with { Generation = existing?.Generation ?? 0 }, shape, plan);
 
-            // Intent first: from here a successor knows everything.
+            // Intent first: from here a successor knows everything. The tables and the
+            // plugin version the spec names are checked again under the lock their removal
+            // takes, so the entry is never written beside the removal of what it names.
             spec = spec with
             {
                 Generation = (existing?.Generation ?? 0) + 1,
@@ -488,65 +661,87 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 Writes = shape.TablesWritten,
                 Pending = reset ? "reset" : null,
             };
-            await CommitAsync(runtime, spec, plan.Action, options.Caller, steps, cancellationToken).ConfigureAwait(false);
+            using (await context.LockReferencesAsync(cancellationToken).ConfigureAwait(false))
+            {
+                RequireReferences(spec, shape);
+                await CommitAsync(runtime, spec, plan.Action, options.Caller, steps, cancellationToken).ConfigureAwait(false);
+            }
+
+            // The intent is recorded: what follows is carried through whatever becomes of
+            // the caller, so nothing below takes its token.
             runtime.Shape = shape;
             runtime.Graph = graph;
-
             if (runtime.Current is not null || existing is not null)
                 await StopCurrentAsync(runtime, context.Options.StopTimeout).ConfigureAwait(false);
             if (!runtime.Wedged)
             {
                 if (changes.Count > 0)
                     ReleaseBinding(runtime);
-                if (reset)
-                    await FinishResetAsync(runtime, cancellationToken).ConfigureAwait(false);
                 if (runtime.Lease is null)
                 {
                     Bind(runtime, lease);
                     lease = null;
                 }
                 ClearFaults(runtime);
-                if (runtime.Spec.Desired == DesiredState.Running)
-                    await StartCoreAsync(runtime, cancellationToken).ConfigureAwait(false);
-                else
-                    Set(runtime, PipelineState.Stopped);
+                await ReconcileAsync(runtime).ConfigureAwait(false);
             }
             return new DeployResult(runtime.Spec, shape, plan);
         }
         finally
         {
             lease?.Dispose();
+
+            // Still under the queue: a placeholder is dropped where no other call can be
+            // half-way through using it.
             if (!runtime.Exists)
-                _pipelines.TryRemove(new KeyValuePair<string, PipelineRuntime>(spec.Id, runtime));
+                _pipelines.TryRemove(new KeyValuePair<string, PipelineRuntime>(runtime.Id, runtime));
+            exit.Dispose();
         }
+    }
+
+    /// <summary>What a spec names outside itself must be there: its tables declared, one
+    /// writer per table, its plugin version stored.</summary>
+    private void RequireReferences(PipelineSpec spec, PipelineShape shape)
+    {
+        foreach (var table in shape.TablesRead.Concat(shape.TablesWritten))
+            if (context.Tables.Find(table) is null)
+                throw ServiceException.Conflict($"Table '{table}', which pipeline '{spec.Id}' names, is not declared (it was removed while the spec was being checked).");
+        foreach (var table in shape.TablesWritten)
+        {
+            if (_pipelines.Values.FirstOrDefault(p => p.Exists && p.Id != spec.Id && p.Spec.Writes.Contains(table)) is { } other)
+                throw ServiceException.Conflict($"Table '{table}' is already written by pipeline '{other.Id}'; a table has one writer.");
+            if (context.Tables.Find(table)?.Spec.Loader is { } loader)
+                throw ServiceException.Conflict($"Table '{table}' has a {loader.Kind} loader; a pipeline cannot also write it.");
+        }
+        if (context.Plugins.Manifest(spec.Plugin, spec.Version) is null)
+            throw ServiceException.Conflict($"Plugin '{spec.Plugin}' version {spec.Version} is no longer stored.");
     }
 
     public async Task<ActionPlan> StartAsync(string id, ActionOptions options, CancellationToken cancellationToken)
     {
-        context.RequireLeader();
-        var runtime = Require(id);
-        using var exit = await EnterAsync(runtime, "start", cancellationToken).ConfigureAwait(false);
+        var (runtime, exit) = await EnterExistingAsync(id, "start", cancellationToken).ConfigureAwait(false);
+        using var _ = exit;
         RequireGeneration(runtime, options.ExpectedGeneration);
         var plan = new ActionPlan("pipeline.start", id, options.DryRun,
             ["desired state: Running", "build a generation on the committed state; sources resume from the committed offsets"]);
         if (options.DryRun)
             return plan;
+        RefuseWhileRemoving(runtime);
         if (runtime.Spec.Desired != DesiredState.Running)
             await CommitAsync(runtime, runtime.Spec with { Desired = DesiredState.Running, Generation = runtime.Spec.Generation + 1 },
                 plan.Action, options.Caller, plan.Steps, cancellationToken).ConfigureAwait(false);
         if (runtime.Current is null)
         {
             ClearFaults(runtime);
-            await StartCoreAsync(runtime, cancellationToken).ConfigureAwait(false);
+            await ReconcileAsync(runtime).ConfigureAwait(false);
         }
         return plan;
     }
 
     public async Task<ActionPlan> StopAsync(string id, ActionOptions options, CancellationToken cancellationToken)
     {
-        context.RequireLeader();
-        var runtime = Require(id);
-        using var exit = await EnterAsync(runtime, "stop", cancellationToken).ConfigureAwait(false);
+        var (runtime, exit) = await EnterExistingAsync(id, "stop", cancellationToken).ConfigureAwait(false);
+        using var _ = exit;
         RequireGeneration(runtime, options.ExpectedGeneration);
         var steps = new List<string> { "desired state: Stopped", "stop sources, drain the circuit, commit, stop deliveries" };
         foreach (var table in runtime.Spec.Reads)
@@ -557,7 +752,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 steps.Add(reader is null
                     ? $"reads '{table}': nothing committed yet, so it holds no history"
                     : $"reads '{table}': its checkpoint holds the table's history; it must restart within {reader.VersionsUntilCutLoose} versions" +
-                      (reader.TimeUntilCutLoose is { } time ? $" (about {time:g} at the current rate)" : "") + " or it will need a reset");
+                      (reader.TimeUntilCutLoose is { } time ? $" (about {Durations.Text(time)} at the current rate)" : "") + " or it will need a reset");
             }
             catch (ServiceException)
             {
@@ -566,23 +761,27 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         var plan = new ActionPlan("pipeline.stop", id, options.DryRun, steps);
         if (options.DryRun)
             return plan;
+        RefuseWhileRemoving(runtime);
         if (runtime.Spec.Desired != DesiredState.Stopped)
             await CommitAsync(runtime, runtime.Spec with { Desired = DesiredState.Stopped, Generation = runtime.Spec.Generation + 1 },
                 plan.Action, options.Caller, steps, cancellationToken).ConfigureAwait(false);
         await StopCurrentAsync(runtime, context.Options.StopTimeout).ConfigureAwait(false);
         if (!runtime.Wedged)
-            Set(runtime, PipelineState.Stopped);
+            await ReconcileAsync(runtime).ConfigureAwait(false);
         return plan;
     }
 
     public async Task<ActionPlan> RestartAsync(string id, ActionOptions options, CancellationToken cancellationToken)
     {
-        context.RequireLeader();
-        var runtime = Require(id);
-        using var exit = await EnterAsync(runtime, "restart", cancellationToken).ConfigureAwait(false);
+        var (runtime, exit) = await EnterExistingAsync(id, "restart", cancellationToken).ConfigureAwait(false);
+        using var _ = exit;
         RequireGeneration(runtime, options.ExpectedGeneration);
-        var plan = new ActionPlan("pipeline.restart", id, options.DryRun,
-            ["stop the generation (drain, commit)", "clear Failed and the restart count", "build a new generation on the same state"]);
+        var steps = new List<string> { "stop the generation (drain, commit)", "clear Failed and the restart count" };
+        if (runtime.Spec.Pending is { } pending)
+            steps.Add($"finish the pending {pending}");
+        if (runtime.Spec.Pending != "remove")
+            steps.Add(runtime.Spec.Desired == DesiredState.Running ? "build a new generation on the same state" : "leave stopped");
+        var plan = new ActionPlan("pipeline.restart", id, options.DryRun, steps);
         if (options.DryRun)
             return plan;
         using (var write = await context.Catalog.BeginAsync(cancellationToken).ConfigureAwait(false))
@@ -591,22 +790,18 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             await write.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         await StopCurrentAsync(runtime, context.Options.StopTimeout).ConfigureAwait(false);
-        if (!runtime.Wedged)
+        if (!runtime.Wedged || runtime.Spec.Pending == "remove")
         {
             ClearFaults(runtime);
-            if (runtime.Spec.Desired == DesiredState.Running)
-                await StartCoreAsync(runtime, cancellationToken).ConfigureAwait(false);
-            else
-                Set(runtime, PipelineState.Stopped);
+            await ReconcileAsync(runtime).ConfigureAwait(false);
         }
         return plan;
     }
 
     public async Task<ActionPlan> ResetAsync(string id, ActionOptions options, CancellationToken cancellationToken)
     {
-        context.RequireLeader();
-        var runtime = Require(id);
-        using var exit = await EnterAsync(runtime, "reset", cancellationToken).ConfigureAwait(false);
+        var (runtime, exit) = await EnterExistingAsync(id, "reset", cancellationToken).ConfigureAwait(false);
+        using var _ = exit;
         RequireGeneration(runtime, options.ExpectedGeneration);
         var steps = new List<string>
         {
@@ -623,26 +818,26 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         var plan = new ActionPlan("pipeline.reset", id, options.DryRun, steps);
         if (options.DryRun)
             return plan;
+        RefuseWhileRemoving(runtime);
 
-        await CommitAsync(runtime, runtime.Spec with { Pending = "reset", Generation = runtime.Spec.Generation + 1 },
-            plan.Action, options.Caller, steps, cancellationToken).ConfigureAwait(false);
+        // A reset that is already pending is finished, not recorded a second time.
+        if (runtime.Spec.Pending != "reset")
+            await CommitAsync(runtime, runtime.Spec with { Pending = "reset", Generation = runtime.Spec.Generation + 1 },
+                plan.Action, options.Caller, steps, cancellationToken).ConfigureAwait(false);
+
+        // The intent is recorded; the rest does not depend on the caller staying.
         await StopCurrentAsync(runtime, context.Options.StopTimeout).ConfigureAwait(false);
         if (runtime.Wedged)
             return plan;
-        await FinishResetAsync(runtime, cancellationToken).ConfigureAwait(false);
         ClearFaults(runtime);
-        if (runtime.Spec.Desired == DesiredState.Running)
-            await StartCoreAsync(runtime, cancellationToken).ConfigureAwait(false);
-        else
-            Set(runtime, PipelineState.Stopped);
+        await ReconcileAsync(runtime).ConfigureAwait(false);
         return plan;
     }
 
     public async Task<ActionPlan> RemoveAsync(string id, ActionOptions options, CancellationToken cancellationToken)
     {
-        context.RequireLeader();
-        var runtime = Require(id);
-        using var exit = await EnterAsync(runtime, "remove", cancellationToken).ConfigureAwait(false);
+        var (runtime, exit) = await EnterExistingAsync(id, "remove", cancellationToken).ConfigureAwait(false);
+        using var _ = exit;
         RequireGeneration(runtime, options.ExpectedGeneration);
         var steps = new List<string> { "stop the generation", "tombstone its state (one empty commit record stays in the changelog)", "delete the catalog entry" };
         foreach (var table in runtime.Spec.Reads)
@@ -655,10 +850,11 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         if (options.DryRun)
             return plan;
 
-        await CommitAsync(runtime, runtime.Spec with { Desired = DesiredState.Removed, Pending = "remove", Generation = runtime.Spec.Generation + 1 },
-            plan.Action, options.Caller, steps, cancellationToken).ConfigureAwait(false);
-        await StopCurrentAsync(runtime, context.Options.StopTimeout).ConfigureAwait(false);
-        await FinishRemoveAsync(runtime, cancellationToken).ConfigureAwait(false);
+        if (runtime.Spec.Pending != "remove")
+            await CommitAsync(runtime, runtime.Spec with { Desired = DesiredState.Removed, Pending = "remove", Generation = runtime.Spec.Generation + 1 },
+                plan.Action, options.Caller, steps, cancellationToken).ConfigureAwait(false);
+        ClearFaults(runtime);
+        await ReconcileAsync(runtime).ConfigureAwait(false);
         return plan;
     }
 
@@ -674,16 +870,75 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         }
     }
 
-    /// <summary>The second half of a reset, also run by a leader that finds one pending.</summary>
-    private async Task FinishResetAsync(PipelineRuntime runtime, CancellationToken cancellationToken)
+    /// <summary>
+    /// Brings a pipeline to what its spec says, the pending act first. Every path that can
+    /// start a generation comes through here — an action, a backoff retry, a takeover, a
+    /// reopened table — so a pipeline with a reset or a removal pending is never started
+    /// around it: the act is finished, or the pipeline waits in <c>Backoff</c> and the act
+    /// is tried again. The caller holds the pipeline's queue. Never throws for a failure of
+    /// the pipeline.
+    /// </summary>
+    private async Task ReconcileAsync(PipelineRuntime runtime)
+    {
+        CancelRetry(runtime);
+        if (!Leads)
+        {
+            if (runtime.Current is null && !runtime.Wedged)
+                Set(runtime, PipelineState.Stopped, "this node no longer leads");
+            return;
+        }
+
+        if (runtime.Spec.Pending is { } pending)
+        {
+            try
+            {
+                // A pending act never runs beside a live generation of the state it drops.
+                await StopCurrentAsync(runtime, context.Options.StopTimeout).ConfigureAwait(false);
+                if (pending == "remove")
+                {
+                    await FinishRemoveAsync(runtime).ConfigureAwait(false);
+                    return;
+                }
+                if (runtime.Wedged)
+                {
+                    Set(runtime, PipelineState.Wedged);
+                    return;
+                }
+                await FinishResetAsync(runtime).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // Tenant code and the backend both end here, cancellations of their own
+                // included: the pipeline's failure, tried again, never the node's.
+                HandleFault(runtime, ex, runtime.Generations, $"{pending} not finished");
+                return;
+            }
+        }
+
+        if (runtime.Spec.Desired == DesiredState.Running)
+            await StartCoreAsync(runtime).ConfigureAwait(false);
+        else if (runtime.Wedged)
+            Set(runtime, PipelineState.Wedged);
+        else if (runtime.Current is null)
+            Set(runtime, PipelineState.Stopped);
+    }
+
+    /// <summary>The second half of a reset, also run by a leader that finds one pending.
+    /// Safe to run again after a failure part-way.</summary>
+    private async Task FinishResetAsync(PipelineRuntime runtime)
     {
         var spec = runtime.Spec;
-        await context.Storage.Pipeline(runtime.Id).StartNewIncarnationAsync(cancellationToken).ConfigureAwait(false);
+        await context.Storage.Pipeline(runtime.Id).StartNewIncarnationAsync(CancellationToken.None).ConfigureAwait(false);
         foreach (var (slot, config) in spec.Sinks)
         {
             if (TryConnector(config) is not IResettableSinkConnector resettable)
                 continue;
-            await resettable.ResetAsync(new SinkContext(new SlotStart
+
+            // A connector's call is tenant code: it gets a bound, and its token is
+            // cancelled at that bound.
+            var timeout = context.Options.ConnectorTimeout;
+            var limit = new CancellationTokenSource(timeout);
+            var sink = new SinkContext(new SlotStart
             {
                 Circuit = null!,
                 PipelineId = runtime.Id,
@@ -693,21 +948,28 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 Logger = _logger,
                 Services = context.Services,
                 Leadership = context.Backend.Leadership,
-                Cancellation = cancellationToken,
-            }), cancellationToken).ConfigureAwait(false);
+                Cancellation = limit.Token,
+            });
+            var reset = Task.Run(() => resettable.ResetAsync(sink, limit.Token));
+            if (!await reset.CompletesWithin(timeout).ConfigureAwait(false))
+            {
+                reset.Forget();
+                throw new TimeoutException($"The connector of sink '{slot}' did not finish its reset within {Durations.Text(timeout)}.");
+            }
+            await reset.ConfigureAwait(false);
         }
-        await CommitAsync(runtime, spec with { Pending = null, Generation = spec.Generation + 1 }, "pipeline.reset.finished", "service", null, cancellationToken)
+        await CommitAsync(runtime, spec with { Pending = null, Generation = spec.Generation + 1 }, "pipeline.reset.finished", "service", null, CancellationToken.None)
             .ConfigureAwait(false);
     }
 
-    private async Task FinishRemoveAsync(PipelineRuntime runtime, CancellationToken cancellationToken)
+    private async Task FinishRemoveAsync(PipelineRuntime runtime)
     {
         if (!runtime.Wedged)
         {
-            await context.Storage.Pipeline(runtime.Id).StartNewIncarnationAsync(cancellationToken).ConfigureAwait(false);
+            await context.Storage.Pipeline(runtime.Id).StartNewIncarnationAsync(CancellationToken.None).ConfigureAwait(false);
             ReleaseBinding(runtime);
         }
-        await CommitAsync(runtime, runtime.Spec, "pipeline.remove.finished", "service", null, cancellationToken, delete: true).ConfigureAwait(false);
+        await CommitAsync(runtime, runtime.Spec, "pipeline.remove.finished", "service", null, CancellationToken.None, delete: true).ConfigureAwait(false);
         runtime.Exists = false;
         _pipelines.TryRemove(new KeyValuePair<string, PipelineRuntime>(runtime.Id, runtime));
         context.Events.Publish("pipeline", runtime.Id, "removed");
@@ -744,10 +1006,10 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
 
     // ── a generation ───────────────────────────────────────────────────────────────────
 
-    /// <summary>Builds and starts a generation. Caller holds the pipeline's queue. Never
-    /// throws for a failure of the pipeline: that ends in Blocked, Backoff, Failed or
-    /// NeedsReset.</summary>
-    private async Task StartCoreAsync(PipelineRuntime runtime, CancellationToken cancellationToken)
+    /// <summary>Builds and starts a generation. Called by <see cref="ReconcileAsync"/>
+    /// only, with the pipeline's queue held. Never throws for a failure of the pipeline:
+    /// that ends in Blocked, Backoff, Failed or NeedsReset.</summary>
+    private async Task StartCoreAsync(PipelineRuntime runtime)
     {
         CancelRetry(runtime);
         if (runtime.Wedged)
@@ -767,20 +1029,35 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             if (runtime.Lease is not { } bound || bound.Name != spec.Plugin || bound.Version != spec.Version)
             {
                 ReleaseBinding(runtime);
-                Bind(runtime, await context.Plugins.AcquireAsync(spec.Plugin, spec.Version, cancellationToken).ConfigureAwait(false));
+                Bind(runtime, await context.Plugins.AcquireAsync(spec.Plugin, spec.Version, CancellationToken.None).ConfigureAwait(false));
             }
             generation = Build(runtime, number);
-            runtime.Starting = true;
+            runtime.Starting = generation;
             generation.Circuit.Start();
             await StartEdgesAsync(runtime, generation).ConfigureAwait(false);
+
+            // The start can take as long as a connector does, and the node may have been
+            // fenced or stopped meanwhile. Whoever ended it could not see this generation
+            // (Current did not name it yet), so it is ended here rather than published.
+            if (!Leads)
+                throw new NoLongerLeadingException();
             runtime.Current = generation;
-            runtime.Starting = false;
+            runtime.Starting = null;
             Set(runtime, PipelineState.Running);
             Watch(runtime, generation);
         }
+        catch (NoLongerLeadingException)
+        {
+            runtime.Starting = null;
+            generation!.Logs?.NoLongerLeading();
+            Abandon(generation!);
+            await TeardownAsync(runtime, generation!, TimeSpan.Zero).ConfigureAwait(false);
+            if (!runtime.Wedged)
+                Set(runtime, PipelineState.Stopped, "this node no longer leads");
+        }
         catch (TableNotOpenException ex)
         {
-            runtime.Starting = false;
+            runtime.Starting = null;
             if (generation is not null)
                 await TeardownAsync(runtime, generation, context.Options.StopTimeout).ConfigureAwait(false);
             if (runtime.Wedged)
@@ -791,11 +1068,28 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         }
         catch (Exception ex)
         {
-            runtime.Starting = false;
+            runtime.Starting = null;
             if (generation is not null)
                 await TeardownAsync(runtime, generation, context.Options.StopTimeout).ConfigureAwait(false);
             if (!runtime.Wedged)
-                HandleFault(runtime, ex, number);
+                HandleFault(runtime, DefinitionBinding.Cause(ex), number);
+        }
+    }
+
+    private sealed class NoLongerLeadingException : Exception;
+
+    private static void Abandon(Generation generation)
+    {
+        foreach (var sink in generation.Builder.Sinks)
+        {
+            try
+            {
+                sink.Abandon(generation.Circuit);
+            }
+            catch
+            {
+                // Abandoning is best effort.
+            }
         }
     }
 
@@ -806,6 +1100,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         var lease = runtime.Lease!;
         var definition = lease.Definition(spec.Definition);
         var settings = definition.BindSettings(spec.Settings, lease.Json);
+        var logs = new GenerationLogs(context.LoggerFactory);
         var builder = new CircuitBuilder(new CircuitOptions
         {
             Name = spec.Id,
@@ -815,14 +1110,14 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             CheckpointMaxDelay = spec.Circuit.CheckpointMaxDelay,
             ErrorPolicy = spec.Circuit.ErrorPolicy,
             MaxStepItemsPerInput = spec.Circuit.MaxStepItemsPerInput ?? 8192,
-            LoggerFactory = context.LoggerFactory,
+            LoggerFactory = logs,
         });
         var pipeline = new PipelineBuilder(spec, builder, context.Tables, _logger, context.Services);
         definition.Build(pipeline, settings);
         CheckBindings(spec, pipeline);
         runtime.Shape = pipeline.Shape;
         runtime.Graph = pipeline.Graph;
-        return new Generation { Number = number, Circuit = builder.Build(), Builder = pipeline };
+        return new Generation { Number = number, Circuit = builder.Build(), Builder = pipeline, Logs = logs };
     }
 
     /// <summary>Deliveries, then the dead-letter reader, then sources — after
@@ -869,10 +1164,41 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         if (deadLetters is not null)
             generation.DeadLetters = Task.Run(() => ReadDeadLettersAsync(runtime, deadLetters, runtime.Lease!.Json));
 
+        // A connector's StartAsync is tenant code that may connect somewhere: it runs off
+        // this thread and within a bound. A start that passes the bound fails the
+        // generation — this pipeline's fault, retried — and holds up nothing else: not the
+        // pipeline's queue, and not a takeover, which waits for every pipeline's start.
+        var timeout = context.Options.ConnectorTimeout;
         foreach (var input in generation.Builder.Inputs)
         {
             var config = spec.Inputs[input.Name];
-            var source = await input.Start(context.Connector(config), For(input.Name, config)).ConfigureAwait(false);
+            var connector = context.Connector(config);
+            var slot = For(input.Name, config);
+            var starting = Task.Run(() => input.Start(connector, slot));
+            if (!await starting.CompletesWithin(timeout).ConfigureAwait(false))
+            {
+                generation.Stop.Cancel();
+                starting.ContinueWith(
+                    static async late =>
+                    {
+                        if (late.IsCompletedSuccessfully)
+                        {
+                            try
+                            {
+                                await late.Result.DisposeAsync().ConfigureAwait(false);
+                            }
+                            catch
+                            {
+                                // A source that started after it was given up on.
+                            }
+                        }
+                        else
+                            GC.KeepAlive(late.Exception);
+                    },
+                    CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default).Forget();
+                throw new TimeoutException($"The source of input '{input.Name}' did not start within {Durations.Text(timeout)}.");
+            }
+            var source = await starting.ConfigureAwait(false);
             generation.Sources.Add((input.Name, source));
             generation.Observe(source.Completion);
         }
@@ -955,7 +1281,10 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             }
         }).Forget();
 
-    private void HandleFault(PipelineRuntime runtime, Exception ex, long generation)
+    /// <summary>What becomes of a pipeline after a failure: Backoff and a retry, or one of
+    /// the states nothing retries. <paramref name="during"/> names a pending act that could
+    /// not be finished; the retry then tries the act again. Caller holds the queue.</summary>
+    private void HandleFault(PipelineRuntime runtime, Exception ex, long generation, string? during = null)
     {
         lock (runtime.Faults)
         {
@@ -963,20 +1292,29 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             while (runtime.Faults.Count > context.Options.FaultBuffer)
                 runtime.Faults.Dequeue();
         }
-        _logger.LogError(ex, "Pipeline {Pipeline} generation {Generation} faulted", runtime.Id, runtime.Spec.Generation);
 
-        if (IsFence(ex) || context.Storage.IsFenced || !context.IsLeader)
+        if (IsFence(ex) || context.Storage.IsFenced || !Leads)
         {
-            // The node is ending, or no longer leads: a restart could commit nothing.
+            // The node is ending, or no longer leads: a restart could commit nothing. The
+            // failure is what being replaced looks like from inside a circuit, so it is
+            // logged as that and not as a fault of the pipeline's.
+            _logger.LogWarning(
+                "Pipeline {Pipeline} generation {Generation} ended because this node no longer leads ({Error}: {Message})",
+                runtime.Id, runtime.Spec.Generation, ex.GetType().Name, ex.Message);
             Set(runtime, PipelineState.Stopped, "this node no longer leads");
             return;
         }
+        if (during is null)
+            _logger.LogError(ex, "Pipeline {Pipeline} generation {Generation} faulted", runtime.Id, runtime.Spec.Generation);
+        else
+            _logger.LogError(ex, "Pipeline {Pipeline} generation {Generation}: {During}; it will be tried again", runtime.Id, runtime.Spec.Generation, during);
+        var prefix = during is null ? "" : during + ": ";
         if (ex is ServiceException { Code: "too-many-plugin-versions" })
         {
-            Set(runtime, PipelineState.Failed, ex.Message);
+            Set(runtime, PipelineState.Failed, prefix + ex.Message);
             return;
         }
-        if (ex.Message.Contains("no longer retained", StringComparison.Ordinal))
+        if (during is null && ex.Message.Contains("no longer retained", StringComparison.Ordinal))
         {
             // Cut loose: a table's history no longer reaches back to this pipeline's checkpoint.
             _logger.LogError("Pipeline {Pipeline} was cut loose from a table's history and needs a reset: {Message}", runtime.Id, ex.Message);
@@ -991,14 +1329,17 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             runtime.FaultTimes.Dequeue();
         if (runtime.FaultTimes.Count > policy.MaxRestarts)
         {
-            Set(runtime, PipelineState.Failed, $"{runtime.FaultTimes.Count} faults within {policy.Within}; the last: {ex.GetType().Name}: {ex.Message}");
+            // No colon before the exception's own text: what follows the first colon of a
+            // reason is treated as a message, and hidden where row data is.
+            Set(runtime, PipelineState.Failed,
+                $"{prefix}{runtime.FaultTimes.Count} faults within {Durations.Text(policy.Within)}; the last: {ex.GetType().Name}: {ex.Message}");
             return;
         }
 
         var delay = policy.BackoffAfter(runtime.FaultTimes.Count);
         runtime.BackoffUntil = now + delay;
         runtime.Restarts++;
-        Set(runtime, PipelineState.Backoff, $"{ex.GetType().Name}: {ex.Message}");
+        Set(runtime, PipelineState.Backoff, $"{prefix}{ex.GetType().Name}: {ex.Message}");
         ScheduleRetry(runtime, delay, PipelineState.Backoff);
     }
 
@@ -1026,10 +1367,12 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             }
             try
             {
-                if (retry.IsCancellationRequested || runtime.State != expected || !runtime.Exists || !context.IsLeader)
+                if (retry.IsCancellationRequested || runtime.State != expected || !runtime.Exists || !Attached(runtime) || !Leads)
                     return;
                 runtime.Operation = "restart";
-                await StartCoreAsync(runtime, CancellationToken.None).ConfigureAwait(false);
+
+                // Not a plain start: a pending reset or removal is what gets retried.
+                await ReconcileAsync(runtime).ConfigureAwait(false);
             }
             finally
             {
@@ -1086,18 +1429,11 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         var dispose = generation.Circuit.DisposeAsync().AsTask();
         if (!await dispose.CompletesWithin(stopTimeout).ConfigureAwait(false))
         {
-            _logger.LogWarning("Pipeline {Pipeline} did not drain within {Timeout}; abandoning its outputs", runtime.Id, stopTimeout);
-            foreach (var sink in generation.Builder.Sinks)
-            {
-                try
-                {
-                    sink.Abandon(generation.Circuit);
-                }
-                catch
-                {
-                    // Abandoning is best effort.
-                }
-            }
+            // No drain was asked for when the bound is zero (a node that no longer leads
+            // abandons): that is not a pipeline that failed to drain.
+            if (stopTimeout > TimeSpan.Zero)
+                _logger.LogWarning("Pipeline {Pipeline} did not drain within {Timeout}; abandoning its outputs", runtime.Id, stopTimeout);
+            Abandon(generation);
             if (!await dispose.CompletesWithin(abandon).ConfigureAwait(false))
             {
                 dispose.Forget();
@@ -1165,8 +1501,13 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         var specs = catalog.Where(e => e.Key.StartsWith("pipeline/", StringComparison.Ordinal))
             .Select(e => ServiceJson.Read<PipelineSpec>(e.Value)).ToDictionary(s => s.Id, StringComparer.Ordinal);
         foreach (var (id, runtime) in _pipelines)
-            if (!specs.ContainsKey(id) && runtime.Current is null)
-                _pipelines.TryRemove(new KeyValuePair<string, PipelineRuntime>(id, runtime));
+        {
+            // A placeholder belongs to the deploy that made it, which drops it itself.
+            if (specs.ContainsKey(id) || !runtime.Exists || runtime.Current is not null || runtime.Starting is not null)
+                continue;
+            runtime.Exists = false;
+            _pipelines.TryRemove(new KeyValuePair<string, PipelineRuntime>(id, runtime));
+        }
         foreach (var spec in specs.Values)
         {
             var runtime = _pipelines.GetOrAdd(spec.Id, _ => new PipelineRuntime(spec, context.Options));
@@ -1177,28 +1518,22 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
 
     /// <summary>The supervisor's part of a takeover: finish every pending reset and
     /// removal, then start every pipeline whose desired state is Running, in parallel,
-    /// each contained.</summary>
+    /// each contained. Only the takeover's own cancellation leaves this method: whatever
+    /// a pipeline throws, cancellations of its own included, is that pipeline's fault.</summary>
     internal async Task StartLeadingAsync(IReadOnlyDictionary<string, string> catalog, CancellationToken cancellationToken)
     {
         SyncFromCatalog(catalog);
+        _accepting = true;
         await Task.WhenAll(_pipelines.Values.Select(async runtime =>
         {
+            using var exit = await EnterAsync(runtime, "takeover", cancellationToken).ConfigureAwait(false);
+            if (!Attached(runtime) || !runtime.Exists)
+                return;
             try
             {
-                using var exit = await EnterAsync(runtime, "takeover", cancellationToken).ConfigureAwait(false);
-                if (runtime.Spec.Pending == "remove")
-                {
-                    await FinishRemoveAsync(runtime, cancellationToken).ConfigureAwait(false);
-                    return;
-                }
-                if (runtime.Spec.Pending == "reset")
-                    await FinishResetAsync(runtime, cancellationToken).ConfigureAwait(false);
-                if (runtime.Spec.Desired == DesiredState.Running)
-                    await StartCoreAsync(runtime, cancellationToken).ConfigureAwait(false);
-                else
-                    Set(runtime, PipelineState.Stopped);
+                await ReconcileAsync(runtime).ConfigureAwait(false);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (Exception ex)
             {
                 _logger.LogError(ex, "Pipeline {Pipeline} could not be taken over", runtime.Id);
                 HandleFault(runtime, ex, runtime.Generations);
@@ -1206,12 +1541,17 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         })).ConfigureAwait(false);
     }
 
-    /// <summary>Stops every pipeline in stop order and in parallel, within the budget.</summary>
+    /// <summary>Stops every pipeline in stop order and in parallel, within the budget.
+    /// From its first line no action starts a generation here: one that was waiting for a
+    /// pipeline's queue finds the node no longer running pipelines when it gets it.</summary>
     internal Task StopAllAsync(TimeSpan budget)
     {
+        _accepting = false;
         var stopTimeout = budget < context.Options.StopTimeout ? budget : context.Options.StopTimeout;
         return Task.WhenAll(_pipelines.Values.Select(async runtime =>
         {
+            // A start in flight is ended rather than waited for.
+            CancelStart(runtime);
             if (!await runtime.Queue.WaitAsync(budget).ConfigureAwait(false))
             {
                 _logger.LogWarning("Pipeline {Pipeline} is busy with '{Operation}' and was not stopped", runtime.Id, runtime.Operation);
@@ -1232,43 +1572,81 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         }));
     }
 
-    /// <summary>A fenced node's circuits can commit nothing: abandon them without draining.</summary>
-    internal Task AbandonAllAsync() => Task.WhenAll(_pipelines.Values.Select(async runtime =>
+    private static void CancelStart(PipelineRuntime runtime)
     {
-        CancelRetry(runtime);
-        if (runtime.Current is not { } generation)
-            return;
-        foreach (var sink in generation.Builder.Sinks)
+        try
         {
+            runtime.Starting?.Stop.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+    }
+
+    /// <summary>
+    /// A fenced node's circuits can commit nothing: abandon them without draining. What
+    /// needs no queue comes first — outputs abandoned, a start in flight cancelled — so
+    /// that whatever holds a pipeline's queue ends at once; then each generation is torn
+    /// down under its queue, like every other teardown. An operation that still holds the
+    /// queue after <see cref="ServiceOptions.StopTimeout"/> is left to end the generation
+    /// itself, which it does: it finds the node no longer leading.
+    /// </summary>
+    internal Task AbandonAllAsync()
+    {
+        _accepting = false;
+        return Task.WhenAll(_pipelines.Values.Select(async runtime =>
+        {
+            if (runtime.Current is { } running)
+            {
+                running.Logs?.NoLongerLeading();
+                Abandon(running);
+            }
+            runtime.Starting?.Logs?.NoLongerLeading();
+            CancelStart(runtime);
+            if (!await runtime.Queue.WaitAsync(context.Options.StopTimeout).ConfigureAwait(false))
+            {
+                _logger.LogWarning("Pipeline {Pipeline} is busy with '{Operation}'; that operation ends its generation", runtime.Id, runtime.Operation);
+                return;
+            }
             try
             {
-                sink.Abandon(generation.Circuit);
+                runtime.Operation = "abandon";
+                CancelRetry(runtime);
+                if (runtime.Current is { } generation)
+                {
+                    Abandon(generation);
+                    await TeardownAsync(runtime, generation, TimeSpan.Zero).ConfigureAwait(false);
+                }
+                if (!runtime.Wedged && runtime.State is PipelineState.Running or PipelineState.Starting or PipelineState.Stopping
+                        or PipelineState.Backoff or PipelineState.Blocked)
+                    Set(runtime, PipelineState.Stopped, "this node no longer leads");
             }
-            catch
+            finally
             {
+                runtime.Operation = null;
+                runtime.Queue.Release();
             }
-        }
-        await TeardownAsync(runtime, generation, TimeSpan.Zero).ConfigureAwait(false);
-        if (!runtime.Wedged)
-            Set(runtime, PipelineState.Stopped, "this node no longer leads");
-    }));
+        }));
+    }
 
     /// <summary>A table was opened from its log again: the generations built on the old
     /// instance hold it, so they are rebuilt.</summary>
     internal void OnTableReopened(string table)
     {
-        if (!context.IsLeader)
+        if (!Leads)
             return;
         foreach (var runtime in _pipelines.Values.Where(p => p.Spec.Reads.Contains(table) || p.Spec.Writes.Contains(table)))
         {
             Task.Run(async () =>
             {
                 using var exit = await EnterAsync(runtime, "table reopened", CancellationToken.None).ConfigureAwait(false);
+                if (!Attached(runtime) || !runtime.Exists || !Leads)
+                    return;
                 if (runtime.Current is null && runtime.State != PipelineState.Blocked)
                     return;
                 await StopCurrentAsync(runtime, context.Options.StopTimeout).ConfigureAwait(false);
-                if (!runtime.Wedged && runtime.Spec.Desired == DesiredState.Running)
-                    await StartCoreAsync(runtime, CancellationToken.None).ConfigureAwait(false);
+                if (!runtime.Wedged)
+                    await ReconcileAsync(runtime).ConfigureAwait(false);
             }).Forget();
         }
     }

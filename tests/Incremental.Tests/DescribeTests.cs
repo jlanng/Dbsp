@@ -94,6 +94,18 @@ public class DescribeTests
         Assert.Equal("Y", after.RowsBy("symbol", "B").Single(r => r.Key == 2).Value.Venue);
         Assert.Empty(after.RowsBy("symbol", "none"));
 
+        // A page of the rows under a key: the keys passed over are not read, and the
+        // total is what the index holds under the key.
+        var first = after.RowsBy("symbol", "B", 0, 1, out var total);
+        var second = after.RowsBy("symbol", "B", 1, 1, out _);
+        Assert.Equal(2, total);
+        Assert.Equal([2, 3], first.Concat(second).Select(r => r.Key).Order());
+        Assert.Empty(after.RowsBy("symbol", "B", 2, 5, out total));
+        Assert.Equal(2, total);
+        Assert.Empty(after.RowsBy("symbol", "none", 0, 5, out total));
+        Assert.Equal(0, total);
+        Assert.Throws<ArgumentOutOfRangeException>(() => after.RowsBy("symbol", "B", -1, 1, out _));
+
         Assert.Throws<ArgumentException>(() => after.RowsBy("venue", "X"));
         Assert.Throws<ArgumentException>(() => after.RowsBy("symbol", 1));
     }
