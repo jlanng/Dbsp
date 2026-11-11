@@ -7,7 +7,7 @@
     <RootNamespace>Incremental.EnrichmentService</RootNamespace>
     <CircuitWorkers>1</CircuitWorkers>   <!-- GC heap count; every pipeline spec this host seeds runs one worker -->
     <!-- The contract and plugin projects live in this directory too; their files are theirs. -->
-    <DefaultItemExcludes>$(DefaultItemExcludes);Contracts/**;Pipelines/**;Pipelines.V2/**</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);Contracts/**;Pipelines/**;Pipelines.V2/**;Pipelines.Tests/**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>

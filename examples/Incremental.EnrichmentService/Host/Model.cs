@@ -8,7 +8,7 @@ namespace Incremental.EnrichmentService;
 /// What the pipelines should have delivered, computed without them: the smoke test tells
 /// the model everything it does to the world — trades published, reference rows changed,
 /// versions deployed, state reset — and compares each sink with what the model expects.
-/// It is the specification of the three definitions, written as plain loops.
+/// It is the specification of the five definitions, written as plain loops.
 /// </summary>
 public sealed class Model(WorldShape shape)
 {
@@ -18,7 +18,17 @@ public sealed class Model(WorldShape shape)
     public Dictionary<int, Desk> Desks { get; } = [];
     public Dictionary<string, EnrichmentModel> Enrichments { get; } = new(StringComparer.Ordinal);
     public ExposureModel? Exposure { get; set; }
+    public QualityModel? Quality { get; set; }
+    public Dictionary<string, AlertsModel> Alerts { get; } = new(StringComparer.Ordinal);
     public long Trades { get; private set; }
+
+    /// <summary>How many intervals of quotes have been published.</summary>
+    public long QuoteIntervals { get; set; }
+
+    public WorldShape Shape => shape;
+
+    /// <summary>The published trades no desk could have booked: no quantity.</summary>
+    public IEnumerable<Trade> Poison => Replay().Where(t => t.Quantity <= 0);
 
     public TraderDesk TraderDesk(int traderId)
     {
@@ -36,6 +46,8 @@ public sealed class Model(WorldShape shape)
             foreach (var enrichment in Enrichments.Values)
                 enrichment.Arrive(this, trade);
             Exposure?.Arrive(this, trade);
+            foreach (var alerts in Alerts.Values)
+                alerts.Arrive(trade);
         }
         Trades += count;
     }
@@ -213,4 +225,96 @@ public sealed class ExposureModel(TimeSpan window)
         }
         return expected;
     }
+}
+
+/// <summary>
+/// The execution-quality definition: every execution is priced by the quote of its
+/// instrument and interval if there is one, and counted — priced or unpriced — in every
+/// sliding window that covers it. A function of what has been published and nothing else:
+/// which input the pipeline read first, and whether it has been restarted, do not enter.
+/// </summary>
+public sealed class QualityModel(TimeSpan window, TimeSpan hop)
+{
+    public (long Priced, long Unpriced) Counts(Model model)
+    {
+        long priced = 0, unpriced = 0;
+        foreach (var trade in model.Replay())
+            _ = Slippage(model, trade) is null ? unpriced++ : priced++;
+        return (priced, unpriced);
+    }
+
+    private static decimal? Slippage(Model model, Trade trade)
+    {
+        var interval = model.Shape.IntervalOf(trade.ExecutedAt);
+        if (interval >= model.QuoteIntervals || !model.Shape.Quoted(trade.InstrumentId, interval))
+            return null;                                                // the left join's unmatched side
+        var mid = model.Shape.Mid(trade.InstrumentId, interval);
+        return Math.Round((trade.Price - mid) / mid * 10_000m, 2);
+    }
+
+    public Dictionary<string, JsonObject> Expected(Model model)
+    {
+        var totals = new Dictionary<(string AssetClass, long Start), (long Priced, long Unpriced, decimal Bps)>();
+        foreach (var trade in model.Replay())
+        {
+            var assetClass = model.Instruments[trade.InstrumentId].AssetClass;
+            var slippage = Slippage(model, trade);
+            var at = trade.ExecutedAt.UtcTicks;
+            // Windows start at multiples of the hop; those that cover the execution.
+            for (var start = at - at % hop.Ticks; start > at - window.Ticks; start -= hop.Ticks)
+            {
+                var held = totals.GetValueOrDefault((assetClass, start));
+                totals[(assetClass, start)] = slippage is { } bps
+                    ? (held.Priced + 1, held.Unpriced, held.Bps + bps)
+                    : (held.Priced, held.Unpriced + 1, held.Bps);
+            }
+        }
+        var expected = new Dictionary<string, JsonObject>(StringComparer.Ordinal);
+        foreach (var ((assetClass, startTicks), total) in totals)
+        {
+            var start = new DateTimeOffset(startTicks, TimeSpan.Zero);
+            var key = $"{assetClass}@{start.UtcDateTime:yyyy-MM-ddTHH:mm:ss}Z";
+            expected[JsonSerializer.Serialize(key, JsonSerializerOptions.Web)] = new JsonObject
+            {
+                ["assetClass"] = assetClass,
+                ["windowStart"] = start,
+                ["windowEnd"] = start + window,
+                ["priced"] = total.Priced,
+                ["unpriced"] = total.Unpriced,
+                ["slippageBps"] = total.Bps,
+            };
+        }
+        return expected;
+    }
+}
+
+/// <summary>One deployment of the watchlist-alerts definition: an alert for each sizeable
+/// execution whose counterparty was on its list when the execution arrived.</summary>
+public sealed class AlertsModel(Dictionary<string, WatchlistEntry> watchlist, decimal minNotional, string severity)
+{
+    private readonly Dictionary<string, JsonObject> _alerts = new(StringComparer.Ordinal);
+
+    public Dictionary<string, WatchlistEntry> Watchlist => watchlist;
+
+    public static string Key(long tradeId, DateTimeOffset executedAt) => $"{tradeId}@{executedAt.UtcTicks}";
+
+    public void Arrive(Trade trade)
+    {
+        if (trade.Quantity <= 0)
+            return;                                                     // the definition throws: a dead letter
+        var notional = trade.Quantity * trade.Price;
+        if (notional < minNotional || !watchlist.TryGetValue(trade.CounterpartyId, out var entry))
+            return;
+        _alerts[Key(trade.Id, trade.ExecutedAt)] = new JsonObject
+        {
+            ["tradeId"] = trade.Id,
+            ["executedAt"] = trade.ExecutedAt,
+            ["counterpartyId"] = entry.CounterpartyId,
+            ["reason"] = entry.Reason,
+            ["notional"] = notional,
+            ["severity"] = severity,
+        };
+    }
+
+    public Dictionary<string, JsonObject> Expected() => _alerts;
 }

@@ -38,11 +38,14 @@ public sealed partial class KafkaStack : IAsyncDisposable
     public string Bootstrap => _options.Bootstrap;
     public string Prefix => _options.Prefix;
     public string TradesTopic => $"{Prefix}.trades";
+    public string QuotesTopic => $"{Prefix}.quotes";
+    public string DeadLetterTopic(string pipeline) => $"{Prefix}.dead.{pipeline}";
     public string SinkTopic(string name) => $"{Prefix}.out.{name}";
     public string Table(string name) => $"{Prefix}_{name}";
     public string ChangeTopic(string table) => DebeziumPostgres.Topic(Prefix, "public", Table(table));
     private string Connector => $"{Prefix}-refdata";
-    private string[] SinkTopics => [SinkTopic("trade-enrichment"), SinkTopic("large-trades"), SinkTopic("desk-exposure")];
+    private string[] SinkTopics => [SinkTopic("trade-enrichment"), SinkTopic("large-trades"), SinkTopic("desk-exposure"), SinkTopic("execution-quality")];
+    private string[] PlainTopics => [TradesTopic, QuotesTopic, DeadLetterTopic("sanctions-alerts"), DeadLetterTopic("credit-alerts")];
 
     private DebeziumPostgresOptions Debezium
     {
@@ -99,7 +102,7 @@ public sealed partial class KafkaStack : IAsyncDisposable
         await connect.WaitUntilRunningAsync(Connector, TimeSpan.FromSeconds(60));
 
         using var admin = new AdminClientBuilder(new AdminClientConfig { BootstrapServers = Bootstrap }).Build();
-        var topics = new List<TopicSpecification> { new() { Name = TradesTopic, NumPartitions = 1, ReplicationFactor = 1 } };
+        var topics = PlainTopics.Select(topic => new TopicSpecification { Name = topic, NumPartitions = 1, ReplicationFactor = 1 }).ToList();
         topics.AddRange(SinkTopics.Select(topic => new TopicSpecification
         {
             Name = topic, NumPartitions = 1, ReplicationFactor = 1,
@@ -155,6 +158,53 @@ public sealed partial class KafkaStack : IAsyncDisposable
             });
         }
         await Task.Run(() => Producer.Flush(TimeSpan.FromSeconds(30)));
+    }
+
+    /// <summary>How many quotes the quotes topic holds.</summary>
+    public long QuotesPublished()
+    {
+        using var consumer = new ConsumerBuilder<byte[], byte[]>(
+            new ConsumerConfig { BootstrapServers = Bootstrap, GroupId = "enrichment-example-probe", EnableAutoCommit = false }).Build();
+        return consumer.QueryWatermarkOffsets(new TopicPartition(QuotesTopic, 0), TimeSpan.FromSeconds(10)).High.Value;
+    }
+
+    /// <summary>Appends quotes to the quotes topic, keyed by instrument.</summary>
+    public async Task ProduceQuotesAsync(IEnumerable<Quote> quotes)
+    {
+        foreach (var quote in quotes)
+        {
+            Producer.Produce(QuotesTopic, new Message<byte[], byte[]>
+            {
+                Key = JsonSerializer.SerializeToUtf8Bytes(quote.InstrumentId, Json),
+                Value = JsonSerializer.SerializeToUtf8Bytes(quote, Json),
+            });
+        }
+        await Task.Run(() => Producer.Flush(TimeSpan.FromSeconds(30)));
+    }
+
+    /// <summary>Every value on a topic, in order: what a consumer of an append sink's
+    /// topic — the dead letters — reads.</summary>
+    public List<string> ReadValues(string topic)
+    {
+        using var consumer = new ConsumerBuilder<byte[], byte[]>(new ConsumerConfig
+        {
+            BootstrapServers = Bootstrap, GroupId = "enrichment-example-reader", EnableAutoCommit = false, IsolationLevel = IsolationLevel.ReadCommitted,
+        }).Build();
+        var partition = new TopicPartition(topic, 0);
+        var end = consumer.QueryWatermarkOffsets(partition, TimeSpan.FromSeconds(10)).High.Value;
+        var values = new List<string>();
+        if (end == 0)
+            return values;
+        consumer.Assign(new TopicPartitionOffset(partition, Offset.Beginning));
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        while (consumer.Position(partition) is var position && (position == Offset.Unset || position.Value < end))
+        {
+            if (DateTime.UtcNow > deadline)
+                throw new TimeoutException($"Reading {topic} to offset {end} took more than 30 s.");
+            if (consumer.Consume(TimeSpan.FromMilliseconds(500))?.Message is { Value: not null } message)
+                values.Add(Encoding.UTF8.GetString(message.Value));
+        }
+        return values;
     }
 
     /// <summary>A compacted topic read to its end and folded: key → latest value, a

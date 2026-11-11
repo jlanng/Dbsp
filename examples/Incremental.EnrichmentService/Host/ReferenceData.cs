@@ -20,6 +20,13 @@ public sealed record WorldShape
     /// <summary>Event time between one trade and the next.</summary>
     public TimeSpan TradeInterval { get; init; } = TimeSpan.FromMilliseconds(20);
 
+    /// <summary>One trade in this many has no quantity: a record one of the definitions
+    /// (watchlist-alerts) throws on and the others merely carry. 0: none.</summary>
+    public int PoisonEvery { get; init; }
+
+    /// <summary>The length of the interval a reference quote is for.</summary>
+    public TimeSpan QuoteInterval { get; init; } = TimeSpan.FromMinutes(1);
+
     public static readonly DateTimeOffset Epoch = new(2026, 1, 5, 9, 0, 0, TimeSpan.Zero);
 
     private static readonly (string Name, string Region)[] DeskSeed =
@@ -60,9 +67,11 @@ public sealed record WorldShape
         r = Mix(r);
         var counterparty = 1 + (int)(r % (ulong)(Counterparties + Counterparties / 20 + 1));
         r = Mix(r);
-        var quantity = 100 * (1 + (long)(r % 500));
+        var quantity = PoisonEvery > 0 && offset % PoisonEvery == PoisonEvery - 1 ? 0 : 100 * (1 + (long)(r % 500));
         r = Mix(r);
-        var price = 5m + (long)(r % 50_000) / 100m;
+        // Within half a percent of the instrument's own level, so that a price can be
+        // compared with the instrument's reference quote.
+        var price = Math.Round(Level(instrument) * (1 + ((long)(r % 1001) - 500) / 100_000m), 2);
         return new Trade(
             offset % TradeKeySpace, instrument, trader, CounterpartyId(counterparty), quantity, price,
             Epoch + TimeSpan.FromTicks(TradeInterval.Ticks * offset));
@@ -74,6 +83,44 @@ public sealed record WorldShape
         position < Instruments
             ? Instrument((int)position + 1)
             : Instrument(1 + (int)(Mix((ulong)position) % (ulong)Instruments), position);
+
+    // ── the quote feed ─────────────────────────────────────────────────────────────────
+
+    /// <summary>Three instruments in four are quoted in an interval, a different quarter
+    /// left out each time: so some executions never meet a reference price.</summary>
+    public int QuotesPerInterval => Instruments - Instruments / 4;
+
+    private int Rotation => Instruments / 4 + 1;
+
+    /// <summary>The quote feed's record at a position: interval after interval, each
+    /// interval's quotes together and stamped with the interval's start.</summary>
+    public Quote QuoteAt(long position)
+    {
+        var interval = position / QuotesPerInterval;
+        var instrument = 1 + (int)((interval * Rotation + position % QuotesPerInterval) % Instruments);
+        return new Quote(instrument, Epoch + QuoteInterval * interval, Mid(instrument, interval));
+    }
+
+    public bool Quoted(int instrument, long interval) =>
+        ((instrument - 1 - interval * Rotation) % Instruments + Instruments) % Instruments < QuotesPerInterval;
+
+    /// <summary>The reference price: within a fifth of a percent of the instrument's level.</summary>
+    public decimal Mid(int instrument, long interval) =>
+        Math.Round(Level(instrument) * (1 + ((long)(Mix((ulong)(instrument * 1_000_003L + interval)) % 401) - 200) / 100_000m), 4);
+
+    /// <summary>What the instrument trades around: between 5 and 505.</summary>
+    private static decimal Level(int instrument) => 5m + (long)(Mix((ulong)instrument * 7919) % 50_000) / 100m;
+
+    /// <summary>Which quote interval an instant falls in.</summary>
+    public long IntervalOf(DateTimeOffset at) => (at - Epoch).Ticks / QuoteInterval.Ticks;
+
+    // ── the watchlists ─────────────────────────────────────────────────────────────────
+
+    public IEnumerable<WatchlistEntry> Sanctions =>
+        Enumerable.Range(1, Counterparties).Where(n => n % 11 == 0).Select(n => new WatchlistEntry(CounterpartyId(n), "sanctioned"));
+
+    public IEnumerable<WatchlistEntry> CreditWatch =>
+        Enumerable.Range(1, Counterparties).Where(n => n % 7 == 3).Select(n => new WatchlistEntry(CounterpartyId(n), "downgrade review"));
 
     // splitmix64: a position in, well-spread bits out, the same in every process.
     private static ulong Mix(ulong x)
@@ -221,6 +268,48 @@ public sealed class CounterpartyFile
             text.AppendLine(JsonSerializer.Serialize(row, Json));
         var temporary = _path + ".writing";
         File.WriteAllText(temporary, text.ToString());
+        File.Move(temporary, _path, overwrite: true);
+    }
+}
+
+/// <summary>A watchlist, as a JSON-lines file the <c>file</c> table loader reads. Like the
+/// counterparties, it changes by being rewritten whole.</summary>
+public sealed class WatchlistFile
+{
+    private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
+    private readonly string _path;
+
+    public WatchlistFile(string directory, string fileName, IEnumerable<WatchlistEntry> entries, bool overwrite)
+    {
+        FileName = fileName;
+        _path = Path.Combine(directory, fileName);
+        if (!overwrite && File.Exists(_path))
+        {
+            foreach (var line in File.ReadLines(_path).Where(l => l.Length > 0))
+            {
+                var row = JsonSerializer.Deserialize<WatchlistEntry>(line, Json)!;
+                Rows[row.CounterpartyId] = row;
+            }
+            return;
+        }
+        foreach (var entry in entries)
+            Rows[entry.CounterpartyId] = entry;
+        Write();
+    }
+
+    public string FileName { get; }
+    public Dictionary<string, WatchlistEntry> Rows { get; } = new(StringComparer.Ordinal);
+
+    public void Add(WatchlistEntry entry)
+    {
+        Rows[entry.CounterpartyId] = entry;
+        Write();
+    }
+
+    private void Write()
+    {
+        var temporary = _path + ".writing";
+        File.WriteAllLines(temporary, Rows.Values.OrderBy(r => r.CounterpartyId, StringComparer.Ordinal).Select(r => JsonSerializer.Serialize(r, Json)));
         File.Move(temporary, _path, overwrite: true);
     }
 }

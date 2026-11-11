@@ -46,6 +46,10 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   run the built binary and stop it with SIGTERM (a backgrounded `dotnet run` ignores SIGINT).
   Its build copies the plugin (`Pipelines/`) to `plugins/` beside the host and zips
   version 2 (`Pipelines.V2/`, the same sources with `V2` defined) to `plugin-packages/`.
+  `--poison N` sets how many generated trades have no quantity (the dead letters; 200).
+  The definitions' own tests are `dotnet test --project
+  examples/Incremental.EnrichmentService/Pipelines.Tests` (xunit v3 on
+  `PipelineTestHarness`; under a second, and CI runs them).
 - Trade enrichment on shared tables: `dotnet run --project examples/Incremental.TradeEnrichment`
   prints a narrative of twelve checked claims and exits 1 if one is wrong (`-- --trades N`).
 - Service guide: `docs/enrichment-service.md`. Its C# blocks are regions of the example's
@@ -239,6 +243,18 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     absent. Do not put anything not content-addressed on that topic.
   - Every sink a connector creates is wrapped in `leadership.Leased` by the supervisor;
     a connector must not write from anywhere but the sink's `WriteAsync`.
+  - The `files` connector's formats are persisted: the sink's object names
+    (`{prefix}{step:D19}-{term:D6}.jsonl`) and line shapes (`FileSinkFormat`), and the
+    source's position in the checkpoint's partition → offset map (`FilePosition`:
+    partition 0 the line, 1 the name's length, 2… the name in two banks, each offset
+    prefixed by the object's ordinal so that it only rises). Change either and deployed
+    pipelines lose their place: a new connector name, not an edit.
+  - Dead letters with a sink bound (`PipelineSpec.DeadLetters`) are an acknowledged
+    output: nothing acknowledges a batch before the sink has it, and a sink that fails
+    faults the pipeline — never drop to the ring and carry on.
+  - `PipelineTestHarness` builds a definition through the same `DefinitionBinding` and
+    `PipelineBuilder` as the supervisor; keep it so, or its tests stop meaning what a
+    deploy would do.
   - A table, plugin or pipeline that fails is that thing's failure: shown, retried, never
     thrown out of a takeover callback. Only the catalog and the storage may fail a node.
   - Nothing waits without a bound, and nothing holds another pipeline's queue: teardown is

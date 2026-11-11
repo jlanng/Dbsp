@@ -236,7 +236,7 @@ public sealed record DeskExecution(string Group, decimal Notional, DateTimeOffse
 public sealed record Exposure(string Group, DateTimeOffset WindowStart, DateTimeOffset WindowEnd, decimal Notional);
 ```
 
-And a derived table, with no input and no sink:
+A derived table, with no input and no sink:
 
 <!-- snippet: examples/Incremental.EnrichmentService/Pipelines/TraderDesks.cs#trader-desks -->
 ```csharp
@@ -255,6 +255,241 @@ public sealed class TraderDesks : IPipelineDefinition
                 .GroupBy(t => t.DeskId)
                 .Join(p.Table(Reference.Desks), (_, t, d) => new TraderDesk(t.Id, t.Name, d.Id, d.Name, d.Region)).Named("trader-desk"));
 }
+```
+
+#### Two inputs
+
+A definition may declare any number of inputs. Each is a slot of its own, bound by the
+spec to a connector of its own, and the two streams are joined with the core's stream
+join. This one joins executions to the reference price quoted for their instrument and
+minute, then looks the instrument up in a table:
+
+<!-- snippet: examples/Incremental.EnrichmentService/Pipelines/ExecutionQuality.cs#execution-quality -->
+```csharp
+/// <summary>
+/// Two inputs joined to each other: every execution meets the reference price quoted for
+/// its instrument in the interval it was done in, and the difference — the slippage, in
+/// basis points — is summed per asset class over a sliding window.
+/// <para>
+/// Both inputs carry event time, so the circuit's watermark is the lower of the two: it
+/// only moves when both feeds have moved, and nothing is late merely because one source
+/// was read ahead of the other. The join's key is (instrument, interval), and
+/// <c>EvictWhen</c> closes a key when the watermark passes the interval's end — from then
+/// on neither side holds anything for it, which is what keeps the state of a join between
+/// two unbounded streams bounded.
+/// </para>
+/// <para>
+/// It is a left join: an execution in an instrument that was not quoted in its interval is
+/// still counted, as unpriced. Should the quote arrive after the execution — and before the
+/// interval closes — the unpriced row is taken back and the priced one put in its place,
+/// through the window totals too.
+/// </para>
+/// </summary>
+[Pipeline("execution-quality", Description = "Executions ⋈ reference quotes on (instrument, interval): slippage per asset class in sliding windows.")]
+public sealed class ExecutionQuality : IPipelineDefinition<ExecutionQuality.Settings>
+{
+    public sealed record Settings
+    {
+        [Range(1, 86_400), Description("The length, in seconds, of the interval a quote is the reference price for.")]
+        public int QuoteSeconds { get; init; } = 60;
+
+        [Range(1, 86_400), Description("The sliding window's length in seconds.")]
+        public int WindowSeconds { get; init; } = 300;
+
+        [Range(1, 86_400), Description("How often, in seconds, a new window starts.")]
+        public int HopSeconds { get; init; } = 60;
+
+        [Range(0, 3600), Description("How late, in seconds of event time, a record of either input may arrive and still count.")]
+        public int LatenessSeconds { get; init; } = 5;
+    }
+
+    public void Build(PipelineBuilder p, Settings s)
+    {
+        var interval = TimeSpan.FromSeconds(s.QuoteSeconds);
+        var lateness = TimeSpan.FromSeconds(s.LatenessSeconds);
+        IntervalKey In(int instrument, DateTimeOffset at) =>
+            new(instrument, new DateTimeOffset(at.UtcTicks - at.UtcTicks % interval.Ticks, TimeSpan.Zero));
+
+        // One slot per input; the spec binds each to a connector of its own.
+        var executions = p.Input<Trade>("executions").WithEventTime(t => t.ExecutedAt, lateness);
+        var quotes = p.Input<Quote>("quotes").WithEventTime(q => q.At, lateness);
+
+        var priced = executions
+            .GroupBy(t => In(t.InstrumentId, t.ExecutedAt))
+            .EvictWhen(key => key.Start + interval)
+            .LeftJoin(
+                quotes.GroupBy(q => In(q.InstrumentId, q.At)),
+                (_, t, q) => new Execution(t.InstrumentId, t.ExecutedAt, Math.Round((t.Price - q.Mid) / q.Mid * 10_000m, 2)),
+                (_, t) => new Execution(t.InstrumentId, t.ExecutedAt, null)).Named("priced");
+
+        var quality = priced
+            // A table lookup after the stream join: the instrument's asset class, as of arrival.
+            .Lookup(p.Table(Reference.Instruments), x => x.InstrumentId,
+                (x, i) => new ClassedExecution(i.AssetClass, x.ExecutedAt, x.SlippageBps)).Named("classed")
+            .WithEventTime(x => x.ExecutedAt, lateness)
+            .GroupBy(x => x.AssetClass)
+            .HoppingWindow(TimeSpan.FromSeconds(s.WindowSeconds), TimeSpan.FromSeconds(s.HopSeconds))
+            .AggregateLinear(new QualityTotals()).Named("quality")
+            .Rows()
+            .Select(w => new Quality(w.Key, w.WindowStart, w.WindowEnd, w.Value.Priced, w.Value.Unpriced, w.Value.SlippageBps));
+
+        p.UpsertSink("quality", quality, q => $"{q.AssetClass}@{q.WindowStart.UtcDateTime:yyyy-MM-ddTHH:mm:ss}Z");
+    }
+}
+
+/// <summary>The join's key: an instrument and the start of a quote interval.</summary>
+public readonly record struct IntervalKey(int InstrumentId, DateTimeOffset Start);
+
+public sealed record Execution(int InstrumentId, DateTimeOffset ExecutedAt, decimal? SlippageBps);
+
+public sealed record ClassedExecution(string AssetClass, DateTimeOffset ExecutedAt, decimal? SlippageBps);
+
+/// <summary>What a window holds per asset class. A linear aggregate keeps this and nothing
+/// else per window: a row added or taken back changes it by the row's own contribution.</summary>
+public readonly record struct Totals(long Priced, long Unpriced, decimal SlippageBps);
+
+public sealed class QualityTotals : ILinearAggregate<ClassedExecution, Totals>
+{
+    public Totals Zero => default;
+
+    public Totals Map(ClassedExecution x, long weight) =>
+        x.SlippageBps is { } bps ? new Totals(weight, 0, bps * weight) : new Totals(0, weight, 0);
+
+    public Totals Combine(Totals a, Totals b) => new(a.Priced + b.Priced, a.Unpriced + b.Unpriced, a.SlippageBps + b.SlippageBps);
+}
+
+public sealed record Quality(string AssetClass, DateTimeOffset WindowStart, DateTimeOffset WindowEnd, long Priced, long Unpriced, decimal SlippageBps);
+```
+
+What a second input changes:
+
+- **The watermark is the lower of the inputs'.** Each `WithEventTime` is a clock, and the
+  circuit's watermark is the minimum over them, less the lateness. So a record is never
+  late because the other source happened to be read first — after a restart, say, when
+  one topic is drained in a step and the other is not — and nothing closes until both
+  feeds have passed it. The price is that an input with no records holds the watermark
+  where it is: windows stay open and the join keeps its keys.
+- **A join between two streams keeps both sides, so bound it.** `EvictWhen` on a
+  grouping says when a key is finished; here a key is an instrument and a minute, and it
+  closes when the watermark passes the minute's end. What was emitted for it stays final.
+  Without it the join's state grows with the streams. The join's key has to carry the
+  time for that to be expressible: joining on the instrument alone would keep every
+  execution for ever.
+- **`LeftJoin` emits the unmatched row and takes it back.** An execution whose quote has
+  not arrived is emitted as unpriced; when the quote arrives the unpriced row is
+  retracted and the priced one asserted, and the window totals downstream follow. The
+  sink sees one row per window whose numbers move.
+- **One checkpoint holds every input's position.** Each source resumes from its own —
+  a topic's partition offsets, a file and a line — and the two are committed together
+  with the state they produced, so a restart or a takeover cannot leave the join with
+  one side further on than its state says.
+- **Order between the inputs is not defined** and the definition must not depend on
+  it. This one does not: whichever of an execution and its quote arrives first, the
+  result after both is the same.
+
+Its spec binds two slots:
+
+<!-- snippet: examples/Incremental.EnrichmentService/Host/World.cs#spec-two-inputs -->
+```csharp
+public PipelineSpec ExecutionQuality(string version = "") => new()
+{
+    Id = "execution-quality",
+    Plugin = Plugin,
+    Version = version,
+    Definition = "execution-quality",
+    Settings = Json("""{ "quoteSeconds": 60, "windowSeconds": 300, "hopSeconds": 60, "latenessSeconds": 5 }"""),
+    // Two inputs, each bound on its own: the trade feed, and the quote files (or topic).
+    Inputs = new Dictionary<string, JsonElement> { ["executions"] = Trades, ["quotes"] = Quotes },
+    Sinks = new Dictionary<string, JsonElement> { ["quality"] = Sink("execution-quality") },
+};
+```
+
+#### An append sink, dead letters, one definition on two tables
+
+<!-- snippet: examples/Incremental.EnrichmentService/Pipelines/WatchlistAlerts.cs#watchlist-alerts -->
+```csharp
+/// <summary>
+/// An alert for every execution with a counterparty on a watchlist: an append-only result,
+/// so it has an append sink — each alert is delivered once per step that produced it and
+/// never taken back. Which watchlist is the spec's business: the definition names the slot
+/// <c>watchlist</c>, and a spec's <c>"tables": { "watchlist": "sanctions" }</c> binds it,
+/// so the same class is deployed once per list.
+/// <para>
+/// An execution with no quantity cannot be sized, and <see cref="Sized"/> throws on it.
+/// Deployed with <c>"errorPolicy": "DeadLetter"</c> the record is dropped and reported —
+/// to the pipeline's dead-letter sink if the spec binds one — and the pipeline carries on;
+/// under the default policy the same record stops it.
+/// </para>
+/// </summary>
+[Pipeline("watchlist-alerts", Description = "Executions with a counterparty on a watchlist, as an append-only stream of alerts.")]
+public sealed class WatchlistAlerts : IPipelineDefinition<WatchlistAlerts.Settings>
+{
+    public sealed record Settings
+    {
+        [Range(0, 1e12), Description("Executions with a notional below this raise no alert.")]
+        public decimal MinNotional { get; init; }
+
+        [StateNeutral, Description("What an alert from this deployment is marked with.")]
+        public string Severity { get; init; } = "review";
+    }
+
+    public void Build(PipelineBuilder p, Settings s)
+    {
+        var alerts = p.Input<Trade>("executions")
+            .Select(Sized)
+            .Where(x => x.Notional >= s.MinNotional)
+            // On arrival, and append-only: nothing is remembered. An execution whose
+            // counterparty is not on the list finds no row and is dropped.
+            .LookupAppendOnly(p.Table(Reference.Watchlist), x => x.Trade.CounterpartyId,
+                (x, entry) => new Alert(x.Trade.Id, x.Trade.ExecutedAt, entry.CounterpartyId, entry.Reason, x.Notional, s.Severity));
+
+        p.AppendSink("alerts", alerts);
+    }
+
+    private static SizedExecution Sized(Trade t) =>
+        t.Quantity > 0
+            ? new SizedExecution(t, t.Quantity * t.Price)
+            : throw new ArgumentException($"Execution {t.Id} at {t.ExecutedAt:O} has quantity {t.Quantity}; an execution has a positive quantity.");
+}
+
+public sealed record SizedExecution(Trade Trade, decimal Notional);
+
+public sealed record Alert(long TradeId, DateTimeOffset ExecutedAt, string CounterpartyId, string Reason, decimal Notional, string Severity);
+```
+
+- **`p.AppendSink`** is for a result that is only ever added to. Each step's records are
+  delivered once, under the step's sequence number; a retraction reaching it faults the
+  pipeline, because an append sink cannot take a record back. Everything upstream of it
+  must therefore be append-only: an append input, `Select`, `Where`, `LookupAppendOnly`.
+- **The error policy is the spec's**, per pipeline (`"circuit": { "errorPolicy":
+  "DeadLetter" }`), or the definition's per operator (`.OnError(…)`). Under `DeadLetter`
+  the execution `Sized` throws on is dropped, counted and reported, and the pipeline
+  carries on; where the dropped records go is [below](#dead-letters).
+- **A table slot is bound by the spec.** The definition says `p.Table(Reference.Watchlist)`,
+  which names the slot `watchlist`. The host declares two tables of that definition
+  (`AddTable(Reference.Watchlist, loader, name: "sanctions")` and `"credit-watch"`), and
+  each deployment's spec says which one it reads:
+
+<!-- snippet: examples/Incremental.EnrichmentService/Host/World.cs#spec-alerts -->
+```csharp
+public PipelineSpec WatchlistAlerts(string id, string watchlist, decimal minNotional, string severity, string version = "") => new()
+{
+    Id = id,
+    Plugin = Plugin,
+    Version = version,
+    Definition = "watchlist-alerts",
+    Settings = Json($$"""{ "minNotional": {{minNotional.ToString(System.Globalization.CultureInfo.InvariantCulture)}}, "severity": "{{severity}}" }"""),
+    // A record the definition throws on is dropped and reported, not fatal…
+    Circuit = new PipelineCircuitOptions { ErrorPolicy = Incremental.RecordErrorPolicy.DeadLetter },
+    // …and kept: any append sink connector will do. Files in memory, a topic on Kafka.
+    DeadLetters = kafka is null
+        ? Files($"dead-letters/{id}/")
+        : Json($$"""{ "connector": "kafka", "connection": "log", "topic": "{{kafka.DeadLetterTopic(id)}}" }"""),
+    // The definition's table slot "watchlist", bound to one of the two declared watchlists.
+    Tables = new Dictionary<string, string> { ["watchlist"] = watchlist },
+    Inputs = new Dictionary<string, JsonElement> { ["executions"] = Trades },
+    Sinks = new Dictionary<string, JsonElement> { ["alerts"] = Files($"alerts/{id}/") },
+};
 ```
 
 #### Rules for definitions
@@ -371,11 +606,12 @@ and gives it its config:
 { "connector": "kafka", "connection": "log", "topic": "enrich.trades" }
 ```
 
-The first two are connectors the example's host registers; the third is built in. A spec
-may also carry `tables` (table slot → declared table, so one definition can read
-`instruments-eu` here and `instruments-us` there), `circuit` (workers, checkpoint
-interval, `errorPolicy`) and `restart` (how many faults in how long before the pipeline
-is `Failed`).
+The first two are connectors the example's host registers; the third is built in, as
+are `files` and `memory` ([below](#the-built-in-connectors)). A spec may also carry
+`tables` (table slot → declared table, so one definition can read `sanctions` here and
+`credit-watch` there), `circuit` (workers, checkpoint interval, `errorPolicy`),
+`deadLetters` (a connector config: where dropped records are kept) and `restart` (how
+many faults in how long before the pipeline is `Failed`).
 
 Deploy it from the host (`node.Pipelines.DeployAsync(spec, new DeployOptions(), ct)`),
 as a seed (`AddPipeline(spec)`, applied once per deployment: the catalog records which
@@ -411,23 +647,240 @@ the definition's `Build`).
 | `GET table-sources` | the loader kinds — `file`, `kafka`, `debezium` and the host's — with their config and the kind of connection each names |
 
 ```bash
-curl 'http://127.0.0.1:5180/admin/api/plugins/enrichment.pipelines/085cbd14f11deb0d/definitions/desk-exposure/template?id=exposure-eu'
+curl 'http://127.0.0.1:5180/admin/api/plugins/enrichment.pipelines/9fc096cf168f00ef/definitions/desk-exposure/template?id=exposure-eu'
 ```
 
 answers, in the example,
 
 ```json
-{ "spec": { "id": "exposure-eu", "plugin": "enrichment.pipelines", "version": "085cbd14f11deb0d",
+{ "spec": { "id": "exposure-eu", "plugin": "enrichment.pipelines", "version": "9fc096cf168f00ef",
             "definition": "desk-exposure", "settings": { "windowSeconds": 60, "latenessSeconds": 5 },
             "inputs": { "executions": { "connector": "trade-feed" } },
             "sinks":  { "exposure":   { "connector": "view" } } },
   "valid": true, "problems": [], "notes": [],
-  "connectorsForSlot": { "executions": ["kafka", "memory", "trade-feed"], "exposure": ["kafka", "memory", "view"] } }
+  "connectorsForSlot": { "executions": ["files", "kafka", "memory", "trade-feed"], "exposure": ["files", "kafka", "memory", "view"] } }
 ```
 
 and `PUT pipelines/exposure-eu` accepts that `spec` unchanged. Where a slot's connector
-needs more than its name (a `kafka` slot needs a connection and a topic) the template
-leaves those properties empty, `valid` is false and `notes` says what to fill in.
+needs more than its name (a `kafka` slot needs a connection and a topic, a `files` slot
+a store and a prefix) the template leaves those properties empty, `valid` is false and
+`notes` says what to fill in.
+
+### 5. A test
+
+A definition is tested without a node. `PipelineTestHarness`
+(`Incremental.Service.Testing`, in the `Incremental.Service` package) binds the settings
+and runs `Build` exactly as the service does, over tables the test fills, with inputs
+the test feeds and sinks it reads. Steps are the test's to take, and a step returns when
+the sinks hold what it produced — so there is nothing to wait for and nothing to poll.
+
+<!-- snippet: examples/Incremental.EnrichmentService/Pipelines.Tests/TradeEnrichmentTests.cs#test-trade-enrichment -->
+```csharp
+public class TradeEnrichmentTests
+{
+    private static readonly DateTimeOffset T0 = new(2026, 1, 5, 9, 0, 0, TimeSpan.Zero);
+
+    private static readonly Instrument Abc = new(1, "ABC", "GB0000000001", "Equity", 2m);
+    private static readonly Counterparty Acme = new("CP0001", "Acme Holdings", "GB", "AA");
+    private static readonly TraderDesk Ada = new(7, "Ada A.", 3, "Macro", "EMEA");
+
+    // The definition, its settings as a spec carries them, and the tables it reads with
+    // their first rows. Nothing else exists: no node, no connector, no catalog.
+    private static Task<PipelineTestHarness> StartAsync(string settings = """{ "minNotional": 1000 }""") =>
+        PipelineTestHarness.For<TradeEnrichment>()
+            .Settings(settings)
+            .Table(Reference.Instruments, [Abc])
+            .Table(Reference.Counterparties, [Acme])
+            .Table(Reference.TraderDesks, [Ada])
+            .StartAsync();
+
+    private static Trade Trade(long id, long quantity, string counterparty = "CP0001") => new(id, 1, 7, counterparty, quantity, 10m, T0);
+
+    [Fact]
+    public async Task A_trade_is_joined_to_its_three_tables_and_filtered_by_notional()
+    {
+        await using var pipeline = await StartAsync();
+        var trades = pipeline.KeyedInput<long, Trade>("trades");
+        await trades.UpsertAsync(Trade(1, quantity: 100));      // 100 × 10 × multiplier 2 = 2,000
+        await trades.UpsertAsync(Trade(2, quantity: 10));       // 200: below the minimum
+        await pipeline.StepAsync();                              // returns when the sinks are written
+
+        var enriched = pipeline.UpsertSink<long, EnrichedTrade>("enriched").Rows;
+        Assert.Equal(new EnrichedTrade(1, "ABC", "Acme Holdings", "AA", "Ada A.", "Macro", "EMEA", 2000m), Assert.Single(enriched).Value);
+    }
+
+    [Fact]
+    public async Task The_instrument_and_the_desk_are_retroactive_and_the_counterparty_is_as_of_arrival()
+    {
+        await using var pipeline = await StartAsync();
+        await pipeline.KeyedInput<long, Trade>("trades").UpsertAsync(Trade(1, quantity: 100));
+        await pipeline.StepAsync();
+
+        // Three tables change. Two are joined, one was looked up when the trade arrived.
+        await pipeline.Table(Reference.Instruments).UpsertAsync(Abc with { Multiplier = 3m });
+        await pipeline.Table(Reference.TraderDesks).UpsertAsync(Ada with { Desk = "Rates", Region = "APAC" });
+        await pipeline.Table(Reference.Counterparties).UpsertAsync(Acme with { Name = "Acme (renamed)" });
+        await pipeline.StepAsync();
+
+        var row = pipeline.UpsertSink<long, EnrichedTrade>("enriched").Rows[1];
+        Assert.Equal(3000m, row.Notional);                      // repriced
+        Assert.Equal(("Rates", "APAC"), (row.Desk, row.Region)); // moved
+        Assert.Equal("Acme Holdings", row.Counterparty);        // left alone
+    }
+
+    [Fact]
+    public async Task An_unknown_counterparty_is_marked_and_a_deleted_trade_leaves_the_sink()
+    {
+        await using var pipeline = await StartAsync();
+        var trades = pipeline.KeyedInput<long, Trade>("trades");
+        await trades.UpsertAsync(Trade(1, quantity: 100, counterparty: "CP9999"));
+        await pipeline.StepAsync();
+        var sink = pipeline.UpsertSink<long, EnrichedTrade>("enriched");
+        Assert.Equal(("(unknown)", "NR"), (sink.Rows[1].Counterparty, sink.Rows[1].Rating));
+
+        await trades.DeleteAsync(1);
+        await pipeline.StepAsync();
+        Assert.Empty(sink.Rows);
+    }
+
+    [Fact]
+    public async Task Settings_an_operator_could_not_deploy_are_refused_here_too()
+    {
+        var refused = await Assert.ThrowsAsync<ServiceException>(() => StartAsync("""{ "minNotional": -1 }"""));
+        Assert.Contains(refused.Details, d => d.Contains("minNotional"));
+    }
+}
+```
+
+| | |
+|---|---|
+| `PipelineTestHarness.For<TDefinition>()` | then `.Settings(json)`, `.Table(definition, rows, name)`, `.BindTable(slot, table)`, `.ErrorPolicy(…)`, `.Workers(n)`, `.Services(provider)`, and `.StartAsync()` |
+| `Input<T>(slot)`, `KeyedInput<TKey, TValue>(slot)` | the core's input handles: `InsertAsync`, `RemoveAsync`, `UpsertAsync`, `DeleteAsync` |
+| `Table(definition, name)` | `UpsertAsync(rows)`, `DeleteAsync(keys)` — one table version each — and `Rows`, which is also how a derived table (`ToTable`) is read |
+| `StepAsync()` | one step over everything sent and changed since the last. A record that faults the circuit is thrown from here. |
+| `UpsertSink<TKey, TRow>(slot).Rows`, `AppendSink<T>(slot).Records` | what the slot's sink holds |
+| `DeadLetters`, `Watermark`, `Shape` | the records dropped so far; the event-time watermark; the slots and tables `Build` declared |
+
+Settings that would be refused at a deploy are refused by `StartAsync` with the same
+`ServiceException`, and a slot asked for under the wrong name or type says what the
+definition declared. A table the definition reads and the test does not give starts
+empty. Run a definition with `.Workers(2)` at least once: keyed state that is not
+behind an exchange on its key is only wrong with more than one worker.
+
+Two inputs are two handles. The order in which a test sends is the order of arrival
+within a step, and the watermark is read between steps:
+
+<!-- snippet: examples/Incremental.EnrichmentService/Pipelines.Tests/ExecutionQualityTests.cs#test-two-inputs -->
+```csharp
+[Fact]
+public async Task An_execution_meets_the_quote_of_its_interval_whichever_of_the_two_arrives_first()
+{
+    await using var pipeline = await StartAsync();
+    var executions = pipeline.Input<Trade>("executions");
+    var quotes = pipeline.Input<Quote>("quotes");
+
+    // The quote first, then the execution: 101 against a mid of 100 is +100 bp.
+    await quotes.InsertAsync(new Quote(1, T0, 100m));
+    await executions.InsertAsync(Execution(1, instrument: 1, second: 10, price: 101m));
+    // The execution first: no quote yet for the gilt, so it is counted as unpriced.
+    await executions.InsertAsync(Execution(2, instrument: 2, second: 20, price: 99m));
+    await pipeline.StepAsync();
+
+    // Each execution is in the two windows that cover it.
+    Assert.Equal((1, 0, 100m), Windows(pipeline)[("Equity", T0)]);
+    Assert.Equal((1, 0, 100m), Windows(pipeline)[("Equity", T0.AddMinutes(-1))]);
+    Assert.Equal((0, 1, 0m), Windows(pipeline)[("Govt Bond", T0)]);
+
+    // The gilt's quote arrives: the unpriced row is taken back, the priced one counted.
+    await quotes.InsertAsync(new Quote(2, T0, 100m));
+    await pipeline.StepAsync();
+    Assert.Equal((1, 0, -100m), Windows(pipeline)[("Govt Bond", T0)]);
+}
+
+[Fact]
+public async Task A_quote_prices_only_its_own_interval_and_a_closed_interval_is_forgotten()
+{
+    await using var pipeline = await StartAsync();
+    var executions = pipeline.Input<Trade>("executions");
+    var quotes = pipeline.Input<Quote>("quotes");
+
+    await quotes.InsertAsync(new Quote(1, T0, 100m));
+    await executions.InsertAsync(Execution(1, instrument: 1, second: 70, price: 102m));        // the next interval: no quote there
+    await pipeline.StepAsync();
+    Assert.Equal((0, 1, 0m), Windows(pipeline)[("Equity", T0.AddMinutes(1))]);
+
+    // Both inputs move on by ten minutes, and the watermark — the lower of the two —
+    // passes the end of that interval: the join has let go of it, and the execution's
+    // result is final. A quote for it now is late, and dropped.
+    await quotes.InsertAsync(new Quote(1, T0.AddMinutes(10), 100m));
+    await executions.InsertAsync(Execution(2, instrument: 1, second: 600, price: 100m));
+    await pipeline.StepAsync();
+    Assert.True(pipeline.Watermark > T0.AddMinutes(2));
+
+    await quotes.InsertAsync(new Quote(1, T0.AddMinutes(1), 100m));
+    await pipeline.StepAsync();
+    Assert.Equal((0, 1, 0m), Windows(pipeline)[("Equity", T0.AddMinutes(1))]);
+}
+```
+
+And the error policy is the harness's to set, as it is the spec's:
+
+<!-- snippet: examples/Incremental.EnrichmentService/Pipelines.Tests/WatchlistAlertsTests.cs#test-dead-letters -->
+```csharp
+[Fact]
+public async Task An_execution_that_cannot_be_sized_is_a_dead_letter_and_the_rest_carry_on()
+{
+    await using var pipeline = await PipelineTestHarness.For<WatchlistAlerts>()
+        .Settings("""{ "severity": "block" }""")
+        .Table(Reference.Watchlist, [new WatchlistEntry("CP0001", "sanctioned")])
+        .ErrorPolicy(RecordErrorPolicy.DeadLetter)          // a spec's "circuit": { "errorPolicy": "DeadLetter" }
+        .StartAsync();
+
+    await pipeline.InsertAsync("executions",
+    [
+        Execution(1, "CP0001"),
+        Execution(2, "CP0001", quantity: 0),                // what the generator's poison flag produces
+        Execution(3, "CP0002"),                             // not on the list
+        Execution(4, "CP0001"),
+    ]);
+    await pipeline.StepAsync();
+
+    Assert.Equal([1L, 4L], pipeline.AppendSink<Alert>("alerts").Records.Select(a => a.TradeId).Order());
+    Assert.All(pipeline.AppendSink<Alert>("alerts").Records, a => Assert.Equal(("sanctioned", "block", 1000m), (a.Reason, a.Severity, a.Notional)));
+
+    var dropped = Assert.Single(pipeline.DeadLetters);
+    Assert.Equal(Execution(2, "CP0001", quantity: 0), dropped.Record);
+    Assert.Contains("has quantity 0", dropped.Exception.Message);
+}
+
+[Fact]
+public async Task Under_the_default_policy_the_same_execution_stops_the_pipeline()
+{
+    await using var pipeline = await PipelineTestHarness.For<WatchlistAlerts>().StartAsync();
+    await pipeline.InsertAsync("executions", [Execution(2, "CP0001", quantity: 0)]);
+    var fault = await Assert.ThrowsAnyAsync<Exception>(() => pipeline.StepAsync());
+    Assert.Contains("has quantity 0", fault.ToString());
+}
+```
+
+The test project is an ordinary one that references the plugin and the contract
+([`Pipelines.Tests`](../examples/Incremental.EnrichmentService/Pipelines.Tests); xunit
+here, but the harness knows no test framework):
+
+```xml
+<ItemGroup>
+  <PackageReference Include="Incremental.Service" Version="…" />
+  <PackageReference Include="xunit.v3" Version="4.0.1" />
+  <ProjectReference Include="..\Contracts\Enrichment.Contracts.csproj" />
+  <ProjectReference Include="..\Pipelines\Enrichment.Pipelines.csproj" />
+</ItemGroup>
+```
+
+What the harness leaves out is what the service adds round a circuit — connectors, a
+restart from a checkpoint, a replace on kept state, a takeover. A definition cannot get
+those wrong by itself; what it can get wrong is what it computes, and what its state is
+keyed by. For the rest, run the service in memory: the smoke test below is that, for
+this example.
 
 ## The host
 
@@ -445,6 +898,7 @@ var service = builder.Services.AddIncrementalService(o =>
     })
     .AddContracts(typeof(Instrument).Assembly)                                      // row types and table definitions
     .AddObjectStore("refdata", _ => new LocalObjectStore(Path.Combine(world.DataDirectory, "refdata")))
+    .AddObjectStore("lake", _ => world.Lake)                                        // quote files in, alerts and dead letters out
     .AddTableSource("instrument-feed", _ => new InstrumentFeedSourceFactory(world.Instruments))
     .AddTableSource("directory", _ => new DirectorySourceFactory(world.Traders, world.Desks))
     .AddSourceConnector("trade-feed", _ => new TradeFeedConnector(world.Trades))
@@ -715,13 +1169,77 @@ public sealed class ViewConnector(Views views) : IUpsertSinkConnector, IResettab
 ```
 
 A connector implements the kinds it supports and no others; a slot bound to a connector
-that does not implement the slot's kind is refused at the dry run. Built in are `memory`
-(tests), `kafka` (append and keyed sources, JSON or Debezium; upsert and append sinks),
-and the table loaders `file`, `kafka` and `debezium`.
+that does not implement the slot's kind is refused at the dry run.
 
 Both connectors implement `IConfigDescribed`, which is optional: it is what `GET
 connectors` shows of a connector's config, and what a spec template fills in. A table
 source factory may implement it too.
+
+### The built-in connectors
+
+| | append input | keyed input | upsert sink | append sink |
+|---|---|---|---|---|
+| `kafka` | a record is an insertion | a value upserts, a tombstone deletes; or Debezium change events | a compacted topic | a topic |
+| `files` | a line is an insertion | a line upserts | objects of key/row lines | objects of records |
+| `memory` | in-process logs and sinks by name, for tests | | | |
+
+and the table loaders `file`, `kafka` and `debezium`.
+
+**`files`** reads and writes JSON-lines objects under a prefix of an object store the
+host registered (`AddObjectStore(name, …)`: `LocalObjectStore` for a directory; S3 or
+anything else is an `IObjectStore` you write — five methods):
+
+```json
+{ "connector": "files", "store": "lake", "prefix": "quotes/", "pollInterval": "00:00:05", "suffix": ".jsonl" }
+{ "connector": "files", "store": "lake", "prefix": "alerts/sanctions/", "minInterval": "00:00:02" }
+```
+
+*As a source* it reads the objects under the prefix in ordinal order of their names, one
+record per line, then lists the prefix again every `pollInterval` for objects that sort
+after the last one read. Its position is the object and the line, and it is in the
+pipeline's checkpoint: a restart or a takeover carries on at the next line, and reads
+nothing twice. Three things follow from reading in name order:
+
+- an object must be whole when it appears — write it elsewhere and move it, or put it in
+  one request. An object that grows after it was read to its end is not read again;
+- an object that arrives with a name sorting before the position is never read. Name
+  objects by time or by a counter, zero-padded;
+- old objects can be deleted. The position does not need the object it names.
+
+A line that is not a record is rejected in its place: it faults the pipeline under the
+default error policy and is a dead letter — with its object and line — under
+`DeadLetter`. A keyed input takes every line as an upsert; there is no line that
+deletes. Names of up to 256 bytes can be checkpointed. The listing is the store's:
+every poll lists the whole prefix, so keep a prefix to what is still arriving.
+
+*As a sink* it writes one object per step that has output:
+
+```
+alerts/sanctions/0000000000000000412-000003.jsonl        {prefix}{step, 19 digits}-{leader term, 6 digits}.jsonl
+```
+
+An append sink's lines are the records. An upsert sink's are changes, at most one per
+key in an object:
+
+```json
+{"key":"Equity@2026-01-05T09:00:00Z","row":{"assetClass":"Equity","priced":41,"unpriced":9,"slippageBps":88.21}}
+{"key":"FX@2026-01-05T08:56:00Z","deleted":true}
+```
+
+A reader takes the objects in name order and, for an upsert sink, keeps the last line
+for each key: that is the key's latest row, and a key whose last line says `deleted`
+has none. `FileSinkFormat.ReadAppendsAsync` and `ReadUpsertsAsync` do exactly this over
+an `IObjectStore`. Delivery is at least once, and the names are what make it harmless:
+a step delivered again writes the same name with the same content, and a generation
+that starts deletes the objects of steps above its checkpoint, because those steps are
+about to be run again and may be cut differently. A pipeline that is reset has its
+objects deleted. So a prefix belongs to one slot of one pipeline. Nothing merges or
+compacts the objects; an upsert sink's prefix is a change log, and what reads it folds it.
+
+`minInterval` is for the number of objects. A step's write waits until that long after
+the last one; the pipeline's checkpoint waits for the write, so the pipeline pauses,
+its inputs queue up behind their bounded channels, and the next step and its object
+are larger. Every sink of that pipeline is that much later.
 
 ## Run the example
 
@@ -729,11 +1247,22 @@ source factory may implement it too.
 dotnet run --project examples/Incremental.EnrichmentService
 ```
 
-One node on the in-memory backend, no docker. Open <http://127.0.0.1:5180/admin/>. Five
+One node on the in-memory backend, no docker. Open <http://127.0.0.1:5180/admin/>. Seven
 tables are loaded — instruments by the positions source, traders and desks by the
-snapshot source, counterparties from a file, `trader-desks` by a pipeline — four
-pipelines run, and a generator publishes 50 trades a second and changes one reference
-row every five seconds. The sinks are at <http://127.0.0.1:5180/views>.
+snapshot source, counterparties and the two watchlists from files, `trader-desks` by a
+pipeline — seven pipelines run, and a generator publishes 50 trades a second, a file of
+reference quotes for every minute of the trades' event time, and one change of
+reference data every five seconds. The upsert sinks are at
+<http://127.0.0.1:5180/views>; the alerts and the dead letters are files under the
+directory the program prints as `files:`.
+
+| pipeline | definition | shows |
+|---|---|---|
+| `trade-enrichment`, `large-trades` | `trade-enrichment` | start here: a keyed input, a lookup, two retroactive joins; one definition deployed twice with different settings |
+| `trader-desks` | `trader-desks` | a derived table |
+| `desk-exposure` | `desk-exposure` | an append input, event time, tumbling windows |
+| `execution-quality` | `execution-quality` | two inputs joined to each other, a left join, a sliding window, a custom aggregate; one input read from files |
+| `sanctions-alerts`, `credit-alerts` | `watchlist-alerts` | an append sink to files, `errorPolicy: DeadLetter` with a durable dead-letter sink, one definition on two tables |
 
 | | |
 |---|---|
@@ -742,6 +1271,7 @@ row every five seconds. The sinks are at <http://127.0.0.1:5180/views>.
 | `-- --headless` | the smoke test, in memory; add `--nodes 2` for a takeover, `--kafka` for two processes and a kill |
 | `-- --kafka --clean` | removes what the Kafka mode made under its prefix |
 | `--otlp` | export the meters over OTLP ([monitoring](#operating-it-monitoring)) |
+| `--poison N` | one generated trade in N has no quantity, which `watchlist-alerts` refuses: the dead letters. Default 200; 0 for none |
 | `--port N`, `--rate N`, `--prefix name`, `--no-generate`, `--no-pipelines`, `--verbose` | |
 
 It can be left running. Trade ids come round again after 20,000, so the pipelines'
@@ -765,7 +1295,7 @@ Things to try in the UI, in the default mode:
    The dry run says a state choice is required, and what the choice has to go on:
 
    ```
-   version: 085cbd14f11deb0d → 048315b5d89db24c
+   version: 9fc096cf168f00ef → 40f55db8dfa26625
    state shapes: unchanged — the 4 state store(s) are the same and hold the same types
    with the same members (Enrichment.Contracts.Counterparty, …, Enrichment.Pipelines.Booked,
    Enrichment.Pipelines.Priced and 2 more); what the definition computes from them is not compared
@@ -781,6 +1311,14 @@ Things to try in the UI, in the default mode:
    desk, which is the part the last clause says is not compared: the sums stored under
    desk names are not sums per region. Reset, and it reads its input again from the start.
 6. **Pipelines → large-trades → Remove…** The dialog wants the id typed.
+7. **Dead letters.** `sanctions-alerts` and `credit-alerts` each drop the trades the
+   generator makes with no quantity — one in 200 — and carry on. The page shows the
+   newest with the operator, the exception and the record; the same records are in
+   `dead-letters/sanctions-alerts/` under the files directory, one object per step, and
+   stay there when the node does not.
+8. **Pipelines → execution-quality → Topology.** Two inputs, the join between them, the
+   table lookup, the window. Its `quotes` input is the files under `quotes/`: its
+   source's position reads as a file name and a line.
 
 ### On Kafka, with a standby
 
@@ -845,10 +1383,13 @@ service.UseKafkaBackend(new KafkaServiceBackendOptions
 `-- --headless` drives the service through its admin API and checks every sink against a
 model computed without the pipelines
 ([`Host/Model.cs`](../examples/Incremental.EnrichmentService/Host/Model.cs)): deploy,
-2,000 trades, a desk move, a multiplier correction, a counterparty rename, an upload of
-version 2, a replace keeping state, a replace resetting it, a removal, and — with two
-nodes — a takeover. A claim that does not hold exits 1. CI does not run it (it runs no
-example); run it after changing the service.
+2,000 trades and the quotes for them, a desk move, a multiplier correction, a
+counterparty rename, an addition to a watchlist, an upload of version 2, two replaces
+keeping state (one of them the two-input pipeline), a replace resetting it, a removal,
+and — with two nodes — a takeover. The alert files and the dead letters are read back
+with `FileSinkFormat` and compared too: every alert once, every dropped record there.
+A claim that does not hold exits 1 (47 claims in memory, 59 with two nodes, 58 on
+Kafka). CI does not run it (it runs no example); run it after changing the service.
 
 ## The admin UI
 
@@ -1033,12 +1574,57 @@ compaction is due at twice what survived — so the log is at most about twice t
 pipelines' live state. Nothing of it survives the process; it is for one machine, tests
 and demonstrations, and Kafka is the backend to run on.
 
+<a id="dead-letters"></a>
 **Dead letters.** Under `"circuit": { "errorPolicy": "DeadLetter" }` a record an
-operator throws on is dropped — its retraction too — and kept in a ring of the newest
-256 per pipeline, on the node that ran it. The ring is not durable and does not survive
-a failover; a durable dead-letter sink is not built. Under the default policy, `Fault`,
-the same record faults the pipeline, and since it is read again after the restart, the
-pipeline ends in `Failed`.
+operator throws on, or a source cannot read, is dropped — its retraction too — counted,
+and kept in a ring of the newest 256 per pipeline on the node that ran it, which is
+what the UI's page shows. Under the default policy, `Fault`, the same record faults the
+pipeline, and since it is read again after the restart, the pipeline ends in `Failed`.
+
+The ring is memory. To keep dropped records, bind the pipeline's dead-letter sink in
+its spec — any connector that is an append sink:
+
+```json
+"deadLetters": { "connector": "kafka", "connection": "msk-main", "topic": "enrichment.dead.sanctions-alerts" }
+"deadLetters": { "connector": "files", "store": "lake", "prefix": "dead-letters/sanctions-alerts/" }
+```
+
+Each dropped record is then delivered as one record of this shape, a step's worth at a
+time:
+
+```json
+{ "pipeline": "sanctions-alerts", "generation": 3, "step": 412, "time": "2026-11-11T02:14:09.118Z",
+  "operator": "n2.select", "weight": 1, "exceptionType": "ArgumentException",
+  "message": "Execution 913 at 2026-01-05T09:21:04.0000000+00:00 has quantity 0; an execution has a positive quantity.",
+  "source": null, "record": "{\"id\":913,\"instrumentId\":77,…}", "after": { "executions#p0": 5187 } }
+```
+
+`operator` is the operator's name in the topology; `weight` is negative when what was
+dropped was a retraction; `record` is the record as JSON text, cut at 4,096 characters.
+`source` is where the record lies in its source when the source itself rejected it
+(`enrich.trades[0]@5190`, `quotes/00000012.jsonl:44`); for a record an operator dropped
+it is null, and `after` — every input's position in the last checkpoint before the
+step — says where in the inputs to start looking. `generation` is the spec's.
+
+The pipeline's checkpoint waits for the sink, exactly as it waits for its other sinks:
+a dropped record is in the dead-letter sink before the checkpoint that passes it. So a
+crash or a takeover loses none — the new leader runs the uncommitted steps again and
+delivers what they drop — and may deliver some twice; deduplicate on pipeline,
+generation, step, operator and record if that matters.
+
+**A dead-letter sink that cannot be written stops the pipeline.** The write is retried
+(`ServiceOptions.SinkDelivery`: five times by default, 100 ms doubling to 5 s); then
+the pipeline faults with `The circuit's dead letters could not be stored (…)`,
+restarts under its restart policy from its checkpoint, and after too many faults is
+`Failed`, which makes the node `Degraded`. Nothing is dropped unrecorded and nothing
+is committed past a record that is not stored. The other two choices were to drop to
+the ring and carry on, which loses the only record of something that was not
+delivered, and to wait for the sink for ever, which looks like a healthy pipeline that
+has stopped. What to look at: the pipeline's `deadLetterSink` in the API
+(`delivered`, `batches`, `writeInFlightSince`, `lastError`, `lastErrorTime`,
+`failedWrites`), `blockedOn: sink-ack:deadLetters` while a write has been in flight
+for longer than `StallAfter`, and the fault itself. A pipeline you would rather keep
+running than keep its dead letters is one with no `deadLetters` bound.
 
 **Security.** With no `AuthorizationPolicy` the admin API answers only loopback
 requests that name a loopback host, carry no forwarding header (`Forwarded`,
@@ -1153,7 +1739,7 @@ commit every step; a pipeline with `checkpointMaxDelay` or slow sinks needs its 
 | Not committing | `pipeline.checkpoint_age > 60` | Steps are not finishing or commits are not landing; look at `sink_ack_wait` next. |
 | Sink not acknowledging | `pipeline.sink_ack_wait > 30` | The pipeline is held by a sink: no step runs while a commit waits for delivery. |
 | Falling behind its input | `pipeline.source_lag` rising for 10 min, or above what your latency allows | Capacity, or a slow sink upstream of the commit. |
-| Records dropped | `increase(pipeline.dead_letters[5m]) > 0` | Each is a record that was not delivered. The ring on the leader has the newest 256. |
+| Records dropped | `increase(pipeline.dead_letters[5m]) > 0` | Each is a record that was not delivered. The ring on the leader has the newest 256; the pipeline's dead-letter sink, if its spec binds one, has all of them. |
 | A replace was rolled back | `increase(pipeline.rollbacks[1h]) > 0` (ticket) | Someone's deploy did not take; the audit says why. |
 | Loader stuck | `tables{state="LoaderFaulted"} > 0` for 5 min, or `table.loader_lag` rising | Readers keep the last version; the data is going stale. |
 | Table faulted | `tables{state="Faulted"} + tables{state="Failed"} > 0` | Pipelines that read it are `Blocked`. |
@@ -1265,9 +1851,16 @@ with no authentication. Specifically not verified:
   middle of deleting a plugin version looks at whether it still leads before each file
   it deletes, which leaves a window of one call in which it can delete a file the new
   leader has just stored again. Importing the version again puts the file back.
-- **No `file` source or sink connector, no durable dead-letter sink, no test harness
-  for definitions** (`PipelineTestHarness` in the design). Test a definition by running
-  a node in memory with the `memory` connector, as `tests/Incremental.Service.Tests` do.
+- **The `files` connector is plain.** JSON lines only; no compression, no Parquet, no
+  partitioned paths. A source lists its whole prefix at every poll and reads strictly in
+  name order. A sink writes one object per step and never merges them. A keyed input
+  from files has no deletes. And one hole is known: a leader that has been replaced and
+  finishes a write it had begun can leave an object for a step the new leader then
+  produces nothing for, which a reader cannot tell from a real one — the lease check
+  before every write narrows this to a write in flight across the takeover.
+- **Dead letters on a topic are at least once**, like every sink: a step that is run
+  again after a crash delivers its dropped records again. The envelope carries the
+  pipeline, generation and step to deduplicate on.
 - **A contract cannot change shape under a running service.** Changing a row type of a
   shared table means a new table (a new name) or a new deployment.
 - **One leader runs everything.** The load must fit one node; a pipeline may use several

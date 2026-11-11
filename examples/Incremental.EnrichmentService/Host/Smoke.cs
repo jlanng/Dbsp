@@ -14,8 +14,8 @@ namespace Incremental.EnrichmentService;
 
 /// <summary>
 /// <c>--headless</c>: the example run unattended, as a test. It deploys the pipelines
-/// through the admin API, publishes trades, changes reference data, replaces a pipeline
-/// keeping its state and another resetting it, removes one, and — with two nodes — moves
+/// through the admin API, publishes trades and quotes, changes reference data, replaces
+/// pipelines keeping their state and another resetting it, removes one, and — with two nodes — moves
 /// leadership; after every act it compares what the sinks hold with a model. Any claim that
 /// does not hold ends the run with exit code 1.
 /// With <c>--kafka</c> the first node is a child process on the local connector stack and
@@ -32,6 +32,7 @@ public sealed class Smoke(ExampleOptions options)
     private readonly WorldShape _shape = new()
     {
         Instruments = 400, Counterparties = 120, TradeKeySpace = 1500, TradeInterval = TimeSpan.FromMilliseconds(250),
+        PoisonEvery = 97,                   // about one execution in a hundred has no quantity
     };
     private readonly List<ExampleNode> _nodes = [];
     private readonly TimeSpan _patience = options.Kafka ? TimeSpan.FromSeconds(120) : TimeSpan.FromSeconds(45);
@@ -126,6 +127,54 @@ public sealed class Smoke(ExampleOptions options)
     private Task EnrichedIs(string text, string id = "trade-enrichment") =>
         SinkIs(text, id, () => _model.Enrichments[id].Expected(_model));
 
+    private Task QualityIs(string text) => SinkIs(text, "execution-quality", () => _model.Quality!.Expected(_model));
+
+    /// <summary>What an alert pipeline's files sink holds — read as any consumer of it
+    /// would, with <see cref="FileSinkFormat"/> — against the model: every alert, once.</summary>
+    private Task AlertsAre(string text, string id) => Claim(text, async () =>
+    {
+        var rows = new Dictionary<string, string>(StringComparer.Ordinal);
+        var lines = 0;
+        await foreach (var alert in FileSinkFormat.ReadAppendsAsync<JsonElement>(_world.Lake, $"alerts/{id}/"))
+        {
+            lines++;
+            rows[AlertsModel.Key(alert.GetProperty("tradeId").GetInt64(), alert.GetProperty("executedAt").GetDateTimeOffset())] = alert.GetRawText();
+        }
+        return Model.Difference(_model.Alerts[id].Expected(), rows) ?? Unless(lines == rows.Count, $"{lines - rows.Count} alert(s) are in the files twice");
+    });
+
+    /// <summary>The pipeline's durable dead letters: files in memory, a topic on Kafka.</summary>
+    private async Task<List<DeadLetterEnvelope>> DeadLettersAsync(string id)
+    {
+        if (_kafka is not null)
+            return _kafka.ReadValues(_kafka.DeadLetterTopic(id)).Select(v => JsonSerializer.Deserialize<DeadLetterEnvelope>(v, JsonSerializerOptions.Web)!).ToList();
+        var letters = new List<DeadLetterEnvelope>();
+        await foreach (var letter in FileSinkFormat.ReadAppendsAsync<DeadLetterEnvelope>(_world.Lake, $"dead-letters/{id}/"))
+            letters.Add(letter);
+        return letters;
+    }
+
+    /// <summary>Every execution the pipeline dropped is in its dead-letter sink — exactly
+    /// once in the files, at least once on a topic — and nothing else is.</summary>
+    private Task DeadLettersAre(string text, string id) => Claim(text, async () =>
+    {
+        var letters = await DeadLettersAsync(id);
+        string Key(DeadLetterEnvelope letter)
+        {
+            var record = JsonDocument.Parse(letter.Record!).RootElement;
+            return AlertsModel.Key(record.GetProperty("id").GetInt64(), record.GetProperty("executedAt").GetDateTimeOffset());
+        }
+        var expected = _model.Poison.Select(t => AlertsModel.Key(t.Id, t.ExecutedAt)).ToHashSet();
+        var actual = letters.Select(Key).ToHashSet();
+        if (!actual.SetEquals(expected))
+            return $"the sink holds {actual.Count} distinct dropped executions, {expected.Count} expected; e.g. {expected.Except(actual).Concat(actual.Except(expected)).First()}";
+        if (_kafka is null && letters.Count != expected.Count)
+            return $"{letters.Count - expected.Count} dead letter(s) are in the files twice";
+        return letters.FirstOrDefault(l => l.Pipeline != id || l.ExceptionType != "ArgumentException" || !l.Message.Contains("has quantity 0") || l.Step < 1) is { } wrong
+            ? $"a dead letter reads {JsonSerializer.Serialize(wrong, JsonSerializerOptions.Web)}"
+            : null;
+    });
+
     // ── act 0: a node, its tables ──────────────────────────────────────────────────────
 
     private async Task StartAsync(string dataDirectory)
@@ -145,7 +194,7 @@ public sealed class Smoke(ExampleOptions options)
             Console.WriteLine($"0. The local stack under the prefix '{prefix}': three Postgres tables, a Debezium connector, a trades topic, three sink topics.");
             await _kafka.EnsureAsync(_shape);
             _world = new World(_shape, dataDirectory, _kafka, freshData: true);
-            _specs = new Specs(_kafka);
+            _specs = new Specs(_kafka, TimeSpan.Zero);
 
             // Node a is a process of its own, so that it can be killed.
             _child = StartChild(
@@ -164,7 +213,7 @@ public sealed class Smoke(ExampleOptions options)
         {
             Console.WriteLine($"0. {(options.Nodes >= 2 ? "Two nodes" : "One node")} on the in-memory backend, the admin API on a loopback port.");
             _world = new World(_shape, dataDirectory, null, freshData: true);
-            _specs = new Specs(null);
+            _specs = new Specs(null, TimeSpan.Zero);
             var cluster = new InMemoryServiceCluster();
             var ports = FreePorts(2);
             var nodeOptions = new ExampleOptions { SeedPipelines = false, Generate = false, Verbose = options.Verbose, Quiet = !options.Verbose };
@@ -211,7 +260,7 @@ public sealed class Smoke(ExampleOptions options)
     private async Task DeployAsync()
     {
         Console.WriteLine();
-        Console.WriteLine("1. Four pipelines are deployed through the admin API from the stored plugin, version 1.");
+        Console.WriteLine("1. Seven pipelines are deployed through the admin API from the stored plugin, version 1.");
 
         var refused = await _admin.PutAsync("pipelines/trade-enrichment", _specs.TradeEnrichment("trade-enrichment", -1));
         await Claim("a spec whose settings fail validation (minNotional −1) is refused, and nothing is deployed",
@@ -221,17 +270,29 @@ public sealed class Smoke(ExampleOptions options)
         _model.Enrichments["trade-enrichment"] = new EnrichmentModel(250_000m);
         _model.Enrichments["large-trades"] = new EnrichmentModel(5_000_000m);
         _model.Exposure = new ExposureModel(TimeSpan.FromSeconds(60));
+        _model.Quality = new QualityModel(TimeSpan.FromSeconds(300), TimeSpan.FromSeconds(60));
+        _model.Alerts["sanctions-alerts"] = new AlertsModel(new(_world.Sanctions.Rows), 0, "block");
+        _model.Alerts["credit-alerts"] = new AlertsModel(new(_world.CreditWatch.Rows), 1_000_000m, "review");
         foreach (var spec in new[]
                  {
                      _specs.TraderDesks(), _specs.TradeEnrichment("trade-enrichment", 250_000m),
                      _specs.TradeEnrichment("large-trades", 5_000_000m), _specs.DeskExposure(),
+                     _specs.ExecutionQuality(), _specs.SanctionsAlerts(), _specs.CreditAlerts(),
                  })
         {
             var deployed = await _admin.PutAsync($"pipelines/{spec.Id}", spec);
             if (deployed.Status != 200)
                 await Claim($"{spec.Id} deploys", () => $"the deploy answered {deployed.Status} {deployed.Body?.ToJsonString()}");
         }
-        await Claim("all four are Running", () => RunningAsync("trader-desks", "trade-enrichment", "large-trades", "desk-exposure"));
+        await Claim("all seven are Running", () => RunningAsync(
+            "trader-desks", "trade-enrichment", "large-trades", "desk-exposure", "execution-quality", "sanctions-alerts", "credit-alerts"));
+        await Claim("sanctions-alerts and credit-alerts are one definition deployed twice: its table slot 'watchlist' is bound to a different declared table in each", async () =>
+        {
+            var sanctions = (await _admin.GetAsync("pipelines/sanctions-alerts"))["pipeline"]!["reads"]!.AsArray().Select(r => r!.GetValue<string>()).ToList();
+            var credit = (await _admin.GetAsync("pipelines/credit-alerts"))["pipeline"]!["reads"]!.AsArray().Select(r => r!.GetValue<string>()).ToList();
+            return Unless(sanctions.SequenceEqual(["sanctions"]) && credit.SequenceEqual(["credit-watch"]),
+                $"they read {string.Join(",", sanctions)} and {string.Join(",", credit)}");
+        });
         await Claim($"the derived table trader-desks holds traders ⋈ desks: {_shape.Traders} rows, written by a pipeline",
             async () => Model.Difference(_model.ExpectedTraderDesks(), await TableRowsAsync("trader-desks")));
     }
@@ -262,6 +323,9 @@ public sealed class Smoke(ExampleOptions options)
         else
             _world.Trades.Publish(count);
         _model.Arrive(count);
+        // The reference quotes, up to the interval the last trade falls in.
+        await _world.PublishQuotesThroughAsync(_shape.TradeAt(_model.Trades - 1).ExecutedAt);
+        _model.QuoteIntervals = _world.QuoteIntervals;
     }
 
     private async Task TradesAsync()
@@ -273,6 +337,31 @@ public sealed class Smoke(ExampleOptions options)
         await EnrichedIs($"large-trades, the same definition with other settings and its own state, delivered its {_model.Enrichments["large-trades"].Expected(_model).Count:N0}", "large-trades");
         await SinkIs($"desk-exposure delivered {_model.Exposure!.Expected().Count} window totals — every execution counted once, in the minute of its execution time",
             "desk-exposure", _model.Exposure.Expected);
+
+        // Two inputs joined to each other.
+        var (priced, unpriced) = _model.Quality!.Counts(_model);
+        var source = _kafka is null ? $"{_model.QuoteIntervals} files read in name order by the files connector" : "a second topic";
+        await QualityIs($"execution-quality joined the executions to {_model.QuoteIntervals * _shape.QuotesPerInterval:N0} reference quotes ({source}) on instrument and minute: " +
+                        $"{priced:N0} priced, {unpriced:N0} with no quote counted as unpriced (a left join), in {_model.Quality.Expected(_model).Count} sliding windows");
+
+        // An append sink, to files; and the records the definition refuses.
+        var poison = _model.Poison.Count();
+        await AlertsAre($"sanctions-alerts wrote its {_model.Alerts["sanctions-alerts"].Expected().Count} alerts to files, each once (an append sink, one object per step)", "sanctions-alerts");
+        await AlertsAre($"credit-alerts, the same definition on the other watchlist with a minimum notional, wrote its {_model.Alerts["credit-alerts"].Expected().Count}", "credit-alerts");
+        var where = _kafka is null ? "in its dead-letter files" : "on its dead-letter topic";
+        await DeadLettersAre($"{poison} executions have no quantity; sanctions-alerts, deployed with errorPolicy DeadLetter, dropped each and carried on, and each is {where} with its error and step", "sanctions-alerts");
+        await DeadLettersAre("so did credit-alerts, to a sink of its own", "credit-alerts");
+        await Claim("…and the admin API says so: the count, the newest records, and what the dead-letter sink has confirmed", async () =>
+        {
+            var pipeline = (await _admin.GetAsync("pipelines/sanctions-alerts"))["pipeline"]!;
+            var page = await _admin.GetAsync("pipelines/sanctions-alerts/dead-letters?limit=5");
+            return Unless(
+                pipeline["deadLetters"]!.GetValue<long>() == poison && pipeline["deadLetterSink"]?["delivered"]?.GetValue<long>() == poison
+                && pipeline["state"]!.GetValue<string>() == "Running" && page["items"]!.AsArray().Count == Math.Min(5, poison),
+                $"the pipeline reads {pipeline.ToJsonString()}");
+        });
+        await Claim("the other pipelines read the same executions and none of them faulted: only the definition that sizes an execution refuses one without a quantity",
+            () => RunningAsync("trade-enrichment", "large-trades", "desk-exposure", "execution-quality"));
     }
 
     // ── act 3: reference data changes ──────────────────────────────────────────────────
@@ -327,6 +416,16 @@ public sealed class Smoke(ExampleOptions options)
             async () => Model.Difference(
                 new() { [JsonSerializer.Serialize(renamed.Id)] = (JsonObject)JsonSerializer.SerializeToNode(renamed, JsonSerializerOptions.Web)! },
                 await TableRowsAsync("counterparties", renamed.Id)));
+        // A counterparty is put on the sanctions list, in the file that table is loaded from.
+        var upcoming = Enumerable.Range(0, 500).Select(i => _shape.TradeAt(_model.Trades + i))
+            .First(t => t.Quantity > 0 && _world.Counterparties.Rows.ContainsKey(t.CounterpartyId) && !_world.Sanctions.Rows.ContainsKey(t.CounterpartyId)).CounterpartyId;
+        var listed = new WatchlistEntry(upcoming, "sanctioned today");
+        var earlier = _model.Replay().Count(t => t.CounterpartyId == upcoming && t.Quantity > 0);
+        _world.Sanctions.Add(listed);
+        await Claim($"{upcoming} is put on the sanctions list, in its file, and the table follows",
+            async () => Unless((await TableRowsAsync("sanctions", upcoming)).Count == 1, "the table does not have the row yet"));
+        _model.Alerts["sanctions-alerts"].Watchlist[upcoming] = listed;
+
         await PublishAsync(500);
         await EnrichedIs("500 more trades: those booked with it since carry the new name, and those delivered before keep the old one (a lookup on arrival)");
         await Claim("…and both names are in the sink", () => Task.Run(() =>
@@ -335,6 +434,9 @@ public sealed class Smoke(ExampleOptions options)
             return Unless(names.Contains(old.Name) && names.Contains(renamed.Name), "one of the two names is absent");
         }));
         await SinkIs("desk-exposure counted the new executions under the desks their traders sit on now", "desk-exposure", _model.Exposure.Expected);
+        var since = _model.Alerts["sanctions-alerts"].Expected().Values.Count(a => a["counterpartyId"]!.GetValue<string>() == upcoming);
+        await AlertsAre($"sanctions-alerts raised {since} alert(s) for {upcoming}'s executions since, and none for its {earlier} before: an append-only lookup remembers nothing", "sanctions-alerts");
+        await QualityIs("execution-quality counted the new executions against the new quotes");
     }
 
     private async Task<Instrument> ChangeInstrumentAsync(int id)
@@ -365,14 +467,14 @@ public sealed class Smoke(ExampleOptions options)
     private async Task VersionsAsync()
     {
         Console.WriteLine();
-        Console.WriteLine("4. Version 2 of the plugin is uploaded as a zip and two pipelines are replaced.");
+        Console.WriteLine("4. Version 2 of the plugin is uploaded as a zip and three pipelines are replaced.");
         var package = Path.Combine(AppContext.BaseDirectory, "plugin-packages", "enrichment.pipelines-v2.zip");
         var upload = new ByteArrayContent(await File.ReadAllBytesAsync(package));
         upload.Headers.ContentType = new MediaTypeHeaderValue("application/zip");
         var uploaded = await _admin.SendAsync(HttpMethod.Post, "/admin/api/plugins", upload);
         var v2 = _v2 = uploaded.Body?["plugin"]?["version"]?.GetValue<string>() ?? "";
-        await Claim("the upload is stored as a second version beside the first, with the same three definitions",
-            () => Unless(uploaded.Status == 201 && uploaded.Body!["plugin"]!["definitions"]!.AsArray().Count == 3, $"the upload answered {uploaded.Status} {uploaded.Body?.ToJsonString()}"));
+        await Claim("the upload is stored as a second version beside the first, with the same five definitions",
+            () => Unless(uploaded.Status == 201 && uploaded.Body!["plugin"]!["definitions"]!.AsArray().Count == 5, $"the upload answered {uploaded.Status} {uploaded.Body?.ToJsonString()}"));
 
         // trade-enrichment: version 2 adds a computed column and changes nothing stored.
         var enrichment = _specs.TradeEnrichment("trade-enrichment", 250_000m, v2);
@@ -392,6 +494,11 @@ public sealed class Smoke(ExampleOptions options)
         _model.Enrichments["trade-enrichment"].V2 = true;
         await Claim("with state=keep it is replaced and runs version 2",
             async () => Unless(kept.Status == 200, $"the replace answered {kept.Status} {kept.Body?.ToJsonString()}") ?? await VersionAsync("trade-enrichment", v2));
+        // execution-quality: two inputs, a stream join's state, windows — kept across the replace.
+        var quality = await _admin.PutAsync("pipelines/execution-quality?state=keep", _specs.ExecutionQuality(v2));
+        await Claim("execution-quality, with its two inputs, is replaced the same way and runs version 2",
+            async () => Unless(quality.Status == 200, $"the replace answered {quality.Status} {quality.Body?.ToJsonString()}") ?? await VersionAsync("execution-quality", v2));
+
         await PublishAsync(500);
         await EnrichedIs($"500 more trades: rows emitted since carry the new column; of the {before:N0} delivered before, those untouched since are as version 1 left them — nothing was recomputed");
         await Claim("…and it read only the new trades: its state and its input offsets were kept", async () =>
@@ -399,6 +506,9 @@ public sealed class Smoke(ExampleOptions options)
             var read = (await _admin.GetAsync("pipelines/trade-enrichment"))["sources"]!.AsArray().Sum(s => s!["records"]!.GetValue<long>());
             return Unless(read is >= 500 and < 1000, $"the new generation read {read} records");
         });
+
+        await QualityIs("execution-quality's windows equal the model: the open intervals' join state, the open windows and both inputs' positions were kept");
+        await Claim("…and each of its two inputs resumed where its own checkpointed position stood", () => ResumedAsync("execution-quality"));
 
         // desk-exposure: version 2 groups by region, so version 1's state is not its state.
         var stale = _model.Exposure!.Expected();
@@ -427,6 +537,21 @@ public sealed class Smoke(ExampleOptions options)
                 && templated["settings"]?["minNotional"]?.GetValue<decimal>() == 0
                 && dryRun.Status == 200,
                 $"the template was {template.ToJsonString()} and its dry run answered {dryRun.Status} {dryRun.Body?.ToJsonString()}"));
+    }
+
+    /// <summary>Null when the pipeline's present generation has read, on each input, some
+    /// of that input's feed and not all of it: it resumed, rather than starting again.</summary>
+    private async Task<string?> ResumedAsync(string id)
+    {
+        var quotes = _model.QuoteIntervals * _shape.QuotesPerInterval;
+        foreach (var source in (await _admin.GetAsync($"pipelines/{id}"))["sources"]!.AsArray())
+        {
+            var (slot, read) = (source!["slot"]!.GetValue<string>(), source["records"]!.GetValue<long>());
+            var published = slot == "quotes" ? quotes : _model.Trades;
+            if (read <= 0 || read >= published)
+                return $"{id}'s input '{slot}' read {read} of {published} records";
+        }
+        return null;
     }
 
     private Dictionary<string, JsonObject> _staleExposure = [];
@@ -460,6 +585,7 @@ public sealed class Smoke(ExampleOptions options)
         await PublishAsync(500);
         await EnrichedIs("500 more trades: trade-enrichment never stopped");
         await SinkIs("neither did desk-exposure", "desk-exposure", ExpectedExposure);
+        await QualityIs("nor execution-quality");
         await Claim("the audit log has every change made here, newest first", async () =>
         {
             var actions = (await _admin.GetAsync("audit?limit=50"))["items"]!.AsArray().Select(a => a!["action"]!.GetValue<string>()).ToList();
@@ -502,12 +628,17 @@ public sealed class Smoke(ExampleOptions options)
         _admin = standby;
         await Claim("b leads", async () => await RoleAsync(standby) is "Leader" ? null : "b is not the leader");
         Console.WriteLine($"        ({moved.Elapsed.TotalSeconds:N1} s from {(_kafka is null ? "the request" : "the kill")} to b ready as leader)");
-        await Claim("its three pipelines are Running, on the versions the catalog names", async () =>
-            await RunningAsync("trader-desks") ?? await VersionAsync("trade-enrichment", _v2) ?? await VersionAsync("desk-exposure", _v2));
+        await Claim("its six pipelines are Running, on the versions the catalog names", async () =>
+            await RunningAsync("trader-desks", "sanctions-alerts", "credit-alerts") ?? await VersionAsync("trade-enrichment", _v2)
+            ?? await VersionAsync("desk-exposure", _v2) ?? await VersionAsync("execution-quality", _v2));
 
         await PublishAsync(500);
         await EnrichedIs("500 more trades: trade-enrichment's sink equals the model — state, offsets and tables all carried over");
         await SinkIs("so does desk-exposure's", "desk-exposure", ExpectedExposure);
+        await QualityIs("and execution-quality's: the stream join's state and two input positions, one of them " + (_kafka is null ? "a file and a line" : "on a second topic"));
+        await AlertsAre("the alert files hold every alert once: the new leader's file sink took up the step numbers where the checkpoint stood", "sanctions-alerts");
+        await AlertsAre("…for both deployments", "credit-alerts");
+        await DeadLettersAre($"the dead-letter sink holds every dropped execution, those since the takeover included{(_kafka is null ? "" : " (at least once: a topic keeps a step that is run again)")}", "sanctions-alerts");
 
         // A trader moves after the takeover: the new leader's table loaders carry on too.
         var trader = _model.Traders[_shape.TradeAt(1).TraderId];
@@ -518,7 +649,7 @@ public sealed class Smoke(ExampleOptions options)
             _world.Traders.Upsert(movedTrader);
         _model.Change(movedTrader);
         await EnrichedIs($"{movedTrader.Name} moves desk: the new leader's loader, its trader-desks pipeline and the join carry the change to the sink");
-        await Claim("b resumed both pipelines' inputs where a's last checkpoint stood, rather than reading them again", async () =>
+        await Claim("b resumed the pipelines' inputs — execution-quality's two included — where a's last checkpoint stood, rather than reading them again", async () =>
         {
             foreach (var id in new[] { "trade-enrichment", "desk-exposure" })
             {
@@ -526,7 +657,7 @@ public sealed class Smoke(ExampleOptions options)
                 if (read < 500 || read >= _model.Trades)
                     return $"{id} on b read {read} of {_model.Trades} records";
             }
-            return null;
+            return await ResumedAsync("execution-quality");
         });
     }
 

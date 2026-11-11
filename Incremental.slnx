@@ -13,6 +13,7 @@
   </Folder>
   <Folder Name="/examples/plugins/">
     <Project Path="examples/Incremental.EnrichmentService/Contracts/Enrichment.Contracts.csproj" />
+    <Project Path="examples/Incremental.EnrichmentService/Pipelines.Tests/Enrichment.Pipelines.Tests.csproj" />
     <Project Path="examples/Incremental.EnrichmentService/Pipelines.V2/Enrichment.Pipelines.V2.csproj" />
     <Project Path="examples/Incremental.EnrichmentService/Pipelines/Enrichment.Pipelines.csproj" />
   </Folder>

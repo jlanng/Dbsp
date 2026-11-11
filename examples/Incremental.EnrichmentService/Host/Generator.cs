@@ -5,7 +5,8 @@ namespace Incremental.EnrichmentService;
 /// <summary>
 /// Keeps the world moving while the example runs for a person: trades at a steady rate
 /// and, every few seconds, one change of reference data — an instrument's multiplier, a
-/// trader's desk, a counterparty's name. In memory it moves the feeds the adapters read;
+/// trader's desk, a counterparty's name — and the reference quotes, an interval at a time,
+/// as the trades' event time reaches them. In memory it moves the feeds the adapters read;
 /// on Kafka it produces to the trades topic and updates rows in Postgres, and only while
 /// one of this process's nodes leads, so that two processes do not both generate.
 /// </summary>
@@ -33,12 +34,14 @@ public sealed class Generator(World world, IReadOnlyList<ExampleNode> nodes, int
                         if (!nodes.Any(n => n.Node.IsLeader))
                         {
                             produced = -1;
+                            world.ForgetQuotePosition();
                             continue;
                         }
                         if (produced < 0)
                             produced = await Task.Run(kafka.TradesPublished, stop);
                         await kafka.ProduceTradesAsync(shape, produced, perTick);
                         produced += perTick;
+                        await world.PublishQuotesThroughAsync(shape.TradeAt(produced - 1).ExecutedAt);
                         if (changeReferenceData)
                         {
                             if (++revision % 2 == 0)
@@ -50,6 +53,8 @@ public sealed class Generator(World world, IReadOnlyList<ExampleNode> nodes, int
                     else
                     {
                         world.Trades.Publish(perTick);
+                        // The reference prices keep pace with the trades' event time.
+                        await world.PublishQuotesThroughAsync(shape.TradeAt(world.Trades.Published - 1).ExecutedAt);
                         if (changeReferenceData)
                         {
                             switch (++revision % 3)

@@ -30,6 +30,10 @@ jobs:
       # assemblies from the test plugin projects' output directories, which the build made.
       - name: Test Service
         run: dotnet test --project tests/Incremental.Service.Tests -c Release --no-build
+      # The example plugin's own tests: its definitions on PipelineTestHarness, as a
+      # plugin author would write them.
+      - name: Test example pipelines
+        run: dotnet test --project examples/Incremental.EnrichmentService/Pipelines.Tests -c Release --no-build
       # Validates the NuGet packaging (metadata, XML docs, SourceLink, symbols) on every build.
       - name: Pack
         run: |

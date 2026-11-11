@@ -12,7 +12,8 @@ using Incremental.Service;
 //
 //   dotnet run --project examples/Incremental.EnrichmentService -- --kafka --clean      remove what the Kafka mode made
 //
-// Other flags: --port N, --rate N (trades per second), --prefix name (Kafka topics and
+// Other flags: --port N, --rate N (trades per second), --poison N (one trade in N has no
+// quantity, which one definition refuses; 0 for none), --prefix name (Kafka topics and
 // Postgres tables), --no-generate, --no-pipelines, --verbose, --otlp (export the meters
 // over OTLP; the endpoint is OTEL_EXPORTER_OTLP_ENDPOINT). README.md beside this file
 // walks through all of it.
@@ -46,7 +47,7 @@ if (args.Contains("--clean"))
 var dataDirectory = options.DataDirectory
     ?? Path.Combine(Path.GetTempPath(), "incremental-enrichment-service", options.Kafka ? options.Prefix : "memory-" + Environment.ProcessId);
 // Event time moves at the pace trades are generated, so a one-minute window takes a minute.
-var shape = new WorldShape { TradeInterval = TimeSpan.FromSeconds(1.0 / Math.Max(1, options.Rate)) };
+var shape = new WorldShape { TradeInterval = TimeSpan.FromSeconds(1.0 / Math.Max(1, options.Rate)), PoisonEvery = Math.Max(0, options.Poison) };
 
 KafkaStack? kafka = null;
 var nodes = new List<ExampleNode>();
@@ -85,7 +86,8 @@ try
         Console.WriteLine($"node {node.Node.NodeId}: {node.AdminUrl}");
     Console.WriteLine(kafka is null
         ? $"sinks:  {nodes[0].Url}/views"
-        : $"sinks:  the topics {kafka.SinkTopic("trade-enrichment")}, {kafka.SinkTopic("large-trades")} and {kafka.SinkTopic("desk-exposure")}");
+        : $"sinks:  the topics {kafka.SinkTopic("trade-enrichment")}, {kafka.SinkTopic("large-trades")}, {kafka.SinkTopic("desk-exposure")} and {kafka.SinkTopic("execution-quality")}");
+    Console.WriteLine($"files:  {world.LakeDirectory} (alerts/ and, in memory, quotes/ and dead-letters/)");
     Console.WriteLine("Ctrl+C to stop.");
 
     var generator = options.Generate ? new Generator(world, nodes, options.Rate).RunAsync(stop.Token) : Task.CompletedTask;

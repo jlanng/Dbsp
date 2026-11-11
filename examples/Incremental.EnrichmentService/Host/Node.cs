@@ -72,6 +72,7 @@ public sealed class ExampleNode : IAsyncDisposable
             })
             .AddContracts(typeof(Instrument).Assembly)                                      // row types and table definitions
             .AddObjectStore("refdata", _ => new LocalObjectStore(Path.Combine(world.DataDirectory, "refdata")))
+            .AddObjectStore("lake", _ => world.Lake)                                        // quote files in, alerts and dead letters out
             .AddTableSource("instrument-feed", _ => new InstrumentFeedSourceFactory(world.Instruments))
             .AddTableSource("directory", _ => new DirectorySourceFactory(world.Traders, world.Desks))
             .AddSourceConnector("trade-feed", _ => new TradeFeedConnector(world.Trades))

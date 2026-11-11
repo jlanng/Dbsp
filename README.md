@@ -426,7 +426,10 @@ so implementations never see cross-thread access to one store.
   checkpoint before anything stops and rolled back if the state turns out not to fit; the
   service publishes a meter, `Incremental.Service`, for a monitoring system; and the
   admin API says what a deploy needs — a definition's slots and settings, the registered
-  connectors and connections, a starting spec. See *Running many pipelines* in
+  connectors and connections, a starting spec. A `files` connector reads and writes
+  JSON-lines objects through `IObjectStore` (a directory is built in; S3 is yours to
+  plug in), a spec's `deadLetters` keeps dropped records in any append sink, at least
+  once and across a takeover, and `PipelineTestHarness` tests a definition with no node. See *Running many pipelines* in
   [docs/intro.md](docs/intro.md) and
   [docs/design/enrichment-service.md](docs/design/enrichment-service.md), *As built*.
 
@@ -478,8 +481,9 @@ so implementations never see cross-thread access to one store.
 
 - **Start here for the service:** [docs/enrichment-service.md](docs/enrichment-service.md)
   is a guide from an empty directory to a running pipeline plugin — the contract, a
-  definition, the project file, a spec — then the host and its adapters, the admin UI,
-  and operating notes (failover, reset, retention, dead letters, MSK). Its code is quoted
+  definition, the project file, a spec, a test — then the host and its adapters, the
+  built-in connectors, the admin UI, and operating notes (failover, reset, retention,
+  dead letters, MSK). Its code is quoted
   from `examples/Incremental.EnrichmentService`, a complete host:
 
   ```bash
@@ -677,7 +681,9 @@ truncate to `Circuit.CommittedStep` on restart — both spelled out in
 delegate or a null key faults the circuit. `DeadLetter` drops the record instead, reports
 it — record, weight, operator, exception — on the bounded `circuit.DeadLetters` channel
 (which must be read) and counts it in `incremental.circuit.dead_letters`; `.OnError(policy)`
-overrides it for one operator. A dropped record's retraction is dropped too, which for
+overrides it for one operator. With `AcknowledgeDeadLetters` the checkpoint waits until
+the reader has stored each step's dropped records (`circuit.DeadLetterBatches`,
+`DeliverDeadLettersToAsync`), so a crash loses none. A dropped record's retraction is dropped too, which for
 stateless operators relies on deterministic delegates. The default path has no exception
 handling in it. The list of operators that can dead-letter is in
 [docs/intro.md](docs/intro.md).
@@ -705,7 +711,9 @@ src/Incremental.Service            the generic parts of an enrichment service: t
                                        pipeline supervisor (one circuit per pipeline), plugin
                                        loading, catalog, service node, metrics and the meter
                                        `Incremental.Service`, discovery; an in-memory backend
-                                       (bounded) and a Kafka one
+                                       (bounded) and a Kafka one; the `kafka`, `files` and
+                                       `memory` connectors; a durable dead-letter sink per
+                                       pipeline; PipelineTestHarness for plugin authors
 src/Incremental.Service.Admin      the admin JSON API and web UI for a service node (ASP.NET
                                        Core; the UI is embedded, hand-written, no build step)
 tests/Incremental.Tests            xunit: Z-set algebra, per-step delta semantics, multi-worker runs,
@@ -743,9 +751,11 @@ examples/Incremental.TradeEnrichment trades enriched from shared tables, as a na
                                        instrument is renamed, a trade is amended; every claim it
                                        prints is checked against a model, and a wrong one exits 1
 examples/Incremental.EnrichmentService  a host for Incremental.Service with the admin UI: a contract
-                                       assembly, a pipeline plugin in two versions (three
+                                       assembly, a pipeline plugin in two versions (five
                                        definitions: joins and a lookup, event-time windows, a derived
-                                       table), two custom table sources, a source and a sink connector,
+                                       table, two inputs joined to each other, an append sink with dead
+                                       letters) and its tests (Pipelines.Tests, on PipelineTestHarness),
+                                       two custom table sources, a source and a sink connector,
                                        a generator. In memory by default (`--nodes 2` adds a standby);
                                        `--kafka --node a|b` runs two processes on the connector stack
                                        with Postgres → Debezium → tables and Kafka sinks; `--headless`

@@ -60,6 +60,17 @@ public sealed class TraderDesksTable : TableDefinition<int, TraderDesk>
     protected override void Configure(TableBuilder<int, TraderDesk> table) => table.Index(ByDesk);
 }
 
+/// <summary>A counterparty someone wants to hear about, and why.</summary>
+public sealed record WatchlistEntry(string CounterpartyId, string Reason);
+
+/// <summary>A watchlist's shape. It is declared under more than one name — <c>sanctions</c>,
+/// <c>credit-watch</c> — and a pipeline's spec says which of them its slot reads.</summary>
+public sealed class WatchlistTable : TableDefinition<string, WatchlistEntry>
+{
+    public override string Name => "watchlist";
+    public override string KeyOf(WatchlistEntry row) => row.CounterpartyId;
+}
+
 /// <summary>The tables, for <c>p.Table(Reference.Instruments)</c>.</summary>
 public static class Reference
 {
@@ -68,6 +79,7 @@ public static class Reference
     public static readonly TradersTable Traders = new();
     public static readonly DesksTable Desks = new();
     public static readonly TraderDesksTable TraderDesks = new();
+    public static readonly WatchlistTable Watchlist = new();
 }
 
 /// <summary>
@@ -76,3 +88,7 @@ public static class Reference
 /// </summary>
 public sealed record Trade(
     long Id, int InstrumentId, int TraderId, string CounterpartyId, long Quantity, decimal Price, DateTimeOffset ExecutedAt);
+
+/// <summary>The reference price feed's record: an instrument's mid price for the interval
+/// that starts at <c>At</c>. Not every instrument is quoted in every interval.</summary>
+public sealed record Quote(int InstrumentId, DateTimeOffset At, decimal Mid);

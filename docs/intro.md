@@ -643,7 +643,17 @@ The rules:
 - **Delivery.** Dead letters are published like a plain output: after the checkpoint
   commits, so a crash can lose the ones from the last step — unless the circuit has an
   acknowledged output, in which case everything is published before the commit and a
-  restart reports them again, under the same `Step`.
+  restart reports them again, under the same `Step`. Published is not stored, though:
+  the channel can hold them when the process dies.
+- **Dead letters that must not be lost.** `CircuitOptions.AcknowledgeDeadLetters` makes
+  the dead-letter output an acknowledged one. Dropped records then arrive a step at a
+  time on `circuit.DeadLetterBatches`, and the checkpoint waits until the reader has
+  acknowledged each batch (`batch.Acknowledge()`), exactly as it waits for a sink — so a
+  record is in the reader's store before the checkpoint that passes it, and is dropped
+  and reported again after a crash before that. `circuit.DeliverDeadLettersToAsync(sink,
+  letter => …)` does the reading for any `IAppendSink<T>`, with the sink retries; when
+  they run out the circuit faults with the sink's failure in its message rather than
+  commit past the batch.
 - **Cost.** Under `Fault` the operators run the loops they always ran; there is no
   exception handling on that path. Under `DeadLetter` a record that does not throw costs a
   `try` region and allocates nothing.
@@ -1380,10 +1390,23 @@ faults, dead letters), tables (loader, readers, rows), plugins, cluster, audit �
 embedded in the package: nothing to build, nothing fetched from elsewhere.
 `dotnet run --project tests/Incremental.Service.AdminHost` runs it with data.
 
+**Files, dead letters, and a test harness.** Besides `kafka` and `memory` a slot can be
+bound to the built-in `files` connector: JSON-lines objects under a prefix of an
+`IObjectStore` the host registered (a local directory is built in; S3 is five methods to
+write). As a source it reads objects in name order with the object and line in the
+checkpoint; as a sink it writes one object per step, named by the step so that a step
+delivered again overwrites itself. A spec's `deadLetters` binds any append sink
+connector as the pipeline's dead-letter sink: dropped records are delivered there, at
+least once, before the checkpoint that passes them, and a sink that will not take them
+stops the pipeline and says why. And `Incremental.Service.Testing.PipelineTestHarness`
+runs one definition in a test — settings bound as the service binds them, tables the
+test fills, inputs it feeds, steps it takes, sinks and dead letters it reads — with no
+node and no HTTP.
+
 **A guide and a complete host.** [enrichment-service.md](enrichment-service.md) walks
-through writing a contract, a definition and a plugin project, the host and its adapters
-(table sources with and without positions, a source connector, a sink connector), the
-UI, and operating notes. It is written around `examples/Incremental.EnrichmentService`,
+through writing a contract, a definition, a plugin project and its tests, the host and
+its adapters (table sources with and without positions, a source connector, a sink
+connector), the UI, and operating notes. It is written around `examples/Incremental.EnrichmentService`,
 which runs in memory (`dotnet run --project examples/Incremental.EnrichmentService`), as
 two processes on Kafka with reference data arriving from Postgres through Debezium
 (`-- --kafka --node a`, `-- --kafka --node b`), and as a smoke test that checks every sink
