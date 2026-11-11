@@ -54,6 +54,10 @@ public sealed class ExampleOptions
     /// <summary>No log output at all: the smoke test's nodes, whose story its claims tell.</summary>
     public bool Quiet { get; init; }
 
+    /// <summary>Kafka mode: run the node under <c>NodeSupervisor</c>, which starts it again
+    /// when it ends. Off with <c>--no-supervise</c>.</summary>
+    public bool Supervise { get; init; } = true;
+
     public static ExampleOptions Parse(string[] args)
     {
         string? Value(string name)
@@ -89,6 +93,7 @@ public sealed class ExampleOptions
             Verbose = args.Contains("--verbose"),
             UiDirectory = Value("--ui-dir"),
             Otlp = args.Contains("--otlp"),
+            Supervise = !args.Contains("--no-supervise"),
         };
     }
 }

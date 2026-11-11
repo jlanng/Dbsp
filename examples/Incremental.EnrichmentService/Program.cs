@@ -12,6 +12,10 @@ using Incremental.Service;
 //
 //   dotnet run --project examples/Incremental.EnrichmentService -- --kafka --clean      remove what the Kafka mode made
 //
+// A Kafka node runs under a supervisor of its own (NodeSupervisor): when the node ends
+// because it lost the leadership — or is killed — it is started again and comes back as
+// the standby. --no-supervise runs the node alone, for a platform that restarts it.
+//
 // Other flags: --port N, --rate N (trades per second), --poison N (one trade in N has no
 // quantity, which one definition refuses; 0 for none), --prefix name (Kafka topics and
 // Postgres tables), --no-generate, --no-pipelines, --verbose, --otlp (export the meters
@@ -30,6 +34,16 @@ catch (Exception ex) when (ex is ArgumentException or FormatException)
 
 if (options.Headless)
     return await new Smoke(options).RunAsync();
+
+// <snippet:supervisor>
+// A node that has led and no longer does ends its process (exit code 3 fenced, 4 resigned,
+// 5 cannot lead), and something must start it again: then it is the standby. Under
+// systemd, Kubernetes or ECS that is the platform's restart policy. From a terminal there
+// is nobody, so the program supervises itself: this process only starts the node, as a
+// child, and starts it again each time it ends.
+if (options.Kafka && options.Supervise && !args.Contains("--clean") && !NodeSupervisor.IsSupervised)
+    return await NodeSupervisor.RunAsync(args);
+// </snippet:supervisor>
 
 if (args.Contains("--clean"))
 {

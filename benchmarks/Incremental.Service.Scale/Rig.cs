@@ -92,6 +92,7 @@ internal sealed class Rig(Arguments arguments)
             "--cache", cache ?? Path.Combine(_work, "cache-" + id),
             "--plugins", plugins ? Path.Combine(AppContext.BaseDirectory, "plugins") : "",
             "--log-level", arguments.Text("--log-level", "Warning"),
+            "--supervise", "true",
         };
         args.AddRange(Security.Forward(arguments));
         var node = new NodeProcess(id, args, Path.Combine(_work, $"{id}-{_nodes.Count}.stderr.log"));
@@ -257,9 +258,10 @@ internal sealed class Rig(Arguments arguments)
             await TakeoverAsync("kill", b, killedAt, watch, pipelines);
 
             // ── H: the dead node comes back, cold, as the standby ──────────────────────
+            // Nobody starts it: its supervisor does, as soon as it sees the process gone.
             await b.RunAsync($"churn {_churn} {_rows}", "churning");
-            var restartedA = Now;
-            a = Start("a", ports[0], ports[1], plugins: false);
+            var restartedA = await a.StartedAfterAsync(killedAt);
+            Note("supervisor.kill-to-process-started", restartedA - killedAt, "ms");
             var back = await a.StatusWhenAsync(s => s.GetProperty("warm").GetBoolean() && s.GetProperty("leader").GetString() == "b", "the restarted node to stand by", pollMs: 250);
             Note("standby.cold-to-warm.with-state", T(back) - restartedA, "ms");
             await b.StatusWhenAsync(s => s.GetProperty("peerReady").GetBoolean(), "the leader to see a ready standby");
@@ -270,7 +272,12 @@ internal sealed class Rig(Arguments arguments)
             watch.Arm(askedAt);
             a.Send("takeover");
             await TakeoverAsync("manual", a, askedAt, watch, pipelines);
-            Note("manual.old-leader-exit-code", await b.ExitCodeAsync());
+            Note("manual.old-leader-exit-code", await b.SupervisedExitAfterAsync(askedAt));
+
+            // Fenced is final for the process, not for the node: its supervisor starts it
+            // again and it stands by behind the node that replaced it.
+            var bBack = await b.StatusWhenAsync(s => s.GetProperty("warm").GetBoolean() && s.GetProperty("leader").GetString() == "a", "the fenced node to stand by again", pollMs: 250);
+            Note("manual.fenced-node-warm-standby-again", T(bBack) - askedAt, "ms");
 
             await ColdStartAsync(a, ports[2], watch, pipelines);
             steady.Cancel();
@@ -306,7 +313,9 @@ internal sealed class Rig(Arguments arguments)
     /// cache, no plugin directory, nobody to follow: everything comes from the broker.</summary>
     private async Task ColdStartAsync(NodeProcess last, int port, SinkWatch watch, List<(string Id, string Definition)> pipelines)
     {
-        last.Kill();
+        // Every node and its supervisor: nothing is to come back by itself here.
+        foreach (var node in _nodes)
+            node.KillWithSupervisor();
         await Task.Delay(500);
         var startedC = Now;
         watch.Arm(startedC);
@@ -644,6 +653,11 @@ internal sealed class NodeProcess : IDisposable
     private readonly StreamWriter _stderr;
     private readonly string _stderrPath;
 
+    // What the node's supervisor said on stderr: each process it started and each exit
+    // it saw, with the time the line arrived.
+    private readonly List<(int Pid, long At)> _starts = [];
+    private readonly List<(int Code, long At)> _exits = [];
+
     public NodeProcess(string id, IEnumerable<string> args, string stderrPath)
     {
         Id = id;
@@ -675,7 +689,16 @@ internal sealed class NodeProcess : IDisposable
         _process.ErrorDataReceived += (_, e) =>
         {
             lock (_stderr)
+            {
                 _stderr.WriteLine(e.Data);
+                if (e.Data is not { } line)
+                    return;
+                var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                if (System.Text.RegularExpressions.Regex.Match(line, @"node supervisor: started process (\d+)") is { Success: true } started)
+                    _starts.Add((int.Parse(started.Groups[1].Value), now));
+                else if (System.Text.RegularExpressions.Regex.Match(line, @"node supervisor: process \d+ ended with exit code (\d+)") is { Success: true } ended)
+                    _exits.Add((int.Parse(ended.Groups[1].Value), now));
+            }
         };
         _process.BeginOutputReadLine();
         _process.BeginErrorReadLine();
@@ -739,7 +762,68 @@ internal sealed class NodeProcess : IDisposable
         return await WaitAsync(answer, e => Events(answer).IndexOf(e) >= before);
     }
 
-    public Task<JsonElement> StatusAsync() => RunAsync("status", "status");
+    /// <summary>The node's status. Asked again every few seconds until answered: a node
+    /// that ended with the question unread is answered for by its next incarnation.</summary>
+    public async Task<JsonElement> StatusAsync()
+    {
+        var before = Events("status").Count;
+        while (true)
+        {
+            Send("status");
+            for (var waited = 0; waited < 5000; waited += 10)
+            {
+                if (Events("status") is { } answers && answers.Count > before)
+                    return answers[^1];
+                if (Events("crashed").Count > 0)
+                    throw new InvalidOperationException($"Node '{Id}' crashed: {Events("crashed")[^1].GetRawText()}");
+                if (_process.HasExited)
+                    throw new InvalidOperationException($"Node '{Id}' and its supervisor exited with code {_process.ExitCode}.");
+                await Task.Delay(10);
+            }
+        }
+    }
+
+    /// <summary>When the supervisor started the node's process, the first time after
+    /// <paramref name="after"/> (Unix ms).</summary>
+    public async Task<long> StartedAfterAsync(long after)
+    {
+        var clock = Stopwatch.StartNew();
+        while (true)
+        {
+            lock (_stderr)
+            {
+                foreach (var (_, at) in _starts)
+                {
+                    if (at >= after)
+                        return at;
+                }
+            }
+            if (clock.Elapsed > TimeSpan.FromMinutes(2))
+                throw new TimeoutException($"Node '{Id}' was not started again by its supervisor.");
+            await Task.Delay(10);
+        }
+    }
+
+    /// <summary>The exit code the supervisor saw the node's process end with, the first
+    /// time after <paramref name="after"/> (Unix ms).</summary>
+    public async Task<int> SupervisedExitAfterAsync(long after)
+    {
+        var clock = Stopwatch.StartNew();
+        while (true)
+        {
+            lock (_stderr)
+            {
+                foreach (var (code, at) in _exits)
+                {
+                    if (at >= after)
+                        return code;
+                }
+            }
+            if (clock.Elapsed > TimeSpan.FromMinutes(2))
+                throw new TimeoutException($"Node '{Id}' did not end.");
+            await Task.Delay(10);
+        }
+    }
 
     public async Task<(long Heap, long Rss)> GcAsync()
     {
@@ -762,11 +846,40 @@ internal sealed class NodeProcess : IDisposable
         }
     }
 
-    /// <summary><c>kill -9</c>.</summary>
+    /// <summary><c>kill -9</c> of the node's process. Its supervisor, which is the
+    /// process this object started, notices and starts it again.</summary>
     public void Kill()
     {
-        if (!_process.HasExited)
-            _process.Kill();
+        int pid;
+        lock (_stderr)
+            pid = _starts.Count > 0 ? _starts[^1].Pid : -1;
+        if (pid < 0)
+        {
+            KillWithSupervisor();
+            return;
+        }
+        try
+        {
+            using var node = Process.GetProcessById(pid);
+            node.Kill();
+        }
+        catch (ArgumentException)
+        {
+            // It ended a moment ago.
+        }
+    }
+
+    /// <summary><c>kill -9</c> of the supervisor and the node: nothing comes back.</summary>
+    public void KillWithSupervisor()
+    {
+        try
+        {
+            if (!_process.HasExited)
+                _process.Kill(entireProcessTree: true);
+        }
+        catch (InvalidOperationException)
+        {
+        }
     }
 
     public async Task<int> ExitCodeAsync()

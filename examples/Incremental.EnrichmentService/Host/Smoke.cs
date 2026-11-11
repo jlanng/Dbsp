@@ -40,7 +40,9 @@ public sealed class Smoke(ExampleOptions options)
     private Model _model = null!;
     private Specs _specs = null!;
     private KafkaStack? _kafka;
-    private Process? _child;
+    private Process? _child;                // node a's supervisor, which starts node a
+    private AdminClient? _first;            // node a's own admin API, whoever leads
+    private readonly List<int> _nodeProcesses = [];   // node a's process ids, as its supervisor reports them
     private AdminClient _admin = null!;     // the leader's
     private int _claims;
 
@@ -202,8 +204,8 @@ public sealed class Smoke(ExampleOptions options)
                 "--peer-probe-port", ports[3].ToString(), "--data", dataDirectory, "--no-generate", "--no-pipelines", "--no-prepare",
                 "--bootstrap", options.Bootstrap, "--postgres", options.Postgres, "--connect", options.Connect,
                 "--postgres-host-for-connect", options.PostgresHostForConnect);
-            _admin = new AdminClient($"http://127.0.0.1:{ports[0]}");
-            await Claim("node a, a process of its own, leads the new deployment and is ready", async () =>
+            _admin = _first = new AdminClient($"http://127.0.0.1:{ports[0]}");
+            await Claim("node a, a process of its own under its supervisor, leads the new deployment and is ready", async () =>
                 _child.HasExited ? throw new Failed($"node a exited with code {_child.ExitCode}") : await RoleAsync(_admin) is "Leader" ? null : "not the leader yet");
 
             // Node b is in this process: the standby, and later the survivor.
@@ -620,7 +622,7 @@ public sealed class Smoke(ExampleOptions options)
         var standby = new AdminClient(_nodes[^1].Url);
         Console.WriteLine(_kafka is null
             ? "6. Node b, the standby in the same process, takes over."
-            : "6. Node a is killed (SIGKILL); node b, the standby in this process, takes over by itself.");
+            : "6. Node a is killed (SIGKILL); node b, the standby in this process, takes over by itself; a's supervisor starts a again.");
         await Claim("b is a warm standby: it has the catalog, the tables and version 2 of the plugin — which it was never given, only the catalog names it", async () =>
         {
             var status = (await standby.GetAsync("node"))["status"]!;
@@ -651,8 +653,13 @@ public sealed class Smoke(ExampleOptions options)
         }
         else
         {
-            _child!.Kill(entireProcessTree: true);
-            await _child.WaitForExitAsync();
+            // The node, not its supervisor: what dies in production is the node.
+            int node;
+            lock (_nodeProcesses)
+                node = _nodeProcesses[^1];
+            using var process = Process.GetProcessById(node);
+            process.Kill();
+            await process.WaitForExitAsync();
         }
         _admin = standby;
         await Claim("b leads", async () => await RoleAsync(standby) is "Leader" ? null : "b is not the leader");
@@ -697,6 +704,23 @@ public sealed class Smoke(ExampleOptions options)
             }
             return await ResumedAsync("execution-quality");
         });
+        if (_kafka is not null)
+        {
+            // Two nodes again, without anybody's help: the supervisor contract.
+            await Claim("node a is back: its supervisor started the process again, and it stands by behind b, warm — nobody restarted it by hand", async () =>
+            {
+                int starts;
+                lock (_nodeProcesses)
+                    starts = _nodeProcesses.Count;
+                if (starts < 2)
+                    return $"a's supervisor has started {starts} process(es)";
+                var status = (await _first!.GetAsync("node"))["status"]!;
+                return Unless(
+                    status["leadership"]!["role"]!.GetValue<string>() == "Standby" && status["leadership"]!["leaderNodeId"]?.GetValue<string>() == "b"
+                    && status["standby"]?["takeoverWouldBeWarm"]?.GetValue<bool>() == true,
+                    $"a is {status["leadership"]!["role"]} behind {status["leadership"]!["leaderNodeId"]}, not warm because {status["standby"]?["notWarmBecause"]?.ToJsonString()}");
+            });
+        }
     }
 
     // ── plumbing ───────────────────────────────────────────────────────────────────────
@@ -718,6 +742,14 @@ public sealed class Smoke(ExampleOptions options)
         var child = Process.Start(start)!;
         void Echo(string? line)
         {
+            // "node supervisor: started process 1234": the node itself, which act 6 kills.
+            const string started = "node supervisor: started process ";
+            if (line is not null && line.IndexOf(started, StringComparison.Ordinal) is >= 0 and var at
+                && int.TryParse(line.AsSpan(at + started.Length), out var node))
+            {
+                lock (_nodeProcesses)
+                    _nodeProcesses.Add(node);
+            }
             if (line is not null && options.Verbose)
                 Console.WriteLine("        a| " + line);
         }

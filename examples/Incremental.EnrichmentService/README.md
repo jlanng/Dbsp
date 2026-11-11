@@ -90,11 +90,16 @@ dotnet run --project examples/Incremental.EnrichmentService --no-build -- --kafk
 
 1. Open <http://127.0.0.1:5180/admin/> (a, Leader) and <http://127.0.0.1:5181/admin/>
    (b, Standby; its *Cluster* page says whether a takeover now would be warm).
-2. Kill a: `kill -9 $(pgrep -f 'EnrichmentService.* --node a')`.
+2. Kill a. Terminal 1 runs a supervisor and, under it, the node; the supervisor printed
+   the node's process id (`node supervisor: started process 12345`). Kill that one:
+   `kill -9 $(pgrep -n -f 'EnrichmentService.* --node a')` (`-n`: the newer of the two).
 3. Watch b's page: after about three seconds it is Leader, term 2, with every pipeline
    Running; *Cluster → Last takeover* shows the time by stage. It is `Degraded`
-   (`no-ready-standby`) until a standby answers.
-4. Start a again (terminal 1). It is the standby now.
+   (`no-ready-standby`) for the few seconds until a is back.
+4. Terminal 1: the supervisor says the node ended and starts it again. It is the standby
+   now, and nobody restarted it — a node that stops leading ends its process, and
+   something must always bring it back (`NodeSupervisor` here; your platform's restart
+   policy in production; `--no-supervise` to run the node alone).
 5. Ctrl+C in terminal 2: b steps down, because a ready standby answers, and a leads
    within a second.
 
@@ -120,7 +125,7 @@ Everything is named after `--prefix` (default `enrich`) and stays until removed:
 ```bash
 dotnet run --project examples/Incremental.EnrichmentService -- --kafka --clean
 
-# the smoke test on Kafka: node a as a child process, killed with SIGKILL; its own prefix, removed afterwards
+# the smoke test on Kafka: node a as a supervised child process, killed with SIGKILL and back by itself; its own prefix, removed afterwards
 dotnet run --project examples/Incremental.EnrichmentService -- --headless --kafka
 ```
 

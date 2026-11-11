@@ -76,6 +76,14 @@ The run stops, rather than push the machine into swap, when less than 1.5 GB of 
 is available. On a 30 GB machine with the broker on it, two nodes fit at three million
 rows and one node at five.
 
+Each node the rig starts runs under `NodeSupervisor` (the `node` command with
+`--supervise`): the process the rig holds is the supervisor, and the node is its child.
+`kill -9` in the scenario is of the node; nobody starts it again but its supervisor
+(`supervisor.kill-to-process-started`), and it comes back cold as the standby. After the
+manual takeover the fenced node ends with exit code 3 and is likewise started again
+(`manual.fenced-node-warm-standby-again` is from the request to that node standing by,
+warm, behind the node that replaced it).
+
 ## Another broker
 
 ```
