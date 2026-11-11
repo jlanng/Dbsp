@@ -133,16 +133,22 @@
     tag: s.stateNeutral ? 'state-neutral' : null, tagTitle: 'Changing it keeps the pipeline’s state without being asked',
   });
 
-  /** One slot's binding: which connector, then that connector's config. */
-  function bindingEditor(prefix, kind, binding, connectors, replace, changed) {
-    const able = connectors.filter(c => c.kinds.includes(kind));
+  /**
+   * One slot's binding: which connector, then that connector's config. `carriers` are
+   * the connectors the node says can carry this slot's types (a connector may carry only
+   * some); null when the node was not asked, and then every connector of the kind is offered.
+   */
+  function bindingEditor(prefix, kind, binding, connectors, replace, changed, carriers) {
+    const ofKind = connectors.filter(c => c.kinds.includes(kind));
+    const able = carriers ? ofKind.filter(c => carriers.includes(c.name)) : ofKind;
     const current = connectors.find(c => c.name === binding.connector);
     return [
       field(`${prefix}-connector`, 'Connector',
         h('select', { class: 'input', id: `${prefix}-connector`, on: { change: e => replace({ connector: e.target.value }) } },
           !binding.connector && h('option', { value: '', selected: true }, 'Choose…'),
           binding.connector && !able.includes(current) && h('option', { value: binding.connector, selected: true },
-            current ? `${binding.connector} (cannot be bound to a ${kind})` : `${binding.connector} (not registered on this node)`),
+            !current ? `${binding.connector} (not registered on this node)`
+              : ofKind.includes(current) ? `${binding.connector} (does not carry this slot’s type)` : `${binding.connector} (cannot be bound to a ${kind})`),
           able.map(c => h('option', { value: c.name, selected: c.name === binding.connector }, c.name))),
         able.length === 0 ? `No registered connector can be bound to a ${kind}.` : null),
       current && able.includes(current) && schemaFields(prefix, current.config, binding, changed),
@@ -174,7 +180,7 @@
       loading: true, loadError: null, view: 'form', text: '', textError: null,
       spec: spec ? clone(spec) : { id: '', plugin: '', version: '', definition: '', desired: 'Running', circuit: { workers: 1, checkpointInterval: 1, errorPolicy: 'Fault' }, tables: {}, inputs: {}, sinks: {} },
       plugins: [], connectors: [], tables: [], pipelines: [],
-      described: null, describedFor: '', describing: false, describeError: null, notes: [], seq: 0,
+      described: null, describedFor: '', describing: false, describeError: null, notes: [], carriers: null, seq: 0,
       choice: null, needsChoice: false, evidence: [], checked: null, result: null, error: null, busy: false,
     };
     const s = () => st.spec;
@@ -201,17 +207,22 @@
      */
     async function describe(adopt) {
       const sp = s();
-      st.described = null; st.describeError = null; st.notes = [];
+      st.described = null; st.describeError = null; st.notes = []; st.carriers = null;
       if (!sp.plugin || !sp.version || !sp.definition) { st.describedFor = ''; draw(); return; }
       const seq = ++st.seq;
       st.describing = true; draw();
       try {
         const under = adopt === 'keep' && sp.settings && Object.keys(sp.settings).length ? '?settings=' + enc(JSON.stringify(sp.settings)) : '';
         const described = await api(`plugins/${enc(sp.plugin)}/${enc(sp.version)}/definitions/${enc(sp.definition)}` + under);
+        // The node's starting spec, and with it which connectors can carry each slot.
+        // Editing a spec as it is ('keep') wants only the second, and does without it
+        // if the node will not say.
         let template = null;
-        if (adopt !== 'keep') template = await api(`plugins/${enc(sp.plugin)}/${enc(sp.version)}/definitions/${enc(sp.definition)}/template`);
+        try { template = await api(`plugins/${enc(sp.plugin)}/${enc(sp.version)}/definitions/${enc(sp.definition)}/template`); }
+        catch (e) { if (adopt !== 'keep') throw e; }
         if (seq !== st.seq) return;
-        if (template) {
+        st.carriers = template ? template.connectorsForSlot || null : null;
+        if (template && adopt !== 'keep') {
           const from = template.spec, merge = adopt === 'merge';
           const pick = (mine, theirs, names) => Object.fromEntries(names.map(n => [n, merge && mine && n in mine ? mine[n] : (theirs || {})[n]]).filter(([, v]) => v !== undefined));
           sp.settings = pick(sp.settings, from.settings, described.settings.map(x => x.name));
@@ -333,7 +344,8 @@
             h('span', { class: 'tag' }, `${kindOf}<${x.keyType ? x.keyType + ', ' : ''}${x.type}>`)),
           x.members && x.members.length > 0 && h('details', { class: 'more' }, h('summary', null, group === 'inputs' ? 'What a record must carry' : 'What a record carries'),
             h('pre', { class: 'code wrap' }, x.members.join('\n'))),
-          bindingEditor(`${group}-${x.name}`, x.kind, binding, st.connectors, next => { sp[group][x.name] = next; changed(); }, changed));
+          bindingEditor(`${group}-${x.name}`, x.kind, binding, st.connectors, next => { sp[group][x.name] = next; changed(); }, changed,
+            st.carriers && st.carriers[x.name]));
       };
 
       const tableSlots = d ? [...new Map(d.tables.map(t => [t.slot, t])).values()] : [];
