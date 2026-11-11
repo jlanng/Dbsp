@@ -25,6 +25,13 @@ for (var i = 0; i + 1 < args.Length; i += 2)
 string Argument(string name, string fallback = "") => arguments.GetValueOrDefault(name, fallback);
 int Number(string name, int fallback) => int.Parse(Argument(name, fallback.ToString(CultureInfo.InvariantCulture)), CultureInfo.InvariantCulture);
 
+// --supervise 1: this process is the node's supervisor — it starts the node as a child
+// and starts it again when it ends fenced, resigned or killed, which is what a deployment's
+// platform does. Standard input and output are the child's, so the test talks to whichever
+// incarnation is running.
+if (Argument("--supervise") == "1" && !NodeSupervisor.IsSupervised)
+    return await NodeSupervisor.RunAsync(args, new NodeSupervisorOptions { Log = line => Console.Error.WriteLine($"{DateTime.UtcNow:HH:mm:ss.fff} {line}") });
+
 var nodeId = Argument("--node");
 var probePort = Number("--probe-port", 0);
 var peerPort = Number("--peer-port", 0);
@@ -48,7 +55,10 @@ try
 {
     var lifetime = new Lifetime();
     var services = new ServiceCollection();
-    services.AddLogging(b => b.SetMinimumLevel(LogLevel.Information).AddProvider(new StderrLogs()));
+    // INCREMENTAL_LOG_LEVEL=Debug lets the Kafka client's debug lines through (with
+    // INCREMENTAL_KAFKA_CLIENT="debug=eos,broker,protocol"): how a stall is read.
+    var logLevel = Enum.TryParse<LogLevel>(Environment.GetEnvironmentVariable("INCREMENTAL_LOG_LEVEL"), ignoreCase: true, out var asked) ? asked : LogLevel.Information;
+    services.AddLogging(b => b.SetMinimumLevel(logLevel).AddProvider(new StderrLogs(logLevel)));
     services.AddSingleton<IHostApplicationLifetime>(lifetime);
     var builder = services.AddIncrementalService(o =>
         {
@@ -74,6 +84,7 @@ try
                     .Select(pair => pair.Split('=', 2)).ToDictionary(pair => pair[0], pair => pair[1]),
             },
             TakeoverAfter = TimeSpan.FromMilliseconds(Number("--takeover-after-ms", 3000)),
+            TakeoverCeiling = TimeSpan.FromMilliseconds(Number("--takeover-ceiling-ms", 30000)),
             ProbeListen = probePort > 0 ? new IPEndPoint(IPAddress.Loopback, probePort) : null,
             PeerProbe = peerPort > 0 ? ("127.0.0.1", peerPort) : null,
         })
@@ -88,7 +99,7 @@ try
     node.Backend.Leadership.Changed += status =>
         Emit("role", new { role = status.Role.ToString(), term = status.Term, leader = status.LeaderNodeId, leaderTerm = status.LeaderTerm });
     await node.StartAsync(default);
-    Emit("started", new { role = node.Status.Leadership.Role.ToString() });
+    Emit("started", new { role = node.Status.Leadership.Role.ToString(), pid = Environment.ProcessId });
 
     object Status()
     {
@@ -110,6 +121,8 @@ try
             pluginsPending = status.Standby?.PluginsPending ?? 0,
             catalog = status.CatalogVersion,
             peer = status.Peer,
+            pid = Environment.ProcessId,
+            counters = node.Backend.Describe().Counters,
             takeover = kafka?.LastTakeover is { } t
                 ? new
                 {
@@ -235,19 +248,19 @@ internal sealed class Lifetime : IHostApplicationLifetime
     public void StopApplication() => _stop.TrySetResult();
 }
 
-internal sealed class StderrLogs : ILoggerProvider
+internal sealed class StderrLogs(LogLevel minimum) : ILoggerProvider
 {
-    public ILogger CreateLogger(string categoryName) => new Logger(categoryName);
+    public ILogger CreateLogger(string categoryName) => new Logger(categoryName, minimum);
 
     public void Dispose()
     {
     }
 
-    private sealed class Logger(string category) : ILogger
+    private sealed class Logger(string category, LogLevel minimum) : ILogger
     {
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
 
-        public bool IsEnabled(LogLevel logLevel) => logLevel >= LogLevel.Information;
+        public bool IsEnabled(LogLevel logLevel) => logLevel >= minimum;
 
         public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter) =>
             Console.Error.WriteLine($"{DateTime.UtcNow:HH:mm:ss.fff} {logLevel} {category}: {formatter(state, exception)}{(exception is null ? "" : " — " + exception)}");

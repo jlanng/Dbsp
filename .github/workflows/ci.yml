@@ -87,9 +87,9 @@ jobs:
         run: |
           set -o pipefail
           dotnet test --project tests/Incremental.Service.Tests -c Release --no-build | tee service-tests.log
-          # Four, exactly: the tests that stop and start brokers, which need three of them
-          # (the kafka3 compose profile, not started here).
-          grep -Eq '^\s*skipped: 4\s*$' service-tests.log
+          # Six, exactly: the tests that stop, kill and freeze brokers, which need three of
+          # them (the kafka3 compose profile, not started here).
+          grep -Eq '^\s*skipped: 6\s*$' service-tests.log
       - name: Smoke, enrichment service on Kafka with a killed leader
         run: dotnet run -c Release --no-build --project examples/Incremental.EnrichmentService -- --headless --kafka
       - name: Measured failover times

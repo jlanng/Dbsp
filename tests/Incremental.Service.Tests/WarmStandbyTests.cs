@@ -411,12 +411,19 @@ public class WarmStandbyTests
         await using var b = await StartAsync(cluster, "b", memory);
         await Eventually(() => b.Pipelines.Pipelines.Any(p => p.Id == "tc" && p.State == PipelineState.Built), "the standby to build the pipeline");
         Assert.Equal(1, b.Plugins.Plugins.Single(p => p.Version == v1.Version).Users);
+        Assert.Equal("loaded", b.Plugins.Plugins.Single(p => p.Version == v1.Version).LoadState);
 
         // Removed: the standby drops the circuit it built and the plugin version it
         // loaded for it, or that version's code could never unload there.
         await a.Pipelines.RemoveAsync("tc", new ActionOptions(), default).WaitAsync(TestService.Timeout);
         await Eventually(() => b.Pipelines.Pipelines.Count == 0, "the standby to see the removal");
-        await Eventually(() => b.Plugins.Plugins.Single(p => p.Version == v1.Version).Users == 0, "the standby to let go of the plugin version");
+        await Eventually(() => b.Plugins.Plugins.Single(p => p.Version == v1.Version).Users == 0, "the catalog to name no user of the plugin version");
+
+        // "Users" is what the catalog says. Whether this node has let go is whether the
+        // version is still loaded here: it is unloaded when its last lease is given back,
+        // and the standby's built circuit held one.
+        await Eventually(
+            () => b.Plugins.Plugins.Single(p => p.Version == v1.Version).LoadState == "stored", "the standby to give its lease back, which unloads the version");
     }
 
     [Fact]

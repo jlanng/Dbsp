@@ -135,6 +135,12 @@ public sealed class KafkaServiceBackend : IServiceBackend
             counters["commitsCompleted"] = connected.CommitsCompleted;
             counters["recordsWritten"] = connected.RecordsWritten;
             counters["idleHeartbeats"] = connected.IdleHeartbeats;
+            counters["writerResets"] = connected.WriterResets;
+        }
+        if (_leadership.Inner is { } leadership)
+        {
+            counters["takeoversAbandoned"] = leadership.TakeoversAbandoned;
+            counters["takeoversHeld"] = leadership.TakeoversHeld;
         }
         counters["blobsIndexed"] = _blobs.Indexed;
         return new BackendInfo("kafka", settings, counters);
@@ -225,7 +231,19 @@ public sealed class KafkaServiceBackend : IServiceBackend
 
         private KafkaLeadership Started => Inner ?? throw new InvalidOperationException("The leadership has not been started.");
 
-        public Task TakeOverAsync(CancellationToken cancellationToken) => Started.TakeOverAsync(cancellationToken);
+        public async Task TakeOverAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                await Started.TakeOverAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (KafkaLogNotAcquiredException ex)
+            {
+                // Another node took the log first. This one has promoted nothing and
+                // stands by again: the request failed, the node did not.
+                throw new ServiceException("takeover-lost", ex.Message, 409);
+            }
+        }
 
         public Task StepDownAsync(CancellationToken cancellationToken) => Started.StepDownAsync(cancellationToken);
 
@@ -328,6 +346,7 @@ internal sealed class KafkaBlobStore : IBlobStore, IDisposable
     private T Apply<T>(T config) where T : ClientConfig
     {
         config.BootstrapServers = _log.BootstrapServers;
+        KafkaClientDefaults.Apply(config);
         foreach (var (key, value) in _log.ClientConfig)
             config.Set(key, value);
         return config;

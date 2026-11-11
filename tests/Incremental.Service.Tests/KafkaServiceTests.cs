@@ -190,6 +190,74 @@ public class KafkaServiceTests(ITestOutputHelper output)
             "the changed pipeline to run its new settings");
     }
 
+    /// <summary>
+    /// A takeover that fences the leader and is then fenced itself, before its term is
+    /// committed — what a replaced leader's stale request to the coordinator did in one
+    /// broker test, leaving both nodes ended (StaleEpochRequestTests in the Kafka tests
+    /// is that request). The standby has promoted nothing: it must still be the standby
+    /// it was, with its tables followed and its circuits built, and lead when asked again.
+    /// </summary>
+    [Fact]
+    public async Task A_standby_fenced_before_its_takeover_commits_is_still_a_warm_standby_and_leads_when_asked_again()
+    {
+        await using var env = KafkaTestEnv.Create();
+        var tradesTopic = await env.CreateTopicAsync("trades");
+        var countsTopic = await env.CreateTopicAsync("counts", compacted: true);
+        var trades = Trades(0, 400);
+        foreach (var trade in trades.Take(200))
+            env.ProduceJson(tradesTopic, trade.Id, trade);
+        await env.FlushAsync();
+
+        await using var a = await env.StartNodeAsync("a", lead: true);
+        await a.DeployAsync(Spec("counts", "counts") with
+        {
+            Inputs = new Dictionary<string, JsonElement> { ["trades"] = KafkaBinding(tradesTopic) },
+            Sinks = new Dictionary<string, JsonElement> { ["out"] = KafkaBinding(countsTopic) },
+        });
+        await KafkaTestEnv.TopicEqualsAsync(countsTopic, Counts.Model(trades.Take(200)), "the first half counted");
+        await using var b = await env.StartNodeAsync("b");
+        await WarmStandbyAsync(b);
+        await Eventually(() => b.Pipelines.Get("counts").State == PipelineState.Built, "the standby to build the circuit");
+
+        // A third process takes the transactional id while b's takeover holds it and has
+        // not committed its term, and is gone again.
+        var log = ((KafkaServiceBackend)b.Node.Backend).Log;
+        var intruded = 0;
+        log.WhileAcquiring = point =>
+        {
+            if (point != "term-read" || Interlocked.Exchange(ref intruded, 1) != 0)
+                return;
+            var third = KafkaLog.ConnectAsync(env.Log("c")).GetAwaiter().GetResult();
+            third.AcquireWriterAsync().WaitAsync(Timeout).GetAwaiter().GetResult();
+            third.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        };
+        var lost = await Assert.ThrowsAsync<ServiceException>(() => b.Node.TakeOverAsync(new NodeActionOptions(), default)).WaitAsync(Timeout);
+        Assert.Equal("takeover-lost", lost.Code);
+        Assert.Equal(409, lost.Status);
+
+        // b is what it was: a standby, not fenced, its process not asked to end.
+        Assert.Equal(NodeRole.Standby, b.Node.Status.Leadership.Role);
+        Assert.False(b.Node.Backend.Leadership.WhenFinished.IsCompleted);
+        Assert.Equal(1, b.Node.Backend.Describe().Counters["takeoversAbandoned"]);
+        Assert.Equal(1, b.Node.Backend.Describe().Counters["writerResets"]);
+        await Eventually(() => a.Node.Status.Leadership.Role == NodeRole.Fenced, "the old leader to find itself fenced");
+
+        // Nobody leads. The rest of the input arrives; b is asked again and carries on
+        // from the old leader's last checkpoint with the circuit it had built.
+        foreach (var trade in trades.Skip(200))
+            env.ProduceJson(tradesTopic, trade.Id, trade);
+        await env.FlushAsync();
+        await WarmStandbyAsync(b);
+        Assert.Equal(PipelineState.Built, b.Pipelines.Get("counts").State);
+        await b.Node.TakeOverAsync(new NodeActionOptions(), default).WaitAsync(Timeout);
+        Assert.True(b.Node.IsLeader);
+        Assert.Equal(3, b.Node.Status.Leadership.Term);
+        await b.Running("counts");
+        await KafkaTestEnv.TopicEqualsAsync(countsTopic, Counts.Model(trades), "everything counted once the standby led");
+        var read = b.Pipelines.Get("counts").Sources.Sum(s => s.Stats.Records);
+        Assert.InRange(read, 200, 399);   // it resumed; it did not read the topic again
+    }
+
     [Fact]
     public async Task A_deposed_leaders_catalog_write_is_refused_by_the_broker()
     {
@@ -581,7 +649,22 @@ public class KafkaServiceTests(ITestOutputHelper output)
         // leader had not committed may be there twice.
         Assert.Equal(poison, all.Where(e => e.Source is null).Select(TradeId).Distinct().Order());
         Assert.Equal([$"{tradesTopic}[0]@241", $"{tradesTopic}[0]@60"], all.Where(e => e.Source is not null).Select(e => e.Source).Distinct().Order());
-        Assert.True(all.Count <= poison.Count + 2 + 8, $"{all.Count} dead letters for {poison.Count + 2} dropped records");
+
+        // How many twice is not a matter of chance: a step's dead letters are with their
+        // sink before the step's checkpoint commits, and no step runs while that waits, so
+        // what the takeover found published and not committed is one step's — the last one
+        // the old leader ran. Every record that is there twice was dropped by that one
+        // step; how many records a step holds is the batch's affair (all of the second
+        // half when it arrives at once, which is what a slower commit on three brokers
+        // makes likely — the bound this test used to have, eight, was one broker's luck).
+        var copies = all.GroupBy(e => e.Source ?? "trade " + TradeId(e)).ToList();
+        Assert.All(copies, copy => Assert.InRange(copy.Count(), 1, 2));
+        var twice = copies.Where(copy => copy.Count() == 2).ToList();
+        var steps = twice.Select(copy => copy.First().Step).Distinct().ToList();
+        Assert.True(steps.Count <= 1,
+            $"{twice.Count} dropped records were delivered twice, by {steps.Count} of the old leader's steps ({string.Join(", ", steps)}); only its last, uncommitted step may be");
+        Assert.All(twice, copy => Assert.True(
+            copy.First().Source is not null || TradeId(copy.First()) >= 120, $"{copy.Key} was delivered twice and is from before the takeover began"));
     }
 
     [Fact]

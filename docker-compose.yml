@@ -97,6 +97,16 @@ services:
   #   INCREMENTAL_KAFKA_BOOTSTRAP=localhost:9192,localhost:9292,localhost:9392 INCREMENTAL_KAFKA_REPLICATION=3
   # (and INCREMENTAL_KAFKA_BROKERS, the three container names, for the tests that stop one).
   # No volume: the data goes with the containers. Plaintext, local development only.
+  # Each broker has a fixed address on a network of their own. Without one a container
+  # that is killed and started again comes back at a new address, and the other brokers
+  # spend socket.connection.setup.timeout.ms (ten seconds) on the old one before they
+  # look it up again — long enough for the controller quorum to be without a leader for
+  # twelve seconds after the next broker goes. A real broker keeps its address.
+  # The brokers also name each other by those addresses and not by container name: a
+  # stopped container's name no longer resolves, and the lookup — made on the one thread
+  # a controller talks to its peers on — takes five seconds to say so. With names, and
+  # with the controller listener left to advertise the container's own host name, the
+  # two surviving controllers needed eight seconds to agree on a leader.
   # Remove them with `docker compose rm -sf kafka3-1 kafka3-2 kafka3-3`: `down` with a
   # profile also stops the services that have none (Redis).
   kafka3-1: &kafka3
@@ -104,15 +114,18 @@ services:
     profiles: ["kafka3"]
     ports:
       - "9192:9192"
+    networks:
+      kafka3:
+        ipv4_address: 10.89.93.11
     environment: &kafka3-env
       KAFKA_NODE_ID: 1
       CLUSTER_ID: "4L6g3nShT-eMCtK--X86sw"
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:19092,HOST://:9192,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka3-1:19092,HOST://localhost:9192
+      KAFKA_LISTENERS: PLAINTEXT://:19092,HOST://:9192,CONTROLLER://10.89.93.11:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://10.89.93.11:19092,HOST://localhost:9192
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka3-1:9093,2@kafka3-2:9093,3@kafka3-3:9093
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@10.89.93.11:9093,2@10.89.93.12:9093,3@10.89.93.13:9093
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_DEFAULT_REPLICATION_FACTOR: 3
       KAFKA_MIN_INSYNC_REPLICAS: 2
@@ -131,21 +144,27 @@ services:
     <<: *kafka3
     ports:
       - "9292:9292"
+    networks:
+      kafka3:
+        ipv4_address: 10.89.93.12
     environment:
       <<: *kafka3-env
       KAFKA_NODE_ID: 2
-      KAFKA_LISTENERS: PLAINTEXT://:19092,HOST://:9292,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka3-2:19092,HOST://localhost:9292
+      KAFKA_LISTENERS: PLAINTEXT://:19092,HOST://:9292,CONTROLLER://10.89.93.12:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://10.89.93.12:19092,HOST://localhost:9292
 
   kafka3-3:
     <<: *kafka3
     ports:
       - "9392:9392"
+    networks:
+      kafka3:
+        ipv4_address: 10.89.93.13
     environment:
       <<: *kafka3-env
       KAFKA_NODE_ID: 3
-      KAFKA_LISTENERS: PLAINTEXT://:19092,HOST://:9392,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka3-3:19092,HOST://localhost:9392
+      KAFKA_LISTENERS: PLAINTEXT://:19092,HOST://:9392,CONTROLLER://10.89.93.13:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://10.89.93.13:19092,HOST://localhost:9392
 
   # A broker that refuses a client it does not know, kept out of the default profiles:
   #   docker compose --profile kafka-sasl up -d
@@ -187,6 +206,12 @@ services:
       interval: 5s
       timeout: 10s
       retries: 30
+
+networks:
+  kafka3:
+    ipam:
+      config:
+        - subnet: 10.89.93.0/24
 
 volumes:
   redis-data:

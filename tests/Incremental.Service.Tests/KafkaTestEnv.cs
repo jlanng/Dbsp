@@ -146,7 +146,11 @@ internal sealed class KafkaTestEnv : IAsyncDisposable
         // Idempotent: a retry after a broker died before it answered must not put a record
         // into the topic twice, or the test would compare the sinks with a model the
         // input no longer matches.
-        _producer ??= new ProducerBuilder<byte[], byte[]>(new ProducerConfig { BootstrapServers = Bootstrap, LingerMs = 2, EnableIdempotence = true }).Build();
+        // And with the settings the service's own clients start from: with the client's
+        // defaults this producer waits a minute on a broker that has stopped answering,
+        // and a test that times the service would time its own input.
+        _producer ??= new ProducerBuilder<byte[], byte[]>(
+            KafkaClientDefaults.Apply(new ProducerConfig { BootstrapServers = Bootstrap, LingerMs = 2, EnableIdempotence = true })).Build();
 
     public static byte[] Json<T>(T value) => JsonSerializer.SerializeToUtf8Bytes(value, JsonSerializerOptions.Web);
 
