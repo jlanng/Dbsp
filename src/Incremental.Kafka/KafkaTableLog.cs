@@ -98,6 +98,7 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
         var table = new KafkaTableLog<TKey, TRow>(log, name, rowPartitions);
         var asWriter = log.IsWriter;
         var head = await table.ReadHeadAsync(cancellationToken).ConfigureAwait(false);
+        var undecidedUntil = Environment.TickCount64 + (long)options.OperationTimeout.TotalMilliseconds;
         while (head is null)
         {
             if (log.IsWriter)
@@ -110,6 +111,22 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
                 head = await table.ReadHeadAsync(cancellationToken).ConfigureAwait(false);
                 if (head is not null)
                     break;
+
+                // No head, read as the writer. Before this is taken for a new table: every
+                // record its partitions hold must be decided (the committed end is the
+                // end). Where it is not — a partition whose leader was elected a moment
+                // ago and has not caught up — the table may well exist, and a new
+                // identity written over it would orphan every row it has.
+                if (!await table.RowsDecidedAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    if (Environment.TickCount64 > undecidedUntil)
+                        throw new KafkaLogException(
+                            $"Table '{name}': '{table.RowsTopic}' holds records that are neither committed nor aborted after {options.OperationTimeout}, " +
+                            "and no head record. It cannot be told whether the table exists.");
+                    await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+                    head = null;
+                    continue;
+                }
 
                 // A new table: mint its identity. Version 0, in every partition, so that a
                 // restore finds a head wherever it looks.
@@ -226,6 +243,20 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
         }, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>Whether, in every rows partition, the end of committed data is the end of
+    /// everything written: nothing is undecided, so what a read finds is all there is.</summary>
+    private async Task<bool> RowsDecidedAsync(CancellationToken cancellationToken)
+    {
+        foreach (var partition in _rows)
+        {
+            var committed = await _log.EndOffsetAsync(partition, cancellationToken).ConfigureAwait(false);
+            var written = await _log.UncommittedEndOffsetAsync(partition, cancellationToken).ConfigureAwait(false);
+            if (committed != written)
+                return false;
+        }
+        return true;
+    }
+
     public async ValueTask<long> LastVersionAsync(CancellationToken cancellationToken = default)
     {
         if (_lastIsExact)
@@ -235,9 +266,30 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
         // After the takeover's InitTransactions this is final — the old writer's last
         // transaction is decided and its markers written.
         var asWriter = _log.IsWriter;
-        var head = await ReadHeadAsync(cancellationToken).ConfigureAwait(false)
-            ?? throw new KafkaLogException($"Table '{_name}' has no head record in '{RowsTopic}'.");
-        CheckEpoch(head.Epoch);
+
+        // This log was opened on a table that exists, and a table's versions only grow. A
+        // read that finds no head, or one older than this process has already read, was
+        // answered from a partition whose end is not yet what it will be — its leader was
+        // elected a moment ago, after brokers came back. That passes, and until it has the
+        // answer must not be believed: a takeover that did would fail (no head), or go on
+        // from a version the table has left behind.
+        var deadline = Environment.TickCount64 + (long)_log.Options.OperationTimeout.TotalMilliseconds;
+        Head? head;
+        while (true)
+        {
+            head = await ReadHeadAsync(cancellationToken).ConfigureAwait(false);
+            if (head is not null)
+            {
+                CheckEpoch(head.Epoch);
+                if (head.Version >= Interlocked.Read(ref _last))
+                    break;
+            }
+            if (Environment.TickCount64 > deadline)
+                throw new KafkaLogException(head is null
+                    ? $"Table '{_name}' has no head record in '{RowsTopic}'."
+                    : $"Table '{_name}': the head record in '{RowsTopic}' is at version {head.Version}, and this process has read version {Interlocked.Read(ref _last)}.");
+            await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+        }
         NoteLast(head.Version);
         if (asWriter)
             _lastIsExact = true;
@@ -445,7 +497,7 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var result = consumer.Consume(TimeSpan.FromMilliseconds(100));
+            var result = consumer.ConsumeAssigned(TimeSpan.FromMilliseconds(100));
             if (result is null)
             {
                 if (Environment.TickCount64 - idleSince > (long)_log.Options.OperationTimeout.TotalMilliseconds)

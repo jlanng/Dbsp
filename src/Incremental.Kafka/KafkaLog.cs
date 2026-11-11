@@ -58,6 +58,18 @@ public sealed class KafkaLog : IAsyncDisposable
     private volatile KafkaLogFencedException? _fenced;
     private readonly TaskCompletionSource _whenFenced = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private long _term;
+
+    // The highest leader term this process has read from the leader topic, in any role.
+    private long _termSeen;
+
+    /// <summary>Tells the log of a leader term read from the leader topic: a floor under
+    /// the term a later takeover by this process may find.</summary>
+    internal void NoteTermSeen(long term)
+    {
+        long seen;
+        while ((seen = Interlocked.Read(ref _termSeen)) < term)
+            Interlocked.CompareExchange(ref _termSeen, term, seen);
+    }
     private long _heartbeatSequence;
     private long _idleHeartbeats;
     private long _inTransactionHeartbeats;
@@ -313,6 +325,7 @@ public sealed class KafkaLog : IAsyncDisposable
     private async Task AcquireAsync(CancellationToken cancellationToken)
     {
         ThrowIfFenced();
+        var clock = System.Diagnostics.Stopwatch.StartNew();
         if (!_initialised)
         {
             while (true)
@@ -344,7 +357,37 @@ public sealed class KafkaLog : IAsyncDisposable
 
         // Every earlier writer's transactions are decided now, so the leader topic's last
         // term is final.
-        var term = await ReadLastTermAsync(cancellationToken).ConfigureAwait(false) + 1;
+        var initialised = clock.Elapsed;
+
+        // Terms never fall. This process may have read a term from the leader topic
+        // already (a standby follows it); a read now that finds a lower one, or none in a
+        // topic that holds records, was answered from a partition whose end is not yet
+        // what it will be — its leader was elected a moment ago, with a broker down. Taken
+        // at its word, the new writer would announce a term that has been used.
+        var floor = Interlocked.Read(ref _termSeen);
+        var deadline = Environment.TickCount64 + (long)_options.OperationTimeout.TotalMilliseconds;
+        long last;
+        while (true)
+        {
+            last = await ReadLastTermAsync(cancellationToken).ConfigureAwait(false);
+            if (last >= floor && (last > 0
+                    || await UncommittedEndOffsetAsync(_leaderPartition, cancellationToken).ConfigureAwait(false)
+                    == await EndOffsetAsync(_leaderPartition, cancellationToken).ConfigureAwait(false)))
+                break;
+            if (Environment.TickCount64 > deadline)
+            {
+                var committed = await EndOffsetAsync(_leaderPartition, cancellationToken).ConfigureAwait(false);
+                var written = await UncommittedEndOffsetAsync(_leaderPartition, cancellationToken).ConfigureAwait(false);
+                var first = await StartOffsetAsync(_leaderPartition, cancellationToken).ConfigureAwait(false);
+                throw new KafkaLogException(
+                    $"The last leader term could not be read from '{_leaderPartition.Topic}': it gave {last}, and this process has read term {floor} " +
+                    $"(the topic starts at {first}, its committed end is {committed} and its end {written}). The topic's end is not settled; " +
+                    "the takeover can be tried again.");
+            }
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        }
+        var term = last + 1;
+        var termRead = clock.Elapsed;
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_closed, this);
@@ -361,6 +404,10 @@ public sealed class KafkaLog : IAsyncDisposable
         await EnqueueAsync(commit, acquiring: true).ConfigureAwait(false);
         Interlocked.Exchange(ref _term, term);
         _isWriter = true;
+        _options.Logger?.LogInformation(
+            "Kafka log {Prefix}: writer acquired as term {Term}: transactional.id initialised in {InitMs} ms, last term read in {ReadMs} ms, term committed in {CommitMs} ms",
+            _options.TopicPrefix, term, (long)initialised.TotalMilliseconds, (long)(termRead - initialised).TotalMilliseconds,
+            (long)(clock.Elapsed - termRead).TotalMilliseconds);
     }
 
     /// <summary>A record of the leader topic. Under the key <c>term</c>: written once by
@@ -687,11 +734,19 @@ public sealed class KafkaLog : IAsyncDisposable
 
             // What CommitTransaction would flush anyway, flushed here in slices so that the
             // heartbeats continue. What is left for the commit is one round trip.
+            var flushing = System.Diagnostics.Stopwatch.StartNew();
+            var said = 0L;
             while (_fenced is null && _producer.Flush(TimeSpan.FromMilliseconds(Math.Min(beatEvery, 250))) > 0)
             {
                 _stop.Token.ThrowIfCancellationRequested();
                 if (beats)
                     BeatIfDue(beatEvery, ref lastBeat);
+                if (flushing.ElapsedMilliseconds / 5000 > said)
+                {
+                    said = flushing.ElapsedMilliseconds / 5000;
+                    _options.Logger?.LogWarning(
+                        "Kafka transaction has been waiting {Seconds} s for the brokers to take its records.", (long)flushing.Elapsed.TotalSeconds);
+                }
             }
         }
         catch (KafkaException ex)
@@ -706,10 +761,11 @@ public sealed class KafkaLog : IAsyncDisposable
             // again, and the retries single the real cause out.
             culprit = IsRecordRefusal(ex) ? producing : null;
             error = ex;
-            Abort();
+            Abort(ex);
             return false;
         }
 
+        var committing = System.Diagnostics.Stopwatch.StartNew();
         while (true)
         {
             try
@@ -717,16 +773,22 @@ public sealed class KafkaLog : IAsyncDisposable
                 _producer.CommitTransaction(TimeSpan.FromSeconds(5));
                 break;
             }
-            catch (KafkaRetriableException)
+            catch (KafkaRetriableException ex)
             {
                 // Resumable, and the outcome is still open: keep asking. If the broker
                 // gives up on the transaction first, the next answer is a fence or an abort.
                 _stop.Token.ThrowIfCancellationRequested();
+
+                // A commit that does not come back is a leader that looks dead to its
+                // standby: say what it is waiting for.
+                _options.Logger?.LogWarning(
+                    "Kafka transaction commit has not completed after {Seconds} s ({Code}: {Reason}); still asking.",
+                    (long)committing.Elapsed.TotalSeconds, ex.Error.Code, ex.Error.Reason);
             }
             catch (KafkaTxnRequiresAbortException ex)
             {
                 error = ex;
-                Abort();
+                Abort(ex);
                 return false;
             }
             catch (KafkaException ex)
@@ -737,7 +799,7 @@ public sealed class KafkaLog : IAsyncDisposable
                 // Neither retriable nor a clean "abort me". An abort that succeeds settles
                 // it as not committed; one that fails ends the writer (Abort throws).
                 error = ex;
-                Abort();
+                Abort(ex);
                 return false;
             }
         }
@@ -799,7 +861,9 @@ public sealed class KafkaLog : IAsyncDisposable
         }
     }
 
-    private void Abort()
+    /// <summary>Aborts the open transaction. <paramref name="because"/> is what made
+    /// the abort necessary: if the abort itself fails, that is the cause worth reading.</summary>
+    private void Abort(KafkaException? because = null)
     {
         while (true)
         {
@@ -815,7 +879,10 @@ public sealed class KafkaLog : IAsyncDisposable
             catch (KafkaException ex)
             {
                 // The transaction could not be aborted, so its outcome is not known here.
-                throw MarkFenced(ex);
+                throw MarkFenced(ex, because is null || IsFencing(ex)
+                    ? null
+                    : $"The Kafka log's producer has failed and cannot write again ({ex.Error.Reason}); the transaction was being aborted " +
+                      $"because of: {because.Error.Code}: {because.Error.Reason}");
             }
         }
     }
@@ -890,6 +957,7 @@ public sealed class KafkaLog : IAsyncDisposable
                 [new TopicSpecification { Name = topic, NumPartitions = partitions, ReplicationFactor = _options.ReplicationFactor, Configs = config }],
                 new CreateTopicsOptions { RequestTimeout = _options.OperationTimeout, OperationTimeout = _options.OperationTimeout })
                 .WaitAsync(cancellationToken).ConfigureAwait(false);
+            await LeadersKnownAsync(topic, partitions, cancellationToken).ConfigureAwait(false);
             return partitions;
         }
         catch (CreateTopicsException ex) when (ex.Results.All(r => r.Error.Code == ErrorCode.TopicAlreadyExists))
@@ -900,22 +968,22 @@ public sealed class KafkaLog : IAsyncDisposable
             throw new KafkaLogException($"Could not create topic '{topic}': {ex.Results[0].Error.Reason}", ex);
         }
 
-        var actual = await RetryAsync(async () =>
+        var actual = await RetryAsync(async attempt =>
         {
             var described = await _admin.DescribeTopicsAsync(
-                TopicCollection.OfTopicNames([topic]), new DescribeTopicsOptions { RequestTimeout = _options.OperationTimeout })
+                TopicCollection.OfTopicNames([topic]), new DescribeTopicsOptions { RequestTimeout = attempt })
                 .ConfigureAwait(false);
             return described.TopicDescriptions[0].Partitions.Count;
-        }, cancellationToken).ConfigureAwait(false);
+        }, cancellationToken, topic).ConfigureAwait(false);
         if (fixedPartitions && actual != partitions)
             throw new KafkaLogException(
                 $"Topic '{topic}' has {actual} partition(s) and this log is configured for {partitions}. The count can never change: " +
                 "records are placed by it. Configure the log with the topic's count, or use a different topic prefix.");
 
         var wanted = config["cleanup.policy"];
-        var configs = await RetryAsync(() => _admin.DescribeConfigsAsync(
+        var configs = await RetryAsync(attempt => _admin.DescribeConfigsAsync(
             [new ConfigResource { Type = ResourceType.Topic, Name = topic }],
-            new DescribeConfigsOptions { RequestTimeout = _options.OperationTimeout }), cancellationToken).ConfigureAwait(false);
+            new DescribeConfigsOptions { RequestTimeout = attempt }), cancellationToken, topic).ConfigureAwait(false);
         if (configs[0].Entries.TryGetValue("cleanup.policy", out var policy) && policy.Value != wanted)
             throw new KafkaLogException(
                 $"Topic '{topic}' has cleanup.policy={policy.Value}; this log needs cleanup.policy={wanted}. " +
@@ -923,15 +991,44 @@ public sealed class KafkaLog : IAsyncDisposable
         return actual;
     }
 
+    /// <summary>
+    /// After creating a topic: asks for its metadata until every partition has a leader,
+    /// which also puts that answer into the admin client's cache. Without it the cache
+    /// can keep the answer from the instant of creation — no leader yet — and the first
+    /// call that needs a leader (the table's head, a partition's end) waits out a request
+    /// timeout on it. On one broker a new topic has its leaders at once; on three it
+    /// takes some milliseconds, and every table opened on new topics paid for it.
+    /// Best effort: a caller that still meets a missing leader retries.
+    /// </summary>
+    private async Task LeadersKnownAsync(string topic, int partitions, CancellationToken cancellationToken)
+    {
+        var deadline = Environment.TickCount64 + (long)_options.OperationTimeout.TotalMilliseconds;
+        while (Environment.TickCount64 < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                var metadata = await Task.Run(() => _admin.GetMetadata(topic, TimeSpan.FromSeconds(5)), cancellationToken).ConfigureAwait(false);
+                var found = metadata.Topics.FirstOrDefault(t => t.Topic == topic);
+                if (found is { Error.IsError: false } && found.Partitions.Count >= partitions && found.Partitions.All(p => p.Leader >= 0))
+                    return;
+            }
+            catch (KafkaException)
+            {
+            }
+            await Task.Delay(20, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
     /// <summary>The partition count of a topic this log does not own (a sink's).</summary>
     internal Task<int> PartitionCountAsync(string topic, CancellationToken cancellationToken) =>
-        RetryAsync(async () =>
+        RetryAsync(async attempt =>
         {
             var described = await _admin.DescribeTopicsAsync(
-                TopicCollection.OfTopicNames([topic]), new DescribeTopicsOptions { RequestTimeout = _options.OperationTimeout })
+                TopicCollection.OfTopicNames([topic]), new DescribeTopicsOptions { RequestTimeout = attempt })
                 .ConfigureAwait(false);
             return described.TopicDescriptions[0].Partitions.Count;
-        }, cancellationToken);
+        }, cancellationToken, topic);
 
     // ── reading ────────────────────────────────────────────────────────────────────────
 
@@ -946,11 +1043,11 @@ public sealed class KafkaLog : IAsyncDisposable
 
     /// <summary>The ends of committed data of several partitions, in one request.</summary>
     internal Task<long[]> EndOffsetsAsync(IReadOnlyList<TopicPartition> partitions, CancellationToken cancellationToken) =>
-        RetryAsync(async () =>
+        RetryAsync(async attempt =>
         {
             var result = await _admin.ListOffsetsAsync(
                 partitions.Select(p => new TopicPartitionOffsetSpec { TopicPartition = p, OffsetSpec = OffsetSpec.Latest() }),
-                new ListOffsetsOptions { IsolationLevel = IsolationLevel.ReadCommitted, RequestTimeout = _options.OperationTimeout })
+                new ListOffsetsOptions { IsolationLevel = IsolationLevel.ReadCommitted, RequestTimeout = attempt })
                 .ConfigureAwait(false);
             var ends = new long[partitions.Count];
             foreach (var info in result.ResultInfos)
@@ -959,11 +1056,11 @@ public sealed class KafkaLog : IAsyncDisposable
                 for (var i = 0; i < ends.Length; i++)
                 {
                     if (partitions[i].Topic == at.Topic && partitions[i].Partition == at.Partition)
-                        ends[i] = at.Offset.Value;
+                        ends[i] = OffsetOf(at);
                 }
             }
             return ends;
-        }, cancellationToken);
+        }, cancellationToken, [.. partitions.Select(p => p.Topic)]);
 
     /// <summary>The first offset a partition still holds.</summary>
     internal Task<long> StartOffsetAsync(TopicPartition partition, CancellationToken cancellationToken) =>
@@ -972,29 +1069,100 @@ public sealed class KafkaLog : IAsyncDisposable
     private Task<long> ListOffsetAsync(
         TopicPartition partition, OffsetSpec spec, CancellationToken cancellationToken,
         IsolationLevel isolation = IsolationLevel.ReadCommitted) =>
-        RetryAsync(async () =>
+        RetryAsync(async attempt =>
         {
             var result = await _admin.ListOffsetsAsync(
                 [new TopicPartitionOffsetSpec { TopicPartition = partition, OffsetSpec = spec }],
-                new ListOffsetsOptions { IsolationLevel = isolation, RequestTimeout = _options.OperationTimeout })
+                new ListOffsetsOptions { IsolationLevel = isolation, RequestTimeout = attempt })
                 .ConfigureAwait(false);
-            return result.ResultInfos[0].TopicPartitionOffsetError.Offset.Value;
-        }, cancellationToken);
+            return OffsetOf(result.ResultInfos[0].TopicPartitionOffsetError);
+        }, cancellationToken, partition.Topic);
+
+    /// <summary>
+    /// The offset a <c>ListOffsets</c> answer carries for one partition — or its error,
+    /// thrown. The client reports a partition it could not ask (its leader is down and no
+    /// other is elected yet) inside the answer, with the offset left unset, and does not
+    /// throw: read as it stands that is offset −1001, which every caller here would take
+    /// for "nothing was ever written". A takeover with a broker down then found no last
+    /// term (and announced one that had been used) and no head for a table that had one.
+    /// Thrown, it is a failure that passes, and the call is made again.
+    /// </summary>
+    internal static long OffsetOf(TopicPartitionOffsetError answer)
+    {
+        if (answer.Error is { IsError: true } error)
+            throw new KafkaException(error);
+        if (answer.Offset.Value < 0)
+            throw new KafkaException(new Error(ErrorCode.LeaderNotAvailable, $"No offset was given for {answer.TopicPartition}."));
+        return answer.Offset.Value;
+    }
 
     internal Task DeleteRecordsBeforeAsync(TopicPartition partition, long offset, CancellationToken cancellationToken) =>
-        RetryAsync(async () =>
+        RetryAsync(async attempt =>
         {
             await _admin.DeleteRecordsAsync(
                 [new TopicPartitionOffset(partition, offset)],
-                new DeleteRecordsOptions { RequestTimeout = _options.OperationTimeout, OperationTimeout = _options.OperationTimeout })
+                new DeleteRecordsOptions { RequestTimeout = attempt, OperationTimeout = attempt })
                 .ConfigureAwait(false);
             return true;
-        }, cancellationToken);
+        }, cancellationToken, partition.Topic);
 
     /// <summary>Runs an admin call, retrying the failures a cluster produces while a topic
     /// is new or a partition's leader is moving, for up to the operation timeout.</summary>
-    private Task<T> RetryAsync<T>(Func<Task<T>> call, CancellationToken cancellationToken) =>
-        RetryTransientAsync(call, _options.OperationTimeout, cancellationToken);
+    private Task<T> RetryAsync<T>(Func<TimeSpan, Task<T>> call, CancellationToken cancellationToken, params string[] topics) =>
+        RetryTransientAsync(call, _options.OperationTimeout, cancellationToken, () => RefreshMetadata(_admin, topics));
+
+    /// <summary>Asks the cluster for the topics' metadata through <paramref name="admin"/>,
+    /// which puts what it answers into that client's cache. Failures are the next
+    /// attempt's to report.</summary>
+    internal static void RefreshMetadata(IAdminClient admin, IEnumerable<string> topics)
+    {
+        foreach (var topic in topics.Distinct(StringComparer.Ordinal))
+        {
+            try
+            {
+                admin.GetMetadata(topic, TimeSpan.FromSeconds(5));
+            }
+            catch (KafkaException)
+            {
+            }
+        }
+    }
+
+    /// <summary>
+    /// As the other overload, giving each attempt its own request timeout — half a second
+    /// for the first, doubling, never past what is left of <paramref name="timeout"/> —
+    /// and running <paramref name="betweenAttempts"/> after a failure that passes. An
+    /// admin call that needs a partition's leader (<c>ListOffsets</c>, <c>DeleteRecords</c>)
+    /// takes it from the client's metadata cache. On a cluster of several brokers a topic
+    /// created a moment ago can be in that cache with no leader — the answer at the instant
+    /// of creation — and the call then waits out its whole request timeout for a refresh
+    /// nothing triggers, and fails with "No leaders found". Asked again it finds the same
+    /// cache. So an attempt is short, and between attempts the topics' metadata is asked
+    /// for outright, which replaces the cached answer. Given the whole operation timeout,
+    /// the first attempt used all of it: on three brokers one test in five of
+    /// <c>Incremental.Kafka.Tests</c> failed that way after 30 s.
+    /// </summary>
+    internal static async Task<T> RetryTransientAsync<T>(
+        Func<TimeSpan, Task<T>> call, TimeSpan timeout, CancellationToken cancellationToken, Action? betweenAttempts = null)
+    {
+        var deadline = Environment.TickCount64 + (long)timeout.TotalMilliseconds;
+        for (var attempt = 0; ; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var left = TimeSpan.FromMilliseconds(Math.Max(100, deadline - Environment.TickCount64));
+            var mine = TimeSpan.FromMilliseconds(500 << Math.Min(attempt, 6));
+            try
+            {
+                return await call(mine < left ? mine : left).WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (KafkaException ex) when (IsTransient(ex) && Environment.TickCount64 < deadline)
+            {
+                if (betweenAttempts is not null)
+                    await Task.Run(betweenAttempts, cancellationToken).ConfigureAwait(false);
+                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
 
     /// <summary>Runs <paramref name="call"/>, and again every 100 ms while it fails in a way
     /// that passes (<see cref="IsTransient"/>), until <paramref name="timeout"/> has gone
@@ -1029,7 +1197,10 @@ public sealed class KafkaLog : IAsyncDisposable
             or ErrorCode.Local_Transport or ErrorCode.Local_AllBrokersDown or ErrorCode.NotEnoughReplicas
             or ErrorCode.NetworkException or ErrorCode.Local_NoEnt or ErrorCode.BrokerNotAvailable
             or ErrorCode.ReplicaNotAvailable or ErrorCode.KafkaStorageError or ErrorCode.FencedLeaderEpoch
-            or ErrorCode.UnknownLeaderEpoch or ErrorCode.NotController or ErrorCode.Local_WaitCoord;
+            or ErrorCode.UnknownLeaderEpoch or ErrorCode.NotController or ErrorCode.Local_WaitCoord
+            // A leader elected a moment ago whose high watermark has not caught up yet:
+            // it will not give an end that could be lower than the one it gave before.
+            or ErrorCode.OffsetNotAvailable or ErrorCode.Local_UnknownPartition or ErrorCode.Local_UnknownTopic;
 
         return exception switch
         {
@@ -1098,6 +1269,9 @@ public sealed class KafkaLog : IAsyncDisposable
                 var consumer = _shortReader ??= CreateConsumer(forShortReads: true);
                 try
                 {
+                    // It is polled only while a read runs, and a read may begin with a
+                    // metadata request: its callbacks (a token refresh) are served first.
+                    consumer.ServeCallbacks();
                     var result = read(consumer);
                     consumer.Unassign();
                     return result;
@@ -1187,7 +1361,7 @@ public sealed class KafkaLog : IAsyncDisposable
         {
             cancellationToken.ThrowIfCancellationRequested();
             _stop.Token.ThrowIfCancellationRequested();
-            var result = consumer.Consume(TimeSpan.FromMilliseconds(100));
+            var result = consumer.ConsumeAssigned(TimeSpan.FromMilliseconds(100));
             if (result is null)
             {
                 if (Environment.TickCount64 - idleSince > (long)_options.OperationTimeout.TotalMilliseconds)
@@ -1260,7 +1434,7 @@ public sealed class KafkaLog : IAsyncDisposable
             var reported = -1L;
             while (!token.IsCancellationRequested)
             {
-                var result = consumer.Consume(TimeSpan.FromMilliseconds(100));
+                var result = consumer.ConsumeAssigned(TimeSpan.FromMilliseconds(100));
                 if (result is null)
                     continue;
 
@@ -1280,7 +1454,7 @@ public sealed class KafkaLog : IAsyncDisposable
                     next = result.Offset.Value + 1;
                     if (records.Count >= MaxBatch)
                         break;
-                    result = consumer.Consume(TimeSpan.Zero);
+                    result = consumer.ConsumeAssigned(TimeSpan.Zero);
                 }
 
                 // Caught up without being told so: when the only offset between the last

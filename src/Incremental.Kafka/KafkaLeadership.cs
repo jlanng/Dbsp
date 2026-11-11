@@ -673,6 +673,7 @@ public sealed class KafkaLeadership : IAsyncDisposable
                 return; // a record older than one already seen: only a restarted watch reads those
             leaderChanged = record.Term != _leaderTerm || record.Node != _leaderNode || record.Resigned != _leaderResigned;
             _leaderTerm = record.Term;
+            _log.NoteTermSeen(record.Term);
             _leaderNode = record.Node;
             _leaderAt = record.At;
             _leaderResigned = record.Resigned;

@@ -74,6 +74,10 @@ public sealed class KafkaServiceBackend : IServiceBackend
         _options = options;
         _logger = (ILogger?)loggerFactory?.CreateLogger("Incremental.Service.Kafka") ?? options.Log.Logger
             ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
+
+        // The log speaks too — an aborted transaction, a commit that is not coming back —
+        // and a host that gave it no logger of its own would never hear it.
+        options.Log.Logger ??= loggerFactory?.CreateLogger("Incremental.Kafka");
         _leadership = new NodeLeadership(this);
         _blobs = new KafkaBlobStore(options.Log, NodeId, _logger);
     }
@@ -414,7 +418,11 @@ internal sealed class KafkaBlobStore : IBlobStore, IDisposable
     private void Refresh(CancellationToken cancellationToken)
     {
         var consumer = Consumer();
-        var end = consumer.QueryWatermarkOffsets(_partition, Patience).High.Value;
+
+        // Used now and then, and asked for watermarks before it is ever polled: its
+        // callbacks (a token refresh) are served first, or it has no token to connect with.
+        consumer.ServeCallbacks();
+        var end = Watermark(consumer, cancellationToken);
         if (_scanned >= end)
             return;
         consumer.Assign(new TopicPartitionOffset(_partition, _scanned));
@@ -422,7 +430,7 @@ internal sealed class KafkaBlobStore : IBlobStore, IDisposable
         while (_scanned < end)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var result = consumer.Consume(TimeSpan.FromMilliseconds(200));
+            var result = consumer.ConsumeAssigned(TimeSpan.FromMilliseconds(200));
             if (result?.Message is null)
             {
                 // Compaction leaves gaps at the end of what was asked for; the position says so.
@@ -438,6 +446,29 @@ internal sealed class KafkaBlobStore : IBlobStore, IDisposable
             _scanned = result.Offset.Value + 1;
         }
         consumer.Unassign();
+    }
+
+    /// <summary>The end of the blob topic. A topic created a moment ago is not known to
+    /// every broker of a cluster at once, and one that is between leaders has no end to
+    /// give: both pass, and are asked about again.</summary>
+    private long Watermark(IConsumer<byte[], byte[]> consumer, CancellationToken cancellationToken)
+    {
+        var deadline = Environment.TickCount64 + (long)Patience.TotalMilliseconds;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                return consumer.QueryWatermarkOffsets(_partition, TimeSpan.FromSeconds(5)).High.Value;
+            }
+            catch (KafkaException ex) when (Environment.TickCount64 < deadline && ex.Error.Code is
+                ErrorCode.Local_UnknownPartition or ErrorCode.Local_UnknownTopic or ErrorCode.UnknownTopicOrPart or ErrorCode.LeaderNotAvailable
+                or ErrorCode.NotLeaderForPartition or ErrorCode.Local_TimedOut or ErrorCode.RequestTimedOut or ErrorCode.Local_Transport
+                or ErrorCode.Local_AllBrokersDown or ErrorCode.Local_WaitCoord or ErrorCode.NetworkException or ErrorCode.Local_NoEnt)
+            {
+                Thread.Sleep(100);
+            }
+        }
     }
 
     private void Note(ConsumeResult<byte[], byte[]> record)
@@ -567,7 +598,7 @@ internal sealed class KafkaBlobStore : IBlobStore, IDisposable
                     cancellationToken.ThrowIfCancellationRequested();
                     if (Environment.TickCount64 > deadline)
                         throw new TimeoutException($"Reading blob {sha256} from '{Topic}' at offset {offsets[i]} timed out.");
-                    result = consumer.Consume(TimeSpan.FromMilliseconds(200));
+                    result = consumer.ConsumeAssigned(TimeSpan.FromMilliseconds(200));
                 }
                 if (result.Offset.Value != offsets[i] || result.Message.Value is null
                     || Encoding.UTF8.GetString(result.Message.Key ?? []) != $"{sha256}/{i}")

@@ -523,7 +523,7 @@ public sealed class KafkaSource : IAsyncDisposable
         while (!request.IsCompleted)
         {
             _stop.Token.ThrowIfCancellationRequested();
-            consumer.Consume(TimeSpan.FromMilliseconds(20));
+            consumer.ConsumeAssigned(TimeSpan.FromMilliseconds(20));
         }
         return request.GetAwaiter().GetResult();
     }
@@ -555,7 +555,7 @@ public sealed class KafkaSource : IAsyncDisposable
     /// up to the operation timeout: that passes, and a source that gave up on it would
     /// fail a start — or a takeover — over nothing.</summary>
     private Task<long[]> ListOffsetsAsync(IAdminClient admin, int partitions, OffsetSpec spec, CancellationToken cancellationToken) =>
-        KafkaLog.RetryTransientAsync(async () =>
+        KafkaLog.RetryTransientAsync(async attempt =>
         {
             var result = await admin.ListOffsetsAsync(
                 Enumerable.Range(0, partitions).Select(p => new TopicPartitionOffsetSpec
@@ -563,13 +563,13 @@ public sealed class KafkaSource : IAsyncDisposable
                     TopicPartition = new TopicPartition(_options.Topic, p),
                     OffsetSpec = spec,
                 }),
-                new ListOffsetsOptions { IsolationLevel = _options.IsolationLevel, RequestTimeout = _options.OperationTimeout })
+                new ListOffsetsOptions { IsolationLevel = _options.IsolationLevel, RequestTimeout = attempt })
                 .ConfigureAwait(false);
             var offsets = new long[partitions];
             foreach (var info in result.ResultInfos)
-                offsets[info.TopicPartitionOffsetError.Partition.Value] = info.TopicPartitionOffsetError.Offset.Value;
+                offsets[info.TopicPartitionOffsetError.Partition.Value] = KafkaLog.OffsetOf(info.TopicPartitionOffsetError);
             return offsets;
-        }, _options.OperationTimeout, cancellationToken);
+        }, _options.OperationTimeout, cancellationToken, () => KafkaLog.RefreshMetadata(admin, [_options.Topic]));
 
     /// <summary>Reads the whole topic as it stands and replaces the table's rows with what
     /// it says, recording the ends as the table's position.</summary>
@@ -581,7 +581,7 @@ public sealed class KafkaSource : IAsyncDisposable
         while (Enumerable.Range(0, ends.Length).Any(p => position[p] < ends[p]))
         {
             _stop.Token.ThrowIfCancellationRequested();
-            var result = consumer.Consume(TimeSpan.FromMilliseconds(100));
+            var result = consumer.ConsumeAssigned(TimeSpan.FromMilliseconds(100));
             if (result is null)
                 continue;
             var p = result.Partition.Value;
@@ -621,7 +621,7 @@ public sealed class KafkaSource : IAsyncDisposable
         {
             // With changes staged, do not wait for more: commit them as soon as the client
             // has nothing fetched.
-            var result = consumer.Consume(_target.Staged > 0 ? TimeSpan.Zero : TimeSpan.FromMilliseconds(100));
+            var result = consumer.ConsumeAssigned(_target.Staged > 0 ? TimeSpan.Zero : TimeSpan.FromMilliseconds(100));
             if (result is null || result.IsPartitionEOF)
             {
                 // The end-of-partition event carries the position past whatever follows

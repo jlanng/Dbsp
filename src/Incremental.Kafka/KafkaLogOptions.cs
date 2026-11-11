@@ -124,7 +124,7 @@ public sealed class KafkaLogOptions
     public IReadOnlyDictionary<string, string> TableChangesTopicConfig { get; init; } = new Dictionary<string, string>();
 
     /// <summary>Receives the Kafka clients' log lines and errors. Null discards them.</summary>
-    public ILogger? Logger { get; init; }
+    public ILogger? Logger { get; set; }
 
     internal string EffectiveTransactionalId => TransactionalId ?? TopicPrefix + ".writer";
 
