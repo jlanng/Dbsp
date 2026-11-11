@@ -564,22 +564,29 @@ internal sealed class DefinitionBinding(string name, Type type, Type? settingsTy
         var found = new Dictionary<string, DefinitionBinding>(StringComparer.Ordinal);
         foreach (var type in assembly.GetTypes())
         {
-            if (!type.IsClass || type.IsAbstract)
+            if (ForType(type) is not { } binding)
                 continue;
-            var generic = type.GetInterfaces().Where(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IPipelineDefinition<>)).ToList();
-            var plain = typeof(IPipelineDefinition).IsAssignableFrom(type);
-            if (generic.Count == 0 && !plain)
-                continue;
-            if (generic.Count + (plain ? 1 : 0) > 1)
-                throw ServiceException.Invalid($"Definition class {type.FullName} implements more than one definition interface; it has one settings type or none.");
-            if (type.GetConstructor(Type.EmptyTypes) is null)
-                throw ServiceException.Invalid($"Definition class {type.FullName} has no public parameterless constructor.");
-            var attribute = type.GetCustomAttribute<PipelineAttribute>();
-            var name = attribute?.Name ?? type.Name;
-            if (!found.TryAdd(name, new DefinitionBinding(name, type, generic.FirstOrDefault()?.GetGenericArguments()[0], attribute?.Description)))
-                throw ServiceException.Invalid($"The plugin has two pipeline definitions named '{name}' ({found[name].Type.FullName} and {type.FullName}).");
+            if (!found.TryAdd(binding.Name, binding))
+                throw ServiceException.Invalid($"The plugin has two pipeline definitions named '{binding.Name}' ({found[binding.Name].Type.FullName} and {type.FullName}).");
         }
         return found;
+    }
+
+    /// <summary>The binding of one class; null for a class that is not a definition.</summary>
+    public static DefinitionBinding? ForType(Type type)
+    {
+        if (!type.IsClass || type.IsAbstract)
+            return null;
+        var generic = type.GetInterfaces().Where(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IPipelineDefinition<>)).ToList();
+        var plain = typeof(IPipelineDefinition).IsAssignableFrom(type);
+        if (generic.Count == 0 && !plain)
+            return null;
+        if (generic.Count + (plain ? 1 : 0) > 1)
+            throw ServiceException.Invalid($"Definition class {type.FullName} implements more than one definition interface; it has one settings type or none.");
+        if (type.GetConstructor(Type.EmptyTypes) is null)
+            throw ServiceException.Invalid($"Definition class {type.FullName} has no public parameterless constructor.");
+        var attribute = type.GetCustomAttribute<PipelineAttribute>();
+        return new DefinitionBinding(attribute?.Name ?? type.Name, type, generic.FirstOrDefault()?.GetGenericArguments()[0], attribute?.Description);
     }
 }
 
