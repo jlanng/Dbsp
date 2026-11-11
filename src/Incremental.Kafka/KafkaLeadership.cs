@@ -264,6 +264,7 @@ public sealed class KafkaLeadership : IAsyncDisposable
     private long _notBeforeTicks;
     private long _takeoversAbandoned;
     private long _takeoversHeld;
+    private long _lastHeldTicks;
     private long _lastHeldLogTicks;
     private FollowerLag? _lag;
     private TakeoverTimings? _lastTakeover;
@@ -728,6 +729,7 @@ public sealed class KafkaLeadership : IAsyncDisposable
             _leaderResigned = record.Resigned;
             _heardTicks = Environment.TickCount64;
             _uncommittedEnd = -1;
+            Interlocked.Exchange(ref _lastHeldTicks, 0);
 
             // Heard while this node is on its way to fencing it: the leader is alive and
             // committing, so the takeover is given up while that is still free. Not a
@@ -903,19 +905,27 @@ public sealed class KafkaLeadership : IAsyncDisposable
 
     /// <summary>Whether a takeover at the ceiling should wait: the leader answers its
     /// probe as the leader, and the brokers say outright that the log cannot be written
-    /// (<see cref="KafkaLog.ProbeWritePathAsync"/>). Anything short of that — a leader that
-    /// no longer answers, brokers that cannot be asked or see nothing wrong — and the
-    /// ceiling stands.</summary>
+    /// (<see cref="KafkaLog.ProbeWritePathAsync"/>) or said so until a moment ago.
+    /// Anything short of that — a leader that no longer answers, brokers that cannot be
+    /// asked or see nothing wrong — and the ceiling stands.</summary>
     private async Task<bool> HeldByBrokersAsync(TimeSpan silence, CancellationToken token)
     {
         if (!await ProbeAsync(token).ConfigureAwait(false))
             return false;
         var (path, why) = await _log.ProbeWritePathAsync(token).ConfigureAwait(false);
-        if (path != KafkaLog.WritePath.Unwritable)
-            return false;
-        Interlocked.Increment(ref _takeoversHeld);
         var now = Environment.TickCount64;
-        if (now - Interlocked.Read(ref _lastHeldLogTicks) >= 10_000)
+        if (path != KafkaLog.WritePath.Unwritable)
+        {
+            // The brokers can commit again, or it cannot be told. A leader that was held
+            // up by them needs a moment to say so — its client has to find them first —
+            // and gets two takeover timeouts from the last "no" before its silence is
+            // its own again.
+            var last = Interlocked.Read(ref _lastHeldTicks);
+            return last != 0 && now - last < (long)(_options.TakeoverAfter.TotalMilliseconds * 2);
+        }
+        Interlocked.Exchange(ref _lastHeldTicks, now);
+        Interlocked.Increment(ref _takeoversHeld);
+        if (now - Interlocked.Read(ref _lastHeldLogTicks) >= 10_000 || Interlocked.Read(ref _lastHeldLogTicks) == 0)
         {
             Interlocked.Exchange(ref _lastHeldLogTicks, now);
             _logger?.LogWarning(

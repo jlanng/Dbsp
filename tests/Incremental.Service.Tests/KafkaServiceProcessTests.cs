@@ -900,8 +900,13 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
             fault + "-one", env, d, trades, stall, $"broker {index + 1} ({(roles.Count == 0 ? "no role" : string.Join(", ", roles))}) was lost by {fault} for {away.TotalSeconds:F0} s",
             new() { ["broker"] = index + 1, ["roles"] = roles, ["awayS"] = away.TotalSeconds });
         Assert.False(moved, "the loss of one broker of three moved the leadership");
-        Assert.True(stall.LongestMs < 25_000, $"the sink was silent for {stall.LongestMs} ms over the loss of one broker");
-        Assert.True(stall.LongestDelayMs < 28_000, $"a trade took {stall.LongestDelayMs} ms to reach the sink over the loss of one broker");
+
+        // The bound is the takeover ceiling, not the 9 to 15 s this takes almost always:
+        // in one kill of thirty the two brokers that were left spent the whole twenty
+        // seconds waiting on connections to the dead one before a transaction could
+        // begin again (durability-and-standby.md, As built: broker failures).
+        Assert.True(stall.LongestMs < 30_000, $"the sink was silent for {stall.LongestMs} ms over the loss of one broker");
+        Assert.True(stall.LongestDelayMs < 30_000, $"a trade took {stall.LongestDelayMs} ms to reach the sink over the loss of one broker");
     }
 
     /// <summary>
@@ -1048,10 +1053,13 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         // Two of three brokers: no controller quorum, no partition with two replicas in
         // sync. Nothing can be written or elected — for longer than the transaction
         // timeout (60 s), the heartbeat interval and the takeover ceiling put together.
+        // INCREMENTAL_KAFKA_OUTAGE_SECONDS makes it shorter: under the transaction timeout
+        // the leader's open transaction survives the outage, and so should the leader.
+        var seconds = int.TryParse(Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_OUTAGE_SECONDS"), out var asked) ? asked : 70;
         var outage = Stopwatch.StartNew();
         await DockerAsync("stop", "-t", "1", Brokers[0]);
         await DockerAsync("stop", "-t", "1", Brokers[1]);
-        await Task.Delay(TimeSpan.FromSeconds(70));
+        await Task.Delay(TimeSpan.FromSeconds(seconds));
         var held = (await b.StatusAsync()).GetProperty("counters").GetProperty("takeoversHeld").GetInt64();
         await DockerAsync("start", Brokers[0]);
         await DockerAsync("start", Brokers[1]);
@@ -1065,7 +1073,7 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         await Task.Delay(2000);
         var (trades, stall) = await load.StopAsync();
         await ConcludeAsync(
-            "no-quorum", env, d, trades, stall, "two of three brokers were down for 70 s",
+            "no-quorum", env, d, trades, stall, $"two of three brokers were down for {seconds} s",
             new() { ["takeoversHeld"] = held, ["wholeToSettledMs"] = null, ["outageMs"] = outage.ElapsedMilliseconds });
         Measured($"kafka3 no-quorum: one leader, a warm standby and a complete sink {back.ElapsedMilliseconds} ms after the cluster was whole");
     }

@@ -171,6 +171,12 @@ public class BrokerFaultSeamTests
         Assert.Equal("1000", consumer.Get("reconnect.backoff.max.ms"));
         Assert.Null(consumer.Get("request.timeout.ms"));
 
+        // An admin client's calls carry their own timeouts, up to the operation timeout;
+        // the socket timeout would cut them all at six seconds.
+        var admin = KafkaClientDefaults.Apply(new AdminClientConfig());
+        Assert.Null(admin.Get("socket.timeout.ms"));
+        Assert.Equal("1000", admin.Get("reconnect.backoff.max.ms"));
+
         // What the caller set stands.
         var own = KafkaClientDefaults.Apply(new ProducerConfig { ReconnectBackoffMaxMs = 250, SocketTimeoutMs = 30_000 });
         Assert.Equal("250", own.Get("reconnect.backoff.max.ms"));

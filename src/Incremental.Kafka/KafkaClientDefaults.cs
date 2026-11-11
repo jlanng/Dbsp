@@ -61,8 +61,15 @@ public static class KafkaClientDefaults
         ArgumentNullException.ThrowIfNull(config);
         foreach (var (key, value) in Settings)
         {
-            // request.timeout.ms is the producer's; the others belong to every client.
+            // request.timeout.ms is the producer's; the others belong to every client —
+            // but for the socket timeout of an admin client. Its calls say how long each
+            // may take (a topic's creation is given the operation timeout, a leader
+            // lookup half a second and then longer), and the socket timeout would cut
+            // every one of them at six seconds: a node starting while the brokers were
+            // electing a controller failed to create its topics that way.
             if (key == "request.timeout.ms" && config is not ProducerConfig)
+                continue;
+            if (key == "socket.timeout.ms" && config is AdminClientConfig)
                 continue;
             if (config.Get(key) is null)
                 config.Set(key, value);

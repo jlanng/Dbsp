@@ -1085,21 +1085,37 @@ public sealed class KafkaLog : IAsyncDisposable
     internal async Task<int> EnsureTopicAsync(
         string topic, int partitions, Dictionary<string, string> config, bool fixedPartitions, CancellationToken cancellationToken)
     {
-        try
+        // Asked again while the brokers cannot say: a cluster between controllers answers
+        // nothing for some seconds, and a node that starts just then — one its supervisor
+        // has restarted in the middle of a broker fault — must not end for it. A request
+        // that timed out may have created the topic; the next one then finds it there.
+        var deadline = Environment.TickCount64 + (long)_options.OperationTimeout.TotalMilliseconds;
+        while (true)
         {
-            await _admin.CreateTopicsAsync(
-                [new TopicSpecification { Name = topic, NumPartitions = partitions, ReplicationFactor = _options.ReplicationFactor, Configs = config }],
-                new CreateTopicsOptions { RequestTimeout = _options.OperationTimeout, OperationTimeout = _options.OperationTimeout })
-                .WaitAsync(cancellationToken).ConfigureAwait(false);
-            await LeadersKnownAsync(topic, partitions, cancellationToken).ConfigureAwait(false);
-            return partitions;
-        }
-        catch (CreateTopicsException ex) when (ex.Results.All(r => r.Error.Code == ErrorCode.TopicAlreadyExists))
-        {
-        }
-        catch (CreateTopicsException ex)
-        {
-            throw new KafkaLogException($"Could not create topic '{topic}': {ex.Results[0].Error.Reason}", ex);
+            try
+            {
+                await _admin.CreateTopicsAsync(
+                    [new TopicSpecification { Name = topic, NumPartitions = partitions, ReplicationFactor = _options.ReplicationFactor, Configs = config }],
+                    new CreateTopicsOptions { RequestTimeout = _options.OperationTimeout, OperationTimeout = _options.OperationTimeout })
+                    .WaitAsync(cancellationToken).ConfigureAwait(false);
+                await LeadersKnownAsync(topic, partitions, cancellationToken).ConfigureAwait(false);
+                return partitions;
+            }
+            catch (CreateTopicsException ex) when (ex.Results.All(r => r.Error.Code == ErrorCode.TopicAlreadyExists))
+            {
+                break;
+            }
+            catch (CreateTopicsException ex) when (ex.Results.All(r => IsTransient(new KafkaException(r.Error))) && Environment.TickCount64 < deadline)
+            {
+            }
+            catch (CreateTopicsException ex)
+            {
+                throw new KafkaLogException($"Could not create topic '{topic}': {ex.Results[0].Error.Reason}", ex);
+            }
+            catch (KafkaException ex) when (IsTransient(ex) && Environment.TickCount64 < deadline)
+            {
+            }
+            await Task.Delay(200, cancellationToken).ConfigureAwait(false);
         }
 
         var actual = await RetryAsync(async attempt =>

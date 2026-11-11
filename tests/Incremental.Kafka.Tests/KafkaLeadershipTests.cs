@@ -850,8 +850,14 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         Assert.True(b.Leadership.TakeoversHeld > 0);
         Assert.True(a.Log.IsWriter);
 
-        // The brokers are back and the leader is still silent: now it is the leader's fault.
+        // The brokers are back and the leader is still silent. It is given two takeover
+        // timeouts to be heard — its client has to find the brokers again — and then it
+        // is the leader's fault.
         b.Log.WritePathOverride = () => (KafkaLog.WritePath.Writable, null);
+        var back = Stopwatch.StartNew();
+        await b.Leadership.WhenRoleAsync(r => r != NodeRole.Standby).WaitAsync(Timeout);
+        Assert.True(back.Elapsed >= After * 2 - Beat, $"the standby took over {back.Elapsed} after the brokers were back; the leader is given {After * 2}");
+        Assert.True(back.Elapsed < After * 2 + TimeSpan.FromSeconds(10), $"the standby waited {back.Elapsed} after the brokers were back; the leader is given {After * 2} and no more");
         await LeadsAsync(b);
         Assert.Equal("ceiling", b.Leadership.Status.LastTakeover!.Reason);
         Assert.Equal(2, b.Leadership.Term);
@@ -936,6 +942,36 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         third.NoteTermSeen(1);
         await third.AcquireWriterAsync().WaitAsync(Timeout);
         Assert.Equal(2, third.Term);
+    }
+
+    /// <summary>The other end of the same rule: the brokers come back, and so does the
+    /// leader. Its first heartbeat ends the matter; nobody is fenced.</summary>
+    [Fact]
+    public async Task A_leader_that_commits_again_once_the_brokers_are_back_keeps_leading_past_the_ceiling()
+    {
+        await using var env = KafkaEnv.Create();
+        await using var a = await StartAsync(env, "a");
+        await LeadsAsync(a);
+        var ceiling = TimeSpan.FromSeconds(2);
+        await using var b = await StartAsync(env, "b", ceiling: ceiling, probe: _ => ValueTask.FromResult(true));
+        await Task.Delay(After);
+        b.Log.WritePathOverride = () => (KafkaLog.WritePath.Unwritable, "the test says so");
+
+        using var stall = Stall(a);
+        await Task.Delay(ceiling * 2);
+        Assert.True(b.Leadership.TakeoversHeld > 0);
+
+        // Back: the brokers can commit, and the leader — a moment later — does.
+        b.Log.WritePathOverride = () => (KafkaLog.WritePath.Writable, null);
+        await Task.Delay(After / 2);
+        stall.Set();
+        await Task.Delay(ceiling * 2);
+        Assert.Equal(NodeRole.Standby, b.Role);
+        Assert.Equal(NodeRole.Leader, a.Role);
+        Assert.True(a.Log.IsWriter);
+        Assert.Equal(1, b.Leadership.Status.LeaderTerm);
+        Assert.Equal(0, b.Leadership.TakeoversAbandoned);
+        await CommitStateAsync(a.Log, "p", "still mine");
     }
 
     // ── stopping part-way, stepping down twice ─────────────────────────────────────────
