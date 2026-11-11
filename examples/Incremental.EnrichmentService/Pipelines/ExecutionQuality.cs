@@ -17,9 +17,9 @@ namespace Enrichment.Pipelines;
 /// was read ahead of the other. The join's key is (instrument, interval), and
 /// <c>EvictWhen</c> closes a key when the watermark passes the interval's end — from then
 /// on neither side holds anything for it, which is what keeps the state of a join between
-/// two unbounded streams bounded while the circuit runs. (Across a restart less so: the
-/// watermark and the keys waiting to close are not in the checkpoint, so a key that no
-/// record touches after a restart is not evicted. The guide says what follows from that.)
+/// two unbounded streams bounded. The watermark and the keys waiting to close are in the
+/// checkpoint with the rows they bound, so that holds across a restart and a takeover
+/// too: a key open when the leader died still closes on the node that took over.
 /// </para>
 /// <para>
 /// It is a left join: an execution in an instrument that was not quoted in its interval is

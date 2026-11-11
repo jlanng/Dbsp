@@ -45,7 +45,10 @@ public sealed class Model(WorldShape shape)
             var trade = shape.TradeAt(offset);
             foreach (var enrichment in Enrichments.Values)
                 enrichment.Arrive(this, trade);
-            Exposure?.Arrive(this, trade);
+            // A straggler is behind the watermark of the pipelines that keep event time:
+            // they drop it. The others carry it like any execution.
+            if (!shape.Stragglers.Contains(offset))
+                Exposure?.Arrive(this, trade);
             foreach (var alerts in Alerts.Values)
                 alerts.Arrive(trade);
         }
@@ -74,6 +77,17 @@ public sealed class Model(WorldShape shape)
 
     /// <summary>A lookup: nothing already delivered changes.</summary>
     public void Change(Counterparty counterparty) => Counterparties[counterparty.Id] = counterparty;
+
+    /// <summary>The published trades an event-time pipeline counts: all but the stragglers,
+    /// which arrived behind its watermark. (True of a pipeline that read the feed as it was
+    /// published. One reset afterwards reads the whole feed in a few steps, with no
+    /// watermark yet to be behind — so the smoke test publishes its straggler last.)</summary>
+    public IEnumerable<Trade> OnTime()
+    {
+        for (long offset = 0; offset < Trades; offset++)
+            if (!shape.Stragglers.Contains(offset))
+                yield return shape.TradeAt(offset);
+    }
 
     /// <summary>A pipeline reset reads its input again from the start, against the tables as they are now.</summary>
     public IEnumerable<Trade> Replay()
@@ -205,7 +219,7 @@ public sealed class ExposureModel(TimeSpan window)
     public void Reset(Model model)
     {
         _executions.Clear();
-        foreach (var trade in model.Replay())
+        foreach (var trade in model.OnTime())
             Arrive(model, trade);
     }
 
@@ -238,7 +252,7 @@ public sealed class QualityModel(TimeSpan window, TimeSpan hop)
     public (long Priced, long Unpriced) Counts(Model model)
     {
         long priced = 0, unpriced = 0;
-        foreach (var trade in model.Replay())
+        foreach (var trade in model.OnTime())
             _ = Slippage(model, trade) is null ? unpriced++ : priced++;
         return (priced, unpriced);
     }
@@ -255,7 +269,7 @@ public sealed class QualityModel(TimeSpan window, TimeSpan hop)
     public Dictionary<string, JsonObject> Expected(Model model)
     {
         var totals = new Dictionary<(string AssetClass, long Start), (long Priced, long Unpriced, decimal Bps)>();
-        foreach (var trade in model.Replay())
+        foreach (var trade in model.OnTime())
         {
             var assetClass = model.Instruments[trade.InstrumentId].AssetClass;
             var slippage = Slippage(model, trade);

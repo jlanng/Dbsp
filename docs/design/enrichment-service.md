@@ -1776,15 +1776,15 @@ Each has a default this design is built on.
     exiting. It would have saved that run; it puts an exception into "Fenced is final",
     which is what keeps two writers from ever alternating, and it wants a reproduction
     before it is trusted. Until then: a supervisor, and an alert on no leader.
-36. **The watermark and the eviction deadlines are not checkpointed** (the core's, as
-    before; S6 states it for the service). After a restart or a takeover a late record
-    can reopen a closed window, and keys open at the restart that nothing touches again
-    are never evicted. *Alternative:* commit the frozen watermark with each checkpoint
-    and have every evicting operator rebuild its deadline queue from its store at
-    start. The first is an addition to the checkpoint marker (a format-version bump);
-    the second is a scan of every evicting store at each start, which puts the size of
-    the state back into a takeover's `pipelines` stage — or the queue has to be fed as a
-    follower applies records, which no operator does today.
+36. **Event-time state is checkpointed, and an older checkpoint of an event-time
+    pipeline is refused** (S7). The watermark and every deadline are in the checkpoint
+    from state-manifest format 7 on. A pipeline that uses `WithEventTime` and whose
+    state was committed by an earlier build does not start (`state-incompatible`); it
+    needs `state=reset`, which reads its inputs again. A pipeline without event time is
+    not touched. *Alternative:* accept the old checkpoint and rebuild the deadlines
+    from the keys of its state. The deadlines can be rebuilt; the watermark cannot, so
+    the first late record after such a start would still reopen a window — once per
+    pipeline, at the upgrade. It would also want an enumeration on every store.
 37. **State bytes are kept beside the typed stores until the first commit after a
     start** (S6), so a leader's idle pipeline holds its state twice for as long as it is
     idle. *Alternative:* commit once as soon as a circuit has started on existing state,
@@ -1821,6 +1821,24 @@ Each has a default this design is built on.
     example is meant to be left running. *Alternative:* a retention setting on the
     `files` sink itself; then the service deletes a tenant's output on a schedule, which
     a bucket does better.
+44. **A changed number of `WithEventTime` sources refuses the kept state** (S7). The
+    committed clock is per source in declaration order, so a definition version that
+    adds or removes an event-time source (other than its first or its last) cannot
+    `keep`. *Alternative:* key each source's entry by the name of its node, which
+    survives a reordering when the node is `.Named()` and silently misassigns when it is
+    positional and the positions moved; or drop the per-source entries on a mismatch
+    and keep only the watermark, which stalls the watermark until every source has
+    spoken again but never lets it regress.
+45. **`EvictWhen` added to an operator that already has state leaves the keys already
+    there without a deadline** (S7): they close only if a record touches them again.
+    New stores start empty, as ever, and a deadline store is a store. *Alternative:*
+    refuse a `keep` that adds a deadline store beside a non-empty state store of the
+    same operator.
+46. **A pipeline's state size is readable but not shown** (S7):
+    `ChangelogStorageProvider.CountEntries()` walks the state, so it is not in the
+    status the UI polls. *Alternative:* keep a running count per store and show it per
+    pipeline; it is what would let an operator see a definition whose state grows for
+    ever (the second review's `execution-quality`).
 
 ## Not verified
 
@@ -4015,3 +4033,132 @@ and a spec that does is refused.
 - No rolling broker restart was run again: the kafka3 profile was not started in this
   step, so whether a moved leadership in a rolling restart leaves the sink complete is
   still unverified.
+
+### S7 — round three
+
+#### Event-time state survives a restart and a takeover (H2)
+
+The completeness critic's H2: windows and failover did not compose. The watermark and
+the eviction deadlines were operator fields, so a pipeline that restarted — a takeover,
+a replace that keeps state, a fault and a backoff — admitted late records into windows
+that had closed and been delivered, and kept for ever the keys that were open at that
+moment and never touched again. It was documented in S6 and in the guide's limits. It
+is fixed in the core; `durability-and-standby.md`, *As built: event-time state*, has the
+mechanism. For the service it comes to this:
+
+- **Nothing in the service changed to get it.** The clock rides the offsets marker of
+  the commit record a standby already follows, and the deadlines are stores of the
+  pipeline like any other: followed as bytes, held typed by a warm standby's built
+  circuit, handed over by `TakeWarm`, released and re-read by a `keep`. A warm
+  takeover rebuilds no queue: the follower put each deadline into the order as it
+  applied the record.
+- **The one service edit** is in the dead-letter envelope: `after`, the inputs'
+  committed positions, no longer lists the circuit's own entries (`$step` was already
+  left out; `$watermark` and `$watermark#s{n}` now are too).
+- **`GET pipelines/{id}`** shows the clock with the other committed offsets
+  (`committedOffsets["$watermark"]`, UTC ticks), on the leader and on a standby.
+- **An existing deployment.** A pipeline with event time whose state was committed
+  before this build is refused at its start with the reason, and needs `state=reset`
+  (Open for James 36). The example's `desk-exposure` and `execution-quality` are such
+  pipelines; `--kafka --clean` or a new `--prefix` starts them clean.
+- **State shapes.** A deadline store shows in `DescribeState` as kind `Deadline`
+  (key type → `long`), so a version that changes a windowed operator's key type is
+  caught by `StateShapes` as before, now also for its deadlines.
+
+**Public API added (core).** `IDeadlineStore<TKey>`;
+`IStorageProvider.CreateDeadlineStore<TKey>` (a default method: the heap store for a
+provider that does not checkpoint, a refusal for one that does and has not implemented
+it); `CircuitStateStoreKind.Deadline`; `ChangelogStorageProvider.CountEntries()`;
+`RedisStorageProvider` gains a hash and a sorted set per deadline store. State manifest
+format 7 with an `eventtime={sources}` line; offsets-marker keys `$watermark` and
+`$watermark#s{n}`; `$watermark` is a reserved input name.
+
+**Tests.**
+
+- Core: `EventTimeRestartTests` and `DeadlineStoreTests` (described in
+  `durability-and-standby.md`): 76 cases, about 25 s of a core suite that took 10 s, 18 of them on Redis (skipped without it).
+- Service, on Kafka:
+  `KafkaServiceTests.A_takeover_in_the_middle_of_open_windows_reopens_none_and_still_closes_them_all`.
+  Two nodes on the broker; a pipeline of ten-second tumbling totals with a live upsert
+  sink and an `OnClose` sink; 280 ticks over 28 s of event time for five traders, so at
+  the takeover each trader has two closed windows and one open. The checkpoint's
+  `$watermark` is asserted on the leader and on the standby. After the takeover the
+  first record the new leader reads is twenty seconds behind the watermark, in a window
+  already delivered as final; then one trader's records far ahead. Asserted: both sinks
+  equal the model, which has no late record in it; the live topic holds not one more
+  write for the closed window than before the takeover; and the pipeline's state
+  shrinks to exactly that of a second pipeline, deployed afterwards, that only ever saw
+  the last two records (50 entries at the takeover — ten windows of five entries, five of them open and five closed and not yet swept — and 5 afterwards, which is what the second pipeline holds).
+- Service, in memory: a dead letter of an event-time pipeline names its input's
+  position and none of the clock's keys.
+- Mutations: 24, all killed. Twenty in the core — the clock not committed, not
+  restored, restored without its per-source maxima or without the watermark; the
+  deadlines of the tracker, of the session operator and of the window-close operator
+  kept on the heap; rollback, take, set and moved-deadline bookkeeping broken in the
+  in-memory and changelog stores; a follower ignoring deadline records or their
+  tombstones; stale queue entries taken; the two manifest rules dropped — and three in
+  the Redis store (the exact comparison, the lower bound passing a staged removal, a
+  commit not lowering it). The Kafka service test is killed by four of the core ones
+  (clock not committed, clock not restored, deadlines on the heap, follower ignoring
+  deadline records), the dead-letter test by the service edit undone, and the example's
+  two-node smoke by the clock not restored: it then prints `desk-exposure`'s first
+  window holding the straggler's notional alone where the model has the window's total.
+  One mutant survived the first round and got a test: a session key taken back whole
+  kept its deadline, which changed no output and no final state.
+
+**The example.** The limit is out of `ExecutionQuality.cs`, the guide and the example's
+README. The smoke's takeover act (`--headless --nodes 2` and `--headless --kafka`) has
+three more claims: `desk-exposure`'s checkpoint carries the watermark and the standby
+has followed it; the first execution the new leader reads is a *straggler* — it carries
+the time of the feed's first trade, in windows that closed long before — and
+`desk-exposure`'s and `execution-quality`'s sinks equal a model that leaves it out; the
+new leader's own checkpoints carry the watermark on from where the old one's stood.
+`WorldShape.Stragglers` is the knob, and the model drops a straggler only from the two
+event-time pipelines: the others read it like any execution.
+
+**Performance** (the core's hot path changed: every evicting operator's tracker).
+The torture rig (`benchmarks/Incremental.Torture`, Release, `--workers 4 --seconds 20
+--warmup 8`, a 13th-gen i7-13700H; the showcase graph on the heap provider) was run
+before and after, interleaved, four times each:
+
+| | before (dc50885) | after |
+|---|---|---|
+| records/s | 367.6k, 373.6k, 372.8k, 368.4k (mean 370.6k) | 372.8k, 377.1k, 374.5k, 368.4k (mean 373.2k) |
+| allocated per record | 593 B (658 B in the one run a build was running beside) | 566 B |
+| worker CPU per record | 7.88–8.01 µs | 7.90–8.02 µs |
+
+A first, not interleaved, set of three each read 376.2k, 371.9k and 383.1k records/s
+before and 376.2k, 366.7k and 377.9k after, with 594 B and 565–567 B per record. So:
+throughput within the run-to-run spread, allocation down 27 B a record (the list an
+eviction used to allocate, and a map entry where there was a set entry and a queue
+entry's key). `benchmarks -- --assert`: all 10 contracts hold, before and after. Not
+measured: the rig on a checkpointing provider — the changelog record a key now costs
+when it opens and the tombstone when it closes — and a takeover against the number of
+open keys; that a warm takeover does not depend on it is by construction (the follower
+applies each deadline as it reads it) and is not a number.
+
+**Deviations.**
+
+- The task's alternative of rebuilding the deadlines from the keys at start was not
+  taken; the deadlines are a store (above, and why).
+- Existing event-time checkpoints are refused, not migrated; ones without event time
+  are migrated by doing nothing.
+- `IStorageProvider` gained a member. It has a default, so an existing provider
+  compiles; one that checkpoints is refused at `Build()` of an event-time circuit until
+  it implements the member.
+- The window-close operator calls `closesAt` a second time, when a key closes: the
+  deadline store holds ticks, and the notification carries the `DateTimeOffset` the
+  definition gave.
+- The in-memory checkpoint provider and the service test's "state returns to its size"
+  are asserted by entry count, not content: neither can list itself. The changelog and
+  Redis cases compare content.
+
+**Left undone.**
+
+- No state size in the admin API or UI (Open for James 46).
+- No test of a clustered (several-process) circuit restoring its clock.
+- `closesAt` is not under the dead-letter policy.
+- The service test covers a manual takeover in one process. The `kill -9` path is the
+  example's `--headless --kafka` smoke, which checks the sinks against the model with a
+  straggler behind the kill; it does not measure state size.
+

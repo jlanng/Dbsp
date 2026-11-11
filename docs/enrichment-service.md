@@ -284,9 +284,9 @@ minute, then looks the instrument up in a table:
 /// was read ahead of the other. The join's key is (instrument, interval), and
 /// <c>EvictWhen</c> closes a key when the watermark passes the interval's end — from then
 /// on neither side holds anything for it, which is what keeps the state of a join between
-/// two unbounded streams bounded while the circuit runs. (Across a restart less so: the
-/// watermark and the keys waiting to close are not in the checkpoint, so a key that no
-/// record touches after a restart is not evicted. The guide says what follows from that.)
+/// two unbounded streams bounded. The watermark and the keys waiting to close are in the
+/// checkpoint with the rows they bound, so that holds across a restart and a takeover
+/// too: a key open when the leader died still closes on the node that took over.
 /// </para>
 /// <para>
 /// It is a left join: an execution in an instrument that was not quoted in its interval is
@@ -396,21 +396,16 @@ What a second input changes:
   Without it the join's state grows with the streams. The join's key has to carry the
   time for that to be expressible: joining on the instrument alone would keep every
   execution for ever.
-- **The watermark and the eviction hold while a circuit runs, and less across a
-  restart.** The watermark and the list of keys waiting to close are in memory, not in
-  the checkpoint. A circuit that
-  starts — after a restart, a takeover, a replace that keeps state — has no watermark
-  until every input has given it a record and a step has ended, and it knows of no key
-  until a record touches one. Two things follow. A record older than the watermark of
-  before the restart is admitted in that first step: if its window had already closed
-  and been evicted, the aggregate starts that window again from nothing and the sink's
-  row for it is overwritten by the late records' total. And the keys and windows that
-  were open at the restart and get no further record are never evicted: each restart
-  leaves that slice in the stores, the changelog and the standby. With inputs in rough
-  time order the first is the few records that were already late, and the second is
-  the keys that were open at that moment and saw nothing more; a pipeline that is
-  restarted often, or whose state must be exactly bounded, should not rely on eviction
-  alone (*Limits*).
+- **The watermark and the eviction hold across a restart and a takeover.** Both are in
+  the checkpoint: every commit carries the watermark and each input's highest event time
+  beside the input positions, and every key or window waiting to close is an entry in a
+  deadline store that is committed, followed by the standby and restored like the rows it
+  bounds. So a circuit that starts — after a restart, a takeover, a replace that keeps
+  state — has the watermark its last checkpoint had: a record that was late before is
+  late after, and a closed window stays closed. And the keys that were open still close
+  when the watermark passes them, whether or not another record ever touches them. The
+  cost is one more state entry per open key or window per operator that bounds it,
+  written when the key opens and removed when it closes.
 - **`LeftJoin` emits the unmatched row and takes it back.** An execution whose quote has
   not arrived is emitted as unpriced; when the quote arrives the unpriced row is
   retracted and the priced one asserted, and the window totals downstream follow. The
@@ -1495,9 +1490,11 @@ model computed without the pipelines
 2,000 trades and the quotes for them, a desk move, a multiplier correction, a
 counterparty rename, an addition to a watchlist, an upload of version 2, two replaces
 keeping state (one of them the two-input pipeline), a replace resetting it, a removal,
-and — with two nodes — a takeover. The alert files and the dead letters are read back
+and — with two nodes — a takeover, after which the first execution the new leader reads
+is many minutes of event time behind the watermark: the windowed sinks must equal a
+model that leaves it out. The alert files and the dead letters are read back
 with `FileSinkFormat` and compared too: every alert once, every dropped record there.
-A claim that does not hold exits 1 (47 claims in memory, 59 with two nodes, 58 on
+A claim that does not hold exits 1 (48 claims in memory, 62 with two nodes, 61 on
 Kafka). CI runs the two in-memory ones on every build, and the Kafka one in a job of its
 own that starts the connector stack from `docker-compose.yml` and also runs the Kafka
 and Kafka-backed service tests, failing if any of them was skipped
@@ -2259,10 +2256,10 @@ resources are ARNs (`…:topic/<cluster>/<uuid>/{prefix}.*`,
 - **Sink topics and source topics are not created**, and removing a table keeps its log.
 - **Windows:** an idle input stalls the watermark, and events later than the allowed
   lateness are dropped without a record ([intro.md](intro.md#event-time-watermarks-and-lateness)).
-- **Eviction and the watermark do not survive a restart.** Neither is checkpointed: a
-  circuit that starts has no watermark until every input has been seen, and evicts only
-  keys that a record touches after the start. So a late record can reopen a window that
-  had closed before a restart or a takeover and overwrite its row, and keys that were
-  open at the restart and are never touched again stay in the state for good — a slice
-  per restart. This is the core's (`EvictWhen`, windows, a remembered `Lookup`), not the
-  service's; the service restarts circuits more than a program that runs one does.
+- **A checkpoint written before event-time state was kept does not resume a pipeline
+  that uses event time.** State manifests are format 7 from this version: the watermark
+  and the deadlines of open windows and keys are checkpointed
+  ([intro.md](intro.md#event-time-state-across-a-restart)). A pipeline with
+  `WithEventTime` whose state was committed by an earlier build is refused at its start
+  (`state-incompatible`, with the reason) and needs `state=reset`; a pipeline without
+  event time resumes as it is.

@@ -631,6 +631,17 @@ public sealed class Smoke(ExampleOptions options)
         await Claim("a change sent to the standby is refused, with the leader's address",
             () => Unless(refused.Status is 409 or 421 or 503 && refused.Body?["error"]?["leader"] is not null, $"the standby answered {refused.Status} {refused.Body?.ToJsonString()}"));
 
+        // What the leader's last checkpoint of desk-exposure says the time is.
+        long? Watermark(JsonNode pipeline) => pipeline["committedOffsets"]?["$watermark"]?.GetValue<long>();
+        var before = 0L;
+        await Claim("desk-exposure's checkpoint carries its event-time watermark, and the standby has followed it", async () =>
+        {
+            var leader = Watermark(await _admin.GetAsync("pipelines/desk-exposure"));
+            var followed = Watermark(await standby.GetAsync("pipelines/desk-exposure"));
+            before = leader ?? 0;
+            return Unless(leader is > 0 && followed == leader, $"the leader committed {leader}, the standby holds {followed}");
+        });
+
         var moved = Stopwatch.StartNew();
         if (_kafka is null)
         {
@@ -650,10 +661,19 @@ public sealed class Smoke(ExampleOptions options)
             await RunningAsync("trader-desks", "sanctions-alerts", "credit-alerts") ?? await VersionAsync("trade-enrichment", _v2)
             ?? await VersionAsync("desk-exposure", _v2) ?? await VersionAsync("execution-quality", _v2));
 
+        // The first execution the new leader reads is a straggler: it carries the time of
+        // the feed's first trade, in windows that closed long ago under node a.
+        _shape.Stragglers.Add(_model.Trades);
         await PublishAsync(500);
         await EnrichedIs("500 more trades: trade-enrichment's sink equals the model — state, offsets and tables all carried over");
-        await SinkIs("so does desk-exposure's", "desk-exposure", ExpectedExposure);
-        await QualityIs("and execution-quality's: the stream join's state and two input positions, one of them " + (_kafka is null ? "a file and a line" : "on a second topic"));
+        await SinkIs("so does desk-exposure's, and the first of those trades was many minutes of event time late: b dropped it as a would have, " +
+                     "because the watermark came over with the checkpoint — no closed window was reopened", "desk-exposure", ExpectedExposure);
+        await QualityIs("and execution-quality's: the stream join's state, its keys still to close, and two input positions, one of them " + (_kafka is null ? "a file and a line" : "on a second topic"));
+        await Claim("b's own checkpoints carry the watermark on from where a's stood", async () =>
+        {
+            var now = Watermark(await _admin.GetAsync("pipelines/desk-exposure"));
+            return Unless(now > before, $"the watermark was {before} in a's last checkpoint and is {now} in b's");
+        });
         await AlertsAre("the alert files hold every alert once: the new leader's file sink took up the step numbers where the checkpoint stood", "sanctions-alerts");
         await AlertsAre("…for both deployments", "credit-alerts");
         await DeadLettersAre($"the dead-letter sink holds every dropped execution, those since the takeover included{(_kafka is null ? "" : " (at least once: a topic keeps a step that is run again)")}", "sanctions-alerts");

@@ -24,6 +24,11 @@ public sealed record WorldShape
     /// (watchlist-alerts) throws on and the others merely carry. 0: none.</summary>
     public int PoisonEvery { get; init; }
 
+    /// <summary>Feed positions whose execution carries the time of the feed's first trade:
+    /// a record far behind the watermark of any pipeline that has read what came before
+    /// it. The smoke test puts one right behind a takeover.</summary>
+    public HashSet<long> Stragglers { get; } = [];
+
     /// <summary>The length of the interval a reference quote is for.</summary>
     public TimeSpan QuoteInterval { get; init; } = TimeSpan.FromMinutes(1);
 
@@ -74,7 +79,7 @@ public sealed record WorldShape
         var price = Math.Round(Level(instrument) * (1 + ((long)(r % 1001) - 500) / 100_000m), 2);
         return new Trade(
             offset % TradeKeySpace, instrument, trader, CounterpartyId(counterparty), quantity, price,
-            Epoch + TimeSpan.FromTicks(TradeInterval.Ticks * offset));
+            Stragglers.Contains(offset) ? Epoch : Epoch + TimeSpan.FromTicks(TradeInterval.Ticks * offset));
     }
 
     /// <summary>The instrument feed's record at a position: first every instrument once,
