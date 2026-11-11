@@ -63,6 +63,23 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
 - Connector stack: `docker compose --profile connectors up -d` adds Kafka (`localhost:9092`), Postgres with
   logical decoding (`localhost:5432`, user/password/db `incremental`) and Debezium's Kafka
   Connect (`localhost:8083`). Plain `docker compose up -d` stays Redis-only.
+- Three brokers: `docker compose --profile kafka3 up -d` (replication factor 3,
+  `min.insync.replicas` 2, on `localhost:9192,localhost:9292,localhost:9392`; no volume).
+  Run the Kafka and service tests against it with `INCREMENTAL_KAFKA_BOOTSTRAP` set to
+  those three and `INCREMENTAL_KAFKA_REPLICATION=3`; the CDC tests skip there (Kafka
+  Connect writes to the single broker). With
+  `INCREMENTAL_KAFKA_BROKERS=incremental-kafka3-1-1,incremental-kafka3-2-1,incremental-kafka3-3-1`
+  as well, four tests in `KafkaServiceProcessTests` stop and start those containers
+  (every broker shut down in turn, and killed in turn; a takeover with one down; 70 s
+  without a quorum): `-- --filter-method "*broker*"`, about eight minutes; skipped
+  everywhere else. They assert that nothing is lost and one node leads, and record in
+  `measurements.log` whether the leadership moved — a broker restart can move it.
+  `docker compose rm -sf kafka3-1 kafka3-2 kafka3-3` when done — not `down`, which
+  takes Redis and the rest of the stack with it.
+- A broker that refuses unknown clients: `docker compose --profile kafka-sasl up -d`
+  (`localhost:9492`, SASL/OAUTHBEARER with unsigned tokens, deny-by-default ACLs). Only
+  the scale rig talks to it (`--oauth`); its README has the commands. Remove it with
+  `docker compose rm -sf kafka-sasl`.
 - Examples: `dotnet run --project examples/Incremental.Example`,
   `dotnet run --project examples/Incremental.LogAnalytics [-- --redis]`
 - Showcase (the all-features demo): `dotnet run --project examples/Incremental.Showcase`
@@ -79,6 +96,14 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   assertions (delta cost vs state size), which is what `.github/workflows/ci.yml` gates on;
   `-- --log-sizes` prints bytes per row of the Kafka logs' record format (JSON vs the dense
   codec, raw and compressed)
+- Service scale rig: build `benchmarks/Incremental.Service.Scale` in Release and run the
+  built binary — `dotnet Incremental.Service.Scale.dll run --rows 1000000 --state-keys 1000000
+  --broker-container incremental-kafka-1` from its output directory. Two node processes
+  on Kafka, a wide table shared by twenty pipelines, large state, then a cold standby,
+  `kill -9`, a manual takeover and a node from nothing, each timed by stage; about three
+  minutes at a million rows, and it needs the memory (its README says how much). Run it
+  after changing anything a takeover or a standby does; the numbers of record are in
+  docs/design/enrichment-service.md (S6, *Scale*).
 - Throughput rig: `dotnet run -c Release --project benchmarks/Incremental.Torture -- --workers 4`
   runs the showcase pipeline flat out over a sliding order population and reports records/s,
   the process CPU split (workers vs GC), and allocation per record (`--alloc-types` for a
@@ -155,6 +180,17 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   topic it has not seen waits a second for the client to look the leader up, and that
   consumer keeps `fetch.wait.max.ms` at 5 so one read does not wait out the last one's
   long poll. Both cost a takeover or a start-up a second or half a second per table.
+- Kafka clients, wherever one is made (found on three brokers and on a broker with ACLs;
+  docs/design/durability-and-standby.md, last section). Consume through
+  `AssignedConsumer.ConsumeAssigned`, never `consumer.Consume`: the client reports a
+  refused lookup of its never-joined group as a consume error. Call `ServeCallbacks`
+  before asking a consumer that is not being polled for metadata or watermarks: its
+  token refresh runs only inside `Consume`. Take a `ListOffsets` answer through
+  `KafkaLog.OffsetOf`: a partition with no leader comes back as an unset offset, not an
+  exception, and −1001 read as "empty" has cost a repeated term and a lost table head.
+  Admin calls go through `RetryAsync` with the attempt's timeout. Build every client
+  with the connection's `Configure…` callback, or it cannot authenticate where tokens
+  come from a handler.
 - Kafka sources and sinks (`KafkaSource`, `KafkaSinks.cs`). A source's position lives in
   the checkpoint, never in a consumer group: records are handed on stamped with
   (partition, offset), and a source assigns each partition at the committed offset plus
@@ -198,10 +234,18 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   `Build()` refuses.
 - `ChangelogStorage` (`Storage/ChangelogStorage*.cs`). Its record keys
   (`pipeline NUL incarnation NUL store NUL entry`) and the format byte in front of every
-  value are a persisted format: changing either needs a new format byte, not an edit. A
+  value are a persisted format: changing either needs a new format byte, not an edit
+  (1: the serializer's output; 2: a layout tag in front of it). A
   follower applies the log to the stores until `PromoteAsync`, and `Recover()` and commits
   throw before it. Takeover order: promote tables, then the storage, then `Start()` each
   circuit.
+- Layouts (`ChangelogStorageProvider.UseLayout`; docs/design/durability-and-standby.md,
+  *As built: layouts*). A follower may hold typed stores only under a layout: every value
+  its types' leader writes carries the layout, and the follower turns its typed stores
+  back into bytes before it applies a value of another one. Whatever decides a store's
+  types must be in the layout; a circuit built on a provider is started only if
+  `StoreEpoch` has not moved since it was built. Do not apply a record to a typed store
+  on a follower by any path that skips the tag check.
 - Per-record errors (`RecordErrors.cs`). Under `RecordErrorPolicy.Fault` (the default) an
   operator's record loop must contain no exception handling: the dead-letter variant is a
   separate loop or method chosen once per step on `OperatorContext.Errors` being non-null.
@@ -305,7 +349,17 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     dropped only once every enumerating reader has passed it.
   - The state binding: a pipeline's typed stores belong to one plugin version. Changing
     the version, or anything else that changes what the state means, goes through
-    `ChangelogStorageProvider.ReleaseStores()` first.
+    `ChangelogStorageProvider.ReleaseStores()` first. The binding has a name,
+    `PipelineSupervisor.LayoutOf(spec)` (plugin version, definition, settings, workers,
+    error policy, table bindings): `Bind` gives it to the provider, and a start whose
+    spec has another layout rebinds. Add to `LayoutOf` anything new that can change a
+    store's key or value type.
+  - A standby builds each pipeline's circuit on the state it follows
+    (`PipelineSupervisor.WarmAsync`, `ServiceOptions.WarmStandbyPipelines`) and a
+    takeover starts it (`TakeWarm`): a takeover must not do work that grows with a
+    pipeline's state. `WarmStandbyTests` holds the ratio; the scale rig
+    (`benchmarks/Incremental.Service.Scale`) measures it. A standby's build is contained
+    like everything else of a pipeline's: it never makes the node unready or fails it.
 - `Incremental.Service.Admin` (the JSON API and the embedded UI). Its rules:
   - Nothing is returned unbounded: every list goes through `Page`/`Newest` and every
     `limit` is clamped to `MaxRows`. The event feed is one bounded drop-oldest queue per

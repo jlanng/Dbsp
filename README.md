@@ -483,6 +483,17 @@ so implementations never see cross-thread access to one store.
   and eight pipelines on the in-memory backend (`-- --nodes 2` for a leader and a standby
   on ports 5180 and 5181; `--read-only`, `--no-rows`).
 
+  How it behaves at size is measured by `benchmarks/Incremental.Service.Scale`: two node
+  processes on Kafka, a table of millions of wide rows shared by twenty pipelines, large
+  join and aggregate state, and then `kill -9` of the leader. The standby builds every
+  pipeline's circuit on the state it follows, so a takeover starts circuits rather than
+  building them: about a second after the three seconds of silence that decide it,
+  whether the pipelines hold a quarter of a million orders or four million. The numbers,
+  and what a node needs in memory per million rows, are in the guide (*How large, how
+  fast*). `docker compose --profile kafka3` is three brokers at replication factor 3 for
+  the failover and broker-restart tests; `--profile kafka-sasl` is a broker that refuses
+  clients it does not know.
+
 - **Start here for the service:** [docs/enrichment-service.md](docs/enrichment-service.md)
   is a guide from an empty directory to a running pipeline plugin — the contract, a
   definition, the project file, a spec, a test — then the host and its adapters, the

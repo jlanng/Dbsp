@@ -1224,8 +1224,8 @@ What to know before relying on it:
 - **The catalog is the only input to what exists.** It is a shared table (`svc.catalog`)
   on the backend's log. A node that starts on storage that already holds one rebuilds
   the same tables and pipelines and resumes each from its checkpoint; a standby follows
-  it, follows the tables, holds each pipeline's state as bytes, and builds the circuits
-  when it takes over.
+  it, follows the tables, and builds each pipeline's circuit on the state it follows, so
+  that a takeover only has to start them (`ServiceOptions.WarmStandbyPipelines`).
 
 `InMemoryServiceCluster` gives several nodes in one process — `cluster.Node("a")`,
 `cluster.Node("b")` — with real fencing, which is how the takeover order is tested without

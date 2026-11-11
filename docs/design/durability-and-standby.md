@@ -659,7 +659,9 @@ about 19 bytes allocated per record written (one run, one machine).
 **Records.** As the layout above, with these particulars:
 
 - Value = format byte `1` + the serializer's output. A weight is its decimal text. Removal
-  is a tombstone; `RemoveGroup` writes one per member.
+  is a tombstone; `RemoveGroup` writes one per member. (Since 2026-11-11 there is a
+  format `2`, which puts a layout tag in front of the serializer's output: *As built:
+  layouts*, at the end of this document.)
 - The commit record's value is JSON: `{"sequence":…,"term":…,"offsets":{…},"manifests":{…}}`.
   `offsets` is the circuit's offsets map as given, so it carries `$step`, `{table}#t` and
   `{table}#w` with the input offsets. `sequence` counts the incarnation's commits and
@@ -2066,3 +2068,110 @@ table stage is inside `Prepare`; `ServiceTakeoverTimings` splits it out.
 **Measured with the service** (two processes, 21 tables, two plugin pipelines, kill -9
 mid-stream, local broker): see enrichment-service.md, *As built*, S2 — detection is
 `TakeoverAfter`, and everything after the decision totals under a second.
+
+## As built: layouts — typed stores on a follower (2026-11-11)
+
+Measuring the service with large state (enrichment-service.md, *As built*, S6, *Scale*)
+showed what *Warm standby* above left open in the service: a standby that holds a
+pipeline's state as bytes decodes it at takeover, about 1.3 µs an entry, so a takeover
+grew by 2.7 s per million orders in the largest pipeline. A follower may hold typed
+stores instead (it always could: `ApplyReplicated` applies to a store that exists), but
+only if it can never apply a record another version's types wrote. Nothing in the log
+said whose types wrote a record. Now something does.
+
+**The record format gained a format byte.** A value is either
+
+```
+1 <serializer output>                      as before
+2 <n: one byte> <n bytes of layout> <serializer output>
+```
+
+Format 2 is written when the provider has been given a **layout**
+(`ChangelogStorageProvider.UseLayout(string)`, allowed only while it holds no typed
+store): an opaque identity, at most 255 bytes of UTF-8, of whatever decides the stores'
+types. Every value — entries and the commit record — carries it. A provider with no
+layout writes format 1, so nothing changes for a circuit that never calls `UseLayout`.
+A reader accepts both; a build from before this one refuses format 2 by its format byte,
+as it is meant to. So both nodes of a deployment are replaced together before the first
+record is written under a layout: stop the standby, replace the leader, start the standby.
+
+**What a follower does with it.** While it holds typed stores:
+
+- a value whose layout is not the provider's is *foreign*: the stores are turned back
+  into bytes (`ReleaseStores`) before the record is applied, and the record joins the
+  bytes. So does a commit record of another layout.
+- a tombstone carries no value and so no layout. One whose key the store's types cannot
+  read has the same effect, instead of faulting the follower.
+- afterwards no typed store can be created on that follower until `UseLayout` is called
+  again (`GetOrCreate` throws): a circuit that was half built when the layout moved does
+  not finish on the old types.
+
+Because the check is per record, it does not depend on a marker surviving compaction or
+on the follower being close to the end of the log.
+
+**`CommitLayoutAsync()`** writes, on the leader, one transaction holding only a commit
+record: the last checkpoint again (same sequence, same offsets, same manifests) under
+the provider's layout, with `"announcement": true`. It does nothing when the last commit
+record already carries the layout. It exists for liveness, not safety: a follower builds
+typed stores when `CommittedLayout` — the layout of the last commit record it applied —
+is the one it would build, and a pipeline that has not checkpointed since its layout
+changed (it is idle, or it has just been deployed) would otherwise keep its followers on
+bytes.
+
+**Going back.** A store created from held bytes keeps them (`_origins`) until its types
+have written, and `ReleaseStores` gives those bytes back rather than what the types would
+write. On a follower "its types have written" means: a record of its layout was applied
+to a store, or a commit record of its layout that is *not* an announcement arrived. A
+follower that built a layout's stores on an announcement, and then reads another
+announcement because the leader's circuit refused the state and the previous spec was
+put back, returns to the very bytes it had. An idle pipeline therefore holds its state
+twice on a follower — typed and as the bytes it was read from — until its first
+checkpoint under the layout.
+
+**`StoreEpoch`** counts the times the typed stores were given up, by a call or by the
+follower. A circuit built on a provider is good to start only while the epoch is what it
+was before the circuit was built; the service checks this at a takeover.
+
+**What it does not change.** A leader's `ReleaseStores` still re-serializes what its
+types hold, so a member the types do not model is gone from memory there once they have
+committed — and from the follower's typed stores at the same moment, since they are the
+same types reading the same records. The log keeps an entry's old bytes until that entry
+is next written.
+
+Tests: `tests/Incremental.Tests/ChangelogLayoutTests.cs` (seven). The service's use of it
+is in enrichment-service.md, *As built*, S6.
+
+## As built: what three brokers and an authorizing broker found (2026-11-11)
+
+Run against the `kafka3` and `kafka-sasl` compose profiles (enrichment-service.md, *As
+built*, S6, *Scale and a production-shaped Kafka*, has the runs). Each of these was
+invisible on one plaintext broker:
+
+- **A `ListOffsets` answer can carry an error instead of an offset**, per partition, and
+  the client does not throw it: a partition whose leader is down and not yet replaced
+  comes back with its offset unset (−1001). Every caller read that as an empty
+  partition. `KafkaLog.OffsetOf` throws the answer's error, which the admin retry treats
+  as passing. Seen as: a takeover with a broker down announcing a term that had been
+  used; a takeover after a quorum outage finding no head for the catalog.
+- **A writer never announces a term below one it has read** (`KafkaLog.NoteTermSeen`,
+  fed by the leadership's watch of the leader topic), and reads the last term again
+  until it is not, or until the leader topic's committed end is its end. **A table log
+  does not believe a missing head or an older one** on a table it was opened on, and a
+  writer does not mint an identity while the rows partitions hold undecided records.
+- **Admin retries are short attempts with a metadata refresh between them**
+  (`RetryTransientAsync` with an attempt timeout; `LeadersKnownAsync` after a topic is
+  created). An admin call that needs a leader takes it from the client's cache, where a
+  topic created a moment ago can sit with no leader; the call waited out the whole
+  operation timeout and the same call again found the same cache.
+- **A consumer's callbacks run only inside `Consume`**, the OAUTHBEARER token refresh
+  among them. `AssignedConsumer.ServeCallbacks` is called before a consumer is asked
+  for metadata or watermarks (the log's short reader, the service's blob store).
+- **The client looks up the coordinator of its `group.id` although nothing joins the
+  group**, and reports a refusal through `Consume`. `AssignedConsumer.ConsumeAssigned`
+  passes it over; every consume in this library and in the service goes through it.
+- **The writer says when it waits.** A commit that keeps timing out, and a transaction
+  whose records the brokers have not taken for five seconds and every five after, are
+  logged at Warning: that wait is what a standby sees as silence. If an abort itself
+  fails, the message says what the transaction was being aborted for.
+  `KafkaLogOptions.Logger` is settable, and the service gives the log its own logger
+  when the host gave none — before, a host heard none of this.

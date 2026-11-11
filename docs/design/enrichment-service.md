@@ -1607,7 +1607,8 @@ Everything else they raised is in the text above.
 
 Each has a default this design is built on.
 
-1. **Warm circuits on the standby** (default) — the standby loads plugin code and builds
+1. **Warm circuits on the standby** (default; built in S6 after S1 had taken the
+   alternative — see item 30) — the standby loads plugin code and builds
    every confirmed circuit, as durability-and-standby.md specifies. It is what C1's
    layout marker and follower halves exist for. *Alternative:* the standby holds pipeline
    state as bytes and builds at takeover. No plugin code runs on a standby, C1 shrinks to
@@ -1736,6 +1737,36 @@ Each has a default this design is built on.
 29. **A file loader without a `path` is refused when the table is declared** (S6); it
     used to be accepted and fault the loader at its first run. *Alternative:* as
     before, which lets a table be declared ahead of knowing its file.
+30. **A standby builds every pipeline's circuit, so plugin code runs on it** (S6: the
+    definition's `Build` and the operators' constructors; never a step). It is this
+    list's first item decided by measurement: without it a takeover decodes every
+    pipeline's state, 2.7 s per million orders in the largest join. *Alternative:*
+    `WarmStandbyPipelines = false` — no plugin code on a standby, and takeovers that
+    grow with the state. A middle way was not built: decoding the followed bytes at
+    takeover in parallel within a pipeline, which would cut the constant by the core
+    count and keep the growth.
+31. **Layouts are a new format byte in the state log** (S6), so a node from before
+    that build cannot follow a newer leader and both nodes are replaced together.
+    *Alternative:* keep one format and mark a change of layout with a record of its own;
+    the cost is that compaction can remove the marker from under a follower that is
+    behind, which then applies another version's records to its typed stores — the
+    per-record tag exists because that cannot be ruled out.
+32. **The takeover ceiling stays at 30 s.** A broker that is killed (not shut down)
+    leaves the service's leader unable to commit until the controller gives up on it
+    and the coordinator has moved; in one of several runs on three local brokers that
+    silence reached the ceiling and the standby took over, with nothing lost.
+    *Alternative:* a higher `TakeoverCeiling`, which lengthens the outage when the
+    leader really is alive and stuck; or a lower `broker.session.timeout.ms` on the
+    brokers, which is the cluster's to set.
+33. **A refused group lookup is passed over, and no permission on a group is asked
+    for** (S6). The broker's authorizer logs each refusal, about one a second per
+    consumer. *Alternative:* require `Describe` on the three group names
+    (`{prefix}.reader`, `{prefix}.svc.blobs.{node}`, `incremental.source`): a quiet
+    log, one more permission to get wrong, and `incremental.source` is not under the
+    deployment's prefix.
+34. **The broker-stopping tests and the SASL run are not in CI.** They need three
+    brokers whose containers the test may kill, take about ten minutes, and have run
+    only here. *Alternative:* a nightly job on the `kafka3` and `kafka-sasl` profiles.
 
 ## Not verified
 
@@ -1755,10 +1786,13 @@ Each has a default this design is built on.
   the table stage.
 - Takeover time with hundreds of built circuits and their sources; one consumer thread
   per source (durability-and-standby.md, *Limits*) is the likely ceiling.
-- State decode time per entry, which prices *Open for James* 1's alternative and the
-  replace-in-flight takeover.
-- That a follower releasing a large pipeline's stores at a layout marker does not stall
-  its state partition for long enough to matter.
+- ~~State decode time per entry~~ Measured in S6: 1.3 µs an entry for a join's stores,
+  0.4 µs for a total — 2.7 s per million orders in a join pipeline. It is why the
+  standby builds circuits.
+- That a follower releasing a large pipeline's stores at a change of layout does not
+  stall its state partition for long enough to matter. Still not measured: the release
+  re-serializes the stores under the provider's lock, which is the decode's cost again,
+  once per replace that keeps state.
 - That disposing a built, never-started circuit on a follower is free of side effects in
   every operator. `Circuit.DisposeAsync` runs no step unless started, by reading.
 - Scan time of the blob topic near its 512 MB cap.
@@ -3286,3 +3320,401 @@ policy is unchanged and `The_UI_is_served_whole…` passes.
   gutter, where several such edges overlap.
 - `actionlint` could not be fetched on this machine; the workflow was checked by a
   structural script and by running its commands.
+
+#### Scale and a production-shaped Kafka: G1, G12
+
+**The rig (G1).** `benchmarks/Incremental.Service.Scale` (its README has the options):
+two real node processes on the Kafka backend, Release build, a table of wide rows (21
+columns, about 520 bytes of JSON, one index) shared by twenty pipelines from a plugin —
+two that join keyed orders to the table (two state entries per order), two that keep a
+total per party, sixteen that look the party up on arrival and hold nothing — a steady
+2,000 orders a second and 500 changed rows a second, and then a cold standby, `kill -9`
+of the leader, a takeover from under a healthy leader, and one node started from
+nothing. `PipelineStatus.LastStart` (new: plugin, build, start, edges, and whether the
+circuit was the standby's) and the takeover's own stage clock are where the breakdown
+comes from; the first sink write is measured where a reader of the sink sees it.
+
+The machine: 20 hardware threads, 30 GB of memory of which about 20 GB were free, one
+local broker in a container (replication factor 1), NVMe. One run per line unless a
+range is given; times move by some tens of milliseconds between runs.
+
+**What the first measurement showed** (one million rows, one million orders of state,
+`TakeoverAfter` 3 s; the build before this step):
+
+| kill -9 of the leader | |
+|---|---|
+| detection | 3.0 s |
+| fence | 0.65 s |
+| catalog, tables, storage, leader record | 0.06 s |
+| pipelines | **5.5 s** |
+| kill → first record in the last pipeline's sink | **9.4 s** |
+| manual takeover: longest silence in a sink | 6.8 s |
+
+Two things were in the pipelines stage. A takeover built each circuit on the bytes the
+standby had followed, and reading them cost 1.3 µs an entry — 2.7 s for a join pipeline
+holding a million orders, 0.43 s for a total per party. And although the supervisor
+started the pipelines "in parallel", each start ran synchronously up to its first
+await, which is after the build: twenty builds ran one after another on the takeover's
+thread. The critic's expectation was right, and it would have been 27 s at ten million
+orders.
+
+**What was changed.**
+
+1. *A standby builds every pipeline's circuit on the state it follows, and a takeover
+   starts it* (`PipelineSupervisor.WarmAsync`, `TakeWarm`;
+   `ServiceOptions.WarmStandbyPipelines`, on by default). This is *Open for James* 1's
+   default, which S1 had set aside. From the moment a circuit is built, the follower
+   applies the leader's commits to the circuit's own typed stores, one record at a
+   time, so the decode is paid as the state is written and never again. A takeover's
+   pipelines stage is now each circuit's `Start()` (10–20 ms) and its sources and sinks
+   (150–200 ms, all pipelines at once).
+2. *Layouts* make that safe (durability-and-standby.md, *As built: layouts*). A typed
+   store on a follower must never be given a record another version's types wrote —
+   during a replace that keeps state the catalog and the state log are two topics, and
+   a standby can learn of the new spec before or after the new records arrive. Every
+   value a pipeline writes now carries the pipeline's **layout**: twelve hex digits of
+   a hash over the plugin, its version, the definition, the settings, the worker count,
+   the error policy and the table bindings (`PipelineSupervisor.LayoutOf`). It is a new
+   format byte (2) in the state log. A follower holding typed stores turns them back
+   into bytes before it applies a value of another layout, and can then build no store
+   until it is told the new layout. The leader writes one small commit record under the
+   layout before a generation's first start (`CommitLayoutAsync`), so a standby can
+   build an idle pipeline too. The standby builds only when the last commit record it
+   has applied carries the layout of the spec it would build.
+3. *The leader binds by layout too.* A start whose spec has another layout than the
+   stores were bound under releases them and binds again, where before only a change
+   of plugin version did (a settings change that changed a store's type under the same
+   version would have met "already created with different key/value types").
+4. *A takeover's starts really are parallel now*: each on a thread of its own. That
+   matters for what the standby could not build ahead (below), and for a node started
+   from nothing.
+
+**After** (the same run):
+
+| | 1 M rows | 3 M rows |
+|---|---|---|
+| kill → the standby decides (detection) | 3.0 s | 3.1 s |
+| fence | 0.67 s | 0.68 s |
+| catalog, tables, storage | 0.04 s | 0.04 s |
+| leader record, plugin directory, finish | 0.17 s | 0.04 s |
+| pipelines (20 started, all built while standing by) | 0.20 s | 0.21 s |
+| takeover, after the decision | **1.1 s** | **0.98 s** |
+| kill → first record in the first / median / last pipeline's sink | 4.34 / 4.35 / **4.41 s** | 4.30 / 4.32 / **4.43 s** |
+| manual takeover: stages total | 0.91 s | 0.86 s |
+| manual takeover: longest silence in any sink | **1.06 s** | **1.05 s** |
+
+And against the size of the state (one million rows; one join pipeline and one total,
+so the entries are 3 × the orders):
+
+| orders of state | 250,000 | 1,000,000 | 4,000,000 |
+|---|---|---|---|
+| state on the leader's heap | 184 MB | 483 MB | 1,307 MB |
+| takeover after the decision | 0.93 s | 0.97 s | 0.93 s |
+| of which pipelines | 0.16 s | 0.18 s | 0.16 s |
+| kill → first record in the last sink | 4.20 s | 4.34 s | 4.24 s |
+| a cold standby until it is warm | 10.0 s | 13.4 s | 26.9 s |
+
+A takeover no longer grows with the state or with the table. What is left in it:
+
+- **Detection, 3.0 s**: `TakeoverAfter`. It is configuration; lower it and a slow broker
+  is mistaken for a dead leader sooner.
+- **Fence, 0.65 s**, of which 0.5 s is one thing: when the dead writer left a
+  transaction open (it nearly always has — it heartbeats inside every one), the
+  coordinator answers the new writer's first `InitProducerId` with
+  `CONCURRENT_TRANSACTIONS` while it aborts that transaction, and the Kafka client
+  tries again 500 ms later. The log line the writer now prints shows it: `transactional.id
+  initialised in 509 ms, last term read in 118 ms, term committed in 31 ms` (1,011 ms
+  when the old leader is alive and commits again in between, as in a manual takeover
+  under load). The 500 ms is the client's, not ours; nothing was done about it. The
+  118 ms is the end-of-partition wait when the tail of the leader topic is the aborted
+  transaction; it could be shaved and was not.
+- **Sources and sinks, 0.15–0.2 s**: twenty consumers assigned at their committed
+  offsets and twenty producers, in parallel.
+
+**Loading, memory, the standby** (the same runs):
+
+| | 1 M rows | 3 M rows | 5 M rows (one node) |
+|---|---|---|---|
+| load through the table's writer, versions of 20,000 | 7.2 s (138,000 rows/s) | 20.0 s (150,000 rows/s) | 33.2 s (150,000 rows/s) |
+| table topics on the broker (zstd) | 134 MB (141 B/row) | 405 MB (141 B/row) | 675 MB (141 B/row) |
+| leader's heap, table loaded | 1,307 MB | 3,934 MB | 6,490 MB |
+| added by deploying 20 pipelines over it | 5 MB | 4 MB | 1 MB |
+| added by a million orders of state in 4 pipelines | 858 MB | 733 MB | 745 MB |
+| state topic on the broker | 142 MB | 144 MB | 144 MB |
+| standby's heap, warm | 2,296 MB | 4,809 MB | — |
+| working set: leader / standby | 7.8 / 4.0 GB | 12.5 / 8.6 GB | 12.3 GB |
+| a cold standby until it is warm | 15.1 s | 25.9 s | — |
+| the killed leader back as a standby, until warm | 11.2 s | 23.1 s | — |
+| standby's state lag, sampled each second: median / max | 0 / 882 records | 0 / 10,194 records | — |
+| standby's table lag: median / max | 0 / 1 versions | 0 / 0 versions | — |
+| one node from nothing: process start → leader | 12.4 s | 23.7 s | 33.9 s |
+| … → first record in the last sink | 12.5 s | 23.8 s | 34.1 s |
+
+- **One copy of the rows, confirmed**: twenty circuits over a table of one to five
+  million rows add 1–5 MB to the heap.
+- **A node needs about 1.3 GB of heap per million of these rows** (strings are UTF-16
+  in memory: 520 bytes of JSON is about 1.3 KB of objects), the same on a standby.
+  The working set is well above the heap: on the leader at the end of the state fill the
+  GC had committed 2–5 GB more than was live, and about 2.2 GB was not the GC's at all
+  (the Kafka client's buffers for forty-odd clients, the runtime). With
+  `DOTNET_GCHeapHardLimit` the GC's share held at the limit (8.0 GB committed for 5.9 GB
+  live at four million rows). The GC was not tuned further for footprint, and a cap on
+  the gen0 budget changed nothing.
+- **Two nodes of five million rows did not fit in this machine**: at three million the
+  two working sets were 12.5 and 8.6 GB, at five the leader's alone was 12–14 GB, and
+  20–25 GB were free. (Two attempts at four million under a heap limit ended with the
+  standby unable to open the table: `OutOfMemoryException`, the table `Faulted`, the
+  node up and never warm — which is what a limit set too low looks like.) Five million
+  rows were therefore measured on one node, and ten million not at all: by the per-row figures a node would need about
+  13 GB of heap for them and some 20 GB of working set. The takeover's stages do not
+  involve the rows (a table is promoted with two short reads, 4–14 ms for all of them),
+  so nothing suggests the numbers above would move; it was not shown.
+- **A cold standby** reads the tables at 210,000–250,000 rows a second, reads the state,
+  then builds the circuits on it: 15 s at one million rows and six million entries of
+  state, 26 s at three million rows. Until then a takeover is refused unless forced, and a
+  forced one waits for the tables (*S2*, departure 13).
+- **One node from nothing** is bounded by the same reads and has nobody to wait for:
+  about 4.8 s per million rows, plus the state, plus the three seconds of silence it
+  must first observe. This is the one path whose length is the data's, and it stays so:
+  the rows have to come from somewhere.
+
+**What a standby could not build ahead is built at the takeover**, as before, each in
+parallel: a pipeline that writes a table (`ToTable` — its circuit would claim the
+table's writer while the table follows), one whose definition throws on the standby
+(shown as `Unbuilt` with the reason; the standby stays ready), one deployed in the last
+moments before the kill, and all of them when `WarmStandbyPipelines` is off.
+
+**Departures and decisions.**
+
+- **Plugin code now runs on a standby**: the definition's `Build`, and operator
+  constructors. Never a step. S2's "a standby fetches plugin files and loads none" and
+  S1's departure 1 are reversed; `PipelineState.Built`, which S1 left unused, is a
+  standby's built pipeline. *Open for James* 30.
+- **A new format byte in the state log.** Nodes from before this build refuse it, so the
+  two nodes are replaced together (stop the standby, replace the leader, start the
+  standby). State written before it is read as it was. *Open for James* 31.
+- **The design's layout marker, `confirmed` and `previous`-on-the-standby were not
+  built**; the per-record tag does their work with nothing for the standby to interpret
+  but equality. A replace that is rolled back leaves the standby on the bytes it had,
+  through the provider's origins (the leader announces the new layout before its circuit
+  starts, announces the old one again when it puts the spec back, and the follower's
+  stores, which no record was applied to, go back to the bytes they were made of).
+- **A standby's readiness has one more reason**, `pipeline-building`, and
+  `StandbyReadiness.PipelinesToBuild`: a standby is not warm while a circuit it can
+  build is not built. A pipeline it failed to build does not count.
+- **`ReleaseStores` on the leader is unchanged**, and with it the limit recorded in S6's
+  first part: a replaced generation that has committed has rewritten what it touched.
+- **The cold paths decode as before.** A cold standby and a node from nothing read the
+  state as bytes and build once; that is 1.3 µs an entry, in parallel across pipelines
+  and not within one.
+
+**Three brokers (G12).** `docker compose --profile kafka3` is three brokers in KRaft mode
+on ports 9192, 9292 and 9392, replication factor 3, `min.insync.replicas` 2, no volume,
+kept out of the default profiles. The test projects take the replication factor from
+`INCREMENTAL_KAFKA_REPLICATION` (the two failover apps read it too), and the CDC tests
+skip when the broker under test is not the one Kafka Connect writes to. Against it:
+
+| | |
+|---|---|
+| `tests/Incremental.Kafka.Tests` | 108 passed, 4 skipped (three CDC; one that needs the log cleaner) |
+| `tests/Incremental.Service.Tests` | 166 tests with the four broker tests below: in the last full run 164 passed, 1 skipped (CDC) and 1 failed — the rolling-restart test, on a check of its own that named the leader before a takeover had finished. That check and the same one in the outage test were corrected, and the six process tests then passed |
+| the scale rig, 200,000 rows, replication 3 | the run passes: takeover after the decision 0.99 s (fence 0.67), first record in the last sink 4.6 s after `kill -9`, a takeover by hand 0.6 s of silence in a sink; the table loaded at 112,000 rows/s (three replicas, acks from two) |
+
+Four new tests in `KafkaServiceProcessTests` stop and start the broker containers
+(`INCREMENTAL_KAFKA_BROKERS` names them; skipped without it). Each runs two node
+processes, a Kafka-loaded table and a plugin pipeline between two topics, with trades
+produced throughout, and ends by comparing the sink topic with the model.
+
+| | what happened |
+|---|---|
+| a rolling restart: each broker shut down (`docker stop -t 30`), five seconds, started, until every partition has all its replicas in sync | nothing lost in any of 21 runs. In 17 the leader kept leading under term 1 and the pipeline did not restart. In 4 the leadership moved, each time at the third broker — by then the leader of most partitions and the coordinator of the service's transactions: the leader's open transaction waited 10 to 30 s for the brokers to take its records (the writer logs it: `Kafka transaction has been waiting 30 s for the brokers to take its records`), the standby saw no heartbeat for `TakeoverCeiling` and took over, and the old leader exited with 3 |
+| each broker killed in turn (`docker kill`), eight seconds, started | nothing lost in 3 runs. In one nobody took over; in two the standby took over at the ceiling after the third broker's kill (the cluster took 43–48 s to be whole again that time, 8–17 s otherwise), and the old leader exited with 3 |
+| one broker killed, the leader `kill -9`ed 1.5 s later, the broker started under the new leader | the standby led 3.5–5.3 s after the kill (3 s of that is `TakeoverAfter`); the sink complete; the killed node back as a warm standby. Three runs. |
+| two of three brokers killed for 70 s — no controller quorum, nothing writable — then started | the standby had started its takeover at the ceiling and completed it 0.6–3.8 s after the cluster was whole again, at term 2 (four runs); the old leader was fenced and exited with 3; the sink complete, the pipeline not restarted. (Before fix 3 below, that takeover failed and both nodes had exited.) |
+
+**A broker restart can move the leadership.** That is the finding of the two rows
+above, and it is not fully explained. While the partitions a broker led and the
+transaction coordinator it was are moving, the service's leader can commit nothing; its
+heartbeats are records in those commits; and a standby that reads none for
+`TakeoverCeiling` takes over whatever the probe says. The outcome is the designed one
+and loses nothing. What is not known is why the wait was sometimes 30 s when the
+cluster was whole again in 12: a producer `request.timeout.ms` of 5 s instead of 30 did
+not prevent it (one move in six runs), and the client's own log was not taken at debug
+level. On one machine with three brokers it is about one rolling restart in five; what
+it is on MSK, where a broker restart is slower and the brokers are not neighbours, is
+not known. *Open for James* 32.
+
+**What a 60 s+ outage does.** With no quorum the leader can commit nothing and elect
+nothing, and its heartbeats stop. The standby cannot tell that from a dead leader, and
+at `TakeoverCeiling` (30 s of silence, whatever the probe answers) it starts a takeover —
+which waits, because it cannot initialise the transactional id either. When the brokers
+return the takeover completes: the standby leads under the next term within four seconds
+of the cluster being whole. The old leader is fenced by that and exits with 3; it had
+to — its transaction had outlived `transaction.timeout.ms` (60 s) and the coordinator
+would have aborted it and bumped its epoch in any case. Nothing is lost: the sources
+resume from the last checkpoint and the sink is complete. An outage shorter than the
+ceiling ends with the same leader.
+
+**What broke on three brokers, and was fixed.**
+
+1. *A table opened on new topics failed after 30 s, about one time in five.* An admin
+   call that needs a partition's leader (`ListOffsets`, `DeleteRecords`) takes it from
+   the client's metadata cache. On several brokers a topic created a moment ago can be
+   in that cache with no leader, and the call then waits out its request timeout — the
+   whole operation timeout — and fails with "No leaders found". The same call again
+   finds the same cache. Now `EnsureTopicAsync` asks for the new topic's metadata until
+   every partition has a leader (which replaces the cached answer), an admin retry gives
+   each attempt half a second, doubling, and asks for the topics' metadata between
+   attempts. Twenty of 112 Kafka tests failed before; none after.
+2. *The first import of a plugin failed*, and with it every deploy: the blob store asked
+   for the end of its topic an instant after creating it, from a broker that did not
+   know the topic yet (`Local: Unknown partition`). It asks again now.
+3. *A takeover with a broker down read "nothing was ever written" where there was
+   plenty.* `ListOffsets` reports a partition it could not ask — its leader is down and
+   no other is elected yet — inside its answer, with the offset left unset, and does
+   not throw. Read as it stood that was offset −1001, and every caller took it for an
+   empty partition. Two things followed, both seen: after the 70 s outage the standby's
+   takeover found `Table 'svc.catalog' has no head record`, failed and exited, so that
+   both nodes were gone; and with one broker killed just before the leader, the standby
+   found no last term in the leader topic and announced **term 1 again** — two leaders'
+   records under one term, which the fencing survives and nothing that orders by term
+   does. The answer's error is thrown now (`KafkaLog.OffsetOf`) and passes like any
+   other missing leader, so the read is made again. Behind it, three guards that do not
+   depend on the cause: a writer never announces a term below one this process has
+   read; a table log opened on an existing table does not believe a missing head, or
+   one older than it has read; and a writer that finds no head does not mint a new
+   identity for a table while its partitions hold records that are neither committed
+   nor aborted. `OffsetNotAvailable` — the broker's own "my end is not final yet" — is
+   retried too.
+4. *A duplicate in an append input fails a pipeline for good.* The tests' producer was
+   not idempotent, so a retry after a broker died put a trade into the topic twice; the
+   join then asserted the same row twice and the upsert sink refused it, at every
+   restart, until the pipeline was `Failed`. The producer is idempotent now. The
+   behaviour is the product's and is stated in the guide: an append input counts what it
+   is given, and a source that can repeat belongs on a keyed input.
+
+One failure was seen once and not explained: on a first lead, the commit that creates a
+table's identity was aborted and the abort itself was refused (`Failed to end
+transaction: Broker: Producer attempted a transactional operation in an invalid state`),
+which ends the writer; the node exited with 3 six seconds after it started. It did not
+recur in some forty later starts. The writer's message now also says why the transaction
+was being aborted.
+
+**A broker that refuses clients it does not know (G12).** `docker compose --profile
+kafka-sasl` is one broker on port 9492 that accepts only SASL/OAUTHBEARER (unsigned
+tokens — the broker's development validator) and has an authorizer that denies whatever
+no ACL allows. The scale rig takes `--oauth <principal>`: the client configuration then
+names the mechanism and nothing else, and the token comes only from the refresh handlers
+on `ConfigureProducer`, `ConfigureConsumer` and `ConfigureAdmin`, with a life of twenty
+seconds. So a client the service creates without those callbacks cannot authenticate,
+and one that does not refresh is cut off inside the run. `grant-acls.sh` gives the
+node's principal the permissions and the rig's own clients run as another principal.
+
+The whole run passes: first lead, table load, a `kafka` loader, twenty pipelines
+deployed, state, a cold standby, 45 s of steady input, `kill -9`, the standby's
+takeover (1.08 s, first record in the last sink 4.34 s after the kill), the killed node
+back, a takeover by hand, a cold start from the blob topic. In the minute before the kill the leader's clients were handed 200 tokens and the standby's 81 — every client several times over — and the broker denied the node nothing but the group lookups below. Two things
+broke on the way:
+
+1. *A consumer that was asked something before it was ever polled had no token.* A
+   consumer's callbacks, the token refresh among them, run only inside `Consume`. The
+   blob store's consumer is asked for its topic's end first, and the log's short reader
+   for a topic's metadata; both waited sixty seconds and failed with "All broker
+   connections are down" — the first lead took 64 s and imported no plugin.
+   `AssignedConsumer.ServeCallbacks` is called before such a call now.
+2. *A refused group lookup ended a follower, and with it a takeover.* The Kafka client
+   requires a `group.id` and looks up the group's coordinator whether or not the group
+   is ever joined. Without `Describe` on the group the broker refuses, and the client
+   hands that to the application from `Consume` as an error; the state follower treated
+   it as a failed read, and the node's first takeover ended fenced.
+   `AssignedConsumer.ConsumeAssigned` passes it over, and every consume in the libraries
+   goes through it. Nothing the service creates joins a group, so it needs no permission
+   on one — the broker's authorizer log showed nothing denied to the node but those
+   lookups (about one a second per consumer; `Describe` on the three group names
+   quiets it).
+
+The permission set that sufficed, as ACLs and as MSK IAM actions, is in the guide (*On
+Amazon MSK*); the IAM column is a translation and has not been run.
+
+**Public API added in this step.**
+
+- Core: `ChangelogStorageProvider.UseLayout`, `Layout`, `CommittedLayout`,
+  `CommitLayoutAsync`, `StoreEpoch`; a second record value format (format byte 2).
+- Kafka: `AssignedConsumer.ConsumeAssigned` and `ServeCallbacks`.
+- Service: `ServiceOptions.WarmStandbyPipelines`; `PipelineStartTimings` and
+  `PipelineStatus.LastStart`; `StandbyReadiness.PipelinesToBuild` and the not-warm
+  reason `pipeline-building`. `PipelineState.Built` is now used.
+- Compose profiles `kafka3` and `kafka-sasl`; `INCREMENTAL_KAFKA_REPLICATION` and
+  `INCREMENTAL_KAFKA_BROKERS` for the tests; `benchmarks/Incremental.Service.Scale`.
+
+**Tests.** Core, `ChangelogLayoutTests` (7): the format with and without a layout, read
+back as one state; an announcement that moves neither sequence nor offsets and is
+written once; a follower with typed stores that follows its layout and takes over on
+the same store objects; a record of another layout turning the follower's stores back
+into bytes before it is applied, the member the old types do not model intact; an
+announcement that is taken back, leaving the bytes the stores were made of; a follower
+holding what its leader holds once the leader has checkpointed; a tombstone
+the store's types cannot read. Service, `WarmStandbyTests` (9): the takeover ratio
+(below); a standby with building switched off; a pipeline that has never checkpointed;
+a replace that keeps state across two plugin versions while the standby holds the old
+version's stores, then a takeover; a table opened again on the standby; a definition
+that throws on the standby; a standby that is not warm while a build is held at a gate;
+a pipeline removed on the leader; what a layout covers. Seven existing tests said a standby's pipelines are
+`Unbuilt`, have no graph and load no plugin; they now say `Built`.
+
+*The regression test for the requirement* is
+`A_takeover_starts_what_the_standby_built_and_does_not_pay_for_the_state_again`: two
+pipelines on the in-memory backend, 300 and 90,000 keyed entries. The standby's own
+build of each says what reading that state costs (about 5 ms and 200 ms in a Debug
+build); after the takeover each pipeline's build and start are compared, and the
+assertion is a ratio — 300 times the state must add less than a tenth of what reading
+it costs. It takes three seconds. With the standby's circuits not used at a takeover
+it fails.
+
+**Mutation checks.** 20 run, 19 killed (`scratchpad/r5/mutations-core.py`,
+`mutations-svc.py`; the service ones in a copy of the tree, because the broker tests were
+running in this one). Core, 11: a value of another layout applied to a typed store; an
+announcement counted as a checkpoint; a commit record of another layout releasing
+nothing; the tombstone guard off; values written without the layout; an announcement
+advancing the sequence, or written every time; a follower allowed to create stores of
+a layout the log has left; the epoch not moving; the tag not skipped on read; a
+follower keeping the bytes after its leader has checkpointed (survived its first run —
+no test released a follower's stores after a real checkpoint; one does now). Service,
+9: a takeover never using what the standby built; the standby building nothing; the
+leader not announcing the layout; stores bound under no layout; a reopened table
+leaving the built circuit alone; a failed build making the standby unready; the
+standby not saying it is still building; the layout ignoring the plugin version
+(survived, because the two test plugin versions hold state of the same shape; a unit
+test of `LayoutOf` kills it now). One survives: taking the release out of
+`SyncFromCatalog` does not fail the removed-pipeline test — the standby's hold on the
+plugin version goes by some other path that was not found. The fixes found on the
+brokers (`ConsumeAssigned`, `ServeCallbacks`, `OffsetOf`, the term floor, the admin
+retries) have no mutation check: each was a failing run on the `kafka-sasl` or `kafka3`
+profile before it and a passing one after, and nothing on one plain broker provokes them.
+
+**Open for James** gains 30–34: plugin code on the standby; the new format byte and the
+upgrade order it imposes; the takeover ceiling against a broker's failover time; the
+group lookups left refused rather than a permission asked for; the broker tests left
+out of CI.
+
+**Left undone.**
+
+- **Ten million rows, and two nodes at five million**: the machine could not hold them.
+  Five million were measured on one node; the takeover was measured at one and three
+  million rows and at a quarter of a million to four million orders of state.
+- **The fence's half second** (the client's fixed retry while the broker aborts the
+  dead writer's transaction) and the 0.1 s end-of-partition wait behind it.
+- **The cold paths are as they were**: a cold standby and a node from nothing read
+  everything, and a table restore is one consumer.
+- **A pipeline that writes a table is not built ahead** on the standby.
+- **Memory was measured, not tuned.** The working set is about twice the live heap and
+  nothing was done about it; no per-table or per-pipeline memory figure exists.
+- **Real MSK**: IAM itself, TLS, the IAM action names, hours of token refresh, an
+  availability-zone loss, MSK Serverless, MSK Connect. Kafka Connect was not put behind
+  SASL.
+- **The unexplained aborted first commit** above.
+- **The broker tests and the SASL run are not in CI**; neither has run anywhere but
+  this machine.
+- **The admin UI** shows a standby's `Built` pipelines and the graph, with new
+  sentences; no screenshot was retaken and `LastStart` and `PipelinesToBuild` are in
+  the API only.
