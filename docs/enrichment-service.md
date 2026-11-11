@@ -180,6 +180,13 @@ What is going on:
   booked afterwards, while a corrected multiplier reprices every trade in the instrument.
   Put the lookup *before* the retroactive joins if "as it arrived" is to mean the trade's
   arrival: a lookup downstream of a join looks again whenever the join re-emits.
+- **A `Lookup` remembers what it emitted for every record it has seen**, so that it can
+  take exactly that back when the record is retracted. On a keyed input that is one
+  entry per key, like the input's own state. On a stream of records that only ever
+  arrive it is one entry per record, for ever: use `LookupAppendOnly` there, which
+  keeps nothing and faults on a retraction. Where a lookup must sit behind something
+  that retracts and the records never end, group by the lookup key and give the
+  grouping `EvictWhen`.
 - Settings are one type per definition, bound from the spec's `settings` with
   `System.Text.Json` (camelCase, unknown members refused, string enums) and then
   validated with DataAnnotations — before anything is deployed.
@@ -277,7 +284,9 @@ minute, then looks the instrument up in a table:
 /// was read ahead of the other. The join's key is (instrument, interval), and
 /// <c>EvictWhen</c> closes a key when the watermark passes the interval's end — from then
 /// on neither side holds anything for it, which is what keeps the state of a join between
-/// two unbounded streams bounded.
+/// two unbounded streams bounded while the circuit runs. (Across a restart less so: the
+/// watermark and the keys waiting to close are not in the checkpoint, so a key that no
+/// record touches after a restart is not evicted. The guide says what follows from that.)
 /// </para>
 /// <para>
 /// It is a left join: an execution in an instrument that was not quoted in its interval is
@@ -312,7 +321,14 @@ public sealed class ExecutionQuality : IPipelineDefinition<ExecutionQuality.Sett
             new(instrument, new DateTimeOffset(at.UtcTicks - at.UtcTicks % interval.Ticks, TimeSpan.Zero));
 
         // One slot per input; the spec binds each to a connector of its own.
-        var executions = p.Input<Trade>("executions").WithEventTime(t => t.ExecutedAt, lateness);
+        var executions = p.Input<Trade>("executions")
+            // A table lookup before the stream join: the instrument's asset class, as of
+            // arrival. Executions only ever arrive, so the lookup remembers nothing. After
+            // the join it would have to (the join takes rows back), one entry per
+            // execution with nothing to close them: state that grows for ever.
+            .LookupAppendOnly(p.Table(Reference.Instruments), t => t.InstrumentId,
+                (t, i) => new ClassedTrade(i.AssetClass, t.InstrumentId, t.ExecutedAt, t.Price))
+            .WithEventTime(t => t.ExecutedAt, lateness);
         var quotes = p.Input<Quote>("quotes").WithEventTime(q => q.At, lateness);
 
         var priced = executions
@@ -320,13 +336,10 @@ public sealed class ExecutionQuality : IPipelineDefinition<ExecutionQuality.Sett
             .EvictWhen(key => key.Start + interval)
             .LeftJoin(
                 quotes.GroupBy(q => In(q.InstrumentId, q.At)),
-                (_, t, q) => new Execution(t.InstrumentId, t.ExecutedAt, Math.Round((t.Price - q.Mid) / q.Mid * 10_000m, 2)),
-                (_, t) => new Execution(t.InstrumentId, t.ExecutedAt, null)).Named("priced");
+                (_, t, q) => new ClassedExecution(t.AssetClass, t.ExecutedAt, Math.Round((t.Price - q.Mid) / q.Mid * 10_000m, 2)),
+                (_, t) => new ClassedExecution(t.AssetClass, t.ExecutedAt, null)).Named("priced");
 
         var quality = priced
-            // A table lookup after the stream join: the instrument's asset class, as of arrival.
-            .Lookup(p.Table(Reference.Instruments), x => x.InstrumentId,
-                (x, i) => new ClassedExecution(i.AssetClass, x.ExecutedAt, x.SlippageBps)).Named("classed")
             .WithEventTime(x => x.ExecutedAt, lateness)
             .GroupBy(x => x.AssetClass)
             .HoppingWindow(TimeSpan.FromSeconds(s.WindowSeconds), TimeSpan.FromSeconds(s.HopSeconds))
@@ -341,7 +354,9 @@ public sealed class ExecutionQuality : IPipelineDefinition<ExecutionQuality.Sett
 /// <summary>The join's key: an instrument and the start of a quote interval.</summary>
 public readonly record struct IntervalKey(int InstrumentId, DateTimeOffset Start);
 
-public sealed record Execution(int InstrumentId, DateTimeOffset ExecutedAt, decimal? SlippageBps);
+/// <summary>An execution with its instrument's asset class: what the join keeps per key
+/// until the key closes.</summary>
+public sealed record ClassedTrade(string AssetClass, int InstrumentId, DateTimeOffset ExecutedAt, decimal Price);
 
 public sealed record ClassedExecution(string AssetClass, DateTimeOffset ExecutedAt, decimal? SlippageBps);
 
@@ -370,12 +385,32 @@ What a second input changes:
   one topic is drained in a step and the other is not — and nothing closes until both
   feeds have passed it. The price is that an input with no records holds the watermark
   where it is: windows stay open and the join keeps its keys.
+- **The table lookup comes before the join.** Executions only arrive, so
+  `LookupAppendOnly` can class them with no state at all. Behind the left join the rows
+  are taken back and re-asserted, a lookup there would have to remember each one, and
+  with nothing to close them that is an entry per execution for as long as the pipeline
+  lives. (This example had it there, and grew by 3,000 entries a minute.)
 - **A join between two streams keeps both sides, so bound it.** `EvictWhen` on a
   grouping says when a key is finished; here a key is an instrument and a minute, and it
   closes when the watermark passes the minute's end. What was emitted for it stays final.
   Without it the join's state grows with the streams. The join's key has to carry the
   time for that to be expressible: joining on the instrument alone would keep every
   execution for ever.
+- **The watermark and the eviction hold while a circuit runs, and less across a
+  restart.** The watermark and the list of keys waiting to close are in memory, not in
+  the checkpoint. A circuit that
+  starts — after a restart, a takeover, a replace that keeps state — has no watermark
+  until every input has given it a record and a step has ended, and it knows of no key
+  until a record touches one. Two things follow. A record older than the watermark of
+  before the restart is admitted in that first step: if its window had already closed
+  and been evicted, the aggregate starts that window again from nothing and the sink's
+  row for it is overwritten by the late records' total. And the keys and windows that
+  were open at the restart and get no further record are never evicted: each restart
+  leaves that slice in the stores, the changelog and the standby. With inputs in rough
+  time order the first is the few records that were already late, and the second is
+  the keys that were open at that moment and saw nothing more; a pipeline that is
+  restarted often, or whose state must be exactly bounded, should not rely on eviction
+  alone (*Limits*).
 - **`LeftJoin` emits the unmatched row and takes it back.** An execution whose quote has
   not arrived is emitted as unpriced; when the quote arrives the unpriced row is
   retracted and the priced one asserted, and the window totals downstream follow. The
@@ -1034,7 +1069,7 @@ on every record so that the next checkpoint carries them.
 /// Registered as the connector <c>trade-feed</c>; a spec binds a slot to it with
 /// <c>{ "connector": "trade-feed" }</c>.
 /// </summary>
-public sealed class TradeFeedConnector(PositionedFeed<Trade> feed) : IAppendSourceConnector, IKeyedSourceConnector, IConfigDescribed
+public sealed class TradeFeedConnector(PositionedFeed<Trade> feed) : IAppendSourceConnector, IKeyedSourceConnector, IConfigDescribed, ITypedConnector
 {
     // Called at the dry run: check the slot's config here, and name any secret properties.
     public ConnectorDescription Describe(JsonElement config) => new("the example's generated trade feed");
@@ -1042,6 +1077,14 @@ public sealed class TradeFeedConnector(PositionedFeed<Trade> feed) : IAppendSour
     // Optional (IConfigDescribed): what the config accepts, for whoever composes a spec.
     // The admin API lists it under "connectors", and a spec template is built from it.
     public ConfigSchema ConfigSchema { get; } = new([], "The example's generated trade feed. It takes no config.");
+
+    // Optional (ITypedConnector): this feed carries one type, and says so at the dry run
+    // rather than at the first record. A spec template only offers it for slots it can feed.
+    public void RequireTypes(SlotKind kind, Type record, Type? key)
+    {
+        if (record != typeof(Trade))
+            throw new InvalidOperationException($"the trade feed carries {nameof(Trade)}, and the slot wants {record.Name}");
+    }
 
     public Task<IRunningSource> StartAsync<T>(SourceContext<T> context, CancellationToken cancellationToken) where T : notnull
     {
@@ -1176,6 +1219,25 @@ Both connectors implement `IConfigDescribed`, which is optional: it is what `GET
 connectors` shows of a connector's config, and what a spec template fills in. A table
 source factory may implement it too.
 
+A connector that carries only some types says so with `ITypedConnector`, as the trade
+feed does: `RequireTypes` is called at the dry run with the slot's kind and its record
+and key types, and what it throws refuses the binding there. Without it a connector is
+taken to carry anything, and a slot of the wrong type shows at the first record. A spec
+template binds a slot only to a connector that accepts its types, so the form's
+default for `execution-quality` no longer puts `quotes` on the trade feed.
+
+A table source factory is asked the same way: `Create<TKey, TRow>` runs when a table
+is declared — the dry run included — as well as when its loader starts, and a factory
+that throws for a key or row type it does not serve refuses the declare before a log
+is created. So `Create` must open nothing.
+
+Two more optional interfaces are for what the service shows. A sink connector whose
+slot must be the only writer of something returns that something's name as
+`ConnectorDescription.Owns`; the service refuses a second sink slot with the same
+claim (the `files` sink claims its store and prefix). A source connector whose
+position is not a partition and an offset to a person implements `IPositionDescribing`,
+and a dead letter then carries its wording (`afterAt`).
+
 ### The built-in connectors
 
 | | append input | keyed input | upsert sink | append sink |
@@ -1202,16 +1264,31 @@ pipeline's checkpoint: a restart or a takeover carries on at the next line, and 
 nothing twice. Three things follow from reading in name order:
 
 - an object must be whole when it appears — write it elsewhere and move it, or put it in
-  one request. An object that grows after it was read to its end is not read again;
-- an object that arrives with a name sorting before the position is never read. Name
-  objects by time or by a counter, zero-padded;
+  one request — and must not change afterwards. What happens to lines added to an object
+  already read to its end depends on chance: they are not read while the pipeline runs,
+  and they are read if it restarts or fails over while that object is still the last
+  one it read. A last line that was half written when it was read was rejected as
+  malformed, and its completed form is never read;
+- an object is read if, when it is first listed, its name sorts after the object the
+  source is in. One that arrives with a name sorting before the position is never read.
+  With a backlog the source reads the names one listing gave it, for at most one
+  `pollInterval`, before it lists again: an object that arrives with a name among them
+  is read in its place if the source has not passed it by the next listing, and
+  skipped, without a trace, if it has. So names must increase: name objects by time or
+  by a counter, zero-padded, and never write a name that sorts before one already there;
 - old objects can be deleted. The position does not need the object it names.
 
 A line that is not a record is rejected in its place: it faults the pipeline under the
 default error policy and is a dead letter — with its object and line — under
-`DeadLetter`. A keyed input takes every line as an upsert; there is no line that
-deletes. Names of up to 256 bytes can be checkpointed. The listing is the store's:
-every poll lists the whole prefix, so keep a prefix to what is still arriving.
+`DeadLetter`. So is a line longer than `maxLineLength` characters (1,048,576 unless
+the slot says otherwise; at most 67,108,864): it is read past without being held, and
+the dead letter carries its first 4,096 characters. That is what an object that is not
+JSON lines turns into — a JSON array on one line, a Parquet file, a gzip — whatever its
+size; `suffix` keeps such neighbours out of a prefix. A keyed input takes every line as
+an upsert; there is no line that deletes. Names of up to 256 bytes can be checkpointed.
+The listing is the store's: every poll lists the whole prefix, so keep a prefix to what
+is still arriving. (`LocalObjectStore` walks the directory the prefix names — the part
+up to its last `/` — and not the rest of the store.)
 
 *As a sink* it writes one object per step that has output:
 
@@ -1234,8 +1311,14 @@ an `IObjectStore`. Delivery is at least once, and the names are what make it har
 a step delivered again writes the same name with the same content, and a generation
 that starts deletes the objects of steps above its checkpoint, because those steps are
 about to be run again and may be cut differently. A pipeline that is reset has its
-objects deleted. So a prefix belongs to one slot of one pipeline. Nothing merges or
-compacts the objects; an upsert sink's prefix is a change log, and what reads it folds it.
+objects deleted. So a prefix belongs to one sink slot of one pipeline, and the service
+holds to it: a spec whose sink, or dead-letter sink, names a store and prefix that
+another sink slot already writes — its own or another pipeline's — is refused at the dry
+run and at the deploy. (A source may read a prefix a sink writes; that is one pipeline
+feeding another.) An object is written whole or not at all: a write that fails or is
+cancelled part-way leaves nothing under the step's name. Nothing merges, compacts or
+expires the objects; an upsert sink's prefix is a change log, what reads it folds it,
+and how long objects are kept is the bucket's lifecycle rule.
 
 `minInterval` is for the number of objects. Having written a step's object the sink
 waits that long before it acknowledges the step; the pipeline's checkpoint waits for
@@ -1283,12 +1366,19 @@ directory the program prints as `files:`.
 | `--ui-dir src/Incremental.Service.Admin/wwwroot` | serve the admin UI's files from the checkout: an edit is a browser reload away |
 | `--port N`, `--rate N`, `--prefix name`, `--no-generate`, `--no-pipelines`, `--verbose` | |
 
-It can be left running. Trade ids come round again after 20,000, so the pipelines'
-state is bounded, and the in-memory backend compacts its state log as it goes
-(`InMemoryBackendOptions.StateCompactAbove`): a Release build at the default rate
-settles at about 690 MB of resident memory within twenty minutes and stays there, and
-at `--rate 5000` between 540 and 650 MB from the first minute to the tenth — the
-numbers are under *As built*, S6, in the design document.
+It can be left running. Trade ids come round again after 20,000 and what is keyed by
+time closes with the watermark, so the pipelines' state is bounded; the in-memory
+backend compacts its state log as it goes (`InMemoryBackendOptions.StateCompactAbove`);
+and the example deletes what its files sinks wrote beyond the newest 200 objects of
+each prefix, because a directory has no lifecycle rule (`World.TrimSinkObjectsAsync`).
+A Release build at the default rate reaches about 650 MB of resident memory in twenty
+minutes and was between 640 and 720 MB from then to the fortieth, with 170 to 310
+thousand records in the state log throughout and 760 to 1,700 objects, under 10 MB,
+in its files directory. At `--rate 5000` event time runs a hundred times faster and a
+minute of it is 300,000 executions held by the join until it closes: about a million
+state records and 1.8 to 2.7 GB, with no trend over nine minutes. The numbers, and
+what they were before a lookup in `execution-quality` was moved, are under *As built*,
+S6 (*The second review's findings*), in the design document.
 
 Things to try in the UI, in the default mode:
 
@@ -1326,15 +1416,15 @@ Things to try in the UI, in the default mode:
    newest with the operator, the exception and the record; the same records are in
    `dead-letters/sanctions-alerts/` under the files directory, one object per step, and
    stay there when the node does not.
-8. **Pipelines → execution-quality → Topology.** Two inputs, the join between them, the
-   table lookup, the window. Its `quotes` input is the files under `quotes/`: its
+8. **Pipelines → execution-quality → Topology.** Two inputs, the table lookup on one of
+   them, the join between them, the window. Its `quotes` input is the files under `quotes/`: its
    source's position reads as a file name and a line.
 9. **Pipelines → Deploy.** Give it an id (`quality-eu`), choose `execution-quality`, and
    the form shows the definition's settings at their defaults and a block per slot.
    Bind `quotes` to the connector `files`, store `lake`, prefix `quotes/` — the trade
-   feed is offered for it too, since a connector is not asked what record type it
-   carries until it starts — check, deploy. No JSON is typed; *JSON (advanced)* shows
-   the spec the form has written.
+   feed is not offered for it, because it says it carries trades (`ITypedConnector`) —
+   check, deploy. No JSON is typed; *JSON (advanced)* shows the spec the form has
+   written.
 10. **Tables → Declare.** Choose `WatchlistTable`, name it `pep-watch`, loader `file`,
     connection `refdata`, a path. `watchlist-alerts` can then be deployed a third time
     with its `watchlist` slot bound to it.
@@ -1461,7 +1551,8 @@ clears what the last dry run said. A replace that could alter what the state mea
 one is rows looked up — a `Lookup` or `LookupAppendOnly` drawn to the table it probes,
 where a `Join` has the table's changes flowing into it. It opens fitted to the width
 there is at a size that can be read: a long circuit continues in a band below. Select a
-node for its kind and what that kind does, its state stores, what it reads and feeds,
+node for its kind and what that kind does, the name its state stores and dead letters
+know it by, what it reads and feeds,
 and — for an input, a sink or a table — its numbers. Records and time per operator are
 not collected, and the page says so: it is the circuit as declared, not a live view. A
 standby shows the same graph once it has built the circuit (the pipeline is `Built`
@@ -1530,13 +1621,28 @@ from one node's pages to the other's carry both.
 
 ## Operating it
 
-**Failover.** The standby takes over after `TakeoverAfter` (3 s) without a heartbeat. It
-fences the old leader at the broker, promotes the catalog and the tables, builds each
-pipeline's circuit — the one it built while it stood by — and starts the sources at their
+**Failover.** The standby takes over after `TakeoverAfter` (3 s) without a heartbeat
+*when the leader's process is gone*: with a peer probe configured — the set-up this
+guide describes — silence alone is not enough, the standby asks the leader's probe
+port, and a refused or unanswered probe is what lets it go. It then fences the old
+leader at the broker, promotes the catalog and the tables, starts each pipeline's
+circuit — the one it built while it stood by — and starts the sources at their
 committed offsets. Locally the takeover itself is about a second after the three seconds
-of silence, whatever the tables and the pipelines hold (*How large, how fast*, below). Delivery is at least once: whatever the old
-leader had delivered but not committed is delivered again. An upsert sink converges; an
-append sink sees duplicates.
+of silence, whatever the tables and the pipelines hold (*How large, how fast*, below).
+That is the figure for a killed process or a lost machine, and every 4-second
+measurement in this guide is a `kill -9`.
+
+A leader that is alive and cannot commit is the other case: hung in a sink or a
+connector call, cut off from the brokers but still reachable by its peer, or waiting
+for the brokers themselves. It answers the probe, so the standby waits for
+`TakeoverCeiling` (30 s) of silence and takes over then, whatever the probe says.
+Output stops for those 30 s and the takeover: in the broker-restart runs below the
+sinks stood still for 30 to 50 s when that happened. Size a failover budget on both
+figures. A lower ceiling shortens the second and makes a slow broker failover more
+likely to move the leadership (*Through a broker failure*).
+
+Delivery is at least once: whatever the old leader had delivered but not committed is
+delivered again. An upsert sink converges; an append sink sees duplicates.
 
 **A node that stops leading exits.** Exit code 3: fenced by a takeover. 4: resigned
 (stepped down). 5: its catalog writer faulted and no ready standby answered. Run nodes
@@ -1651,8 +1757,10 @@ does the same. It is never started around a pending reset, and a pipeline pendin
 removal is never started. `restart` retries the pending act at once; sending the reset
 or the removal again does too. A deploy is refused until it is finished.
 
-**Secrets in a spec.** A connector names the properties of its config that are secret,
-and the API returns those as `"***"`. A spec sent back with `"***"` in such a property
+**Secrets in a spec.** A connector names the properties of its config that are secret —
+in what `Describe` returns (`SecretProperties`) or by marking them `Secret` in its
+`ConfigSchema`; either is enough, and the second also makes the deploy form a password
+field — and the API returns those as `"***"`. A spec sent back with `"***"` in such a property
 keeps the stored value for that slot and connector, so a spec read from the API can be
 edited and deployed again; where nothing is stored to keep, `"***"` is refused.
 
@@ -1702,7 +1810,12 @@ dropped was a retraction; `record` is the record as JSON text, cut at 4,096 char
 `source` is where the record lies in its source when the source itself rejected it
 (`enrich.trades[0]@5190`, `quotes/00000012.jsonl:44`); for a record an operator dropped
 it is null, and `after` — every input's position in the last checkpoint before the
-step — says where in the inputs to start looking. `generation` is the spec's.
+step, as `{input}#p{partition}` and an offset — says where in the inputs to start
+looking. An input whose position is not a partition and an offset to a person is under
+its own name in `afterAt` instead, in its connector's words: for a `files` input
+`"afterAt": { "quotes": "quotes/00000012.jsonl:40" }`, the object and the last line of
+it the checkpoint covers. (A connector of yours does the same by implementing
+`IPositionDescribing`.) `generation` is the spec's.
 
 The pipeline's checkpoint waits for the sink, exactly as it waits for its other sinks:
 a dropped record is in the dead-letter sink before the checkpoint that passes it. So a
@@ -1827,7 +1940,7 @@ commit every step; a pipeline with `checkpointMaxDelay` or slow sinks needs its 
 
 | Alert | Condition | Why |
 |---|---|---|
-| No leader | `sum(node.role{role="Leader"}) == 0` for 30 s | Nothing runs. A takeover takes `TakeoverAfter` (3 s) plus about a second; 30 s without a leader is not a takeover. |
+| No leader | `sum(node.role{role="Leader"}) == 0` for 45 s | Nothing runs. A takeover from a dead leader takes `TakeoverAfter` (3 s) plus about a second; from one that is alive and cannot commit, `TakeoverCeiling` (30 s) plus about a second. Longer than that without a leader is not a takeover. |
 | Two leaders | `sum(node.role{role="Leader"}) > 1` for 15 s | Fencing makes this harmless for the logs and brief by construction; if it lasts, a node has not noticed it was fenced. |
 | No ready standby | `node.standby_ready == 0` on the leader for 5 min | The next failure is an outage, not a failover. |
 | Standby falling behind | `node.state_lag > 10 000`, or `table.lag > 100`, for 5 min | A takeover now would not be warm. |
@@ -1841,7 +1954,7 @@ commit every step; a pipeline with `checkpointMaxDelay` or slow sinks needs its 
 | A replace was rolled back | `increase(pipeline.rollbacks[1h]) > 0` (ticket) | Someone's deploy did not take; the audit says why. |
 | Loader stuck | `tables{state="LoaderFaulted"} > 0` for 5 min, or `table.loader_lag` rising | Readers keep the last version; the data is going stale. |
 | Table faulted | `tables{state="Faulted"} + tables{state="Failed"} > 0` | Pipelines that read it are `Blocked`. |
-| Takeover slow | `takeover.duration{stage="start_leading"}` above your failover budget | Mostly the `pipelines` stage: state is decoded at takeover. |
+| Takeover slow | on Kafka, `takeover.duration{stage="total"}` above about 3 s, and `{stage="silence"}` above your failover budget | `total` is the takeover from the decision to leading: `fence`, `storage`, `catalog`, `tables`, then `start_leading` (the leader record, seeds, `pipelines`, loaders). It is about a second locally, half of it the `fence`, and does not grow with state when the standby was warm — so a long one is a slow fence (the brokers), or a `pipelines` stage that had to build circuits the standby had not (`standby.pipelines_to_build` was not 0). `silence` is how long the leader had been quiet when the standby went: 3 s for a dead leader, 30 s for one that still answered its probe. `start_leading` alone leaves out the fence and the wait, which is where a slow takeover is slow. |
 
 ## How large, how fast
 
@@ -1849,8 +1962,9 @@ Measured with `benchmarks/Incremental.Service.Scale` (its README has the method)
 node processes on Kafka, Release build, one local broker, a 20-thread machine. The table
 is one of wide reference rows — 21 columns, about 520 bytes of JSON, one index — shared
 by twenty pipelines: two that join keyed orders to it (two state entries per order), two
-that keep a total per party, sixteen stateless lookups. 2,000 orders and 500 changed
-rows a second arrive throughout.
+that keep a total per party, sixteen stateless lookups — except in the state series
+below, which ran one join and one total beside eighteen lookups. 2,000 orders and 500
+changed rows a second arrive throughout.
 
 **Failover.** With a million rows and a million orders of state:
 
@@ -1864,10 +1978,11 @@ rows a second arrive throughout.
 The takeover does not grow with what the node holds, because the standby has already
 built every circuit on the state it follows and only starts them:
 
-| orders of state in the largest pipeline | 250,000 | 1,000,000 | 4,000,000 |
+| orders of state in the one join pipeline (`--joins 1 --aggregates 1`, a million rows) | 250,000 | 1,000,000 | 4,000,000 |
 |---|---|---|---|
 | takeover, after the decision | 0.93 s | 0.97 s | 0.93 s |
 | `kill -9` → first record in the last sink | 4.2 s | 4.3 s | 4.2 s |
+| a cold standby until it is warm (the table, then that state) | 10.0 s | 13.4 s | 26.9 s |
 
 Nor with the table: at three million rows the takeover was 0.98 s and the last sink had
 its first record 4.4 s after the kill.
@@ -1921,7 +2036,7 @@ should hold; the loading, the cold start and the memory scale as above.
 
 | | what happened |
 |---|---|
-| a rolling restart — each broker shut down, five seconds, started | nothing lost; in four runs of five the leader kept leading and the pipeline did not restart; in the fifth the standby took over |
+| a rolling restart — each broker shut down, five seconds, started | 21 runs. In 16 the leader kept leading, the pipeline did not restart and the sink was complete. In 4 the standby took over at the ceiling and the old leader exited with 3; the test of that day stopped there, so the sink was not compared in those runs. In 1 **both nodes ended fenced and exited**, and the sink stood at 7,930 rows of 10,660 until someone would have restarted a node |
 | each broker killed in turn, eight seconds, started | nothing lost; the standby took over in about half the runs, and the old leader exited with 3 |
 | a broker killed, then the leader `kill -9`ed, the broker started under the new leader | the standby led 3.5–5.3 s after the kill; nothing lost |
 | two of three brokers down for 70 s (no quorum: nothing can be written) | the standby led within four seconds of the brokers being back; the old leader was fenced and exited with 3; nothing lost |
@@ -1932,11 +2047,23 @@ those have moved, and to its standby a leader that commits nothing is silent. Th
 standby waits out a silence while the leader still answers its probe, but only up to
 `TakeoverCeiling` (30 s): past it, it takes over, the old leader is fenced and exits,
 and the pipelines carry on from their last checkpoint on the other node. That is what
-happened in the runs above where leadership moved, and it is the designed outcome —
-nothing is lost either way — but it does mean **a broker restart can move the
-leadership**. Run the nodes under a supervisor that restarts them, as for any takeover.
-If the brokers' own failover is slower than thirty seconds where you run, raise
-`KafkaServiceBackendOptions.TakeoverCeiling` above it.
+happened in the runs above where leadership moved, and it is the designed outcome. It
+means **a broker restart can move the leadership**, with output stopped for the 30 to
+50 s that takes — about one rolling restart in four on three local brokers.
+
+It can also go wrong. In one rolling restart of the 21 the standby's takeover was itself
+fenced a moment after it began — the old leader's Kafka client, still alive, had
+initialised the transactional id again — and the old leader was then fenced by the
+standby's: both processes exited with 3 and nothing ran. Nothing committed is lost by
+that (the checkpoint and the logs are where they were), but the service is down until a
+node is started, and a start from nothing is a cold one: 12.5 s at a million rows,
+24–34 s at three to five million (*How large, how fast*). This was seen once, was not
+reproduced and is not fixed. So **run the nodes under a supervisor that restarts them**
+— it is what turns this from an outage into half a minute — and do not plan a rolling
+upgrade of the brokers on "nothing happens": plan on a takeover per upgrade, and watch
+`node.role`. The kill-each-broker runs, which compare the sink after the leadership has
+moved, lost nothing. If the brokers' own failover is slower than thirty seconds where
+you run, raise `KafkaServiceBackendOptions.TakeoverCeiling` above it.
 
 An outage of the whole cluster longer than the ceiling always ends that way: the
 standby's takeover waits for the brokers and completes when they return. One shorter
@@ -2080,8 +2207,18 @@ resources are ARNs (`…:topic/<cluster>/<uuid>/{prefix}.*`,
   pay for the state. `ServiceOptions.WarmStandbyPipelines = false` turns that off: the
   standby then holds state as bytes and loads nothing, and a takeover takes about 2.7 s
   longer per million orders in its largest join. A pipeline that writes a table
-  (`ToTable`) is always built at the takeover. An idle pipeline's state is held twice on
-  the standby until its first checkpoint after a deploy or a replace.
+  (`ToTable`) is always built at the takeover.
+- **A pipeline's state is held twice from a start until its next checkpoint.** A
+  circuit the leader builds on state that is there already — at a cold start, a
+  restart, a takeover that had to build, a replace that keeps state — reads the stored
+  bytes into its typed stores and keeps the bytes until it has committed once, because
+  until then a roll-back, or the build that wrote them, may need them as they were. A
+  checkpoint needs a step and a step needs input, so a pipeline whose inputs are quiet
+  holds both copies for as long as they are quiet: roughly twice its state, with no
+  bound on how long. A standby keeps the second copy only for a pipeline that has not
+  checkpointed since its spec was deployed or replaced; once the leader has, the
+  standby's build needs no way back. The memory table's figures are for pipelines that
+  are running.
 - **Both nodes are upgraded together** across the build that introduced layouts: a
   node from before it refuses the records a newer leader writes (a new format byte in
   the state log). Stop the standby, replace the leader, start the standby.
@@ -2122,3 +2259,10 @@ resources are ARNs (`…:topic/<cluster>/<uuid>/{prefix}.*`,
 - **Sink topics and source topics are not created**, and removing a table keeps its log.
 - **Windows:** an idle input stalls the watermark, and events later than the allowed
   lateness are dropped without a record ([intro.md](intro.md#event-time-watermarks-and-lateness)).
+- **Eviction and the watermark do not survive a restart.** Neither is checkpointed: a
+  circuit that starts has no watermark until every input has been seen, and evicts only
+  keys that a record touches after the start. So a late record can reopen a window that
+  had closed before a restart or a takeover and overwrite its row, and keys that were
+  open at the restart and are never touched again stay in the state for good — a slice
+  per restart. This is the core's (`EvictWhen`, windows, a remembered `Lookup`), not the
+  service's; the service restarts circuits more than a program that runs one does.

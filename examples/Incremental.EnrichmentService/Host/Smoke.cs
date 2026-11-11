@@ -537,6 +537,24 @@ public sealed class Smoke(ExampleOptions options)
                 && templated["settings"]?["minNotional"]?.GetValue<decimal>() == 0
                 && dryRun.Status == 200,
                 $"the template was {template.ToJsonString()} and its dry run answered {dryRun.Status} {dryRun.Body?.ToJsonString()}"));
+
+        // The trade feed carries trades and says so (ITypedConnector): a starting spec
+        // does not put the quotes on it, and a spec that does is refused before it runs.
+        var starting = await _admin.GetAsync($"plugins/{Specs.Plugin}/{v2}/definitions/execution-quality/template?id=quality-from-template");
+        var onTheFeed = starting["spec"]!.Deserialize<PipelineSpec>(SpecJson)!;
+        onTheFeed = onTheFeed with
+        {
+            Inputs = new Dictionary<string, JsonElement>(onTheFeed.Inputs) { ["quotes"] = Specs.Json("""{ "connector": "trade-feed" }""") },
+        };
+        var wrongType = await _admin.PutAsync("pipelines/quality-from-template?dryRun=true", onTheFeed);
+        await Claim("the starting spec for execution-quality binds 'executions' to the trade feed and 'quotes' to something that can carry a quote; quotes bound to the trade feed by hand are refused at the dry run",
+            () => Unless(
+                starting["valid"]!.GetValue<bool>()
+                && starting["spec"]!["inputs"]?["executions"]?["connector"]?.GetValue<string>() == "trade-feed"
+                && starting["spec"]!["inputs"]?["quotes"]?["connector"]?.GetValue<string>() is { } quotes && quotes != "trade-feed"
+                && starting["connectorsForSlot"]?["quotes"]?.AsArray().All(c => c!.GetValue<string>() != "trade-feed") == true
+                && wrongType.Status == 400 && (wrongType.Body?.ToJsonString().Contains("the trade feed carries Trade") ?? false),
+                $"the template was {starting.ToJsonString()} and the dry run with quotes on the trade feed answered {wrongType.Status} {wrongType.Body?.ToJsonString()}"));
     }
 
     /// <summary>Null when the pipeline's present generation has read, on each input, some

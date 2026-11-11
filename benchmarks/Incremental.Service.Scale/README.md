@@ -59,8 +59,11 @@ machine cannot hold twice.
 ## Reading the numbers
 
 - `heap` is the managed heap after a forced, compacting collection: what is live.
-  `rss` is the working set at that moment, which with server GC is about twice the heap
-  and also holds the Kafka client's buffers. A node needs the working set.
+  `rss` is the working set at that moment, which with server GC is well above the
+  heap and also holds the Kafka client's buffers: about twice it on the standby
+  (3.6 GB for 1.8 GB live at a million orders of state), and on the leader 2.7 to 3.6
+  times it (7.8 GB for 2.2 GB live at a million rows, 12.5 GB for 4.7 GB at three
+  million). A node needs the working set: size a container from `rss`, not from `heap`.
 - `first-sink-write` is measured where a reader of the sink would see it: the arrival of
   the first record that was produced after the moment in question.
 - `stages` are the takeover's own clock (`NodeStatus.Leadership.Kafka.LastTakeover` and

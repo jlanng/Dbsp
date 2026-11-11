@@ -103,7 +103,7 @@ public sealed class DirectorySourceFactory(LiveDirectory<int, Trader> traders, L
 /// Registered as the connector <c>trade-feed</c>; a spec binds a slot to it with
 /// <c>{ "connector": "trade-feed" }</c>.
 /// </summary>
-public sealed class TradeFeedConnector(PositionedFeed<Trade> feed) : IAppendSourceConnector, IKeyedSourceConnector, IConfigDescribed
+public sealed class TradeFeedConnector(PositionedFeed<Trade> feed) : IAppendSourceConnector, IKeyedSourceConnector, IConfigDescribed, ITypedConnector
 {
     // Called at the dry run: check the slot's config here, and name any secret properties.
     public ConnectorDescription Describe(JsonElement config) => new("the example's generated trade feed");
@@ -111,6 +111,14 @@ public sealed class TradeFeedConnector(PositionedFeed<Trade> feed) : IAppendSour
     // Optional (IConfigDescribed): what the config accepts, for whoever composes a spec.
     // The admin API lists it under "connectors", and a spec template is built from it.
     public ConfigSchema ConfigSchema { get; } = new([], "The example's generated trade feed. It takes no config.");
+
+    // Optional (ITypedConnector): this feed carries one type, and says so at the dry run
+    // rather than at the first record. A spec template only offers it for slots it can feed.
+    public void RequireTypes(SlotKind kind, Type record, Type? key)
+    {
+        if (record != typeof(Trade))
+            throw new InvalidOperationException($"the trade feed carries {nameof(Trade)}, and the slot wants {record.Name}");
+    }
 
     public Task<IRunningSource> StartAsync<T>(SourceContext<T> context, CancellationToken cancellationToken) where T : notnull
     {

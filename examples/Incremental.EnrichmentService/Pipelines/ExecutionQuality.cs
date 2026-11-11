@@ -17,7 +17,9 @@ namespace Enrichment.Pipelines;
 /// was read ahead of the other. The join's key is (instrument, interval), and
 /// <c>EvictWhen</c> closes a key when the watermark passes the interval's end — from then
 /// on neither side holds anything for it, which is what keeps the state of a join between
-/// two unbounded streams bounded.
+/// two unbounded streams bounded while the circuit runs. (Across a restart less so: the
+/// watermark and the keys waiting to close are not in the checkpoint, so a key that no
+/// record touches after a restart is not evicted. The guide says what follows from that.)
 /// </para>
 /// <para>
 /// It is a left join: an execution in an instrument that was not quoted in its interval is
@@ -52,7 +54,14 @@ public sealed class ExecutionQuality : IPipelineDefinition<ExecutionQuality.Sett
             new(instrument, new DateTimeOffset(at.UtcTicks - at.UtcTicks % interval.Ticks, TimeSpan.Zero));
 
         // One slot per input; the spec binds each to a connector of its own.
-        var executions = p.Input<Trade>("executions").WithEventTime(t => t.ExecutedAt, lateness);
+        var executions = p.Input<Trade>("executions")
+            // A table lookup before the stream join: the instrument's asset class, as of
+            // arrival. Executions only ever arrive, so the lookup remembers nothing. After
+            // the join it would have to (the join takes rows back), one entry per
+            // execution with nothing to close them: state that grows for ever.
+            .LookupAppendOnly(p.Table(Reference.Instruments), t => t.InstrumentId,
+                (t, i) => new ClassedTrade(i.AssetClass, t.InstrumentId, t.ExecutedAt, t.Price))
+            .WithEventTime(t => t.ExecutedAt, lateness);
         var quotes = p.Input<Quote>("quotes").WithEventTime(q => q.At, lateness);
 
         var priced = executions
@@ -60,13 +69,10 @@ public sealed class ExecutionQuality : IPipelineDefinition<ExecutionQuality.Sett
             .EvictWhen(key => key.Start + interval)
             .LeftJoin(
                 quotes.GroupBy(q => In(q.InstrumentId, q.At)),
-                (_, t, q) => new Execution(t.InstrumentId, t.ExecutedAt, Math.Round((t.Price - q.Mid) / q.Mid * 10_000m, 2)),
-                (_, t) => new Execution(t.InstrumentId, t.ExecutedAt, null)).Named("priced");
+                (_, t, q) => new ClassedExecution(t.AssetClass, t.ExecutedAt, Math.Round((t.Price - q.Mid) / q.Mid * 10_000m, 2)),
+                (_, t) => new ClassedExecution(t.AssetClass, t.ExecutedAt, null)).Named("priced");
 
         var quality = priced
-            // A table lookup after the stream join: the instrument's asset class, as of arrival.
-            .Lookup(p.Table(Reference.Instruments), x => x.InstrumentId,
-                (x, i) => new ClassedExecution(i.AssetClass, x.ExecutedAt, x.SlippageBps)).Named("classed")
             .WithEventTime(x => x.ExecutedAt, lateness)
             .GroupBy(x => x.AssetClass)
             .HoppingWindow(TimeSpan.FromSeconds(s.WindowSeconds), TimeSpan.FromSeconds(s.HopSeconds))
@@ -81,7 +87,9 @@ public sealed class ExecutionQuality : IPipelineDefinition<ExecutionQuality.Sett
 /// <summary>The join's key: an instrument and the start of a quote interval.</summary>
 public readonly record struct IntervalKey(int InstrumentId, DateTimeOffset Start);
 
-public sealed record Execution(int InstrumentId, DateTimeOffset ExecutedAt, decimal? SlippageBps);
+/// <summary>An execution with its instrument's asset class: what the join keeps per key
+/// until the key closes.</summary>
+public sealed record ClassedTrade(string AssetClass, int InstrumentId, DateTimeOffset ExecutedAt, decimal Price);
 
 public sealed record ClassedExecution(string AssetClass, DateTimeOffset ExecutedAt, decimal? SlippageBps);
 

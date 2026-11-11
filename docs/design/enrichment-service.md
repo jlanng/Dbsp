@@ -294,7 +294,8 @@ public interface IObjectStore                           // local files built in;
 {
     ValueTask<ObjectInfo?> StatAsync(string path, CancellationToken ct);
     ValueTask<Stream> OpenReadAsync(string path, CancellationToken ct);
-    ValueTask<Stream> OpenWriteAsync(string path, CancellationToken ct);      // write-then-rename
+    ValueTask WriteAsync(string path, Func<Stream, CancellationToken, ValueTask> write, CancellationToken ct);
+                                                        // whole or not at all: replaces the object when `write` returns (S6)
     ValueTask DeleteAsync(string path, CancellationToken ct);
     IAsyncEnumerable<ObjectInfo> ListAsync(string prefix, CancellationToken ct);
 }
@@ -1767,6 +1768,59 @@ Each has a default this design is built on.
 34. **The broker-stopping tests and the SASL run are not in CI.** They need three
     brokers whose containers the test may kill, take about ten minutes, and have run
     only here. *Alternative:* a nightly job on the `kafka3` and `kafka-sasl` profiles.
+35. **A takeover that is itself fenced ends the node, like any fencing** (S6, second
+    review). In one rolling broker restart of 21 that left both nodes fenced and nothing
+    running until a supervisor would have restarted one. *Alternative:* a node whose
+    takeover is fenced within a few seconds of its own `InitTransactions`, and that
+    reads no leader record of a higher term, goes back to standing by instead of
+    exiting. It would have saved that run; it puts an exception into "Fenced is final",
+    which is what keeps two writers from ever alternating, and it wants a reproduction
+    before it is trusted. Until then: a supervisor, and an alert on no leader.
+36. **The watermark and the eviction deadlines are not checkpointed** (the core's, as
+    before; S6 states it for the service). After a restart or a takeover a late record
+    can reopen a closed window, and keys open at the restart that nothing touches again
+    are never evicted. *Alternative:* commit the frozen watermark with each checkpoint
+    and have every evicting operator rebuild its deadline queue from its store at
+    start. The first is an addition to the checkpoint marker (a format-version bump);
+    the second is a scan of every evicting store at each start, which puts the size of
+    the state back into a takeover's `pipelines` stage — or the queue has to be fed as a
+    follower applies records, which no operator does today.
+37. **State bytes are kept beside the typed stores until the first commit after a
+    start** (S6), so a leader's idle pipeline holds its state twice for as long as it is
+    idle. *Alternative:* commit once as soon as a circuit has started on existing state,
+    without a step. The copy goes at once; it costs a transaction per start, and it
+    makes a keep that started a keep that is confirmed — the roll-back would then cover
+    "could not start" and nothing after it, which is all it covers in practice.
+38. **`IObjectStore.WriteAsync(path, write, ct)` replaced `OpenWriteAsync`** (S6, second
+    review): the store makes the object from what the callback wrote, and only if it
+    returned. A stream that renames when disposed cannot tell success from failure.
+    *Alternative:* keep `OpenWriteAsync` and return a stream type with a `CommitAsync`;
+    it leaves the old call compiling and every implementer with a stream class to write.
+    Nothing has been published, so the break costs the hosts in this repository only.
+39. **A files source lists again at most once per `pollInterval` while it has names to
+    read** (S6, second review); the rule a producer must keep is "names increase".
+    *Alternative:* list before every object, which makes "an object whose name sorts
+    after the position is read" exact up to the moment of the listing, at one listing
+    per object — on a store that cannot list "after this name", a backlog of n objects
+    then costs n² names.
+40. **Only the `files` sink claims what it writes** (`ConnectorDescription.Owns`; S6,
+    second review). Two pipelines may still share a Kafka sink topic or a view, which
+    for an append topic is a legitimate fan-in. *Alternative:* the `kafka` connector
+    claims the topic of an upsert sink, where two writers do overwrite each other's keys.
+41. **A line over `maxLineLength` (1,048,576 characters by default) is a rejected
+    record**, a dead letter or a fault by the pipeline's policy, and not an error of the
+    source (S6, second review). *Alternative:* fault the pipeline whatever the policy,
+    since an object that is not JSON lines is a mistake of deployment and not of data;
+    under `DeadLetter` it is now one envelope and the rest of the prefix is read.
+42. **A description's note is cut at its first colon when row data may not be shown**
+    (S6, second review), by the convention the event feed already has. *Alternative:*
+    notes as records with the exception's text in a member of its own; exact, and a
+    change to `DefinitionDescription`, `SpecTemplate` and `PluginDiff`.
+43. **The example deletes its own files-sink objects**, keeping the newest 200 under
+    each prefix (S6, second review), because a directory has no lifecycle rule and the
+    example is meant to be left running. *Alternative:* a retention setting on the
+    `files` sink itself; then the service deletes a tenant's output on a schedule, which
+    a bucket does better.
 
 ## Not verified
 
@@ -2719,7 +2773,11 @@ workers=1, this circuit has workers=2`), before anything stops. Three parts:
   not model. A store created from held bytes now keeps those bytes until the provider's
   next commit (or until a record is applied to it, on a follower), and `ReleaseStores`
   gives them back as they were. Cost: the state's bytes are held twice between a build
-  and its first commit.
+  and its first commit. On the leader that is after any start on existing state (a
+  cold start, a restart, a takeover that built, a keep) and for as long as the
+  pipeline's inputs are quiet, since a commit needs a step; nothing bounds that time. A
+  follower drops the copy as soon as the leader has checkpointed under the same layout,
+  and keeps none when it builds after that. *Open for James* 37.
 
 On these the supervisor does what the design's replace steps 2 and 7 describe, in the
 form the as-built standby allows (it holds bytes and builds nothing, so there is no
@@ -3026,7 +3084,9 @@ an empty stand-in. Inputs are the core's handles. It references no test framewor
 
 - `execution-quality`: two append inputs with event time, joined on (instrument, quote
   interval) with a stream `LeftJoin` under `EvictWhen`, a remembered `Lookup` of the
-  instrument, a hopping window, and a linear aggregate the plugin defines. In memory its
+  instrument (which the second review found keeping an entry per execution for ever; it
+  is a `LookupAppendOnly` before the join now), a hopping window, and a linear aggregate
+  the plugin defines. In memory its
   quotes are files under `quotes/` read by `files` (the generator writes one per minute
   of event time and deletes those older than thirty); on Kafka a second topic.
 - `watchlist-alerts`: an append input, a computed column that throws on a trade with no
@@ -3137,13 +3197,17 @@ quantity sized; the enrichment's filter gone; an unknown counterparty dropped.
 - A dead letter of an operator carries no source position of its own, only the
   inputs' positions at the last checkpoint: the engine does not track which input
   record a derived row came from.
-- `EvictWhen` in `execution-quality` has no test of its own. A record for a closed key
-  is necessarily older than the watermark and is dropped at the input, so eviction
-  cannot be seen from outside; the harness has no view of state size.
+- `EvictWhen` in `execution-quality` has no test of its own. While a circuit runs, a
+  record for a closed key is necessarily older than the watermark and is dropped at the
+  input, so eviction cannot be seen from outside; the harness has no view of state
+  size. (Not so across a restart: the watermark starts again from nothing and the
+  deadlines are not rebuilt. See the second review's findings below, and *Open for
+  James* 36.)
 - The harness does not restart a circuit from its checkpoint or replace a definition
   on kept state.
-- Not soaked: the example was run for seconds, not hours, with its new pipelines. The
-  alert and dead-letter prefixes grow by one object per pipeline every two seconds.
+- ~~Not soaked~~ Soaked in the second review, below: the alert and dead-letter prefixes
+  grew by one object per pipeline every two seconds with nothing to remove them, and
+  the example now prunes them.
 
 #### The admin UI and CI: G7 (the UI half), G8, G10, G13, G14, G16, G17
 
@@ -3527,7 +3591,7 @@ produced throughout, and ends by comparing the sink topic with the model.
 
 | | what happened |
 |---|---|
-| a rolling restart: each broker shut down (`docker stop -t 30`), five seconds, started, until every partition has all its replicas in sync | nothing lost in any of 21 runs. In 17 the leader kept leading under term 1 and the pipeline did not restart. In 4 the leadership moved, each time at the third broker — by then the leader of most partitions and the coordinator of the service's transactions: the leader's open transaction waited 10 to 30 s for the brokers to take its records (the writer logs it: `Kafka transaction has been waiting 30 s for the brokers to take its records`), the standby saw no heartbeat for `TakeoverCeiling` and took over, and the old leader exited with 3 |
+| a rolling restart: each broker shut down (`docker stop -t 30`), five seconds, started, until every partition has all its replicas in sync | 21 runs (twelve as built, six with `request.timeout.ms` 5 s, three back at the default). In 16 the leader kept leading under term 1, the pipeline did not restart and the sink was complete. In 5 the leader lost the leadership (three of the twelve, two of the six), at the third broker — by then the leader of most partitions and the coordinator of the service's transactions: the leader's open transaction waited 10 to 30 s for the brokers to take its records (the writer logs it: `Kafka transaction has been waiting 30 s for the brokers to take its records`) and the standby saw no heartbeat for `TakeoverCeiling` and began a takeover. In 4 of those it completed and the old leader exited with 3; the test as it then was failed there ("the leader did not stay the leader", or a broken pipe to the node that had exited), **so the sink was not compared in any rolling run in which the leadership moved**. In 1 (`k3-rt5-2`) both nodes ended `Fenced` and exited with 3, and the test timed out with the sink at 7,930 rows of 10,660. The three rolling runs made after the test was corrected had no move |
 | each broker killed in turn (`docker kill`), eight seconds, started | nothing lost in 3 runs. In one nobody took over; in two the standby took over at the ceiling after the third broker's kill (the cluster took 43–48 s to be whole again that time, 8–17 s otherwise), and the old leader exited with 3 |
 | one broker killed, the leader `kill -9`ed 1.5 s later, the broker started under the new leader | the standby led 3.5–5.3 s after the kill (3 s of that is `TakeoverAfter`); the sink complete; the killed node back as a warm standby. Three runs. |
 | two of three brokers killed for 70 s — no controller quorum, nothing writable — then started | the standby had started its takeover at the ceiling and completed it 0.6–3.8 s after the cluster was whole again, at term 2 (four runs); the old leader was fenced and exited with 3; the sink complete, the pipeline not restarted. (Before fix 3 below, that takeover failed and both nodes had exited.) |
@@ -3536,14 +3600,31 @@ produced throughout, and ends by comparing the sink topic with the model.
 above, and it is not fully explained. While the partitions a broker led and the
 transaction coordinator it was are moving, the service's leader can commit nothing; its
 heartbeats are records in those commits; and a standby that reads none for
-`TakeoverCeiling` takes over whatever the probe says. The outcome is the designed one
-and loses nothing. What is not known is why the wait was sometimes 30 to 50 s when
-the cluster was whole again in 12 (and why, in one such takeover, initialising the
-transactional id took 14.5 s): a producer `request.timeout.ms` of 5 s instead of 30 did
-not prevent it (one move in six runs), and the client's own log was not taken at debug
-level. On one machine with three brokers it is about one rolling restart in five; what
-it is on MSK, where a broker restart is slower and the brokers are not neighbours, is
-not known. *Open for James* 32.
+`TakeoverCeiling` takes over whatever the probe says. A takeover that completes is the
+designed outcome; that it loses nothing was checked against the sink in the kill runs
+(two of three moved) and not in the rolling ones. What is not known is why the wait was
+sometimes 30 to 50 s when the cluster was whole again in 12 (and why, in one such
+takeover, initialising the transactional id took 14.5 s): a producer
+`request.timeout.ms` of 5 s instead of 30 did not prevent it (two moves in six runs),
+and the client's own log was not taken at debug level. On one machine with three
+brokers it is about one rolling restart in four (5 of 21); what it is on MSK, where a
+broker restart is slower and the brokers are not neighbours, is not known. *Open for
+James* 32.
+
+**One rolling restart left no node alive** (`k3-rt5-2`, 1 of 21). The standby began its
+takeover at the ceiling (leader silent for 30.02 s) and initialised the transactional
+id, which fences the leader. Half a second before the leader noticed, the standby's own
+first abort was refused — `Failed to end transaction: Local: This instance has been
+fenced by a newer instance` — so it took itself for fenced by a third party and exited
+with 3 (`Node b could not complete its takeover`); the leader then failed to acquire
+its producer id (`There is a newer producer with the same transactionalId`), was
+`Fenced`, and exited with 3. The reading that fits the log, unproven: the leader's
+client, alive and recovering from the coordinator's move, re-initialised its producer id
+at the same moment as the standby's `InitTransactions`, each bumping the epoch under the
+other. Nothing committed is lost by it — the test's sink stood at 7,930 of 10,660 rows
+because nothing was running — but it is an outage until a supervisor restarts a node,
+and that start is a cold one. Not reproduced since, not fixed, and no later change is
+known to prevent it. *Open for James* 35.
 
 **What a 60 s+ outage does.** With no quorum the leader can commit nothing and elect
 nothing, and its heartbeats stop. The standby cannot tell that from a dead leader, and
@@ -3708,8 +3789,10 @@ out of CI.
 - **The cold paths are as they were**: a cold standby and a node from nothing read
   everything, and a table restore is one consumer.
 - **A pipeline that writes a table is not built ahead** on the standby.
-- **Memory was measured, not tuned.** The working set is about twice the live heap and
-  nothing was done about it; no per-table or per-pipeline memory figure exists.
+- **Memory was measured, not tuned.** The working set is about twice the live heap on
+  the standby and 2.7 to 3.6 times it on the leader (7.8 GB for 2.2 GB live at a million
+  rows, 12.5 GB for 4.7 GB at three million), and nothing was done about it; no
+  per-table or per-pipeline memory figure exists.
 - **Real MSK**: IAM itself, TLS, the IAM action names, hours of token refresh, an
   availability-zone loss, MSK Serverless, MSK Connect. Kafka Connect was not put behind
   SASL.
@@ -3719,3 +3802,216 @@ out of CI.
 - **The admin UI** shows a standby's `Built` pipelines and the graph, with new
   sentences; no screenshot was retaken and `LastStart` and `PipelinesToBuild` are in
   the API only.
+
+#### The second review's findings
+
+A review of S6 as committed confirmed 29 findings. Each was reproduced where that was
+feasible, fixed where it was a defect of the code, and stated where it was a defect of
+what the documents claimed. None was wrong on inspection; two were narrower than
+reported, and say so below.
+
+**The supervisor.**
+
+- *A second replace that touches no state dropped the spec to go back to.* `Previous`
+  was written only when the deploy at hand changed something state depends on, so a
+  redeploy of an unconfirmed keep with another sink lost the note, and the mismatch at
+  the next start ended in `NeedsReset`. `Previous` is now "the spec that wrote the
+  state": kept through every deploy until a generation has run, and dropped only by a
+  reset or when the spec deployed is, to the state, the one that wrote it. The plan says
+  so (`the state is still generation 1's`) and carries the roll-back line.
+- *A standby's build checked one spec and built another.* `Bind` and `Build` read
+  `runtime.Spec` again, which the node's loop replaces without the pipeline's queue; a
+  replace that landed while the plugin was being fetched gave stores of the old
+  version's types under the new spec's layout tag. Both take the spec now.
+- *A table reopened while a standby was building on it.* `OnTableReopened` marked only
+  circuits that were already kept. It now counts per pipeline, the build records the
+  count from before it resolved its tables, and a circuit is good only while the count
+  stands — the same test at the takeover.
+- *The dead letter's `after` carried a files input's name chunks*, up to 130 entries
+  nobody can read. A source connector may word its position (`IPositionDescribing`);
+  the envelope has `afterAt`, input → words, and such an input's partitions are left
+  out of `after`.
+
+**The `files` connector and the object store.**
+
+- *A checkpoint holding half of a name, then another object read next, mixed the two
+  names.* Ordinals were "the header's, plus one", so after a restart the next object
+  could be given an ordinal whose first chunks a checkpoint already held for another
+  name, and the input dropped the chunks that compared lower. The ordinal is now above
+  every ordinal any committed partition carries, and of the other parity than the
+  current one so that the bank holding the current name is not written
+  (`FilePosition.Next`). The cost is a skipped ordinal in that one case.
+- *A line had no bound.* `BoundedLineReader` reads past a line longer than
+  `maxLineLength` (new in the slot's config; 1,048,576 characters by default) holding
+  4,096 of it, and the line is rejected like any that is not a record.
+- *An object arriving among names already listed was skipped.* A listing is now used
+  for one `pollInterval` at most. That narrows the hole and does not close it — an
+  object that arrives behind the source within one interval is still missed — so the
+  guide's rule was rewritten as what a producer must do: names increase. *Open for
+  James* 39.
+- *A write cut short left a truncated object under the final name.*
+  `IObjectStore.OpenWriteAsync` is gone; `WriteAsync(path, write, ct)` makes the object
+  only if the callback returned (*Open for James* 38).
+- *`LocalObjectStore.ListAsync` walked the whole root.* It walks the directory the
+  prefix names. The example's quote source no longer pays for the alert objects.
+- *Prefixes were not checked across slots or pipelines.* A sink connector may claim
+  what it writes (`ConnectorDescription.Owns`; the files sink claims store and prefix),
+  and a second sink slot with the same claim is refused at the dry run and again where
+  specs are committed. Not in `Build`: two stored specs in conflict would stop each
+  other. Sources are not checked — a source reading what a sink writes is a chain.
+- *An appended-to object is read again only after a restart.* Not changed; the guide
+  no longer says "is not read again".
+
+**Discovery and the admin API.**
+
+- *The template bound a slot to a connector that cannot carry its type.* A connector
+  that carries only some types says so (`ITypedConnector.RequireTypes`), the dry run
+  asks it, and the template offers it only for the slots it accepts. Connectors
+  without the interface are taken to carry anything, as before.
+- *`ConfigProperty.Secret` was read by the form and by nothing else.* A slot's secrets
+  are now the union of what `Describe` names and what the schema marks, and the
+  schema's hold for a config `Describe` refuses.
+- *Notes of a description left with `ExposeRowData` off.* The notes that quote an
+  exception do so after their first colon and no note has another; the three routes
+  pass them through `Head` (the diff used to blank them whole). *Open for James* 42.
+- *A declare's dry run passed for a factory that cannot fill the table.* `CheckDeclare`
+  asks a registered factory for a source of the table's types and drops it.
+- *A leader-only read on a standby was told "mutations go to the leader".* It is told
+  that a definition is described by running its `Build`.
+- *"0 state store(s) … hold the same types"* is now "keeps no state stores", with the
+  tables' types named as the tables'.
+
+**The UI** (driven in a browser against the admin host and the example; the topology
+and deploy-form screenshots were retaken).
+
+- *Text that is not JSON in an array or object setting was dropped without a word.* The
+  field keeps the text as a draft, marks itself invalid and says why, and a form with a
+  draft on screen is not checked or sent.
+- *A dialog outlived the page it was opened on.* It is closed when the route moves to
+  another page.
+- The deploy form offers, for a slot, the connectors the node's template says can
+  carry it (it offered every connector of the slot's kind, the trade feed for quotes
+  among them). And the topology's panel called an operator's name its "state stores"
+  even for an operator that keeps none; the row reads *Known as* and says what the
+  name is for.
+
+**Tests and CI.** `Readers_always_see_exactly_their_pinned_version…` failed about one
+run in six in Release, the configuration CI runs: its four readers were pool tasks and
+could fail to start before the writer had finished. They have threads of their own and
+the writer waits for each to have probed once.
+
+**What the documents claimed.**
+
+- *Broker restarts.* The 21 rolling-restart logs were counted again: 16 with the same
+  leader throughout, 5 in which it lost the leadership (not 4), in none of which the
+  sink was compared, and one of those with both nodes fenced. The table above and the
+  guide say so; the guide no longer tells an operator that a broker restart loses
+  nothing either way.
+- *Event time across a restart.* The example's comment, the guide and this document
+  said a join's state is bounded and a closed window final. Both hold while a circuit
+  runs and neither across a restart, because the watermark and the eviction deadlines
+  are in memory only. Stated in all three places; not fixed (*Open for James* 36).
+- *The roll-back's byte copy.* It is the leader that holds a pipeline's state twice
+  from any start until its next commit, for as long as the pipeline is idle; a standby
+  only until the leader's first checkpoint under the layout. The finding had it on both
+  after every start: `CommitLayoutAsync` writes nothing when the layout already stands,
+  so a standby building on a checkpointed layout keeps no copy. Not changed in code:
+  the copy is what makes a failed start lose nothing, and a layout does not name the
+  build of the contract assemblies — a host restarted with other contract types builds
+  under the same layout, and the copy is what lets that be undone (*Open for James* 37).
+- *The failover figure* is for a dead process. A leader that is alive and cannot
+  commit is taken over at `TakeoverCeiling`; the guide's Failover paragraph, the "No
+  leader" alert, the README and `intro.md` say so.
+- *"Takeover slow"* watched `start_leading`, which leaves out the wait and the fence;
+  it watches `total` and `silence`.
+- `intro.md` still said a standby builds nothing; the scale rig's README and this
+  document said the working set is twice the heap (it is 2.7 to 3.6 times on the
+  leader); the guide's state series did not say it ran one join and one total.
+
+**The example left running.** The guide's "settles at about 690 MB and stays there"
+had been measured before the example gained three pipelines and its file outputs.
+Measured again (Release binary, one in-memory node, default rate, sampled every 30 s;
+the pruning below already in), it did not settle:
+
+| minutes | 10 | 20 | 30 | 40 | 50 | 60 |
+|---|---|---|---|---|---|---|
+| RSS, MB | 515 | 690 | 734 | 921 | 996 | 1,066 |
+
+and at `--rate 5000` it was at 7.4 GB after twelve minutes with 5.6 million records in
+the state log. Before the pruning the files directory also grew by about 90 objects a
+minute with nothing to remove them (the reviewer's run: 2,192 objects after 24.5
+minutes). Two causes, both in the example:
+
+- *`execution-quality` remembered every execution.* It looked the instrument up after
+  its left join with `stream.Lookup`, which keeps what it emitted for each record so
+  that a retraction takes exactly that back, and which — being the plain form — has no
+  grouping to hang `EvictWhen` on (`shared-tables.md`, *Bounding the memory*). Behind a
+  join that retracts, on a stream that never ends, that is an entry per execution for
+  ever: 3,000 a minute at the default rate. The lookup is a `LookupAppendOnly` on the
+  executions before the join now — they only arrive, so it keeps nothing — and the join
+  carries the asset class through. The definition's comment and the guide say why it
+  sits there, and the guide's account of `Lookup` now says what it remembers.
+- *Nothing deleted the sinks' objects.* The example prunes each files-sink prefix to its
+  newest 200 objects every ten quote intervals (*Open for James* 43).
+
+After both (same method):
+
+| minutes | 4 | 8 | 12 | 16 | 20 | 24 | 28 | 32 | 36 | 40 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| RSS, MB | 337 | 423 | 522 | 609 | 648 | 653 | 655 | 650 | 700 | 683 |
+| objects in the files directory | 367 | 731 | 895 | 1,260 | 826 | 1,190 | 1,554 | 1,015 | 1,375 | 835 |
+
+RSS was between 636 and 723 MB from minute 20 to minute 40; the state log held 172 to
+314 thousand records from minute 10 on (the sawtooth of four partitions compacting),
+the collector's committed memory 490 to 536 MB over the last twenty minutes; the files
+directory never held more than 1,691 objects or 9.8 MB. At `--rate 5000` for nine
+minutes — as many records as fifteen hours at the default rate, and nine hundred
+quote intervals — the state log stayed between 0.99 and 1.25 million records and RSS
+between 1.8 and 2.7 GB with no trend (the join holds a minute of event time, which at
+that rate is 300,000 executions). Forty minutes is not a day: what these runs show is
+that the two things that grew no longer do.
+
+One more defect turned up on the way: a `CacheDirectory` given relative to the working
+directory (the soak script's `--data ./dir`) failed every plugin load with "is not an
+absolute path". The cache root is made absolute; a test covers it.
+
+**Deviations.**
+
+- `IObjectStore` changed incompatibly (`WriteAsync` for `OpenWriteAsync`).
+- `DeadLetterEnvelope` gained `AfterAt`; a files input's entries left `After`.
+- The texts of the description notes changed (no colon but before an exception's
+  message), and the diff's notes are cut and not blanked with row data off.
+- The files source's "sorts after the position" rule is weaker than the guide once
+  said, and is documented as it is, not made exact.
+- `execution-quality` has other stores than it had (the remembered lookup is gone), so
+  a deployed one cannot be replaced by the new plugin version with `keep`: the dry run
+  refuses it, and it takes a reset.
+- A fix outside the findings: a relative `CacheDirectory`.
+- Three findings ended as statements and not as code: eviction across a restart, the
+  double-held state, the both-nodes-fenced run.
+
+**Tests added** (each checked by a mutation that it kills, 19 in all): the second
+replace keeping `Previous`; the two standby races, through two test hooks in
+`ServiceOptions` (`BeforeStandbyBind`, `AfterStandbyBuild`); the half-committed name;
+the re-listing; the long line (through the source, and half a billion characters
+through the reader); the write that fails part-way; the listing by prefix; the shared
+prefix; `afterAt`; the typed connector at the dry run and in the template; the schema's
+secret; the factory at the declare; the standby's refusal of a describe; the notes
+with row data off; the unchanged line with no stores. The example's smoke gained a
+claim: the starting spec for `execution-quality` does not put quotes on the trade feed,
+and a spec that does is refused.
+
+**Left undone.**
+
+- The both-fenced takeover is not reproduced and not fixed.
+- The watermark and the eviction deadlines are still not checkpointed.
+- The leader still holds an idle pipeline's state twice after a start.
+- A files source can still miss an object that arrives behind it within one poll
+  interval, and still lists its whole prefix at every poll.
+- The UI's fixes have no automated test: the UI has none of its own.
+- Nothing automated would catch a definition that keeps a store growing for ever, as
+  `execution-quality` did: the harness has no view of state size, and the smokes run
+  for seconds. The evidence is the two runs above.
+- No rolling broker restart was run again: the kafka3 profile was not started in this
+  step, so whether a moved leadership in a rolling restart leaves the sink complete is
+  still unverified.

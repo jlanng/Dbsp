@@ -1255,11 +1255,15 @@ builder.Services.AddIncrementalService(o => { o.PluginDirectory = "plugins"; o.C
 
 Every node starts as a standby. The one that finds nobody leading takes over after
 `TakeoverAfter` (3 s) of silence; the other follows the catalog, the tables and every
-pipeline's state through the broker, fetches plugin files from it, and builds nothing.
-When the leader is killed the standby fences it, promotes the catalog, the tables and the
-state, builds the circuits from their committed state and starts the sources at their
-committed offsets. Locally, with 21 tables and two pipelines, that is about 3 s to notice
-and under a second to take over.
+pipeline's state through the broker, fetches plugin files from it, and builds each
+pipeline's circuit on the state it follows — so tenant plugin code is loaded and its
+definitions run on the standby too, though no step of a circuit does
+(`ServiceOptions.WarmStandbyPipelines = false` turns that off, at the price of building
+at the takeover). When the leader is killed the standby fences it, promotes the catalog,
+the tables and the state, starts the circuits it built and starts the sources at their
+committed offsets. Locally that is about 3 s to notice and about a second to take over,
+whatever the tables and the pipelines hold. A leader that is alive but cannot commit
+still answers its peer's probe, and is taken over only after `TakeoverCeiling` (30 s).
 
 A table loaded from a topic, and a pipeline bound to topics, name a connection and a
 topic and nothing of the cluster:

@@ -488,7 +488,9 @@ so implementations never see cross-thread access to one store.
   join and aggregate state, and then `kill -9` of the leader. The standby builds every
   pipeline's circuit on the state it follows, so a takeover starts circuits rather than
   building them: about a second after the three seconds of silence that decide it,
-  whether the pipelines hold a quarter of a million orders or four million. The numbers,
+  whether the pipelines hold a quarter of a million orders or four million. That is
+  for a leader whose process is gone; one that is alive and cannot commit still
+  answers its peer's probe and is taken over after `TakeoverCeiling`, 30 s. The numbers,
   and what a node needs in memory per million rows, are in the guide (*How large, how
   fast*). `docker compose --profile kafka3` is three brokers at replication factor 3 for
   the failover and broker-restart tests; `--profile kafka-sasl` is a broker that refuses

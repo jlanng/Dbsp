@@ -349,7 +349,24 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     dropped only once every enumerating reader has passed it.
   - The state binding: a pipeline's typed stores belong to one plugin version. Changing
     the version, or anything else that changes what the state means, goes through
-    `ChangelogStorageProvider.ReleaseStores()` first. The binding has a name,
+    `ChangelogStorageProvider.ReleaseStores()` first.
+  - A standby's build (`WarmAsync`) is made from the one spec it read at its start:
+    `Bind` and `Build` take the spec and never read `runtime.Spec` again, because the
+    node's loop replaces that without the pipeline's queue. What it built is good only
+    while the spec generation, the layout, the store epoch and `TableReopens` (counted
+    from before the build) are what they were.
+  - `Previous` on a stored spec is the spec that wrote the state. It stays through
+    every deploy until a generation has run, whatever that deploy changes.
+  - A slot's secrets are what `Describe` names and what the connector's `ConfigSchema`
+    marks; `Secrets(config)` is the one place that says which. A sink's claim
+    (`ConnectorDescription.Owns`) is checked at the dry run and again under the
+    references lock — never in `Build`, where two stored specs would stop each other.
+  - Objects are written through `IObjectStore.WriteAsync`: whole when the callback
+    returns, nothing when it throws. The `files` source holds one line of at most
+    `maxLineLength` characters; its ordinals only rise, past anything a checkpoint may
+    hold of a half-sent name (`FilePosition.Next`).
+  - `ITableSourceFactory.Create` and `ITypedConnector.RequireTypes` run at dry runs:
+    they open nothing. The binding has a name,
     `PipelineSupervisor.LayoutOf(spec)` (plugin version, definition, settings, workers,
     error policy, table bindings): `Bind` gives it to the provider, and a start whose
     spec has another layout rebinds. Add to `LayoutOf` anything new that can change a
@@ -370,13 +387,18 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     error body of its own.
   - Exception messages, stacks, rows and records pass through `AdminState.Message`,
     `Fault`, `Head` or `Event` on their way out: with `ExposeRowData` off none of them may
-    leave, and a service event's text after its first colon counts as a message.
+    leave, and a service event's text after its first colon counts as a message. The
+    notes of a definition's description, template and diff follow the same convention:
+    a note that quotes an exception does so after its first colon and has no other.
   - The UI is seven files in `wwwroot`, no build step, no dependency, no request to another
     origin, and a content security policy without `unsafe-inline`: no inline script, no
     `style` attribute (set styles through the CSSOM), no `innerHTML` with data. Every
     render goes through `morph`, and handlers are `on:` properties found by the delegated
     listener — `addEventListener` on a rendered node is lost at the next patch. A path the
     scripts call must be a route the API maps: `The_UI_is_served_whole…` checks it.
+    A field whose text may not be a value yet (JSON for an array or object setting)
+    keeps the text as a draft, and a form with a draft on screen is not sent; a dialog
+    is closed when the route moves to another page.
   - The deploy and declare forms (`forms.js`) are drawn from the discovery routes
     (`plugins`, a definition's description and template, `connectors`, `connections`,
     `table-definitions`, `table-sources`) and edit one spec object, which the JSON view
