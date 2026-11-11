@@ -1011,13 +1011,17 @@ public sealed class KafkaLeadership : IAsyncDisposable
                     abandon.Cancel();
                     await _log.WhenAcquisitionSettlesAsync().ConfigureAwait(false);
 
-                    // A reader that has promoted nothing can stand by again. Anything
-                    // else — it became the writer after all, or the log is finished —
-                    // is a takeover that failed.
-                    if (_log.IsWriter || _log.IsFenced)
+                    // A log that is finished is a takeover that failed. A reader that
+                    // has promoted nothing stands by again. And a log that became the
+                    // writer in the instant the wait was called off has fenced the
+                    // leader: the takeover goes on, or nobody would lead.
+                    if (_log.IsFenced)
                         System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(lost).Throw();
-                    BackToStandby(reason, lost);
-                    return Promotion.Lost;
+                    if (!_log.IsWriter)
+                    {
+                        BackToStandby(reason, lost);
+                        return Promotion.Lost;
+                    }
                 }
             }
             var fence = clock.Elapsed;

@@ -855,6 +855,11 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         await LeadsAsync(b);
         Assert.Equal("ceiling", b.Leadership.Status.LastTakeover!.Reason);
         Assert.Equal(2, b.Leadership.Term);
+
+        // Let the old leader's writer go, or its disposal waits for it: it finds itself fenced.
+        stall.Set();
+        await a.Leadership.WhenFinished.WaitAsync(Timeout);
+        Assert.Equal(NodeRole.Fenced, a.Role);
     }
 
     [Fact]

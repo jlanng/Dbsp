@@ -32,6 +32,29 @@ int Number(string name, int fallback) => int.Parse(Argument(name, fallback.ToStr
 if (Argument("--supervise") == "1" && !NodeSupervisor.IsSupervised)
     return await NodeSupervisor.RunAsync(args, new NodeSupervisorOptions { Log = line => Console.Error.WriteLine($"{DateTime.UtcNow:HH:mm:ss.fff} {line}") });
 
+// --exit-plan <file>: for the supervisor's own tests, with no node and no broker. Each
+// start takes the file's first line away and does what it says: a number is the exit
+// code to end with at once; "wait" is to stay until SIGTERM and then end with 42. An
+// empty file ends with 0.
+if (Argument("--exit-plan") is { Length: > 0 } plan)
+{
+    var steps = File.ReadAllLines(plan).Where(line => line.Length > 0).ToList();
+    if (steps.Count == 0)
+        return 0;
+    File.WriteAllLines(plan, steps.Skip(1));
+    if (steps[0] != "wait")
+        return int.Parse(steps[0], CultureInfo.InvariantCulture);
+    var asked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    using var term = System.Runtime.InteropServices.PosixSignalRegistration.Create(System.Runtime.InteropServices.PosixSignal.SIGTERM, context =>
+    {
+        context.Cancel = true;
+        asked.TrySetResult();
+    });
+    Console.Out.WriteLine("waiting");
+    await asked.Task;
+    return 42;
+}
+
 var nodeId = Argument("--node");
 var probePort = Number("--probe-port", 0);
 var peerPort = Number("--peer-port", 0);
