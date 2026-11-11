@@ -1236,10 +1236,11 @@ about to be run again and may be cut differently. A pipeline that is reset has i
 objects deleted. So a prefix belongs to one slot of one pipeline. Nothing merges or
 compacts the objects; an upsert sink's prefix is a change log, and what reads it folds it.
 
-`minInterval` is for the number of objects. A step's write waits until that long after
-the last one; the pipeline's checkpoint waits for the write, so the pipeline pauses,
-its inputs queue up behind their bounded channels, and the next step and its object
-are larger. Every sink of that pipeline is that much later.
+`minInterval` is for the number of objects. Having written a step's object the sink
+waits that long before it acknowledges the step; the pipeline's checkpoint waits for
+the acknowledgement, so the pipeline pauses, its inputs queue up behind their bounded
+channels, and the next step and its object are larger. Every sink of that pipeline is
+that much later.
 
 ## Run the example
 

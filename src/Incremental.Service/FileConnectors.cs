@@ -134,10 +134,11 @@ internal sealed record FilesSlotConfig
 /// </para>
 /// <para>
 /// One object per step is many small objects when steps are small. <c>minInterval</c>
-/// spaces them: a step's write waits until that long after the last one. The circuit's
-/// checkpoint waits for the write, so the circuit pauses with it, its input queues up
-/// behind the bounded channel, and the next step — and its object — is larger. It trades
-/// latency of every sink of the pipeline for fewer objects.
+/// spaces them: having written a step's object the sink waits that long before it
+/// acknowledges the step. The circuit's checkpoint waits for the acknowledgement, so the
+/// circuit pauses, its input queues up behind the bounded channel, and the next step —
+/// and its object — is larger. It trades latency of every sink of the pipeline for
+/// fewer objects.
 /// </para>
 /// </summary>
 public sealed class FileConnector(ObjectStores stores)
@@ -220,8 +221,13 @@ public sealed class FileConnector(ObjectStores stores)
     private abstract class StepObjectSink(IObjectStore store, string prefix, TimeSpan spacing, SinkContext context)
     {
         private static readonly byte[] NewLine = "\n"u8.ToArray();
+
+        // The checkpoint this generation started from. Read now and not at the first
+        // write: by then the circuit may have committed steps that gave this sink
+        // nothing, and an object an earlier generation left for one of them would pass
+        // for committed.
+        private readonly long _startedAt = context.CommittedStep ?? 0;
         private bool _cleaned;
-        private long _lastWrite;
 
         protected JsonSerializerOptions Json => context.Json;
 
@@ -233,15 +239,18 @@ public sealed class FileConnector(ObjectStores stores)
                 // Steps above the checkpoint are about to be run again, and an auto-stepping
                 // circuit may cut them differently: what an earlier generation wrote for
                 // them is not the result.
-                await FileSinkFormat.DeleteAboveAsync(store, prefix, context.CommittedStep ?? 0, cancellationToken).ConfigureAwait(false);
+                await FileSinkFormat.DeleteAboveAsync(store, prefix, _startedAt, cancellationToken).ConfigureAwait(false);
                 _cleaned = true;
             }
-            if (spacing > TimeSpan.Zero && _lastWrite != 0 && spacing - System.Diagnostics.Stopwatch.GetElapsedTime(_lastWrite) is var wait && wait > TimeSpan.Zero)
-                await Task.Delay(wait, cancellationToken).ConfigureAwait(false);
             var stream = await store.OpenWriteAsync(FileSinkFormat.ObjectName(prefix, sequence, context.Term), cancellationToken).ConfigureAwait(false);
             await using (stream.ConfigureAwait(false))
                 await write(state, stream, cancellationToken).ConfigureAwait(false);
-            _lastWrite = System.Diagnostics.Stopwatch.GetTimestamp();
+
+            // The object is written at once — the lease was checked a moment ago — and
+            // the acknowledgement is what waits: the circuit commits, and steps again,
+            // only after it.
+            if (spacing > TimeSpan.Zero)
+                await Task.Delay(spacing, cancellationToken).ConfigureAwait(false);
         }
 
         protected static ValueTask EndLineAsync(Stream stream, CancellationToken cancellationToken) => stream.WriteAsync(NewLine, cancellationToken);

@@ -273,6 +273,18 @@ public class FileConnectorTests : IDisposable
         // What a generation that died after writing and before committing leaves behind.
         await PutAsync(FileSinkFormat.ObjectName("out/big-", committed + 1, 1), [new Trade(-2, 1, 99, "uncommitted")]);
         await using var second = await StartAsync(cluster, "a", memory);
+        await second.Running("big");
+
+        // The new generation first commits steps that give the sink nothing (trades below
+        // the threshold): the uncommitted object now lies under the committed step, and
+        // must go all the same when the sink first writes.
+        for (var i = 0; i < 3; i++)
+        {
+            var stepBefore = second.Pipelines.Get("big").CommittedStep ?? 0;
+            log.Append(new Trade(10_000 + i, 1, 1, "small"));
+            await Eventually(() => (second.Pipelines.Get("big").CommittedStep ?? 0) > stepBefore, "a step with no output committed");
+        }
+        Assert.True(second.Pipelines.Get("big").CommittedStep > committed + 1);
         log.AppendRange(trades.Skip(120));
         await EventuallyAsync(async () => (await AppendsAsync<Trade>("out/big-")).Order(ById).SequenceEqual(BigTrades.Model(trades)), "every record once after the restart");
         Assert.NotNull(await _store.StatAsync("out/big-notes.txt", default));
