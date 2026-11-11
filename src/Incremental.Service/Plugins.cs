@@ -33,7 +33,14 @@ public enum PluginKind { Pipeline, Contract }
 
 public sealed record PluginFile(string Path, string Sha256, long Size);
 
-public sealed record SettingInfo(string Name, string JsonType, bool Required, bool StateNeutral, string? Description);
+/// <summary>One setting of a definition. <c>Default</c> is what the settings class holds
+/// when a spec leaves the setting out (null when that is null, or not a plain value);
+/// <c>Values</c> are an enum's member names; <c>Minimum</c> and <c>Maximum</c> come from a
+/// <c>[Range]</c>. The last five are absent in a manifest stored before they existed.</summary>
+public sealed record SettingInfo(
+    string Name, string JsonType, bool Required, bool StateNeutral, string? Description,
+    JsonElement? Default = null, IReadOnlyList<string>? Values = null, double? Minimum = null, double? Maximum = null,
+    bool Nullable = false);
 
 public sealed record PluginDefinitionInfo(
     string Name, string Type, string? Description, string? SettingsType, IReadOnlyList<SettingInfo> Settings);
@@ -438,16 +445,105 @@ internal sealed class DefinitionBinding(string name, Type type, Type? settingsTy
         }
     }
 
-    public PluginDefinitionInfo Describe() => new(
-        name, type.FullName!, description, settingsType?.FullName,
-        settingsType is null ? [] : settingsType.GetProperties(BindingFlags.Public | BindingFlags.Instance)
-            .Where(p => p.CanWrite && p.Name != "EqualityContract")
-            .Select(p => new SettingInfo(
-                JsonNamingPolicy.CamelCase.ConvertName(p.Name), JsonTypeOf(p.PropertyType),
-                p.GetCustomAttribute<RequiredAttribute>() is not null || p.GetCustomAttribute<RequiredMemberAttribute>() is not null,
-                p.GetCustomAttribute<StateNeutralAttribute>() is not null,
-                p.GetCustomAttribute<DescriptionAttribute>()?.Description))
-            .ToList());
+    public PluginDefinitionInfo Describe()
+    {
+        if (settingsType is null)
+            return new PluginDefinitionInfo(name, type.FullName!, description, null, []);
+
+        // The settings as a spec that gives none leaves them: where the defaults are read.
+        object? defaults = null;
+        try
+        {
+            defaults = Activator.CreateInstance(settingsType);
+        }
+        catch
+        {
+            // No parameterless constructor, or one that throws: no defaults to show.
+        }
+        return new PluginDefinitionInfo(
+            name, type.FullName!, description, settingsType.FullName,
+            settingsType.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .Where(p => p.CanWrite && p.Name != "EqualityContract")
+                .Select(p =>
+                {
+                    var plain = System.Nullable.GetUnderlyingType(p.PropertyType) ?? p.PropertyType;
+                    var range = p.GetCustomAttribute<RangeAttribute>();
+                    return new SettingInfo(
+                        JsonNamingPolicy.CamelCase.ConvertName(p.Name), JsonTypeOf(p.PropertyType),
+                        p.GetCustomAttribute<RequiredAttribute>() is not null || p.GetCustomAttribute<RequiredMemberAttribute>() is not null,
+                        p.GetCustomAttribute<StateNeutralAttribute>() is not null,
+                        p.GetCustomAttribute<DescriptionAttribute>()?.Description,
+                        defaults is null ? null : DefaultOf(p, defaults),
+                        plain.IsEnum ? Enum.GetNames(plain) : null,
+                        Number(range?.Minimum), Number(range?.Maximum),
+                        !p.PropertyType.IsValueType || System.Nullable.GetUnderlyingType(p.PropertyType) is not null);
+                })
+                .ToList());
+    }
+
+    private static double? Number(object? bound)
+    {
+        try
+        {
+            return bound is null ? null : Convert.ToDouble(bound, System.Globalization.CultureInfo.InvariantCulture);
+        }
+        catch (Exception ex) when (ex is FormatException or InvalidCastException or OverflowException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>A setting's default as JSON, for the values JSON has a plain form for:
+    /// numbers, booleans, strings (durations, dates and enums among them) and lists of
+    /// those. Written by hand: a serializer would cache metadata for the plugin's types.</summary>
+    private static JsonElement? DefaultOf(PropertyInfo property, object defaults)
+    {
+        object? value;
+        try
+        {
+            value = property.GetValue(defaults);
+        }
+        catch
+        {
+            return null;
+        }
+        using var buffer = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(buffer))
+        {
+            if (!Write(writer, value, depth: 0))
+                return null;
+        }
+        return value is null ? null : JsonDocument.Parse(buffer.ToArray()).RootElement.Clone();
+
+        static bool Write(Utf8JsonWriter writer, object? value, int depth)
+        {
+            switch (value)
+            {
+                case null: writer.WriteNullValue(); return true;
+                case bool b: writer.WriteBooleanValue(b); return true;
+                case string s: writer.WriteStringValue(s); return true;
+                case Enum e: writer.WriteStringValue(e.ToString()); return true;
+                case decimal d: writer.WriteNumberValue(d); return true;
+                case double d: writer.WriteNumberValue(d); return true;
+                case float f: writer.WriteNumberValue(f); return true;
+                case sbyte or byte or short or ushort or int or uint or long:
+                    writer.WriteNumberValue(Convert.ToInt64(value, System.Globalization.CultureInfo.InvariantCulture)); return true;
+                case ulong u: writer.WriteNumberValue(u); return true;
+                case TimeSpan t: writer.WriteStringValue(t.ToString("c")); return true;
+                case DateTimeOffset t: writer.WriteStringValue(t); return true;
+                case DateTime t: writer.WriteStringValue(t); return true;
+                case Guid g: writer.WriteStringValue(g); return true;
+                case System.Collections.IEnumerable items when depth == 0 && value is not System.Collections.IDictionary:
+                    writer.WriteStartArray();
+                    foreach (var item in items)
+                        if (!Write(writer, item, depth + 1))
+                            return false;
+                    writer.WriteEndArray();
+                    return true;
+                default: return false;
+            }
+        }
+    }
 
     private static string JsonTypeOf(Type type)
     {

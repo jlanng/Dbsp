@@ -41,6 +41,9 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   `enrich`; `-- --kafka --clean` removes it). `-- --headless [--nodes 2 | --kafka]` is the
   smoke test: it drives the admin API, checks every sink against `Host/Model.cs`, and
   exits 1 on a claim that does not hold — run it after changing the service; CI does not.
+  `-- --otlp` exports both meters over OTLP (`OTEL_EXPORTER_OTLP_ENDPOINT`); the example is
+  the only project that references OpenTelemetry. To leave it running in the background,
+  run the built binary and stop it with SIGTERM (a backgrounded `dotnet run` ignores SIGINT).
   Its build copies the plugin (`Pipelines/`) to `plugins/` beside the host and zips
   version 2 (`Pipelines.V2/`, the same sources with `V2` defined) to `plugin-packages/`.
 - Trade enrichment on shared tables: `dotnet run --project examples/Incremental.TradeEnrichment`
@@ -256,6 +259,28 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     assembly's simple name; they differ, so never derive one from the other. Which
     reference goes to the host is `HostAssemblies.Provides`: contracts first, then the
     assemblies whose types cross the boundary, then by version.
+  - A replace that keeps state across a change records the spec it replaced
+    (`PipelineSpec.Previous`) until its first generation runs. A generation that cannot
+    start on the state (`CircuitStateMismatchException`, from the store that could not be
+    read or from `Circuit.Start`) is rolled back to it in one catalog commit — by this
+    leader or by its successor — and never retried; with no previous spec it is
+    `NeedsReset`. What `CircuitBuilder.CheckState` can decide is refused before anything
+    stops. Do not add a path that starts a kept-state replace without `Previous`, or one
+    that clears it before the generation is `Running`.
+  - The evidence for keep-or-reset is `StateShape`: text only, never a `Type`, so it
+    outlives the plugin version it was read from. It compares what state stores hold
+    (`CircuitBuilder.DescribeState`), not what the assembly declares.
+  - `ServiceMeter` (the meter `Incremental.Service`): tags are `node`, `pipeline`, `table`
+    and the closed sets `state`, `role`, `stage` — nothing unbounded, nothing from a
+    record. Gauges read the snapshot a node refreshes once a second; a callback must not
+    touch a circuit, a table or the backend.
+  - Discovery (`IServiceDiscovery`, the admin's `connectors`, `connections`,
+    `table-sources`, definition and template endpoints) returns names, kinds and config
+    schemas, never a connection's settings. Describing a definition runs its `Build`
+    against stand-in tables (`PipelineBuilder` detached) and is leader-only.
+  - The in-memory backend must stay bounded: the state log compacts itself
+    (`StateCompactAbove`), table logs cap history by row changes, and a tombstone is
+    dropped only once every enumerating reader has passed it.
   - The state binding: a pipeline's typed stores belong to one plugin version. Changing
     the version, or anything else that changes what the state means, goes through
     `ChangelogStorageProvider.ReleaseStores()` first.

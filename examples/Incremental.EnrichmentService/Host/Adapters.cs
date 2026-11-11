@@ -103,10 +103,14 @@ public sealed class DirectorySourceFactory(LiveDirectory<int, Trader> traders, L
 /// Registered as the connector <c>trade-feed</c>; a spec binds a slot to it with
 /// <c>{ "connector": "trade-feed" }</c>.
 /// </summary>
-public sealed class TradeFeedConnector(PositionedFeed<Trade> feed) : IAppendSourceConnector, IKeyedSourceConnector
+public sealed class TradeFeedConnector(PositionedFeed<Trade> feed) : IAppendSourceConnector, IKeyedSourceConnector, IConfigDescribed
 {
     // Called at the dry run: check the slot's config here, and name any secret properties.
     public ConnectorDescription Describe(JsonElement config) => new("the example's generated trade feed");
+
+    // Optional (IConfigDescribed): what the config accepts, for whoever composes a spec.
+    // The admin API lists it under "connectors", and a spec template is built from it.
+    public ConfigSchema ConfigSchema { get; } = new([], "The example's generated trade feed. It takes no config.");
 
     public Task<IRunningSource> StartAsync<T>(SourceContext<T> context, CancellationToken cancellationToken) where T : notnull
     {
@@ -192,9 +196,13 @@ public sealed class TradeFeedConnector(PositionedFeed<Trade> feed) : IAppendSour
 /// instance, so a plugin version's types can be unloaded with it. Registered as the
 /// connector <c>view</c>: <c>{ "connector": "view", "name": "enriched" }</c>.
 /// </summary>
-public sealed class ViewConnector(Views views) : IUpsertSinkConnector, IResettableSinkConnector
+public sealed class ViewConnector(Views views) : IUpsertSinkConnector, IResettableSinkConnector, IConfigDescribed
 {
     public ConnectorDescription Describe(JsonElement config) => new($"the in-process view '{NameOf(config, "…")}'");
+
+    public ConfigSchema ConfigSchema { get; } = new(
+        [new("name", "string", Description: "The view's name under /views; \"{pipeline}/{slot}\" when left out.")],
+        "An in-process view of each key's latest row.");
 
     public IUpsertSink<TKey, TRow> Create<TKey, TRow>(SinkContext context) where TKey : notnull =>
         new Sink<TKey, TRow>(views.Open(NameOf(context.Config, $"{context.PipelineId}/{context.Slot}")), context.Json);

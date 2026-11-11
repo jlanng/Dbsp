@@ -1648,7 +1648,7 @@ Each has a default this design is built on.
    or a key. `[StateNeutral]` is the escape for settings that truly do not.
 10. **An incompatible `keep` rolls back and reports.** *Alternative:* leave the pipeline
     stopped in `NeedsReset` — simpler, and a tenant's mistaken deploy takes their
-    pipeline down until someone chooses.
+    pipeline down until someone chooses. (Built in S6.)
 11. **Plugin authors reference `Incremental.Service`** (compile time only).
     *Alternative:* a third package, `Incremental.Service.Abstractions`, holding the
     definition interfaces, `PipelineBuilder`'s surface, `TableDefinition` and the test
@@ -1657,6 +1657,28 @@ Each has a default this design is built on.
     kept whatever the readers have committed). *Alternative:* the standby reports its
     positions to the leader through the probe and the floor uses them exactly; less
     history kept, and a standby that stops reporting has to be timed out anyway.
+13. **A replace that was rolled back answers `409 state-incompatible`** (S6), although
+    the catalog did change twice (the replace, then the roll-back) and the pipeline is
+    running. *Alternative:* `200` with a `rolledBack` member in the body. It reads as
+    success to a client that looks only at the status, which is the client that most
+    needs to know its change did not take.
+14. **A state mismatch with nothing to go back to is `NeedsReset`, at once, with no
+    retries** (S6): a spec changed behind the service's back, a table recreated under a
+    running deployment. *Alternative:* the restart policy as for any fault, ending in
+    `Failed` after five tries. Retrying finds the same state every time and logs a stack
+    each time; `Failed` then names no way out, where `NeedsReset` does.
+15. **The in-memory backend compacts by default** (S6: `StateCompactAbove` 8,192 records
+    per partition, `RetainedHistoryChanges` one million per table). *Alternative:* off by
+    default, as the core's `InMemoryStateChangelog` is, and documented as unbounded. The
+    cost of on is a pause inside one commit per doubling of a partition (about 0.1 s per
+    million live records) and a standby cut loose from a table whose leader wrote more
+    than a million row changes while it was not reading.
+16. **The meter's instruments carry a `node` tag** (S6). *Alternative:* none, leaving
+    the node to the exporter's resource attributes — one tag fewer on every series, and
+    two nodes in one process (the in-memory cluster) no longer told apart.
+17. **The example references OpenTelemetry** (S6: two packages, for `--otlp`), so that
+    the guide's monitoring snippet is compiled code. *Alternative:* the snippet as prose
+    in the guide and no dependency; nothing then checks that it still builds.
 
 ## Not verified
 
@@ -2570,3 +2592,259 @@ which is how a stale core assembly was found during the browser pass.
 **Not done.** The step-down change has no test of its own. Blob deletes are still
 unfenced (above). Nothing was run on Windows or against MSK. The fingerprint still
 cannot see a tuple or a private dependency's type used only inside a delegate.
+
+### S6 — round two
+
+A completeness review of S1–S5 listed eighteen gaps (G1–G18). Round two closes them in
+several steps; each records its own part here.
+
+#### Service robustness: G2, G3, G9, G11 and the API half of G7
+
+**A mistaken `keep` no longer takes a pipeline down (G2).** The reviewer's case —
+`circuit.workers` 1 → 2 with `state=keep` answered 200, then four failed starts and
+`Failed` — is now refused at the dry run and at the call with `409 state-incompatible`
+and the core's own finding (`workers changed: the checkpoint was committed with
+workers=1, this circuit has workers=2`), before anything stops. Three parts:
+
+- *The core says what a circuit's state is without building it.*
+  `CircuitBuilder.DescribeState()` runs every node's operator factory against a recording
+  provider and returns each store with its name, kind and key and value types, for every
+  worker. Nothing outside the builder is touched: no table is claimed, no storage read,
+  and the operators are dropped. `CircuitBuilder.CheckState(provider)` builds the
+  manifest from that and compares it with the committed one — the very comparison
+  `Circuit.Start` makes (the two now share `StateManifest`), so "refused beforehand" and
+  "refused at start" cannot drift apart. A test asserts the described manifest equals the
+  committed one for one and three workers.
+- *The refusal at start is typed.* `Circuit.Start` throws `CircuitStateMismatchException`
+  (an `InvalidOperationException`, so existing catches hold) with `Problems`; this is the
+  design's C7. `ChangelogStorageProvider` throws the same when a store's committed bytes
+  cannot be read as the types the circuit declares for it — the case no comparison of
+  layouts can see. A record this version cannot read at all (an unknown format byte)
+  stays an `InvalidDataException`: that is not a mismatch of types.
+- *Types that have committed nothing have no say in what the state is.* The design's
+  "bytes are never round-tripped through types that have not committed" was not true as
+  built: `ReleaseStores` wrote every store back through its current types, so a version
+  that was built on the state and refused to start would have dropped the members it did
+  not model. A store created from held bytes now keeps those bytes until the provider's
+  next commit (or until a record is applied to it, on a follower), and `ReleaseStores`
+  gives them back as they were. Cost: the state's bytes are held twice between a build
+  and its first commit.
+
+On these the supervisor does what the design's replace steps 2 and 7 describe, in the
+form the as-built standby allows (it holds bytes and builds nothing, so there is no
+layout marker and no `confirmed` generation to keep followers in step):
+
+1. A replace that keeps state — chosen, or implied because nothing touching state
+   changed — is dry-run with `CheckState` against the pipeline's provider. Problems are
+   `state-incompatible`, with `DryRun` too. `state-choice-required` already carries
+   `keep is not possible: …` when that is so.
+2. The intent commit records `Previous`: the spec being replaced (or *its* `Previous`,
+   if it never ran — the state is then still its predecessor's).
+3. When the new generation reaches `Running`, `Previous` is cleared
+   (`pipeline.replace.confirmed` in the audit; the entry's generation does not move,
+   because nothing a caller sent changed).
+4. If instead the build or `Circuit.Start` throws `CircuitStateMismatchException`: the
+   generation is torn down, the binding is released (the stores go back to their bytes),
+   `Previous` is committed as the spec under `generation + 1` with the audit action
+   `pipeline.replace.rolled-back` and the problems as its plan, and the pipeline is
+   reconciled — started, if the old spec was running. `DeployAsync` then throws
+   `state-incompatible` saying the change was rolled back and what state the pipeline is
+   in; the event ring gets `rolled back to the spec of generation N: …` (the fact before
+   the colon, so it survives `ExposeRowData` off); `PipelineStatus.RolledBack` holds the
+   record until the next deploy; `incremental.service.pipeline.rollbacks` counts it.
+5. A leader that dies after 2 leaves `Previous` in the catalog. Its successor starts the
+   new spec, meets the same mismatch — it is a property of the state, not of the node —
+   and rolls back itself. A leader that dies after 4's commit leaves the old spec. So a
+   takeover anywhere in a replace ends in one of the two specs, and for a change that
+   does not fit, in the old one.
+6. A mismatch with no `Previous` is `NeedsReset` at once: one Error line without a
+   stack, no retries, and a reason that names what the service can do about it ("deploy
+   the spec that wrote the state with state=keep, or reset the pipeline") rather than
+   the core's advice about Redis key prefixes.
+
+*Departures.* The roll-back is one commit, not the design's two (`generation + 2` and a
+marker): there is no marker to write. A rolled-back replace answers 409 although the
+catalog changed (*Open for James* 13). A plugin version that an unconfirmed replace
+would go back to cannot be deleted. `DeployResult.Spec` is now the redacted spec — it
+returned stored secrets to a caller who had sent `***`.
+
+*Not closed.* Roll-back covers the first start only. A generation that starts, commits
+and then faults on what it reads has rewritten the entries it touched, and there is no
+going back from that; it is an ordinary fault. Meaning is not checked at all: same
+stores, same types, another computation (`desk-exposure` v2) keeps without complaint.
+
+**The in-memory backend is bounded (G3).** The reviewer measured 2.88 M state records
+after 73 minutes at 50 trades/s, rising 41,000 a minute, RSS 1.8 GB.
+
+- `InMemoryStateChangelog(partitions, compactAbove)`: a partition that reaches its
+  threshold is compacted inside the commit that took it there — last record per key —
+  and the threshold moves to twice what survived, never below `compactAbove`. The work is
+  amortised over the appends; the log holds at most about twice the live records plus
+  `compactAbove` per partition. Tombstones are the delicate part: a reader that had seen
+  a record and not yet its tombstone would keep the record for good. Every enumeration of
+  `ReadAsync` registers where it stands, and a tombstone is dropped only below the
+  lowest of them; with no reader, all go (a later reader starts from 0 and never sees the
+  record). This protects a reader for as long as it enumerates, which is how
+  `ChangelogStorage` follows; a reader that stopped and resumed from a remembered offset
+  would not be protected, and the class says so. Off by default in the core
+  (`compactAbove: 0`), on in the service (`InMemoryBackendOptions.StateCompactAbove`,
+  8,192).
+- `InMemoryTableLog(maxRetainedVersions, maxRetainedChanges)`: history was capped by
+  versions only, and one version of a first load can be the whole table. It is now also
+  capped by row changes (`RetainedHistoryChanges`, one million), down to the newest
+  version, which is always kept so that a follower that is up to date is not cut loose by
+  the append it is waiting for.
+- The example's `PositionedFeed` was reported as keeping every trade. It does not: a
+  record is a function of its position and nothing is buffered. The `View` sink was
+  already capped. `MemoryLog<T>` — the memory connector's log, which the admin host's
+  generator feeds — did keep everything, by design, so that a test can replay from 0;
+  it has `RetainLast`, and the admin host sets 100,000. A source that asks for a record
+  already dropped is given the oldest one held, under its true offset.
+
+Measured, example in Release from the built binary, one in-memory node, sampled every
+30 s (`stateRecords` is what the log holds, from `GET node`):
+
+| `--rate 5000`, 10 min | 30 s | 90 s | 210 s | 330 s | 451 s | 571 s |
+|---|---|---|---|---|---|---|
+| RSS, MB | 583 | 560 | 586 | 632 | 653 | 577 |
+| state records held | 197,552 | 212,688 | 226,703 | 258,738 | 278,495 | 225,027 |
+| appended so far | 1.7 M | 5.5 M | 13.0 M | 20.4 M | 27.9 M | 35.4 M |
+
+| default rate (50/s), 30 min | 2 min | 6 min | 10 min | 14 min | 18 min | 22 min | 26 min | 29.5 min |
+|---|---|---|---|---|---|---|---|---|
+| RSS, MB | 202 | 292 | 381 | 576 | 667 | 686 | 691 | 684 |
+| state records held | 49,804 | 131,167 | 193,479 | 206,350 | 211,722 | 225,171 | 238,646 | 223,180 |
+| appended so far | 51,557 | 154,323 | 308,834 | 474,099 | 639,911 | 805,731 | 971,585 | 1,116,620 |
+
+At 5,000/s the 20,000 trade ids are all live within seconds and RSS stays between 537
+and 653 MB over the ten minutes. At the default rate the ids take 400 s to fill, the
+records held are flat from then (190–260 thousand, the sawtooth of compaction), and RSS
+goes on rising to about 690 MB until minute 18 and is 683–696 MB for the last twelve
+minutes: the same level the fast run sits at from the start. That late rise with a flat
+log is the server GC's heap budget being used, not something being kept — the example
+runs server GC with DATAS off (`examples/Directory.Build.props`). Both runs stopped on
+SIGTERM with exit code 0.
+
+**The evidence for keep or reset is the state's own shape (G9).** The fingerprint hashed
+every public type in the plugin assembly, so the example's own v1 → v2 walkthrough —
+which adds a column to a sink row and tells the reader to choose `keep` — showed
+`declared data shapes differ`. `StateShape` replaces it as evidence: the stores
+`DescribeState` reports for the deployed spec (as last built here, or described on
+demand) and for the proposed one, each store's key and value types, and every type those
+are made of with its members as the state serializer sees them — public properties and
+fields, an enum's members with their numbers, tuples and collections by their arguments.
+Table key and row types are in it too. It is text only, so it outlives the load context
+it was read from. `StateShapes.Differences` names what differs: a store that is new
+(starts empty), gone (keep is refused), or of another type; and per changed type the
+members added, dropped or retyped, the stores that hold it, and whether it *identifies*
+entries there (a key, or the value of a weight or indexed store: an old entry is not
+found again — not safe) or is a *value* (a missing member reads as its default). Equal
+shapes read `state shapes: unchanged — the N state store(s) … (types)`. The example's
+walkthrough now reads exactly that, the smoke test claims it, and the guide quotes it.
+The old caveat — a shape used only inside a delegate is not compared — is gone: whatever
+a store holds is a generic argument of the store, tuples and anonymous types included.
+`PluginManifest.Fingerprint` is still computed and stored (it is in a persisted record)
+and no longer shown.
+
+**A meter for a monitoring system (G11).** `ServiceMeter`, the meter
+`Incremental.Service`: 22 instruments — the node's role, term, health, standby readiness
+and state lag; the catalog version; takeovers and a histogram of their duration by
+stage; pipelines by state, and per pipeline whether it is up, source lag, checkpoint age,
+sink-ack wait, dead letters, faults, restarts and roll-backs; tables by state, and per
+table rows, version, follower lag and loader lag. One static meter and a registry of
+nodes, rather than a meter per node: exporters key a metric by meter and instrument
+name, and two meters of one name would have to be merged by them. Tags are `node`,
+`pipeline`, `table` and the closed sets `state`, `role`, `stage`. The gauges read a
+snapshot: per-pipeline values come out of the one-second sample `ServiceMetrics` already
+took (its inputs gained the state and the oldest sink write in flight), node values from
+`Status`, table values from `StatsAsync` every five seconds off the sampling thread — a
+collection walks arrays and touches nothing. `pipeline.up` is reported by the leader
+only: a standby's pipelines are `Unbuilt`, and an alert on `up == 0` must not fire
+there. The memory connector's sources now report lag.
+
+The example exports both meters over OTLP with `--otlp` (snippet `monitoring`, quoted in
+the guide). Checked end to end against a local HTTP sink: all sixteen `incremental.service.*`
+instruments that have a value on a lone in-memory leader arrived at `/v1/metrics`, with
+the core's ten.
+
+**Discovery (G7, the API half).** `IServiceDiscovery` on `ServiceNode`, and five GET
+routes on the admin API:
+
+- `plugins/{name}/{version}/definitions/{definition}` — settings (now with default,
+  enum values, `[Range]` bounds, nullability), input and sink slots with kind, record
+  type and key type, and table slots with access, key and row type and definition.
+  Slots are found by running `Build` against a `PipelineBuilder` in *detached* mode:
+  tables are empty stand-ins made from the `TableDefinition` itself, indexes included,
+  so nothing need be declared or bound. Settings are the ones given, else what an empty
+  spec binds, else the settings class as its constructor leaves it (with a note).
+  Leader only: it runs plugin code.
+- `…/template?id=` — a spec with the real slot names. Each slot is bound to a connector
+  registered for its kind, the host's own before `memory` and `kafka`, taking the first
+  whose `Describe` accepts a config of just its name; a connector that needs more is
+  offered with its required properties empty and a note. Table slots are left to bind by
+  name where a declared table has the slot's name, and bound to the one declared table of
+  the same definition where there is exactly one. The template is then dry-run:
+  `valid`, `problems`.
+- `connectors` — name, slot kinds, whether it resets, and its config schema if it
+  implements `IConfigDescribed` (the built-in `memory` and `kafka` do, and the example's
+  two; the `kafka` schema's `connection` lists the registered names).
+- `connections` — Kafka connections and object stores, name and kind. The records have
+  two members and a test asserts the store's directory is nowhere in the answer.
+- `table-sources` — `file`, `kafka`, `debezium` with their config and the kind of
+  connection each names, and the host's registered kinds (with a schema if the factory
+  implements `IConfigDescribed`).
+
+`SettingInfo` is part of the stored manifest; its five new members are optional, so a
+manifest stored before them reads with them absent, and the definition endpoint
+describes from the loaded assembly, not from the manifest. The UI half — a deploy form
+built on these — is another step's.
+
+**Public API added.**
+
+- Core: `CircuitStateMismatchException`; `CircuitBuilder.DescribeState()`,
+  `CheckState(ICheckpointStorageProvider)`; `CircuitStateStore`, `CircuitStateStoreKind`;
+  `InMemoryStateChangelog(partitions, compactAbove)`, `.Compactions`;
+  `InMemoryTableLog(maxRetainedVersions, maxRetainedChanges)`, `.RetainedChanges`.
+- Service: `PipelineSpec.Previous`; `PipelineRollback`; `PipelineStatus.RolledBack`,
+  `.ReplaceUnconfirmed`; `InMemoryBackendOptions.StateCompactAbove`,
+  `.RetainedHistoryChanges`; `MemoryLog<T>.RetainLast`, `.Retained`,
+  `MemoryConnector.RetainLast`; `ServiceMeter` (`Name`); `ServiceNode.Discovery`,
+  `IServiceDiscovery`, `ConnectorInfo`, `ConnectionInfo`, `TableSourceInfo`,
+  `DefinitionDescription`, `SpecTemplate`, `TableSlotShape`, `IConfigDescribed`,
+  `ConfigSchema`, `ConfigProperty`; `SlotShape.KeyType`, `PipelineShape.TableSlots`;
+  `SettingInfo.Default`, `.Values`, `.Minimum`, `.Maximum`, `.Nullable`.
+- Admin API: the five routes above; the error code `state-incompatible`; `rolledBack`
+  and `replaceUnconfirmed` on a pipeline.
+- Example: `--otlp`.
+
+**Tests.** Core: `InMemoryLogBoundsTests` (4: 4,000 commits over 300 keys with a
+follower reading throughout — over 100,000 records appended, never more than 1,778
+held (twice the live entries plus the thresholds), and the follower equal to the writer
+at the end; a tombstone kept while a reader
+stands before it and dropped once it has gone; no self-compaction without a threshold;
+the table log's cap), two in `ChangelogReleaseTests` (bytes given back untouched before
+a commit and not after; a store that cannot be read is typed and leaves the state as it
+was), three in `StateManifestTests`. Seven existing tests asserted
+`InvalidOperationException` exactly and now name the derived type. Service:
+`ReplaceTests` (5: the reviewer's repro refused at the dry run and the call with the
+pipeline untouched and its sink still matching the model; an unreadable `keep` rolled
+back with the sink matching the model across it and the source resuming at its offset;
+confirmation; a takeover between the mismatch and the roll-back's commit, ending with
+the old spec running on the new leader; `NeedsReset` with no retries), `StateShapeTests`
+(3), `MeterTests` (3, with a `MeterListener`: every gauge on a leader and on a standby,
+the counters and the takeover histogram, the role moving at a takeover, and every tag
+key in the allowed set), `MemoryLogTests` (2), three in `AdminApiTests` and more in its
+standby test. `Incremental.Service.Tests` is 120 tests. The example's smoke test has two
+more claims (the evidence reads `unchanged`; the template deploys as offered).
+
+**Mutation checks.** 25, all killed (`scratchpad/r2/mutations.py`): the tombstone
+horizon ignored; self-compaction never due; the change cap off, and the newest version
+unprotected; origin bytes not kept; the decode failure untyped; `CheckState` comparing a
+manifest with itself; `DescribeState` naming one worker; the pre-check not refusing;
+`Previous` not recorded; the replace never confirmed; the mismatch not recognised; the
+roll-back restoring the new spec; identity and value not told apart; the evidence
+inverted; a standby reporting `pipeline.up`; restarts not counted; a takeover stage
+misnamed; dead letters from the wrong source; the template's memory name; a table slot's
+access; a setting's default; a definition described on a standby; the memory log never
+trimming; `state-choice-required` not saying keep is closed.
+

@@ -1180,7 +1180,18 @@ What to know before relying on it:
   leaves rows the new filter would not have produced. `Keep` across plugin versions reads
   the old version's state as the new version's types, through JSON; it is safe while the
   types that appear in a store's *key* (a grouping's records, a `Distinct`'s values) keep
-  their shape, and not otherwise.
+  their shape, and not otherwise. The refusal says which it is: it compares the state
+  stores of the two specs and the types they hold, and names any store, type and member
+  that differs — or says `state shapes: unchanged`.
+- **A `Keep` that cannot work does not take the pipeline down.** A change the committed
+  checkpoint cannot follow — another worker count, a stateful operator removed or
+  renamed, a table recreated — is refused with `state-incompatible` at the dry run and at
+  the call, before anything stops (`CircuitBuilder.CheckState`). What only shows when
+  the state is read is found when the new generation is built
+  (`CircuitStateMismatchException`): the previous spec is put back and started, the
+  outcome is in the audit, the event feed and the pipeline's status (`RolledBack`), and
+  the caller gets `state-incompatible`. A successor that takes over in the middle does
+  the same.
 - **Pipelines do not disturb each other.** Each has its own queue of operations. One that
   faults is torn down and restarted with a doubling backoff on its committed state; more
   than `maxRestarts` faults within the window and it is `Failed` until an operator
@@ -1291,6 +1302,19 @@ What to know:
 - `node.Status` has what a status page needs: role and terms, heartbeat age, whether the
   delivery lease is held, how the last takeover's time was spent, the peer's answer, and
   on a standby how far its catalog, tables and state are behind.
+- **For a monitoring system there is a meter**, `Incremental.Service`
+  (`ServiceMeter.Name`), beside the core's `Incremental`: pipelines by state, per
+  pipeline whether it is up, its source lag, checkpoint age, sink-ack wait, dead letters,
+  faults, restarts and roll-backs; tables by state with rows, version, follower lag and
+  loader lag; the node's role, term, health, standby readiness and state lag; takeovers
+  and their duration by stage. Tags are the node, a pipeline id or a table name, and
+  closed sets. Add both meters to whatever exporter the host uses;
+  [enrichment-service.md](enrichment-service.md#operating-it-monitoring) lists the
+  instruments and what to alert on.
+- **The in-memory backend is bounded.** Its state log compacts itself
+  (`InMemoryBackendOptions.StateCompactAbove`) and its table logs cap history by row
+  changes as well as by versions, so a node left running holds what is live. It is still
+  one process's memory: Kafka is the backend to run on.
 
 #### Looking at it: the admin API and UI
 
@@ -1345,6 +1369,9 @@ app.MapIncrementalHealth("/health");        // /live, /ready, /status: for a loa
 | PUT | `pipelines/{id}?state=keep\|reset` | deploy or replace |
 | POST | `pipelines/validate`, `pipelines/{id}/start`, `/stop`, `/restart`, `/reset`; DELETE `pipelines/{id}` | |
 | GET | `plugins`, `plugins/{name}` | versions, definitions and their settings, which pipelines use which |
+| GET | `plugins/{name}/{version}/definitions/{definition}` | leader: its settings with defaults, ranges and enum values; its input and sink slots with kinds and types; the tables it reads and writes. `settings=` describes it under those |
+| GET | `plugins/{name}/{version}/definitions/{definition}/template` | leader: a starting spec with the real slot names bound to this host's connectors, and whether the dry run accepts it. `id=` |
+| GET | `connectors`, `connections`, `table-sources` | what a spec may name: connectors with the slot kinds they support and their config; Kafka connections and object stores by name and kind, nothing else; loader kinds with their config |
 | POST | `plugins` (a zip), `plugins/rescan`; DELETE `plugins/{name}/{version}` | |
 | GET | `audit`, `events/recent`, `events` | who changed what; this node's event ring; the live feed |
 

@@ -178,8 +178,17 @@ internal sealed record KafkaSlotConfig
 /// leader term on what they write.
 /// </summary>
 public sealed class KafkaConnector(KafkaConnections connections)
-    : IAppendSourceConnector, IKeyedSourceConnector, IUpsertSinkConnector, IAppendSinkConnector
+    : IAppendSourceConnector, IKeyedSourceConnector, IUpsertSinkConnector, IAppendSinkConnector, IConfigDescribed
 {
+    public ConfigSchema ConfigSchema { get; } = new(
+    [
+        new("connection", "string", Required: true, Description: "A Kafka connection the host registered; it holds the bootstrap servers and client settings."),
+        new("topic", "string", Required: true, Description: "The topic read or written."),
+        new("startFrom", "string", Description: "Sources: where to start with no committed position.", Values: ["earliest", "latest"], Default: "earliest"),
+        new("format", "string", Description: "Keyed inputs: plain JSON values, or Debezium change events.", Values: ["json", "debezium"], Default: "json"),
+        new("producer", "string", Description: "Sinks: a producer of the sink's own, or the backend's transactional one (connection 'log' only).", Values: ["own", "log"], Default: "own"),
+    ], "A topic as an append or keyed input, or as an upsert (compacted) or append sink.");
+
     private (KafkaSlotConfig Config, KafkaConnection Connection) Resolve(JsonElement json)
     {
         var config = KafkaSlotConfig.Parse(json);

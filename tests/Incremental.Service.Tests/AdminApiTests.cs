@@ -331,6 +331,131 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         Assert.Equal("n2.select", letters["items"][0].GetProperty("operator").GetString());
     }
 
+    // ── discovery: what a deploy needs to know ─────────────────────────────────────────
+
+    private async Task<string> PluginVersionAsync() =>
+        (await Admin.Get("plugins"))["items"].EnumerateArray()
+            .First(p => p.GetProperty("name").GetString() == DemoHost.Plugin).GetProperty("version").GetString()!;
+
+    [Fact]
+    public async Task A_definition_is_described_with_its_settings_slots_and_tables()
+    {
+        var version = await PluginVersionAsync();
+        var risk = await Admin.Get($"plugins/{DemoHost.Plugin}/{version}/definitions/desk-risk");
+        Assert.Equal(200, risk.Code);
+        Assert.Equal("desk-risk", risk["definition"].GetString());
+        Assert.Equal(version, risk["version"].GetString());
+        Assert.Empty(risk["notes"].EnumerateArray());
+
+        // Settings: type, default, range.
+        var settings = risk["settings"].EnumerateArray().ToDictionary(s => s.GetProperty("name").GetString()!);
+        Assert.Equal("array", settings["desks"].GetProperty("jsonType").GetString());
+        Assert.Equal(["rates", "credit", "fx", "equities"], settings["desks"].GetProperty("default").EnumerateArray().Select(d => d.GetString()));
+        Assert.Equal("number", settings["top"].GetProperty("jsonType").GetString());
+        Assert.Equal(5, settings["top"].GetProperty("default").GetInt32());
+        Assert.Equal((1, 100), (settings["top"].GetProperty("minimum").GetInt32(), settings["top"].GetProperty("maximum").GetInt32()));
+        Assert.False(settings["top"].GetProperty("required").GetBoolean());
+        Assert.Contains("largest orders", settings["top"].GetProperty("description").GetString());
+
+        // Slots: name, kind, record type and key type — the real names, not placeholders.
+        var input = Assert.Single(risk["inputs"].EnumerateArray());
+        Assert.Equal(("orders", "KeyedInput", "Order", "Int64"),
+            (input.GetProperty("name").GetString(), input.GetProperty("kind").GetString(), input.GetProperty("type").GetString(), input.GetProperty("keyType").GetString()));
+        Assert.Equal(["by-country", "by-symbol", "by-tier", "largest"], risk["sinks"].EnumerateArray().Select(s => s.GetProperty("name").GetString()).Order());
+        var largest = risk["sinks"].EnumerateArray().First(s => s.GetProperty("name").GetString() == "largest");
+        Assert.Equal(("UpsertSink", "EnrichedOrder", "Int64"),
+            (largest.GetProperty("kind").GetString(), largest.GetProperty("type").GetString(), largest.GetProperty("keyType").GetString()));
+
+        // Tables: the slot, the table it resolves to, how it is used, and its types.
+        var tables = risk["tables"].EnumerateArray().ToDictionary(t => t.GetProperty("slot").GetString()!);
+        Assert.Equal(["counterparties", "instruments"], tables.Keys.Order());
+        Assert.Equal(("read", "Int32", "Instrument", "Acme.Contracts.InstrumentsTable"),
+            (tables["instruments"].GetProperty("access").GetString(), tables["instruments"].GetProperty("keyType").GetString(),
+                tables["instruments"].GetProperty("rowType").GetString(), tables["instruments"].GetProperty("definition").GetString()));
+
+        // The slots are those of the settings given: here one desk instead of four changes none.
+        var one = await Admin.Get($"plugins/{DemoHost.Plugin}/{version}/definitions/desk-risk?settings=" + Uri.EscapeDataString("""{ "desks": ["fx"], "top": 3 }"""));
+        Assert.Equal(4, one["sinks"].GetArrayLength());
+        (await Admin.Get($"plugins/{DemoHost.Plugin}/{version}/definitions/desk-risk?settings=" + Uri.EscapeDataString("""{ "top": 500 }"""))).IsError(400, "invalid");
+        (await Admin.Get($"plugins/{DemoHost.Plugin}/{version}/definitions/desk-risk?settings=nope")).IsError(400, "invalid-parameter");
+
+        // A derived table is a table slot that is written; a definition with no settings has none.
+        var positions = await Admin.Get($"plugins/{DemoHost.Plugin}/{version}/definitions/positions");
+        Assert.Empty(positions["settings"].EnumerateArray());
+        Assert.Equal("write", Assert.Single(positions["tables"].EnumerateArray()).GetProperty("access").GetString());
+        Assert.Empty(positions["sinks"].EnumerateArray());
+
+        (await Admin.Get($"plugins/{DemoHost.Plugin}/{version}/definitions/no-such")).IsError(400, "invalid");
+        (await Admin.Get($"plugins/{DemoHost.Plugin}/0000000000000000/definitions/desk-risk")).IsError(400, "invalid");
+    }
+
+    [Fact]
+    public async Task A_spec_template_has_the_real_slot_names_and_passes_the_dry_run_as_it_is()
+    {
+        var version = await PluginVersionAsync();
+        var template = await Admin.Get($"plugins/{DemoHost.Plugin}/{version}/definitions/desk-risk/template?id=my-risk");
+        Assert.Equal(200, template.Code);
+        Assert.True(template["valid"].GetBoolean(), template.Body.ToString());
+        Assert.Empty(template["problems"].EnumerateArray());
+        var spec = template["spec"];
+        Assert.Equal(("my-risk", DemoHost.Plugin, version, "desk-risk"),
+            (spec.GetProperty("id").GetString(), spec.GetProperty("plugin").GetString(), spec.GetProperty("version").GetString(), spec.GetProperty("definition").GetString()));
+        Assert.Equal(5, spec.GetProperty("settings").GetProperty("top").GetInt32());
+        Assert.Equal(4, spec.GetProperty("settings").GetProperty("desks").GetArrayLength());
+        Assert.Equal("memory", spec.GetProperty("inputs").GetProperty("orders").GetProperty("connector").GetString());
+        Assert.Equal("my-risk/orders", spec.GetProperty("inputs").GetProperty("orders").GetProperty("name").GetString());
+        Assert.Equal(["by-country", "by-symbol", "by-tier", "largest"], spec.GetProperty("sinks").EnumerateObject().Select(s => s.Name).Order());
+        Assert.DoesNotContain("<", spec.ToString());        // no placeholder anywhere
+        Assert.Equal(["kafka", "memory"], template["connectorsForSlot"].GetProperty("orders").EnumerateArray().Select(c => c.GetString()));
+
+        // Sent back unchanged, the dry run of a deploy accepts it.
+        var dry = await Admin.SendAsync(HttpMethod.Put, "pipelines/my-risk?dryRun=true", spec.GetRawText());
+        Assert.Equal(200, dry.Code);
+        Assert.Equal("pipeline.deploy", dry["plan"].GetProperty("action").GetString());
+        Assert.Equal("orders", dry["shape"].GetProperty("inputs")[0].GetProperty("name").GetString());
+
+        // The id defaults to the definition's name; a bad one is refused.
+        Assert.Equal("positions", (await Admin.Get($"plugins/{DemoHost.Plugin}/{version}/definitions/positions/template"))["spec"].GetProperty("id").GetString());
+        (await Admin.Get($"plugins/{DemoHost.Plugin}/{version}/definitions/positions/template?id=Not%20Valid")).IsError(400, "invalid");
+    }
+
+    [Fact]
+    public async Task Connectors_connections_and_table_sources_are_listed_with_their_config_and_no_secrets()
+    {
+        var connectors = await Admin.Get("connectors");
+        Assert.Equal(2, connectors["total"].GetInt32());
+        var byName = connectors["items"].EnumerateArray().ToDictionary(c => c.GetProperty("name").GetString()!);
+        Assert.Equal(["AppendInput", "KeyedInput", "UpsertSink", "AppendSink"], byName["memory"].GetProperty("kinds").EnumerateArray().Select(k => k.GetString()));
+        Assert.True(byName["memory"].GetProperty("resettable").GetBoolean());
+        Assert.True(byName["memory"].GetProperty("config").GetProperty("open").GetBoolean());
+        var kafka = byName["kafka"].GetProperty("config").GetProperty("properties").EnumerateArray().ToDictionary(p => p.GetProperty("name").GetString()!);
+        Assert.True(kafka["topic"].GetProperty("required").GetBoolean());
+        Assert.True(kafka["connection"].GetProperty("required").GetBoolean());
+        Assert.Empty(kafka["connection"].GetProperty("values").EnumerateArray());            // this host registered no Kafka connection
+        Assert.Equal(["earliest", "latest"], kafka["startFrom"].GetProperty("values").EnumerateArray().Select(v => v.GetString()));
+        Assert.Equal("earliest", kafka["startFrom"].GetProperty("default").GetString());
+        Assert.False(byName["kafka"].GetProperty("resettable").GetBoolean());
+
+        // Names and kinds, and nothing of where a connection points.
+        var connections = await Admin.Get("connections");
+        var store = Assert.Single(connections["items"].EnumerateArray());
+        Assert.Equal(("refdata", "object-store"), (store.GetProperty("name").GetString(), store.GetProperty("kind").GetString()));
+        Assert.Equal(2, store.EnumerateObject().Count());
+        Assert.DoesNotContain("incremental-admin-host", connections.Body.ToString());        // the store's directory
+
+        var sources = (await Admin.Get("table-sources"))["items"].EnumerateArray().ToDictionary(s => s.GetProperty("kind").GetString()!);
+        Assert.Equal(["debezium", "file", "kafka"], sources.Keys.Order());
+        Assert.Equal("object-store", sources["file"].GetProperty("connection").GetString());
+        Assert.True(sources["file"].GetProperty("builtIn").GetBoolean());
+        Assert.Contains(sources["file"].GetProperty("config").GetProperty("properties").EnumerateArray(),
+            p => p.GetProperty("name").GetString() == "path" && p.GetProperty("required").GetBoolean());
+        Assert.Equal("kafka", sources["debezium"].GetProperty("connection").GetString());
+
+        // Lists like every other: paged and clamped.
+        var page = await Admin.Get("connectors?limit=1&skip=1");
+        Assert.Equal((1, 2, "memory"), (page["items"].GetArrayLength(), page["total"].GetInt32(), page["items"][0].GetProperty("name").GetString()));
+    }
+
     [Fact]
     public async Task The_graph_is_the_circuit_with_its_slots_bound_and_dead_letters_counted()
     {
@@ -920,6 +1045,13 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         var graph = await admin.SendAsync(HttpMethod.Get, "pipelines/enrich-orders/graph", baseUrl: standby);
         Assert.Equal("declared", graph["source"].GetString());
         Assert.Equal(["circuit", "input", "sink", "table", "table"], graph["nodes"].EnumerateArray().Select(n => n.GetProperty("role").GetString()).Order());
+
+        // What there is to deploy with is the host's, so a standby lists it; describing a
+        // definition runs plugin code, which only the leader does.
+        var connectors = await admin.SendAsync(HttpMethod.Get, "connectors", baseUrl: standby);
+        Assert.Equal(["kafka", "memory"], connectors["items"].EnumerateArray().Select(c => c.GetProperty("name").GetString()));
+        var version = (await admin.Get("plugins"))["items"].EnumerateArray().First(p => p.GetProperty("name").GetString() == DemoHost.Plugin).GetProperty("version").GetString();
+        (await admin.SendAsync(HttpMethod.Get, $"plugins/{DemoHost.Plugin}/{version}/definitions/enrich-orders", baseUrl: standby)).IsError(409, "not-leader");
 
         // A mutation there is refused with where to send it.
         var refused = await admin.SendAsync(HttpMethod.Post, "pipelines/trader-activity/stop", baseUrl: standby);

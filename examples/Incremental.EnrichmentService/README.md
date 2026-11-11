@@ -141,6 +141,7 @@ var service = builder.Services.AddIncrementalService(o =>
 | `--prefix name` | Kafka topic prefix and Postgres table prefix (lower-case letters and digits) |
 | `--port N`, `--probe-port N`, `--peer-probe-port N` | |
 | `--rate N` | trades per second (50) |
+| `--otlp` | export the meters `Incremental.Service` and `Incremental` over OTLP; the endpoint is `OTEL_EXPORTER_OTLP_ENDPOINT` (the guide's *Operating it: monitoring*) |
 | `--no-generate`, `--no-pipelines` | start with no generator; seed no pipelines |
 | `--bootstrap`, `--postgres`, `--connect`, `--postgres-host-for-connect` | where the stack is, if not the compose file's |
 | `--data dir` | where the counterparties file and the plugin caches go (a temporary directory by default) |

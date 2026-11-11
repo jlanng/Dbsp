@@ -253,6 +253,12 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
     public ITableRegistry Tables => _context.Tables;
     public IPipelineSupervisor Pipelines => _context.Supervisor;
     public IPluginCatalog Plugins => _context.Plugins;
+
+    /// <summary>What there is to deploy with: connectors, connections, table source
+    /// kinds, and a definition's slots and settings.</summary>
+    public IServiceDiscovery Discovery => _discovery ??= new ServiceDiscovery(_context);
+
+    private ServiceDiscovery? _discovery;
     public bool IsLeader => _started && _context.IsLeader;
 
     /// <summary>Recent per-pipeline and node-wide numbers, sampled once a second from the

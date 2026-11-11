@@ -422,7 +422,11 @@ so implementations never see cross-thread access to one store.
   (`UseKafkaBackend`: two processes on one `KafkaLog` are an active and a warm standby,
   with the catalog, tables, state and plugin files all on the broker; the `kafka`
   connector and the `kafka` and `debezium` table loaders bind slots and tables to topics
-  through named connections). See *Running many pipelines* in
+  through named connections). A replace that keeps state is checked against the committed
+  checkpoint before anything stops and rolled back if the state turns out not to fit; the
+  service publishes a meter, `Incremental.Service`, for a monitoring system; and the
+  admin API says what a deploy needs — a definition's slots and settings, the registered
+  connectors and connections, a starting spec. See *Running many pipelines* in
   [docs/intro.md](docs/intro.md) and
   [docs/design/enrichment-service.md](docs/design/enrichment-service.md), *As built*.
 
@@ -699,8 +703,9 @@ src/Incremental.Kafka              Kafka-backed state changelog and shared-table
                                        inputs and tables (KafkaSource), sinks, Debezium decoding
 src/Incremental.Service            the generic parts of an enrichment service: table registry,
                                        pipeline supervisor (one circuit per pipeline), plugin
-                                       loading, catalog, service node, metrics; an in-memory
-                                       backend and a Kafka one
+                                       loading, catalog, service node, metrics and the meter
+                                       `Incremental.Service`, discovery; an in-memory backend
+                                       (bounded) and a Kafka one
 src/Incremental.Service.Admin      the admin JSON API and web UI for a service node (ASP.NET
                                        Core; the UI is embedded, hand-written, no build step)
 tests/Incremental.Tests            xunit: Z-set algebra, per-step delta semantics, multi-worker runs,

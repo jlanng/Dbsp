@@ -32,13 +32,16 @@ public sealed class PipelineAttribute(string name) : Attribute
 
 public enum SlotKind { AppendInput, KeyedInput, UpsertSink, AppendSink }
 
-public sealed record SlotShape(string Name, SlotKind Kind, string Type);
+/// <summary>An input or sink slot: its kind and the type of its records; for a keyed input
+/// and an upsert sink also the type of the key.</summary>
+public sealed record SlotShape(string Name, SlotKind Kind, string Type, string? KeyType = null);
 
 /// <summary>What a definition's <c>Build</c> declared: its slots and the tables it reads
 /// and writes, by declared table name. Known for any pipeline that has ever validated.</summary>
 public sealed record PipelineShape(
     IReadOnlyList<SlotShape> Inputs, IReadOnlyList<SlotShape> Sinks,
-    IReadOnlyList<string> TablesRead, IReadOnlyList<string> TablesWritten);
+    IReadOnlyList<string> TablesRead, IReadOnlyList<string> TablesWritten,
+    IReadOnlyList<TableSlotShape>? TableSlots = null);
 
 /// <summary>The circuit a definition declared, node by node (the core's
 /// <see cref="CircuitBuilder.Describe"/>), and which of its outputs is which sink slot.
@@ -64,8 +67,15 @@ public sealed class PipelineBuilder
     private readonly ITableRegistry _tables;
     private readonly HashSet<string> _slots = new(StringComparer.Ordinal);
 
-    internal PipelineBuilder(PipelineSpec spec, CircuitBuilder circuit, ITableRegistry tables, ILogger logger, IServiceProvider services)
+    // Describing a definition with nothing deployed: tables are empty stand-ins of the
+    // definition's own shape, so that no table need be declared to learn the slots.
+    private readonly bool _detached;
+    private readonly Dictionary<string, object> _standIns = new(StringComparer.Ordinal);
+
+    internal PipelineBuilder(
+        PipelineSpec spec, CircuitBuilder circuit, ITableRegistry tables, ILogger logger, IServiceProvider services, bool detached = false)
     {
+        _detached = detached;
         _spec = spec;
         _tables = tables;
         Circuit = circuit;
@@ -90,6 +100,26 @@ public sealed class PipelineBuilder
 
     /// <summary>Declared table → the key and row types the definition reads or writes it as.</summary>
     internal Dictionary<string, (Type Key, Type Row)> TableTypes { get; } = new(StringComparer.Ordinal);
+    internal List<TableSlotShape> TableSlots { get; } = [];
+
+    private SharedTable<TKey, TRow> Resolve<TKey, TRow>(TableDefinition<TKey, TRow> table, string slot, string name, bool written)
+        where TKey : notnull
+        where TRow : class
+    {
+        if (!TableSlots.Any(t => t.Slot == slot && t.Access == (written ? "write" : "read")))
+            TableSlots.Add(new TableSlotShape(slot, name, written ? "write" : "read", typeof(TKey).Name, typeof(TRow).Name, table.GetType().FullName!));
+        if (!_detached)
+            return _tables.Get<TKey, TRow>(name);
+        if (_standIns.TryGetValue(name, out var existing))
+            return existing as SharedTable<TKey, TRow>
+                ?? throw new InvalidOperationException($"Table '{name}' is used as two different tables by this definition.");
+        var configured = table.Configured();
+        var standIn = new SharedTable<TKey, TRow>(name, table.KeyOf, configured.Options);
+        foreach (var index in configured.Indexes)
+            index.Declare(standIn);
+        _standIns[name] = standIn;
+        return standIn;
+    }
 
     private readonly Dictionary<string, string> _sinkOutputs = new(StringComparer.Ordinal);
 
@@ -99,9 +129,9 @@ public sealed class PipelineBuilder
     internal PipelineGraph Graph => new(Circuit.Describe(), new Dictionary<string, string>(_sinkOutputs, StringComparer.Ordinal));
 
     internal PipelineShape Shape => new(
-        Inputs.Select(i => new SlotShape(i.Name, i.Kind, i.Type)).ToList(),
-        Sinks.Select(s => new SlotShape(s.Name, s.Kind, s.Type)).ToList(),
-        [.. TablesRead], [.. TablesWritten]);
+        Inputs.Select(i => new SlotShape(i.Name, i.Kind, i.Type, i.KeyType)).ToList(),
+        Sinks.Select(s => new SlotShape(s.Name, s.Kind, s.Type, s.KeyType)).ToList(),
+        [.. TablesRead], [.. TablesWritten], [.. TableSlots]);
 
     private void Claim(string slot)
     {
@@ -122,7 +152,7 @@ public sealed class PipelineBuilder
     {
         ArgumentNullException.ThrowIfNull(table);
         var name = TableName(slot ?? table.Name);
-        var shared = _tables.Get<TKey, TRow>(name);
+        var shared = Resolve(table, slot ?? table.Name, name, written: false);
         if (!TablesRead.Contains(name))
             TablesRead.Add(name);
         TableTypes[name] = (typeof(TKey), typeof(TRow));
@@ -151,7 +181,8 @@ public sealed class PipelineBuilder
         Inputs.Add(new InputSlot(slot, SlotKind.KeyedInput, typeof(TValue).Name,
             (connector, start) => connector is IKeyedSourceConnector keyed
                 ? keyed.StartAsync(new KeyedSourceContext<TKey, TValue>(start, stream), start.Cancellation)
-                : throw Mismatch(slot, connector, "a keyed input (KeyedInput<TKey, TValue>)")));
+                : throw Mismatch(slot, connector, "a keyed input (KeyedInput<TKey, TValue>)"))
+        { KeyType = typeof(TKey).Name });
         return stream;
     }
 
@@ -173,7 +204,8 @@ public sealed class PipelineBuilder
                 var observed = new ObservedUpsertSink<TKey, TRow>(start.Leadership.Leased(sink), start.Stats);
                 return start.Circuit.Handle(output).DeliverToAsync(observed, start.Delivery);
             },
-            circuit => circuit.Handle(output).Abandon()));
+            circuit => circuit.Handle(output).Abandon())
+        { KeyType = typeof(TKey).Name });
     }
 
     /// <summary>A result delivered as upserts keyed by <paramref name="key"/>. The stream
@@ -195,7 +227,8 @@ public sealed class PipelineBuilder
                 var observed = new ObservedUpsertSink<TKey, T>(start.Leadership.Leased(sink), start.Stats);
                 return start.Circuit.Handle(output).DeliverToAsync(observed, key, start.Delivery);
             },
-            circuit => circuit.Handle(output).Abandon()));
+            circuit => circuit.Handle(output).Abandon())
+        { KeyType = typeof(TKey).Name });
     }
 
     /// <summary>An append-only result. A retraction on the stream faults the pipeline.</summary>
@@ -225,7 +258,7 @@ public sealed class PipelineBuilder
     {
         ArgumentNullException.ThrowIfNull(table);
         var name = TableName(slot ?? table.Name);
-        var shared = _tables.Get<TKey, TRow>(name);
+        var shared = Resolve(table, slot ?? table.Name, name, written: true);
         if (TablesWritten.Contains(name))
             throw new InvalidOperationException($"Table '{name}' is written twice by this definition.");
         TablesWritten.Add(name);
@@ -248,9 +281,15 @@ public sealed class PipelineBuilder
         ServiceException.Invalid($"Slot '{slot}' is {kind}; connector {connector.GetType().Name} does not support that kind.");
 }
 
-internal sealed record InputSlot(string Name, SlotKind Kind, string Type, Func<IConnector, SlotStart, Task<IRunningSource>> Start);
+internal sealed record InputSlot(string Name, SlotKind Kind, string Type, Func<IConnector, SlotStart, Task<IRunningSource>> Start)
+{
+    public string? KeyType { get; init; }
+}
 
-internal sealed record SinkSlot(string Name, SlotKind Kind, string Type, Func<IConnector, SlotStart, Task> Start, Action<Circuit> Abandon);
+internal sealed record SinkSlot(string Name, SlotKind Kind, string Type, Func<IConnector, SlotStart, Task> Start, Action<Circuit> Abandon)
+{
+    public string? KeyType { get; init; }
+}
 
 /// <summary>What a slot's typed closure needs to start its source or delivery.</summary>
 internal sealed class SlotStart

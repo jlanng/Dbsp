@@ -199,8 +199,13 @@ internal sealed class ObservedAppendSink<T>(IAppendSink<T> inner, SinkSlotStats 
 /// Config: <c>{ "connector": "memory", "name": "trades" }</c>; the name defaults to
 /// <c>{pipeline}/{slot}</c>.
 /// </summary>
-public sealed class MemoryConnector : IAppendSourceConnector, IKeyedSourceConnector, IUpsertSinkConnector, IAppendSinkConnector, IResettableSinkConnector
+public sealed class MemoryConnector
+    : IAppendSourceConnector, IKeyedSourceConnector, IUpsertSinkConnector, IAppendSinkConnector, IResettableSinkConnector, IConfigDescribed
 {
+    public ConfigSchema ConfigSchema { get; } = new(
+        [new("name", "string", Description: "The log or sink in this process; \"{pipeline}/{slot}\" when left out.")],
+        "In this process's memory: a log a test or a demo appends to, a sink it reads.", Open: true);
+
     private readonly ConcurrentDictionary<string, object> _logs = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, object> _sinks = new(StringComparer.Ordinal);
 

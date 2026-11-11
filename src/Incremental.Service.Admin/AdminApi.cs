@@ -461,6 +461,78 @@ internal static class AdminApi
             });
         });
 
+        // ── what there is to deploy with ───────────────────────────────────────────────
+
+        // A definition's settings (defaults, ranges, enum values), its input and sink
+        // slots with their kinds and types, and the tables it reads and writes. Runs the
+        // definition's Build, so the leader answers it.
+        Get("/plugins/{name}/{version}/definitions/{definition}", async (HttpContext context, string name, string version, string definition) =>
+        {
+            JsonElement? settings = null;
+            if (context.Request.Query["settings"].FirstOrDefault() is { Length: > 0 } given)
+            {
+                try
+                {
+                    settings = JsonDocument.Parse(given).RootElement.Clone();
+                }
+                catch (JsonException ex)
+                {
+                    throw new AdminException(400, "invalid-parameter", $"settings must be a JSON object: {ex.Message}");
+                }
+            }
+            var described = await node.Discovery.DescribeDefinitionAsync(name, version, definition, settings, context.RequestAborted);
+            return Json(new
+            {
+                described.Plugin,
+                described.Version,
+                described.Definition,
+                described.Description,
+                settings = described.Settings.Take(options.MaxRows),
+                inputs = described.Inputs.Take(options.MaxRows),
+                sinks = described.Sinks.Take(options.MaxRows),
+                tables = described.Tables.Take(options.MaxRows),
+                notes = described.Notes.Take(options.MaxRows),
+            });
+        });
+
+        // A spec to start from: the definition's real slot names bound to connectors this
+        // host has, its settings at their defaults — and whether it would deploy as it is.
+        Get("/plugins/{name}/{version}/definitions/{definition}/template", async (HttpContext context, string name, string version, string definition) =>
+        {
+            var template = await node.Discovery.TemplateAsync(
+                name, version, definition, context.Request.Query["id"].FirstOrDefault() is { Length: > 0 } id ? id : null, context.RequestAborted);
+            return Json(new
+            {
+                spec = AdminJson.Spec(template.Spec),
+                template.Valid,
+                problems = template.Problems.Take(options.MaxRows),
+                notes = template.Notes.Take(options.MaxRows),
+                connectorsForSlot = template.ConnectorsForSlot,
+            });
+        });
+
+        Get("/connectors", (HttpContext context) =>
+        {
+            var connectors = node.Discovery.Connectors;
+            var (skip, limit) = Page(context, options);
+            return Json(Paged(connectors.Skip(skip).Take(limit).Cast<object>().ToList(), connectors.Count, skip, limit));
+        });
+
+        // Names and kinds only: where a connection points and how it authenticates are the host's.
+        Get("/connections", (HttpContext context) =>
+        {
+            var connections = node.Discovery.Connections;
+            var (skip, limit) = Page(context, options);
+            return Json(Paged(connections.Skip(skip).Take(limit).Cast<object>().ToList(), connections.Count, skip, limit));
+        });
+
+        Get("/table-sources", (HttpContext context) =>
+        {
+            var sources = node.Discovery.TableSources;
+            var (skip, limit) = Page(context, options);
+            return Json(Paged(sources.Skip(skip).Take(limit).Cast<object>().ToList(), sources.Count, skip, limit));
+        });
+
         Mutation(api.MapPost("/plugins", async (HttpContext context) =>
         {
             if (!options.AllowPluginUpload)

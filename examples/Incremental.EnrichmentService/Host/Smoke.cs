@@ -414,6 +414,19 @@ public sealed class Smoke(ExampleOptions options)
             await SinkIs($"it read every execution again and delivered totals per region; the topic still holds version 1's {stale.Count} per-desk rows, because a reset does not un-write a Kafka sink",
                 "desk-exposure", () => _model.Exposure.Expected().Concat(stale).ToDictionary(r => r.Key, r => r.Value));
         _staleExposure = _kafka is null ? [] : stale;
+
+        // What a deploy needs to know is asked of the service, not read from this host's source.
+        var template = await _admin.GetAsync($"plugins/{Specs.Plugin}/{v2}/definitions/trade-enrichment/template?id=from-template");
+        var templated = template["spec"]!;
+        var dryRun = await _admin.PutAsync("pipelines/from-template?dryRun=true", templated.Deserialize<PipelineSpec>(SpecJson)!);
+        await Claim("the service offers a starting spec for trade-enrichment — slot 'trades' on trade-feed, slot 'enriched' on a view, settings at their defaults — and its dry run accepts it unchanged",
+            () => Unless(
+                template["valid"]!.GetValue<bool>()
+                && templated["inputs"]?["trades"]?["connector"]?.GetValue<string>() == "trade-feed"
+                && templated["sinks"]?["enriched"]?["connector"]?.GetValue<string>() == "view"
+                && templated["settings"]?["minNotional"]?.GetValue<decimal>() == 0
+                && dryRun.Status == 200,
+                $"the template was {template.ToJsonString()} and its dry run answered {dryRun.Status} {dryRun.Body?.ToJsonString()}"));
     }
 
     private Dictionary<string, JsonObject> _staleExposure = [];

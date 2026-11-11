@@ -396,6 +396,39 @@ definition is run against a builder that is never built, every slot is bound to 
 connector that supports its kind, every table is declared with the definition's types.
 Add `?dryRun=true` and that check is all that happens.
 
+#### Asking the service what a spec can say
+
+A spec names slots, connectors, connections and tables. None of that has to be read
+from a host's source: the admin API answers it (the leader, for the first two — they run
+the definition's `Build`).
+
+| | |
+|---|---|
+| `GET plugins/{name}/{version}/definitions/{definition}` | its settings (type, default, range, enum values, required, state-neutral), its input and sink slots (kind, record type, key type), and the tables it reads and writes (slot, key and row type, definition). `?settings={…}` describes it under those settings instead of the defaults. |
+| `GET plugins/{name}/{version}/definitions/{definition}/template?id=…` | a spec to start from: real slot names, each bound to a connector this host registered for that kind of slot (the host's own before `memory` and `kafka`), settings at their defaults — with `valid` saying whether the dry run accepts it as it is, and `connectorsForSlot` listing the alternatives |
+| `GET connectors` | every registered connector: the slot kinds it supports, whether a reset clears what it wrote, and its config's properties if it describes them (`IConfigDescribed`) |
+| `GET connections` | the Kafka connections and object stores by name and kind. Nothing of where they point or how they authenticate. |
+| `GET table-sources` | the loader kinds — `file`, `kafka`, `debezium` and the host's — with their config and the kind of connection each names |
+
+```bash
+curl 'http://127.0.0.1:5180/admin/api/plugins/enrichment.pipelines/085cbd14f11deb0d/definitions/desk-exposure/template?id=exposure-eu'
+```
+
+answers, in the example,
+
+```json
+{ "spec": { "id": "exposure-eu", "plugin": "enrichment.pipelines", "version": "085cbd14f11deb0d",
+            "definition": "desk-exposure", "settings": { "windowSeconds": 60, "latenessSeconds": 5 },
+            "inputs": { "executions": { "connector": "trade-feed" } },
+            "sinks":  { "exposure":   { "connector": "view" } } },
+  "valid": true, "problems": [], "notes": [],
+  "connectorsForSlot": { "executions": ["kafka", "memory", "trade-feed"], "exposure": ["kafka", "memory", "view"] } }
+```
+
+and `PUT pipelines/exposure-eu` accepts that `spec` unchanged. Where a slot's connector
+needs more than its name (a `kafka` slot needs a connection and a topic) the template
+leaves those properties empty, `valid` is false and `notes` says what to fill in.
+
 ## The host
 
 The host is an ordinary generic-host application. It registers the service, the
@@ -546,10 +579,14 @@ on every record so that the next checkpoint carries them.
 /// Registered as the connector <c>trade-feed</c>; a spec binds a slot to it with
 /// <c>{ "connector": "trade-feed" }</c>.
 /// </summary>
-public sealed class TradeFeedConnector(PositionedFeed<Trade> feed) : IAppendSourceConnector, IKeyedSourceConnector
+public sealed class TradeFeedConnector(PositionedFeed<Trade> feed) : IAppendSourceConnector, IKeyedSourceConnector, IConfigDescribed
 {
     // Called at the dry run: check the slot's config here, and name any secret properties.
     public ConnectorDescription Describe(JsonElement config) => new("the example's generated trade feed");
+
+    // Optional (IConfigDescribed): what the config accepts, for whoever composes a spec.
+    // The admin API lists it under "connectors", and a spec template is built from it.
+    public ConfigSchema ConfigSchema { get; } = new([], "The example's generated trade feed. It takes no config.");
 
     public Task<IRunningSource> StartAsync<T>(SourceContext<T> context, CancellationToken cancellationToken) where T : notnull
     {
@@ -640,9 +677,13 @@ checkpoint committed only after the write returns.
 /// instance, so a plugin version's types can be unloaded with it. Registered as the
 /// connector <c>view</c>: <c>{ "connector": "view", "name": "enriched" }</c>.
 /// </summary>
-public sealed class ViewConnector(Views views) : IUpsertSinkConnector, IResettableSinkConnector
+public sealed class ViewConnector(Views views) : IUpsertSinkConnector, IResettableSinkConnector, IConfigDescribed
 {
     public ConnectorDescription Describe(JsonElement config) => new($"the in-process view '{NameOf(config, "…")}'");
+
+    public ConfigSchema ConfigSchema { get; } = new(
+        [new("name", "string", Description: "The view's name under /views; \"{pipeline}/{slot}\" when left out.")],
+        "An in-process view of each key's latest row.");
 
     public IUpsertSink<TKey, TRow> Create<TKey, TRow>(SinkContext context) where TKey : notnull =>
         new Sink<TKey, TRow>(views.Open(NameOf(context.Config, $"{context.PipelineId}/{context.Slot}")), context.Json);
@@ -678,6 +719,10 @@ that does not implement the slot's kind is refused at the dry run. Built in are 
 (tests), `kafka` (append and keyed sources, JSON or Debezium; upsert and append sinks),
 and the table loaders `file`, `kafka` and `debezium`.
 
+Both connectors implement `IConfigDescribed`, which is optional: it is what `GET
+connectors` shows of a connector's config, and what a spec template fills in. A table
+source factory may implement it too.
+
 ## Run the example
 
 ```bash
@@ -696,7 +741,17 @@ row every five seconds. The sinks are at <http://127.0.0.1:5180/views>.
 | `-- --kafka --node a` / `--node b` | one process per node on the local connector stack (below) |
 | `-- --headless` | the smoke test, in memory; add `--nodes 2` for a takeover, `--kafka` for two processes and a kill |
 | `-- --kafka --clean` | removes what the Kafka mode made under its prefix |
+| `--otlp` | export the meters over OTLP ([monitoring](#operating-it-monitoring)) |
 | `--port N`, `--rate N`, `--prefix name`, `--no-generate`, `--no-pipelines`, `--verbose` | |
+
+It can be left running. Trade ids come round again after 20,000, so the pipelines'
+state is bounded, and the in-memory backend compacts its state log as it goes
+(`InMemoryBackendOptions.StateCompactAbove`): a Release build at the default rate
+settles at about 690 MB of resident memory within twenty minutes and stays there, and
+at `--rate 5000` between 540 and 650 MB from the first minute to the tenth — the
+numbers are under *As built*, S6, in the design document. Stop it with Ctrl+C, or with
+SIGTERM if it runs in the background: a backgrounded `dotnet run` does not pass SIGINT
+on to the host, so run the built binary (`bin/…/Incremental.EnrichmentService`) there.
 
 Things to try in the UI, in the default mode:
 
@@ -707,11 +762,24 @@ Things to try in the UI, in the default mode:
 3. **Plugins → upload** `bin/Debug/net10.0/plugin-packages/enrichment.pipelines-v2.zip`
    from the example's output directory. It is stored as a second version.
 4. **Pipelines → trade-enrichment → Edit spec…**, set `"version"` to the new version.
-   The dry run says a state choice is required; choose *keep*. The pipeline restarts on
-   version 2 with its state: `http://127.0.0.1:5180/views/trade-enrichment` now shows a
-   `size` on every row emitted since, and not on the rest.
-5. The same for **desk-exposure**, choosing *reset*: version 2 groups by region, so it
-   reads its input again from the start.
+   The dry run says a state choice is required, and what the choice has to go on:
+
+   ```
+   version: 085cbd14f11deb0d → 048315b5d89db24c
+   state shapes: unchanged — the 4 state store(s) are the same and hold the same types
+   with the same members (Enrichment.Contracts.Counterparty, …, Enrichment.Pipelines.Booked,
+   Enrichment.Pipelines.Priced and 2 more); what the definition computes from them is not compared
+   ```
+
+   Version 2 adds a column to `EnrichedTrade`, the sink's row, which no state store
+   holds — so nothing the state depends on changed, and *keep* is the choice the
+   evidence supports. The pipeline restarts on version 2 with its state:
+   `http://127.0.0.1:5180/views/trade-enrichment` now shows a `size` on every row
+   emitted since, and not on the rest.
+5. The same for **desk-exposure**, choosing *reset*. Its evidence also reads
+   `unchanged` — version 2 keeps the same types and groups them by region instead of by
+   desk, which is the part the last clause says is not compared: the sums stored under
+   desk names are not sums per region. Reset, and it reads its input again from the start.
 6. **Pipelines → large-trades → Remove…** The dialog wants the id typed.
 
 ### On Kafka, with a standby
@@ -891,10 +959,41 @@ a setting not marked `[StateNeutral]`, an input or table binding, or the worker 
 refused with `state-choice-required` until the request says `state=keep` or
 `state=reset`. `keep` restarts the new generation on the old one's state and offsets,
 and recomputes nothing: rows delivered before stay as they were until something changes
-them. It is only as safe as the two versions' state is compatible, and it is not checked
-before the pipeline stops — an incompatible `keep` (a different worker count is one)
-leaves the pipeline in backoff with its committed state untouched, and the way out is
-the old spec or a reset.
+them.
+
+The refusal, and the plan of a dry run, carry the evidence for the choice. It is about
+the state and nothing else: the state stores of the spec that is deployed beside those
+of the one proposed, and the types they hold, member by member.
+
+| It says | It means |
+|---|---|
+| `state shapes: unchanged — the N state store(s) … (types)` | Same stores, same types, same members. `keep` reads what was written. Whether the definition still *means* the same by them is yours to know. |
+| `store 'x' is new (…): it starts empty` | An operator was added. Fine to keep; it sees only what arrives from now on. |
+| `store 'x' (…) has no place in the new circuit` | A stateful operator was removed, renamed or renumbered. `keep` is refused (below). |
+| `type T adds/drops/changes M — it is a value in 'x'` | Entries read with the new member defaulted; a dropped member is lost when an entry is next written. Usually fine to keep. |
+| `type T … — it identifies entries of 'x'` | The type is a key, or the value of a weight or indexed store: old entries are not found again under their new form. Reset. |
+| `keep is not possible: …` | The checkpoint cannot be resumed by the new circuit at all. Reset, or change the spec back. |
+
+**A `keep` that cannot work is refused before anything stops.** The new circuit is
+compared with the committed checkpoint at the dry run and again at the call: another
+worker count, a committed store with no home in the new circuit, or a table that was
+recreated since is `409 state-incompatible` with the reason, and the pipeline is not
+touched — it keeps running. Deploy the change with `state=reset`, or leave out what the
+checkpoint cannot follow.
+
+**A `keep` that turns out not to fit is rolled back.** What only shows when the state is
+read — a stored value that will not read as its new type — is found when the new
+generation is built. Nothing has run on the state by then, and the stores go back to
+the bytes they were made of. The service puts the previous spec back in one catalog
+commit, starts it, and the pipeline runs as before under a new generation number: it was
+down for two starts, not until someone repaired it. The call answers `409
+state-incompatible` saying so; the audit has `pipeline.replace.rolled-back` with the
+reason; the event feed has `rolled back to the spec of generation N`; and the
+pipeline's detail carries `rolledBack` until it is next deployed. A leader that dies in
+the middle leaves either the new spec with a note of the one it replaced — its successor
+tries it, finds the same, and rolls back itself — or the old spec, already put back.
+A circuit that cannot resume its state and has no previous spec to go back to (a spec
+changed behind the service's back) is `NeedsReset` at once, with no retries.
 
 **Reset.** State and input offsets are deleted and the pipeline starts again from its
 inputs' beginning, against the tables as they are now — so a `Lookup`'s "as it arrived"
@@ -921,9 +1020,18 @@ edited and deployed again; where nothing is stored to keep, `"***"` is refused.
 **Retention.** A table keeps the history its readers may still need: back to the oldest
 version any pipeline in the catalog has committed — a stopped pipeline counts — and, for
 the standby's sake, everything newer than `FollowerRetention` (10 min). The backend caps
-it (`RetainedHistoryVersions`: 100,000 on Kafka, 1,024 in memory). A stopped pipeline
-that the cap passes cannot resume and needs a reset; the table page shows each reader's
-distance from that, and the plan a `stop` returns states it.
+it (`RetainedHistoryVersions`: 100,000 on Kafka, 1,024 in memory; in memory also
+`RetainedHistoryChanges`, a million row changes across those versions, since one version
+of a first load can be the whole table). A stopped pipeline that the cap passes cannot
+resume and needs a reset; the table page shows each reader's distance from that, and the
+plan a `stop` returns states it.
+
+**The in-memory backend holds what is live, not what was ever written.** Its state log
+compacts itself: a partition that passes `StateCompactAbove` records (8,192) keeps the
+last record of every key and drops the tombstones every follower has read, and the next
+compaction is due at twice what survived — so the log is at most about twice the
+pipelines' live state. Nothing of it survives the process; it is for one machine, tests
+and demonstrations, and Kafka is the backend to run on.
 
 **Dead letters.** Under `"circuit": { "errorPolicy": "DeadLetter" }` a record an
 operator throws on is dropped — its retraction too — and kept in a ring of the newest
@@ -969,6 +1077,87 @@ the page after it. Rows that are passed over are not looked at, so any row of a 
 any size can be reached. A search (`contains=`) looks at no more than `MaxScannedRows`
 rows per request and then stops with `truncated` and a `next` to carry on from. The rows
 under an index key are paged with `skip`.
+
+## Operating it: monitoring
+
+The libraries publish two `System.Diagnostics.Metrics` meters and reference no exporter:
+
+- **`Incremental.Service`** — the service's own: pipelines, tables, the node's role and
+  readiness, takeovers. What to alert on is here.
+- **`Incremental`** — the core's, one series per circuit (the `circuit` tag is the
+  pipeline id): steps, records, step and commit durations, queue depths, watermark lag.
+  What to look at when an alert has fired.
+
+The host chooses where they go. The example exports both over OTLP when started with
+`--otlp`; the endpoint, protocol and interval are the exporter's standard environment
+variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL`,
+`OTEL_METRIC_EXPORT_INTERVAL`):
+
+<!-- snippet: examples/Incremental.EnrichmentService/Host/Node.cs#monitoring -->
+```csharp
+// The libraries publish two System.Diagnostics.Metrics meters and reference no
+// exporter; the host chooses one. OTLP here, to whatever collector the standard
+// variables name (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL,
+// OTEL_METRIC_EXPORT_INTERVAL).
+builder.Services.AddOpenTelemetry()
+    .ConfigureResource(resource => resource.AddService("enrichment-service", serviceInstanceId: nodeId))
+    .WithMetrics(metrics => metrics
+        .AddMeter(ServiceMeter.Name)        // "Incremental.Service": pipelines, tables, role, readiness, takeovers
+        .AddMeter("Incremental")            // the core: steps, records, durations and queues per circuit
+        .AddOtlpExporter());
+```
+
+That needs the packages `OpenTelemetry.Extensions.Hosting` and
+`OpenTelemetry.Exporter.OpenTelemetryProtocol` in the host; a Prometheus scrape endpoint
+or any other exporter is the same two `AddMeter` calls. Every node exports: the standby's
+series are how you know it is ready.
+
+**The instruments of `Incremental.Service`.** Tags are `node`, `pipeline`, `table` and
+three closed sets (`state`, `role`, `stage`) — never a key, an offset or a message.
+Gauges are read from a snapshot each node refreshes once a second (tables every five).
+
+| Instrument | Tags | |
+|---|---|---|
+| `incremental.service.node.role` | node, role | 1 for the role the node has, 0 for the other four |
+| `incremental.service.node.term` | node | the leader term it holds or last saw |
+| `incremental.service.node.health` | node | 0 healthy, 1 degraded, 2 unhealthy — `/health/status` as a number |
+| `incremental.service.node.standby_ready` | node | on a standby: 1 when a takeover now would be warm; on a leader with a peer configured: 1 when the peer is a ready standby |
+| `incremental.service.node.state_lag` | node | on a standby: state-log records not yet applied |
+| `incremental.service.catalog.version` | node | |
+| `incremental.service.takeovers` (counter) | node | times this node became the leader |
+| `incremental.service.takeover.duration` (histogram, s) | node, stage | `catalog`, `tables`, `pipelines`, `start_leading`; on Kafka also `silence`, `fence`, `storage`, `total` |
+| `incremental.service.pipelines` | node, state | pipelines in each state; every state is reported, zeros included |
+| `incremental.service.pipeline.up` | node, pipeline | leader only, for a pipeline that should run: 1 when it is `Running` |
+| `incremental.service.pipeline.source_lag` | node, pipeline | records its sources have still to read |
+| `incremental.service.pipeline.checkpoint_age` (s) | node, pipeline | since the running generation last committed |
+| `incremental.service.pipeline.sink_ack_wait` (s) | node, pipeline | how long the oldest sink write in flight has waited; 0 with none |
+| `incremental.service.pipeline.dead_letters` (counter) | node, pipeline | records dropped under `errorPolicy: DeadLetter` |
+| `incremental.service.pipeline.faults`, `.restarts`, `.rollbacks` (counters) | node, pipeline | faults; restarts scheduled after one; replaces rolled back |
+| `incremental.service.tables` | node, state | tables in each state |
+| `incremental.service.table.rows`, `.version` | node, table | |
+| `incremental.service.table.lag` | node, table | on a standby: versions of the table's log not yet applied |
+| `incremental.service.table.loader_lag` | node, table | on the leader: what the loader reports it has still to read |
+
+**What to alert on.** The thresholds are starting points for a service whose pipelines
+commit every step; a pipeline with `checkpointMaxDelay` or slow sinks needs its own.
+
+| Alert | Condition | Why |
+|---|---|---|
+| No leader | `sum(node.role{role="Leader"}) == 0` for 30 s | Nothing runs. A takeover takes `TakeoverAfter` (3 s) plus about a second; 30 s without a leader is not a takeover. |
+| Two leaders | `sum(node.role{role="Leader"}) > 1` for 15 s | Fencing makes this harmless for the logs and brief by construction; if it lasts, a node has not noticed it was fenced. |
+| No ready standby | `node.standby_ready == 0` on the leader for 5 min | The next failure is an outage, not a failover. |
+| Standby falling behind | `node.state_lag > 10 000`, or `table.lag > 100`, for 5 min | A takeover now would not be warm. |
+| Node unhealthy | `node.health == 2` for 1 min; `== 1` for 15 min (ticket) | Degraded names its reason in `/health/status`. |
+| Pipeline down | `pipeline.up == 0` for 2 min | Covers `Backoff`, `Blocked`, `Failed`, `NeedsReset` and `Wedged`; `pipelines{state="Failed"} > 0` tells you which kind. |
+| Pipeline flapping | `increase(pipeline.restarts[10m]) >= 3` | More than five faults in ten minutes (`RestartPolicy`) and it is `Failed`, which nothing retries. |
+| Not committing | `pipeline.checkpoint_age > 60` | Steps are not finishing or commits are not landing; look at `sink_ack_wait` next. |
+| Sink not acknowledging | `pipeline.sink_ack_wait > 30` | The pipeline is held by a sink: no step runs while a commit waits for delivery. |
+| Falling behind its input | `pipeline.source_lag` rising for 10 min, or above what your latency allows | Capacity, or a slow sink upstream of the commit. |
+| Records dropped | `increase(pipeline.dead_letters[5m]) > 0` | Each is a record that was not delivered. The ring on the leader has the newest 256. |
+| A replace was rolled back | `increase(pipeline.rollbacks[1h]) > 0` (ticket) | Someone's deploy did not take; the audit says why. |
+| Loader stuck | `tables{state="LoaderFaulted"} > 0` for 5 min, or `table.loader_lag` rising | Readers keep the last version; the data is going stale. |
+| Table faulted | `tables{state="Faulted"} + tables{state="Failed"} > 0` | Pipelines that read it are `Blocked`. |
+| Takeover slow | `takeover.duration{stage="start_leading"}` above your failover budget | Mostly the `pipelines` stage: state is decoded at takeover. |
 
 ## On Amazon MSK
 
@@ -1064,12 +1253,14 @@ with no authentication. Specifically not verified:
 - **The standby builds no circuits.** It holds state as bytes and builds at takeover, so
   the takeover pays for decoding every pipeline's state. That is measured only for small
   state.
-- **`keep` is not verified before the pipeline stops.** What a replace reports about
-  the two versions (`declared data shapes identical` or `differ`) compares what the
-  plugin's own assembly declares: the public members of its types, its enums' members and
-  values, its anonymous types' members. A shape that exists only inside a delegate — a
-  tuple, a type from a private dependency — is not compared, so `identical` is evidence
-  and not proof.
+- **`keep` is checked as far as the state can say.** The layout (worker count, store
+  names, table identities) is compared before anything stops; whether stored values read
+  as their new types is found when the new generation is built, and a failure there rolls
+  the replace back. What neither sees is meaning: two versions with the same stores and
+  the same types that compute different things from them (`desk-exposure` grouping by
+  region instead of by desk) read `state shapes: unchanged`. And once a replaced
+  generation has run and committed, there is no going back to the old state: a member the
+  new types do not model is gone from the entries they have rewritten.
 - **Plugin blobs are deleted by an unfenced writer.** A leader that is replaced in the
   middle of deleting a plugin version looks at whether it still leads before each file
   it deletes, which leaves a window of one call in which it can delete a file the new
