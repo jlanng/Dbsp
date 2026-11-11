@@ -1,9 +1,13 @@
 name: CI
 
+# The enrichment-service branch is built on every push so that its work is checked before
+# there is a pull request for it; workflow_dispatch runs any branch by hand
+# (`gh workflow run CI --ref <branch>`).
 on:
   push:
-    branches: [main]
+    branches: [main, enrichment-service]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build-and-test:
