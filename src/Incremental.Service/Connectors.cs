@@ -283,8 +283,11 @@ public sealed class MemoryConnector : IAppendSourceConnector, IKeyedSourceConnec
         private long _records;
         private long _position;
 
+        private readonly MemoryLog<T> _log;
+
         public Reader(MemoryLog<T> log, long from, Func<T, long, CancellationToken, ValueTask> send)
         {
+            _log = log;
             _position = from - 1;
             _run = Task.Run(async () =>
             {
@@ -311,7 +314,8 @@ public sealed class MemoryConnector : IAppendSourceConnector, IKeyedSourceConnec
         public Task Completion { get; }
 
         public SourceStats Stats => new(
-            Interlocked.Read(ref _records), 0, new Dictionary<int, long> { [0] = Volatile.Read(ref _position) });
+            Interlocked.Read(ref _records), 0, new Dictionary<int, long> { [0] = Volatile.Read(ref _position) },
+            Math.Max(0, _log.Count - 1 - Volatile.Read(ref _position)));
 
         public async ValueTask DisposeAsync()
         {

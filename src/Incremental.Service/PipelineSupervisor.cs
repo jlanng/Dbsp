@@ -300,10 +300,16 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             var generation = runtime.Current;
             long records = 0;
             long? lag = null;
+            long inFlightSince = 0;
             if (generation is not null)
             {
                 foreach (var stats in generation.SinkStats.Values)
+                {
                     records += Interlocked.Read(ref stats.Upserts) + Interlocked.Read(ref stats.Deletes) + Interlocked.Read(ref stats.Appends);
+                    var since = Interlocked.Read(ref stats.InFlightSinceTicks);
+                    if (since != 0 && (inFlightSince == 0 || since < inFlightSince))
+                        inFlightSince = since;
+                }
                 foreach (var (_, source) in generation.Sources)
                 {
                     try
@@ -317,7 +323,9 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                     }
                 }
             }
-            into.Add(new PipelineSampleInput(runtime.Id, generation?.Number ?? 0, records, lag, runtime.DeadLetters.Total));
+            into.Add(new PipelineSampleInput(
+                runtime.Id, generation?.Number ?? 0, records, lag, runtime.DeadLetters.Total,
+                runtime.State, runtime.Spec.Desired == DesiredState.Running, inFlightSince));
         }
     }
 
@@ -1256,6 +1264,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         var spec = runtime.Spec;
         IReadOnlyList<string> problems = [.. mismatch.Problems.Select(Flat)];
         var reason = string.Join("; ", problems);
+        ServiceMeter.PipelineFaults.Add(1, ServiceMeter.Tag("node", context.NodeId), ServiceMeter.Tag("pipeline", runtime.Id));
         lock (runtime.Faults)
         {
             runtime.Faults.Enqueue(new PipelineFault(DateTimeOffset.UtcNow, number, mismatch.GetType().Name, reason, null));
@@ -1304,6 +1313,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             await CommitAsync(runtime, restored, "pipeline.replace.rolled-back", "service", steps, CancellationToken.None).ConfigureAwait(false);
             runtime.RolledBack = new PipelineRollback(
                 DateTimeOffset.UtcNow, spec.Generation, previous.Generation, restored.Generation, spec.Plugin, spec.Version, spec.Definition, problems);
+            ServiceMeter.PipelineRollbacks.Add(1, ServiceMeter.Tag("node", context.NodeId), ServiceMeter.Tag("pipeline", runtime.Id));
             runtime.History.Add(new PipelineTransition(DateTimeOffset.UtcNow, PipelineState.Stopped, restored.Generation,
                 $"rolled back to the spec of generation {previous.Generation}: {reason}"));
             _logger.LogWarning(
@@ -1553,6 +1563,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             Set(runtime, PipelineState.Stopped, "this node no longer leads");
             return;
         }
+        ServiceMeter.PipelineFaults.Add(1, ServiceMeter.Tag("node", context.NodeId), ServiceMeter.Tag("pipeline", runtime.Id));
         if (during is null)
             _logger.LogError(ex, "Pipeline {Pipeline} generation {Generation} faulted", runtime.Id, runtime.Spec.Generation);
         else
@@ -1588,6 +1599,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         var delay = policy.BackoffAfter(runtime.FaultTimes.Count);
         runtime.BackoffUntil = now + delay;
         runtime.Restarts++;
+        ServiceMeter.PipelineRestarts.Add(1, ServiceMeter.Tag("node", context.NodeId), ServiceMeter.Tag("pipeline", runtime.Id));
         Set(runtime, PipelineState.Backoff, $"{prefix}{ex.GetType().Name}: {ex.Message}");
         ScheduleRetry(runtime, delay, PipelineState.Backoff);
     }

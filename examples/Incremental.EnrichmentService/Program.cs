@@ -13,7 +13,8 @@ using Incremental.Service;
 //   dotnet run --project examples/Incremental.EnrichmentService -- --kafka --clean      remove what the Kafka mode made
 //
 // Other flags: --port N, --rate N (trades per second), --prefix name (Kafka topics and
-// Postgres tables), --no-generate, --no-pipelines, --verbose. README.md beside this file
+// Postgres tables), --no-generate, --no-pipelines, --verbose, --otlp (export the meters
+// over OTLP; the endpoint is OTEL_EXPORTER_OTLP_ENDPOINT). README.md beside this file
 // walks through all of it.
 ExampleOptions options;
 try

@@ -21,7 +21,9 @@ public sealed record MetricSample(
 /// one-minute slots, oldest first.</summary>
 public sealed record PipelineMetrics(string Pipeline, IReadOnlyList<MetricSample> Seconds, IReadOnlyList<MetricSample> Minutes);
 
-internal readonly record struct PipelineSampleInput(string Id, long Generation, long RecordsOut, long? InputLag, long DeadLetters);
+internal readonly record struct PipelineSampleInput(
+    string Id, long Generation, long RecordsOut, long? InputLag, long DeadLetters,
+    PipelineState State = PipelineState.Unbuilt, bool DesiredRunning = false, long SinkInFlightSinceTicks = 0);
 
 /// <summary>
 /// The numbers an operator looks at, kept in the process: one <see cref="MeterListener"/>
@@ -68,6 +70,10 @@ public sealed class ServiceMetrics : IDisposable
     private readonly Accumulator _node = new();
     private readonly MeterListener _listener = new();
     private readonly List<PipelineSampleInput> _inputs = [];
+    private volatile PipelineGauge[] _gauges = [];
+
+    /// <summary>Every pipeline as of the last sample, for the service's meter.</summary>
+    internal PipelineGauge[] Gauges => _gauges;
     private readonly object _sampling = new();
     private readonly CancellationTokenSource _stop = new();
     private Task _loop = Task.CompletedTask;
@@ -203,6 +209,8 @@ public sealed class ServiceMetrics : IDisposable
                     _pipelines.TryRemove(id, out _);
             }
 
+            var gauges = new PipelineGauge[_inputs.Count];
+            var at = 0;
             long steps = 0, recordsIn = 0, recordsOut = 0, commits = 0, deadLetters = 0;
             double stepSeconds = 0, stepMax = 0, ackSeconds = 0, ackMax = 0;
             long? lagTotal = null;
@@ -236,6 +244,10 @@ public sealed class ServiceMetrics : IDisposable
                     Interlocked.Exchange(ref a.AckMaxTicks, 0) / (double)TimeSpan.TicksPerSecond,
                     dead, input.InputLag, age);
                 Push(a, sample);
+                gauges[at++] = new PipelineGauge(
+                    input.Id, input.State, input.DesiredRunning, input.InputLag, age,
+                    input.SinkInFlightSinceTicks == 0 ? 0 : Math.Max(0, (now.UtcTicks - input.SinkInFlightSinceTicks) / (double)TimeSpan.TicksPerSecond),
+                    input.DeadLetters);
 
                 steps += sample.Steps;
                 stepSeconds += sample.StepSeconds;
@@ -253,6 +265,7 @@ public sealed class ServiceMetrics : IDisposable
             }
             Push(_node, new MetricSample(
                 now, seconds, steps, stepSeconds, stepMax, recordsIn, recordsOut, commits, ackSeconds, ackMax, deadLetters, lagTotal, oldestCheckpoint));
+            _gauges = gauges;
         }
     }
 

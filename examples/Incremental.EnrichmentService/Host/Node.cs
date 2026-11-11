@@ -4,6 +4,8 @@ using Enrichment.Contracts;
 using Incremental.Kafka;
 using Incremental.Service;
 using Incremental.Service.Admin;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
 
 namespace Incremental.EnrichmentService;
 
@@ -42,6 +44,23 @@ public sealed class ExampleNode : IAsyncDisposable
 
         // What the adapters read and write. In a real host these are clients of real systems.
         builder.Services.AddSingleton(world);
+
+        // Two nodes in one process share the process's meters: one of them exports.
+        if (options.Otlp && (cluster is null || nodeId == "a"))
+        {
+            // <snippet:monitoring>
+            // The libraries publish two System.Diagnostics.Metrics meters and reference no
+            // exporter; the host chooses one. OTLP here, to whatever collector the standard
+            // variables name (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL,
+            // OTEL_METRIC_EXPORT_INTERVAL).
+            builder.Services.AddOpenTelemetry()
+                .ConfigureResource(resource => resource.AddService("enrichment-service", serviceInstanceId: nodeId))
+                .WithMetrics(metrics => metrics
+                    .AddMeter(ServiceMeter.Name)        // "Incremental.Service": pipelines, tables, role, readiness, takeovers
+                    .AddMeter("Incremental")            // the core: steps, records, durations and queues per circuit
+                    .AddOtlpExporter());
+            // </snippet:monitoring>
+        }
 
         // <snippet:host>
         var service = builder.Services.AddIncrementalService(o =>

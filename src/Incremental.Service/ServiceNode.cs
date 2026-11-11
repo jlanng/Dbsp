@@ -289,6 +289,8 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         _catalogOpen.Forget();
 
         _started = true;
+        Metrics.Sampled += RefreshGauges;
+        ServiceMeter.Register(this);
         Metrics.Start();
         _finished = backend.Leadership.WhenFinished.ContinueWith(_ => OnFinishedAsync(), TaskScheduler.Default).Unwrap();
         await backend.Leadership.StartAsync(
@@ -435,6 +437,11 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
             _catalogApplied = catalog.Version;
             _lastTakeover = new ServiceTakeoverTimings(
                 term, DateTimeOffset.UtcNow, _prepared.Catalog, _prepared.Tables, _prepared.TableCount, pipelines, pipelineCount, clock.Elapsed);
+            ServiceMeter.Takeovers.Add(1, ServiceMeter.Tag("node", NodeId));
+            ServiceMeter.RecordTakeover(NodeId, "catalog", _prepared.Catalog);
+            ServiceMeter.RecordTakeover(NodeId, "tables", _prepared.Tables);
+            ServiceMeter.RecordTakeover(NodeId, "pipelines", pipelines);
+            ServiceMeter.RecordTakeover(NodeId, "start_leading", clock.Elapsed);
             _logger.LogInformation(
                 "Service node {Node} leads, term {Term}: catalog {Catalog} ms, {Tables} table(s) {TablesMs} ms, {Pipelines} pipeline(s) {PipelinesMs} ms",
                 NodeId, term, (long)_prepared.Catalog.TotalMilliseconds, _prepared.TableCount, (long)_prepared.Tables.TotalMilliseconds,
@@ -741,6 +748,87 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
 
     public NodeHealth Health => Status.Health;
 
+    // ── the meter's snapshot ───────────────────────────────────────────────────────────
+
+    /// <summary>What the gauges of <see cref="ServiceMeter"/> report for this node; null
+    /// until the first refresh.</summary>
+    internal volatile GaugeSnapshot? Gauges;
+
+    private volatile TableGauge[] _tableGauges = [];
+    private int _gaugeTicks;
+    private int _tablesRefreshing;
+    private long _kafkaTakeoverRecorded;
+
+    /// <summary>Once a second, after the metrics sample: cheap, and never throws.</summary>
+    private void RefreshGauges()
+    {
+        try
+        {
+            // Tables ask their logs how far they are behind, so they are refreshed off
+            // this thread, every five seconds, one refresh at a time.
+            if (_gaugeTicks++ % 5 == 0 && Interlocked.Exchange(ref _tablesRefreshing, 1) == 0)
+                Task.Run(RefreshTableGaugesAsync).Forget();
+            RefreshNodeGauges();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Service node {Node}: refreshing the meter's snapshot failed", NodeId);
+        }
+    }
+
+    internal void RefreshNodeGauges()
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+            return;
+        var status = Status;
+        var role = status.Leadership.Role;
+        bool? standbyReady = role switch
+        {
+            NodeRole.Standby => status.Standby?.TakeoverWouldBeWarm ?? false,
+            NodeRole.Leader when _peerSampled && _context.Backend.Leadership.PeerExpected => _peer is { Role: NodeRole.Standby, Ready: true },
+            _ => null,
+        };
+        Gauges = new GaugeSnapshot(
+            NodeId, role, status.Leadership.Term, (int)status.Health.Level, standbyReady,
+            role == NodeRole.Standby ? Interlocked.Read(ref _stateLag) : null, status.CatalogVersion,
+            status.PipelinesByState, Metrics.Gauges, _tableGauges);
+
+        // The leadership's own stages are known only once it calls the takeover done.
+        if (status.Leadership.Kafka?.LastTakeover is { } kafka && role == NodeRole.Leader
+            && Interlocked.Exchange(ref _kafkaTakeoverRecorded, status.Leadership.Term) != status.Leadership.Term)
+        {
+            ServiceMeter.RecordTakeover(NodeId, "silence", kafka.Silence);
+            ServiceMeter.RecordTakeover(NodeId, "fence", kafka.Fence);
+            ServiceMeter.RecordTakeover(NodeId, "storage", kafka.Storage);
+            ServiceMeter.RecordTakeover(NodeId, "total", kafka.Total);
+        }
+    }
+
+    internal async Task RefreshTableGaugesAsync()
+    {
+        try
+        {
+            var gauges = new List<TableGauge>();
+            foreach (var table in _context.Tables.Tables)
+            {
+                try
+                {
+                    var stats = await _context.Tables.StatsAsync(table.Name).ConfigureAwait(false);
+                    gauges.Add(new TableGauge(stats.Name, stats.State, stats.Rows, stats.Version, stats.LagVersions, stats.Loader?.Lag));
+                }
+                catch (Exception ex) when (ex is ServiceException or ObjectDisposedException or InvalidOperationException)
+                {
+                    // Removed, or reopening: it is in the next refresh or it is gone.
+                }
+            }
+            _tableGauges = [.. gauges];
+        }
+        finally
+        {
+            Volatile.Write(ref _tablesRefreshing, 0);
+        }
+    }
+
     private NodeHealth ComputeHealth(NodeLeadershipStatus leadership, IReadOnlyList<PipelineStatus> pipelines, StandbyReadiness? standby)
     {
         var reasons = new List<string>();
@@ -932,6 +1020,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
+        ServiceMeter.Unregister(this);
         Metrics.Dispose();
         if (_started)
         {

@@ -39,6 +39,10 @@ public sealed class ExampleOptions
     public bool PrepareStack { get; init; } = true;
     public bool Verbose { get; init; }
 
+    /// <summary>Export the meters over OTLP. Where to is the exporter's own configuration:
+    /// <c>OTEL_EXPORTER_OTLP_ENDPOINT</c> and its companions.</summary>
+    public bool Otlp { get; init; }
+
     /// <summary>No log output at all: the smoke test's nodes, whose story its claims tell.</summary>
     public bool Quiet { get; init; }
 
@@ -74,6 +78,7 @@ public sealed class ExampleOptions
             Generate = !headless && !args.Contains("--no-generate"),
             PrepareStack = !args.Contains("--no-prepare"),
             Verbose = args.Contains("--verbose"),
+            Otlp = args.Contains("--otlp"),
         };
     }
 }
