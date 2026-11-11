@@ -107,6 +107,14 @@ public sealed class ServiceOptions
     /// found not to fit the kept state and before the catalog commit that puts the previous
     /// spec back.</summary>
     internal Func<string, Task>? BeforeRollbackCommit { get; set; }
+
+    /// <summary>Test hooks in a standby's build of a pipeline, awaited with its id: after
+    /// the plugin has been acquired and before the stores are bound to it, and after the
+    /// circuit has been built and before it is kept.</summary>
+    internal Func<string, Task>? BeforeStandbyBind { get; set; }
+
+    /// <inheritdoc cref="BeforeStandbyBind"/>
+    internal Func<string, Task>? AfterStandbyBuild { get; set; }
 }
 
 /// <summary>Something that happened on this node: a role change, a pipeline or table

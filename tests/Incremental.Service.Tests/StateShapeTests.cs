@@ -114,9 +114,23 @@ public class StateShapeTests
         var next = Shape(Weight<V1.Seen>("named.seen.distinct"), Value<string, long>("named.count.rows"));
         Assert.Empty(StateShapes.Differences(old, next));
         var line = StateShapes.Unchanged(next);
-        Assert.StartsWith("state shapes: unchanged — the 2 state store(s)", line);
+        Assert.StartsWith("state shapes: unchanged — the 2 state store(s) and the 1 table(s) it reads or writes are the same", line);
         Assert.Contains("StateShapeTests.Seen", line);
         Assert.DoesNotContain("SinkRow", line);
+    }
+
+    [Fact]
+    public void Unchanged_line_of_a_definition_with_no_stores_does_not_call_a_table_s_row_a_state_store_s()
+    {
+        // A stateless lookup over a table: no store, and the only types are the table's.
+        var lookup = StateShapes.Describe([], new Dictionary<string, (Type, Type)> { ["watchlist"] = (typeof(string), typeof(V1.Booked)) });
+        var line = StateShapes.Unchanged(lookup);
+        Assert.DoesNotContain("0 state store", line);
+        Assert.StartsWith("state shapes: unchanged — the definition keeps no state stores, before or after; the 1 table(s) it reads or writes hold the same types", line);
+        Assert.Contains("Booked", line);
+
+        var nothing = StateShapes.Unchanged(StateShapes.Describe([], new Dictionary<string, (Type, Type)>()));
+        Assert.Equal("state shapes: unchanged — the definition keeps no state stores and uses no tables, before or after; what the definition computes from them is not compared", nothing);
     }
 
     [Fact]

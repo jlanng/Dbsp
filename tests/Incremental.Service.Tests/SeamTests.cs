@@ -208,6 +208,111 @@ public class SeamTests
         public IUpsertSink<TKey, TRow> Create<TKey, TRow>(SinkContext context) where TKey : notnull => new InMemoryUpsertSink<TKey, TRow>();
     }
 
+    /// <summary>A source that carries trades and says so.</summary>
+    private sealed class TradesOnlyConnector : IAppendSourceConnector, ITypedConnector
+    {
+        public ConnectorDescription Describe(JsonElement config) => new("trades only");
+
+        public void RequireTypes(SlotKind kind, Type record, Type? key)
+        {
+            if (record != typeof(Trade))
+                throw new InvalidOperationException($"it carries Trade, not {record.Name}");
+        }
+
+        public Task<IRunningSource> StartAsync<T>(SourceContext<T> context, CancellationToken cancellationToken) where T : notnull =>
+            throw new NotSupportedException();
+    }
+
+    [Fact]
+    public async Task A_connector_that_carries_one_type_is_refused_for_another_at_the_dry_run_and_not_offered_by_the_template()
+    {
+        await using var service = await StartAsync(configure: b => b.AddSourceConnector("trades-only", _ => new TradesOnlyConnector()));
+
+        // The host's own connector comes first — for the slot it can feed, and only for that one.
+        var template = await service.Node.Discovery.TemplateAsync(BuiltIn, "", "trade-fills", "tf", default);
+        Assert.Equal("trades-only", template.Spec.Inputs["trades"].GetProperty("connector").GetString());
+        Assert.Equal("memory", template.Spec.Inputs["fills"].GetProperty("connector").GetString());
+        Assert.Contains("trades-only", template.ConnectorsForSlot["trades"]);
+        Assert.DoesNotContain("trades-only", template.ConnectorsForSlot["fills"]);
+        Assert.True(template.Valid, string.Join(" ", template.Problems));
+
+        // Bound by hand all the same, it is refused where the spec is checked, not at the first record.
+        var refused = await Assert.ThrowsAsync<ServiceException>(() => service.Pipelines.ValidateAsync(template.Spec with
+        {
+            Inputs = new Dictionary<string, JsonElement>
+            {
+                ["trades"] = template.Spec.Inputs["trades"], ["fills"] = Json("""{ "connector": "trades-only" }"""),
+            },
+        }, default));
+        Assert.Contains(refused.Details, d => d.StartsWith("input slot 'fills'") && d.Contains("it carries Trade, not Fill"));
+        Assert.DoesNotContain(refused.Details, d => d.StartsWith("input slot 'trades'"));
+    }
+
+    [Fact]
+    public async Task A_definition_asked_of_a_standby_is_refused_as_a_read_only_the_leader_answers()
+    {
+        var cluster = new InMemoryServiceCluster();
+        var memory = new MemoryConnector();
+        await using var leader = await StartAsync(cluster, "a", memory);
+        await using var standby = await StartAsync(cluster, "b", memory);
+        await Eventually(() => standby.Node.Status.Leadership.LeaderNodeId == "a", "the standby knowing its leader");
+        foreach (var ask in new Func<Task>[]
+                 {
+                     () => standby.Node.Discovery.DescribeDefinitionAsync(BuiltIn, "", "counts", null, default),
+                     () => standby.Node.Discovery.TemplateAsync(BuiltIn, "", "counts", null, default),
+                 })
+        {
+            var refused = await Assert.ThrowsAsync<ServiceException>(ask);
+            Assert.Equal(("not-leader", 409), (refused.Code, refused.Status));
+            Assert.DoesNotContain("mutations", refused.Message);
+            Assert.Contains("only the leader does: ask the leader ('a')", refused.Message);
+        }
+        // A mutation is still told what it was told.
+        var mutation = await Assert.ThrowsAsync<ServiceException>(() => standby.DeployAsync(Spec("p", "counts", "in", "out")));
+        Assert.Contains("mutations go to the leader ('a')", mutation.Message);
+    }
+
+    /// <summary>Says which property is secret in its config schema only, and refuses a
+    /// config without a host.</summary>
+    private sealed class SchemaSecretConnector : IUpsertSinkConnector, IConfigDescribed
+    {
+        public ConfigSchema ConfigSchema { get; } = new([new("host", "string", Required: true), new("apiKey", "string", Secret: true)]);
+
+        public ConnectorDescription Describe(JsonElement config) =>
+            config.TryGetProperty("host", out _) ? new("schema-secret") : throw new InvalidOperationException("the config needs a host");
+
+        public IUpsertSink<TKey, TRow> Create<TKey, TRow>(SinkContext context) where TKey : notnull => new InMemoryUpsertSink<TKey, TRow>();
+    }
+
+    [Fact]
+    public async Task A_property_marked_secret_in_the_config_schema_alone_is_blanked_and_restored_too()
+    {
+        await using var service = await StartAsync(configure: b => b.AddSinkConnector("schema-secret", _ => new SchemaSecretConnector()));
+        await service.DeclareInstrumentsAsync(Instruments(3));
+        var spec = Spec("k-enrich", "enrich", "k-in") with
+        {
+            Sinks = new Dictionary<string, JsonElement> { ["out"] = Json("""{ "connector": "schema-secret", "host": "db", "apiKey": "s3cr3t" }""") },
+        };
+        var deployed = await service.DeployAsync(spec);
+        Assert.DoesNotContain("s3cr3t", JsonSerializer.Serialize(deployed.Spec));
+        var shown = service.Pipelines.RedactedSpec("k-enrich");
+        Assert.Equal("***", shown.Sinks["out"].GetProperty("apiKey").GetString());
+        Assert.Equal("db", shown.Sinks["out"].GetProperty("host").GetString());
+
+        // Sent back as shown, the stored secret is kept, not the mark.
+        await service.DeployAsync(shown with { Generation = 0, Circuit = new PipelineCircuitOptions { CheckpointInterval = 3 } });
+        Assert.Equal("s3cr3t", service.Pipelines.Spec("k-enrich").Sinks["out"].GetProperty("apiKey").GetString());
+
+        // A config the connector refuses is still shown without what the schema marks:
+        // a dry run's refusal must not be the way a secret gets out.
+        var refused = await Assert.ThrowsAsync<ServiceException>(() => service.Pipelines.ValidateAsync(spec with
+        {
+            Id = "k-other",
+            Sinks = new Dictionary<string, JsonElement> { ["out"] = Json("""{ "connector": "schema-secret", "apiKey": "s3cr3t" }""") },
+        }, default));
+        Assert.DoesNotContain("s3cr3t", refused.Message + string.Join(" ", refused.Details));
+    }
+
     [Fact]
     public async Task A_spec_is_shown_with_the_properties_its_connector_calls_secret_blanked()
     {

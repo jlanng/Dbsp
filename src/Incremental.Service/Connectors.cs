@@ -5,8 +5,18 @@ using Microsoft.Extensions.Logging;
 namespace Incremental.Service;
 
 /// <summary>What a connector makes of a slot's config: a line for an operator to read, and
-/// the config properties that are secret (the admin API returns those as <c>***</c>).</summary>
-public sealed record ConnectorDescription(string Summary, IReadOnlyList<string>? SecretProperties = null);
+/// the config properties that are secret (the admin API returns those as <c>***</c>, and
+/// likewise every property its <see cref="IConfigDescribed.ConfigSchema"/> marks
+/// <see cref="ConfigProperty.Secret"/>: either declaration is enough).</summary>
+public sealed record ConnectorDescription(string Summary, IReadOnlyList<string>? SecretProperties = null)
+{
+    /// <summary>What a sink bound this way writes alone, as a name that is equal for two
+    /// configs exactly when they would write the same thing (the <c>files</c> sink's is
+    /// its store and prefix): a spec that binds a sink slot to something another sink
+    /// slot — its own or another pipeline's — already owns is refused. Null: nothing is
+    /// claimed.</summary>
+    public string? Owns { get; init; }
+}
 
 /// <summary>
 /// A source or sink kind, registered under a name (<c>AddSourceConnector</c>,
@@ -66,6 +76,29 @@ public interface IAppendSinkConnector : IConnector
 public interface IResettableSinkConnector
 {
     Task ResetAsync(SinkContext context, CancellationToken cancellationToken);
+}
+
+/// <summary>Optional on a source connector whose checkpointed position is not a partition
+/// and an offset as a person reads them: says the position in its own words. A dead
+/// letter then carries that under the input's name (<see cref="DeadLetterEnvelope.AfterAt"/>)
+/// in place of the input's raw partitions.</summary>
+public interface IPositionDescribing
+{
+    /// <summary>The position <paramref name="committed"/> (partition → offset, as the
+    /// source stamped them) stands for, for a slot bound with <paramref name="config"/>;
+    /// null when it says nothing.</summary>
+    string? DescribePosition(JsonElement config, IReadOnlyDictionary<int, long> committed);
+}
+
+/// <summary>Optional on a connector that carries only some types: refuses, at the dry
+/// run, a slot whose records it cannot carry. Without it a connector is taken to carry
+/// any type, and a mismatch shows when the pipeline runs.</summary>
+public interface ITypedConnector
+{
+    /// <summary>Throws <see cref="InvalidOperationException"/>, saying what the connector
+    /// carries, when a slot of this kind with these types cannot be bound to it.
+    /// <paramref name="key"/> is the key type of a keyed input or an upsert sink.</summary>
+    void RequireTypes(SlotKind kind, Type record, Type? key);
 }
 
 public abstract class SlotContext

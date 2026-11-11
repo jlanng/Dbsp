@@ -54,14 +54,16 @@ internal sealed class ServiceContext
     public long Term => Backend.Leadership.Term;
     public bool IsLeader => Leading && !Storage.IsFenced;
 
-    public void RequireLeader()
+    /// <summary>Refuses on a node that does not lead. <paramref name="what"/> says what
+    /// was asked for, when it is not a mutation: a read that only the leader can answer.</summary>
+    public void RequireLeader(string? what = null)
     {
         if (IsLeader)
             return;
         var status = Backend.Leadership.Status;
         throw new ServiceException(
             "not-leader",
-            $"Node '{NodeId}' is {status.Role}; mutations go to the leader" + (status.LeaderNodeId is { } leader ? $" ('{leader}')." : "."), 409);
+            $"Node '{NodeId}' is {status.Role}; {what ?? "mutations go to the leader"}" + (status.LeaderNodeId is { } leader ? $" ('{leader}')." : "."), 409);
     }
 
     public IReadOnlyList<PipelineSpec> PipelineSpecs() => Supervisor.Specs;
@@ -201,6 +203,9 @@ public sealed record LeaderRecord(string NodeId, long Term, string? AdminUrl, IR
 public sealed class ServiceNode : IHostedService, IAsyncDisposable
 {
     private readonly ServiceContext _context;
+
+    /// <summary>For tests of what lies under the node.</summary>
+    internal ServiceContext Context => _context;
     private readonly ILogger _logger;
     private readonly IHostApplicationLifetime? _lifetime;
     private readonly CancellationTokenSource _stopping = new();

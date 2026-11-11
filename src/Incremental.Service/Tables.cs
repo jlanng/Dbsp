@@ -42,11 +42,21 @@ public abstract class TableDefinition<TKey, TRow> : ITableDefinition, ITableDefi
 
     ITableHandle ITableDefinitionInternal.CreateHandle(TableRegistry registry, TableSpec spec) =>
         new TableHandle<TKey, TRow>(registry, this, spec);
+
+    void ITableDefinitionInternal.CheckSource(TableRegistry registry, TableLoaderSpec loader)
+    {
+        var source = registry.CreateSource<TKey, TRow>(loader);
+        (source as IDisposable)?.Dispose();
+    }
 }
 
 internal interface ITableDefinitionInternal
 {
     ITableHandle CreateHandle(TableRegistry registry, TableSpec spec);
+
+    /// <summary>Asks the loader's factory for a source of this table's types and lets it
+    /// go: a factory that does not serve them says so here, before anything is opened.</summary>
+    void CheckSource(TableRegistry registry, TableLoaderSpec loader);
 }
 
 /// <summary>A secondary index, declared once with its selector, so that no pipeline
@@ -174,7 +184,11 @@ public interface ITableSource<TKey, TRow>
     Task RunAsync(TableSourceContext<TKey, TRow> context, CancellationToken cancellationToken);
 }
 
-/// <summary>Registered in DI under a kind name (<c>AddTableSource</c>).</summary>
+/// <summary>Registered in DI under a kind name (<c>AddTableSource</c>). <c>Create</c>
+/// is called when a table's loader starts and also when a declare is checked (the dry run
+/// included), where the source is made and dropped unused: it must open nothing, and it
+/// throws <see cref="InvalidOperationException"/> for a key or row type, or a config, it
+/// does not serve — which refuses the declare.</summary>
 public interface ITableSourceFactory
 {
     ITableSource<TKey, TRow> Create<TKey, TRow>(TableLoaderSpec loader)

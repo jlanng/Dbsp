@@ -504,7 +504,8 @@ internal static class AdminApi
                 inputs = described.Inputs.Take(options.MaxRows),
                 sinks = described.Sinks.Take(options.MaxRows),
                 tables = described.Tables.Take(options.MaxRows),
-                notes = described.Notes.Take(options.MaxRows),
+                // A note that quotes an exception does so after its first colon (DefinitionDescription).
+                notes = described.Notes.Take(options.MaxRows).Select(state.Head),
             });
         });
 
@@ -519,7 +520,7 @@ internal static class AdminApi
                 spec = AdminJson.Spec(template.Spec),
                 template.Valid,
                 problems = template.Problems.Take(options.MaxRows),
-                notes = template.Notes.Take(options.MaxRows),
+                notes = template.Notes.Take(options.MaxRows).Select(state.Head),
                 connectorsForSlot = template.ConnectorsForSlot,
             });
         });
@@ -566,7 +567,7 @@ internal static class AdminApi
                     d.Definition,
                     d.Change,
                     members = d.Members.Take(options.MaxRows),
-                    notes = d.Notes.Take(options.MaxRows).Select(n => state.Message(n) ?? "(hidden: ExposeRowData is off)"),
+                    notes = d.Notes.Take(options.MaxRows).Select(state.Head),
                 }),
                 tableDefinitions = diff.TableDefinitions.Take(options.MaxRows),
                 notes = diff.Notes.Take(options.MaxRows),

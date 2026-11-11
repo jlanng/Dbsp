@@ -201,7 +201,8 @@ public class TableTests
         public ITableSource<TKey, TRow> Create<TKey, TRow>(TableLoaderSpec loader)
             where TKey : notnull
             where TRow : class =>
-            (ITableSource<TKey, TRow>)(object)new Source(this);
+            new Source(this) as ITableSource<TKey, TRow>
+            ?? throw new InvalidOperationException($"the sequence feed carries instruments, not {typeof(TRow).Name}");
 
         private sealed class Source(SequenceFeed feed) : ITableSource<int, Instrument>
         {
@@ -252,6 +253,22 @@ public class TableTests
         lock (feed.ResumedFrom)
             Assert.Equal([-1L, 4L], feed.ResumedFrom);
         Assert.Equal(7, feed.Applied); // nothing was applied twice
+
+        // A factory asked for a table it does not serve refuses the declare — the dry run
+        // too — before a log is created or the catalog names the table.
+        var counterparties = new TableSpec { Name = "parties", Definition = typeof(CounterpartiesTable).FullName!, Loader = new TableLoaderSpec("sequence") };
+        var planned = Assert.Throws<ServiceException>(() => service.Tables.PlanDeclare(counterparties));
+        Assert.Equal("invalid", planned.Code);
+        Assert.Contains("The sequence loader cannot load table 'parties' (String → Counterparty)", planned.Message);
+        Assert.Contains("the sequence feed carries instruments", planned.Message);
+        var declared = await Assert.ThrowsAsync<ServiceException>(() => service.Tables.DeclareAsync(counterparties, default));
+        Assert.Equal(planned.Message, declared.Message);
+        Assert.DoesNotContain(service.Tables.Tables, t => t.Name == "parties");
+        Assert.Null(service.Node.Catalog.Get("table/parties"));
+        Assert.Contains("start its sequence loader", string.Join(" ", service.Tables.PlanDeclare(counterparties with
+        {
+            Name = "more-instruments", Definition = typeof(InstrumentsTable).FullName!,
+        }).Steps));
 
         // An unknown loader kind is refused at the declaration.
         var refused = await Assert.ThrowsAsync<ServiceException>(() => service.Tables.DeclareAsync(new TableSpec

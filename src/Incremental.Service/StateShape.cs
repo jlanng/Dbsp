@@ -214,7 +214,14 @@ internal static class StateShapes
         var named = types.Count == 0 ? "no types of their own"
             : types.Count <= 6 ? string.Join(", ", types)
             : string.Join(", ", types.Take(6)) + $" and {types.Count - 6} more";
-        return $"state shapes: unchanged — the {shape.Stores.Count} state store(s) are the same and hold the same types with the same members ({named}); " +
-               "what the definition computes from them is not compared";
+        // Types covers the tables' rows too: a definition with no store of its own still
+        // has types to name, and they are the tables', not "state stores'".
+        var tables = shape.Tables.Count == 0 ? null : $"the {shape.Tables.Count} table(s) it reads or writes";
+        var what = shape.Stores.Count == 0
+            ? tables is null
+                ? "the definition keeps no state stores and uses no tables, before or after"
+                : $"the definition keeps no state stores, before or after; {tables} hold the same types with the same members ({named})"
+            : $"the {shape.Stores.Count} state store(s){(tables is null ? "" : " and " + tables)} are the same and hold the same types with the same members ({named})";
+        return $"state shapes: unchanged — {what}; what the definition computes from them is not compared";
     }
 }

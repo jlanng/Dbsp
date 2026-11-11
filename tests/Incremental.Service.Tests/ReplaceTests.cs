@@ -153,6 +153,47 @@ public class ReplaceTests
     }
 
     [Fact]
+    public async Task Second_replace_that_touches_no_state_keeps_the_spec_to_go_back_to()
+    {
+        await using var service = await StartAsync();
+        var input = service.Memory.Log<Trade>("in");
+        input.AppendRange(Trades(0, 200));
+        await service.DeployAsync(Spec("p", "counts", "in", "out"));
+        var sink = service.Memory.UpsertSink<string, long>("out");
+        await Eventually(() => Same(sink.Rows, Counts.Model(Trades(0, 200))), "the first output");
+
+        // A keep that will not fit, left stopped: generation 2 never runs, so the state
+        // is still generation 1's and the catalog says so.
+        var stopped = Spec("p", "counts-by-instrument", "in", "out-2") with { Desired = DesiredState.Stopped };
+        await service.DeployAsync(stopped, StateChoice.Keep);
+        Assert.Equal(1, service.Pipelines.Spec("p").Previous?.Generation);
+
+        // The same spec with another sink: nothing that touches state differs from
+        // generation 2 — but the state is not generation 2's.
+        var third = await service.Pipelines.DeployAsync(
+            Spec("p", "counts-by-instrument", "in", "out-3") with { Desired = DesiredState.Stopped }, new DeployOptions(), default);
+        Assert.Equal(1, service.Pipelines.Spec("p").Previous?.Generation);
+        Assert.Equal("counts", service.Pipelines.Spec("p").Previous?.Definition);
+        Assert.Contains(third.Plan.Steps, s => s.Contains("the spec of generation 1 is put back"));
+        Assert.Contains(third.Plan.Steps, s => s.Contains("the state is still generation 1's"));
+        Assert.True(service.Pipelines.Get("p").ReplaceUnconfirmed);
+
+        await service.Pipelines.StartAsync("p", new ActionOptions(), default);
+        await Eventually(() => service.Pipelines.Get("p") is { State: PipelineState.Running, Definition: "counts" }, "the roll-back to generation 1's spec");
+        var status = service.Pipelines.Get("p");
+        Assert.Equal(1, status.RolledBack?.Restored);
+        Assert.Null(service.Pipelines.Spec("p").Previous);
+        input.AppendRange(Trades(200, 100));
+        await Eventually(() => Same(sink.Rows, Counts.Model(Trades(0, 300))), "the output on the kept state");
+
+        // Going back by hand to the spec that wrote the state leaves nothing to go back to.
+        await service.DeployAsync(stopped, StateChoice.Keep);
+        Assert.NotNull(service.Pipelines.Spec("p").Previous);
+        await service.DeployAsync(Spec("p", "counts", "in", "out") with { Desired = DesiredState.Stopped }, StateChoice.Keep);
+        Assert.Null(service.Pipelines.Spec("p").Previous);
+    }
+
+    [Fact]
     public async Task Takeover_in_the_middle_of_a_roll_back_ends_with_the_previous_spec_running()
     {
         var cluster = new InMemoryServiceCluster();

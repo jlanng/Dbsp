@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -65,6 +66,13 @@ internal sealed record FilesSlotConfig
     /// <summary>Sinks only: the least time between two objects (hh:mm:ss).</summary>
     public string? MinInterval { get; init; }
 
+    /// <summary>Sources only: the longest line, in characters, that is read as a record.</summary>
+    public int? MaxLineLength { get; init; }
+
+    public const int DefaultMaxLineLength = 1 << 20;
+
+    public int LineLimit => MaxLineLength ?? DefaultMaxLineLength;
+
     private static readonly JsonSerializerOptions Strict = new(JsonSerializerDefaults.Web)
     {
         UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
@@ -86,7 +94,7 @@ internal sealed record FilesSlotConfig
         catch (JsonException ex)
         {
             throw new InvalidOperationException(
-                $"the files config accepts connector, store, prefix, suffix, pollInterval and minInterval — where the store is belongs to the host ({ex.Message})");
+                $"the files config accepts connector, store, prefix, suffix, pollInterval, maxLineLength and minInterval — where the store is belongs to the host ({ex.Message})");
         }
         if (string.IsNullOrEmpty(parsed.Prefix))
             throw new InvalidOperationException("the files config needs a \"prefix\": the objects of this slot are the ones whose name starts with it");
@@ -98,8 +106,13 @@ internal sealed record FilesSlotConfig
         if (parsed.MinInterval is not null
             && (!TimeSpan.TryParse(parsed.MinInterval, CultureInfo.InvariantCulture, out var spacing) || spacing < TimeSpan.Zero))
             throw new InvalidOperationException($"minInterval is a duration (hh:mm:ss), not '{parsed.MinInterval}'");
+        if (parsed.MaxLineLength is < 1 or > MaxMaxLineLength)
+            throw new InvalidOperationException($"maxLineLength is a number of characters from 1 to {MaxMaxLineLength}, not {parsed.MaxLineLength}");
         return parsed;
     }
+
+    // A line is held whole, as text, while it is parsed: this is what one costs at most.
+    public const int MaxMaxLineLength = 1 << 26;
 }
 
 /// <summary>
@@ -142,7 +155,8 @@ internal sealed record FilesSlotConfig
 /// </para>
 /// </summary>
 public sealed class FileConnector(ObjectStores stores)
-    : IAppendSourceConnector, IKeyedSourceConnector, IAppendSinkConnector, IUpsertSinkConnector, IResettableSinkConnector, IConfigDescribed
+    : IAppendSourceConnector, IKeyedSourceConnector, IAppendSinkConnector, IUpsertSinkConnector, IResettableSinkConnector, IConfigDescribed,
+        IPositionDescribing
 {
     public ConfigSchema ConfigSchema { get; } = new(
     [
@@ -150,6 +164,7 @@ public sealed class FileConnector(ObjectStores stores)
         new("prefix", "string", Required: true, Description: "The objects of this slot are those whose name starts with it. One slot of one pipeline per prefix."),
         new("suffix", "string", Description: "Sources: read only objects whose name ends with this."),
         new("pollInterval", "string", Description: "Sources: how often the prefix is listed for new objects, as a duration (hh:mm:ss).", Default: "00:00:05"),
+        new("maxLineLength", "number", Description: "Sources: the longest line, in characters, read as a record. A longer one is rejected like a line that is not a record, without being held.", Default: "1048576"),
         new("minInterval", "string", Description: "Sinks: the least time between two objects, as a duration (hh:mm:ss). The pipeline pauses to keep it, so steps and objects grow.", Default: "00:00:00"),
     ], "JSON-lines objects under a prefix: read in name order as an append or keyed input, written one object per step as an append or upsert sink.");
 
@@ -162,14 +177,18 @@ public sealed class FileConnector(ObjectStores stores)
     public ConnectorDescription Describe(JsonElement config)
     {
         var (parsed, _) = Resolve(config);
-        return new ConnectorDescription($"objects under {parsed.Prefix} in store {parsed.Store}");
+        // A sink deletes step objects under its prefix (above the checkpoint at a start,
+        // all of them at a reset): the prefix is one sink slot's alone.
+        return new ConnectorDescription($"objects under {parsed.Prefix} in store {parsed.Store}") { Owns = $"files:{parsed.Store}:{parsed.Prefix}" };
     }
+
+    public string? DescribePosition(JsonElement config, IReadOnlyDictionary<int, long> committed) => FilePosition.Describe(committed);
 
     internal static void RequireKind(JsonElement json, SlotKind kind)
     {
         var config = FilesSlotConfig.Parse(json);
-        if (kind is SlotKind.AppendSink or SlotKind.UpsertSink && (config.Suffix is not null || config.PollInterval is not null))
-            throw new InvalidOperationException("\"suffix\" and \"pollInterval\" are a source's settings");
+        if (kind is SlotKind.AppendSink or SlotKind.UpsertSink && (config.Suffix is not null || config.PollInterval is not null || config.MaxLineLength is not null))
+            throw new InvalidOperationException("\"suffix\", \"pollInterval\" and \"maxLineLength\" are a source's settings");
         if (kind is SlotKind.AppendInput or SlotKind.KeyedInput && config.MinInterval is not null)
             throw new InvalidOperationException("\"minInterval\" is a sink's setting");
     }
@@ -242,9 +261,10 @@ public sealed class FileConnector(ObjectStores stores)
                 await FileSinkFormat.DeleteAboveAsync(store, prefix, _startedAt, cancellationToken).ConfigureAwait(false);
                 _cleaned = true;
             }
-            var stream = await store.OpenWriteAsync(FileSinkFormat.ObjectName(prefix, sequence, context.Term), cancellationToken).ConfigureAwait(false);
-            await using (stream.ConfigureAwait(false))
-                await write(state, stream, cancellationToken).ConfigureAwait(false);
+            // Whole or not at all: a write that fails or is cancelled part-way leaves
+            // nothing under the step's name (IObjectStore.WriteAsync).
+            await store.WriteAsync(
+                FileSinkFormat.ObjectName(prefix, sequence, context.Term), (stream, ct) => write(state, stream, ct), cancellationToken).ConfigureAwait(false);
 
             // The object is written at once — the lease was checked a moment ago — and
             // the acknowledgement is what waits: the circuit commits, and steps again,
@@ -459,6 +479,52 @@ internal static class FilePosition
         yield return (1, (ordinal << 32) | (uint)bytes.Length);
     }
 
+    /// <summary>The highest ordinal any committed partition carries. It can be above the
+    /// one partition 1 names: a checkpoint may hold the first parts of the next object's
+    /// name and not yet its length.</summary>
+    public static long Highest(IReadOnlyDictionary<int, long> committed)
+    {
+        long highest = 0;
+        foreach (var offset in committed.Values)
+            highest = Math.Max(highest, offset >> 32);
+        return highest;
+    }
+
+    /// <summary>
+    /// The ordinal for the object after <paramref name="current"/>, given the
+    /// <paramref name="highest"/> ordinal ever sent. It is above every ordinal sent, so
+    /// that no part of the new name is at or below something a checkpoint already holds
+    /// and dropped for it (an input admits only offsets above its position) — which is
+    /// what would mix two names when the object read after a restart is not the one whose
+    /// name was half committed before it. And it has the other parity than
+    /// <paramref name="current"/>, so the new name goes to the bank the current name is
+    /// not in.
+    /// </summary>
+    public static long Next(long current, long highest)
+    {
+        var next = highest + 1;
+        if (((next ^ current) & 1) == 0)
+            next++;
+        if (next > int.MaxValue)
+            throw new InvalidOperationException("The files source has numbered 2³¹ objects; reset the pipeline to start the numbering again.");
+        return next;
+    }
+
+    /// <summary>The committed position as a person reads it: <c>object:line</c>, the
+    /// line being the last one consumed, counted from 1 (0: none of it yet). Null with
+    /// nothing committed.</summary>
+    public static string? Describe(IReadOnlyDictionary<int, long> committed)
+    {
+        try
+        {
+            return Decode(committed) is { } at ? $"{at.Name}:{at.Line + 1}" : null;
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
     /// <summary>The committed position: the ordinal and name of the object the source had
     /// moved to, and the last line of it that is consumed (-1: none). Null with nothing
     /// committed.</summary>
@@ -484,7 +550,8 @@ internal static class FilePosition
 }
 
 /// <summary>Reads the objects under a prefix, in name order, line by line, into an input.
-/// It holds one line and a bounded list of names at a time.</summary>
+/// It holds one line — of at most <c>maxLineLength</c> characters — and a bounded list of
+/// names at a time.</summary>
 internal sealed class FileSourceReader : IRunningSource
 {
     private const int ListAhead = 1024;
@@ -517,7 +584,8 @@ internal sealed class FileSourceReader : IRunningSource
         var position = FilePosition.Decode(committed);
         if (committed.TryGetValue(0, out var offset))
             _offset = offset;
-        _run = Task.Run(() => RunAsync(position, _stop.Token));
+        var highest = FilePosition.Highest(committed);
+        _run = Task.Run(() => RunAsync(position, highest, _stop.Token));
         Completion = _run.ContinueWith(
             t => t.IsFaulted && !_stop.IsCancellationRequested ? Task.FromException(t.Exception!.GetBaseException()) : Task.CompletedTask,
             TaskScheduler.Default).Unwrap();
@@ -532,7 +600,7 @@ internal sealed class FileSourceReader : IRunningSource
     public static T Read<T>(string text, JsonSerializerOptions json) =>
         JsonSerializer.Deserialize<T>(text, json) ?? throw new JsonException("The line is null.");
 
-    private async Task RunAsync((long Ordinal, string Name, long Line)? position, CancellationToken stop)
+    private async Task RunAsync((long Ordinal, string Name, long Line)? position, long highest, CancellationToken stop)
     {
         var ordinal = position?.Ordinal ?? 0;
         var current = position?.Name;
@@ -544,6 +612,7 @@ internal sealed class FileSourceReader : IRunningSource
         {
             stop.ThrowIfCancellationRequested();
             var (next, unread) = await NextAsync(current, resumeCurrent, stop).ConfigureAwait(false);
+            var listed = Stopwatch.GetTimestamp();
             Interlocked.Exchange(ref _unread, unread);
             if (next.Count == 0)
             {
@@ -558,7 +627,7 @@ internal sealed class FileSourceReader : IRunningSource
                 else
                 {
                     // A new object: its name goes into the checkpoint before its first line.
-                    ordinal++;
+                    ordinal = highest = FilePosition.Next(ordinal, highest);
                     foreach (var (partition, offset) in FilePosition.Name(ordinal, name))
                         await _advance(partition, offset, stop).ConfigureAwait(false);
                 }
@@ -566,6 +635,12 @@ internal sealed class FileSourceReader : IRunningSource
                 current = name;
                 await ReadObjectAsync(name, ordinal, from, stop).ConfigureAwait(false);
                 Interlocked.Decrement(ref _unread);
+
+                // A listing is good for one poll interval. With a backlog the names it
+                // gave can take long to read, and an object that arrives meanwhile with a
+                // name among them is only seen by listing again before passing it.
+                if (Stopwatch.GetElapsedTime(listed) >= _config.Poll)
+                    break;
             }
         }
     }
@@ -606,26 +681,41 @@ internal sealed class FileSourceReader : IRunningSource
         await using (stream.ConfigureAwait(false))
         {
             using var reader = new StreamReader(stream, Encoding.UTF8);
+            var lines = new BoundedLineReader(reader, _config.LineLimit);
             long line = -1;
-            while (await reader.ReadLineAsync(stop).ConfigureAwait(false) is { } text)
+            while (await lines.ReadLineAsync(stop).ConfigureAwait(false) is { } read)
             {
                 line++;
-                if (line < from || string.IsNullOrWhiteSpace(text))
+                if (line < from || (!read.TooLong && string.IsNullOrWhiteSpace(read.Text)))
                     continue;
                 if (line > uint.MaxValue)
                     throw new InvalidOperationException($"Object '{name}' has more than {uint.MaxValue} lines.");
                 var offset = FilePosition.Line(ordinal, line);
-                try
+                if (read.TooLong)
                 {
-                    await _send(text, offset, stop).ConfigureAwait(false);
-                    Interlocked.Increment(ref _records);
-                }
-                catch (Exception ex) when (ex is JsonException or NotSupportedException)
-                {
+                    // Not held, not parsed: its first characters and its place are what is reported.
                     Interlocked.Increment(ref _unreadable);
-                    // The position is in the message too: an input's offset says nothing to a person.
-                    await _reject(new FileRecord(name, line, text), new FormatException($"{name}:{line + 1} is not a record: {ex.Message}", ex), offset, stop)
-                        .ConfigureAwait(false);
+                    await _reject(
+                        new FileRecord(name, line, read.Text),
+                        new FormatException(
+                            $"{name}:{line + 1} is a line of {read.Length} characters; the source reads lines of up to {_config.LineLimit} (maxLineLength). " +
+                            "An object that is not JSON lines does not belong under the prefix."),
+                        offset, stop).ConfigureAwait(false);
+                }
+                else
+                {
+                    try
+                    {
+                        await _send(read.Text, offset, stop).ConfigureAwait(false);
+                        Interlocked.Increment(ref _records);
+                    }
+                    catch (Exception ex) when (ex is JsonException or NotSupportedException)
+                    {
+                        Interlocked.Increment(ref _unreadable);
+                        // The position is in the message too: an input's offset says nothing to a person.
+                        await _reject(new FileRecord(name, line, read.Text), new FormatException($"{name}:{line + 1} is not a record: {ex.Message}", ex), offset, stop)
+                            .ConfigureAwait(false);
+                    }
                 }
                 Interlocked.Exchange(ref _offset, offset);
                 _at = $"{name}:{line + 1}";
@@ -645,5 +735,85 @@ internal sealed class FileSourceReader : IRunningSource
             // Cancellation, or the fault Completion already carries.
         }
         _stop.Dispose();
+    }
+}
+
+/// <summary>One line of a text, or the start of one that is longer than the limit.</summary>
+internal readonly record struct LineRead(string Text, long Length, bool TooLong);
+
+/// <summary>
+/// <see cref="TextReader.ReadLine"/> with a bound: a line of more than
+/// <paramref name="limit"/> characters is read past without being held, and returned as
+/// its first <see cref="Kept"/> characters and its length. Lines end at <c>\n</c>,
+/// <c>\r\n</c> or <c>\r</c>, as they do for <see cref="TextReader"/>.
+/// </summary>
+internal sealed class BoundedLineReader(TextReader reader, int limit)
+{
+    public const int Kept = 4096;
+
+    private readonly char[] _buffer = new char[16 * 1024];
+    private readonly StringBuilder _line = new();
+    private int _start;
+    private int _end;
+    private bool _skipLineFeed;
+
+    /// <summary>The most characters of one line this reader has held at a time: bounded
+    /// by the limit whatever the lines are.</summary>
+    internal int Held { get; private set; }
+
+    public async ValueTask<LineRead?> ReadLineAsync(CancellationToken cancellationToken)
+    {
+        _line.Clear();
+        if (_line.Capacity > 64 * 1024)
+            _line.Capacity = Kept;          // one long line does not keep its buffer for the rest
+        long length = 0;
+        var any = false;
+        while (true)
+        {
+            if (_start == _end)
+            {
+                _start = 0;
+                _end = await reader.ReadAsync(_buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
+                if (_end == 0)
+                    return any ? Line(length) : null;
+            }
+            if (_skipLineFeed)
+            {
+                _skipLineFeed = false;
+                if (_buffer[_start] == '\n')
+                {
+                    _start++;
+                    continue;
+                }
+            }
+            var span = _buffer.AsSpan(_start, _end - _start);
+            var end = span.IndexOfAny('\r', '\n');
+            var take = end < 0 ? span.Length : end;
+            any = true;
+            length += take;
+
+            // A line within the limit is held whole; of a longer one, what the report shows.
+            var room = (length > limit ? Kept : limit) - _line.Length;
+            if (room > 0)
+                _line.Append(span[..Math.Min(take, room)]);
+            if (_line.Length > Held)
+                Held = _line.Length;
+            if (end < 0)
+            {
+                _start = _end;
+                continue;
+            }
+            _skipLineFeed = span[end] == '\r';
+            _start += end + 1;
+            return Line(length);
+        }
+    }
+
+    private LineRead Line(long length)
+    {
+        var tooLong = length > limit;
+        if (tooLong && _line.Length > Kept)
+            _line.Length = Kept;
+        return new LineRead(_line.ToString(), length, tooLong);
     }
 }

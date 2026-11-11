@@ -824,6 +824,18 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         Assert.False(table["unreadable"][0].TryGetProperty("message", out _));
         Assert.False(table["unreadable"][0].TryGetProperty("record", out _));
 
+        // A definition's description quotes what its Build threw — which can quote the
+        // settings it was asked with — only when messages may be shown.
+        var version = (await admin.Get("plugins"))["items"].EnumerateArray()
+            .First(p => p.GetProperty("name").GetString() == DemoHost.Plugin).GetProperty("version").GetString();
+        var badDesk = Uri.EscapeDataString("""{ "desks": ["X <b>"] }""");
+        var described = await admin.Get($"plugins/{DemoHost.Plugin}/{version}/definitions/desk-risk?settings={badDesk}");
+        Assert.Equal(200, described.Code);
+        var note = Assert.Single(described["notes"].EnumerateArray()).GetString()!;
+        Assert.StartsWith("The slots may be incomplete, because the definition threw ", note);
+        Assert.DoesNotContain("X <b>", described.Body.ToString());
+        Assert.DoesNotContain(":", note);
+
         // Nothing anywhere in what the API returns quotes the offending value.
         await TestService.Eventually(() => admin.Node.Node.Pipelines.Get("checked-orders").State == PipelineState.Failed, "the checked pipeline failed");
         Assert.Contains((await admin.Get("events/recent?limit=200"))["items"].EnumerateArray(),

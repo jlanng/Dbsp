@@ -229,6 +229,111 @@ public class WarmStandbyTests
     }
 
     [Fact]
+    public async Task A_table_opened_again_while_the_standby_builds_on_it_has_the_circuit_built_again()
+    {
+        var cluster = new InMemoryServiceCluster();
+        var memory = new MemoryConnector();
+        await using var a = await StartAsync(cluster, "a", memory);
+        var instruments = Instruments(5);
+        var table = await a.DeclareInstrumentsAsync(instruments);
+        await a.DeployAsync(Spec("e", "enrich", "in", "out"));
+        var trades = Trades(0, 40, instruments: 5);
+        memory.Log<Trade>("in").AppendRange(trades);
+        var sink = memory.UpsertSink<long, EnrichedTrade>("out");
+        await Eventually(() => Same(sink.Rows, Enrich.Model(trades, instruments)), "the leader's output");
+
+        // The standby's first build of the circuit has resolved the table when the table
+        // is opened from its log again — and that is over before the build is kept. The
+        // circuit holds the old instance, which follows nothing any more.
+        var standby = new TaskCompletionSource<TestService>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var builds = 0;
+        await using var b = await StartAsync(cluster, "b", memory, options: o => o.AfterStandbyBuild = async id =>
+        {
+            if (id != "e" || Interlocked.Increment(ref builds) != 1)
+                return;
+            await (await standby.Task).Tables.ReopenAsync("instruments", default);
+        });
+        standby.SetResult(b);
+        await Eventually(() => Volatile.Read(ref builds) >= 2 && b.Pipelines.Get("e").State == PipelineState.Built, "the standby to build the circuit again");
+
+        instruments[2] = instruments[2] with { Symbol = "RENAMED", Multiplier = 7 };
+        await table.Writer.UpsertAsync(instruments[2]);
+        await table.Writer.CommitAsync();
+        await Eventually(() => Same(sink.Rows, Enrich.Model(trades, instruments)), "the leader applying the change");
+        await Eventually(() => b.Node.Status.Standby is { TakeoverWouldBeWarm: true, StateLagRecords: 0 }, "the standby to follow");
+
+        await b.Node.TakeOverAsync(new NodeActionOptions(), default).WaitAsync(TestService.Timeout);
+        await b.Running("e");
+        var more = Trades(40, 20, instruments: 5);
+        memory.Log<Trade>("in").AppendRange(more);
+        instruments[3] = instruments[3] with { Symbol = "AGAIN", Multiplier = 3 };
+        var promoted = b.Tables.Get<int, Instrument>("instruments");
+        await promoted.Writer.UpsertAsync(instruments[3]);
+        await promoted.Writer.CommitAsync();
+        await Eventually(() => Same(sink.Rows, Enrich.Model(trades.Concat(more), instruments)), "the new leader reading the table it writes, not one left behind");
+    }
+
+    [Fact]
+    public async Task A_spec_replaced_while_the_standby_fetches_the_plugin_does_not_reach_that_build()
+    {
+        var cluster = new InMemoryServiceCluster();
+        var memory = new MemoryConnector();
+        await using var a = await StartAsync(cluster, "a", memory);
+        var v1 = await a.Plugins.ImportDirectoryAsync(PluginDirectory("Acme.Pipelines"), default);
+        var v2 = await a.Plugins.ImportDirectoryAsync(PluginDirectory("Acme.Pipelines.V2"), default);
+        var trades = Trades(0, 150);
+        memory.Log<Trade>("in").AppendRange(trades);
+        var first = (await a.DeployAsync(TraderCounts(v1.Version))).Spec;
+        var sink = memory.UpsertSink<string, string>("out");
+        await Eventually(() => Same(sink.Rows, CountLines("v1", trades)), "version 1 counting");
+        var layout1 = PipelineSupervisor.LayoutOf(a.Pipelines.Spec("tc"));
+
+        // The standby has read generation 1's spec and holds version 1's plugin when the
+        // leader replaces the pipeline with version 2 and the standby's catalog says so.
+        var standby = new TaskCompletionSource<TestService>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var binds = 0;
+        var builds = 0;
+        string? boundAs = null;
+        await using var b = await StartAsync(cluster, "b", memory, options: o =>
+        {
+            o.BeforeStandbyBind = async id =>
+            {
+                if (id != "tc" || Interlocked.Increment(ref binds) != 1)
+                    return;
+                var node = await standby.Task;
+                await a.DeployAsync(TraderCounts(v2.Version), StateChoice.Keep);
+                await Eventually(() => node.Pipelines.Spec("tc").Version == v2.Version, "the standby reading the new spec");
+            };
+            o.AfterStandbyBuild = async id =>
+            {
+                if (id == "tc" && Interlocked.Increment(ref builds) == 1)
+                    boundAs = (await standby.Task).Node.Context.Storage.Pipeline("tc").Layout;
+            };
+        });
+        standby.SetResult(b);
+
+        // What was built under version 1's lease is generation 1's circuit on stores
+        // tagged with generation 1's layout — not version 2's spec through version 1's types.
+        await Eventually(() => Volatile.Read(ref builds) >= 1, "the standby's first build");
+        Assert.Equal(1, first.Generation);
+        Assert.Equal(layout1, boundAs);
+
+        await a.Running("tc");
+        var more = Trades(150, 60);
+        memory.Log<Trade>("in").AppendRange(more);
+        await Eventually(() => Same(sink.Rows, CountLines("v2", trades.Concat(more))), "version 2 counting on version 1's state");
+        await Eventually(
+            () => b.Pipelines.Get("tc") is { State: PipelineState.Built } built && built.Version == v2.Version
+                  && b.Node.Status.Standby is { TakeoverWouldBeWarm: true, StateLagRecords: 0 },
+            "the standby to build version 2");
+        await b.Node.TakeOverAsync(new NodeActionOptions(), default).WaitAsync(TestService.Timeout);
+        await b.Running("tc");
+        var last = Trades(210, 40);
+        memory.Log<Trade>("in").AppendRange(last);
+        await Eventually(() => Same(sink.Rows, CountLines("v2", trades.Concat(more).Concat(last))), "the new leader counting on");
+    }
+
+    [Fact]
     public void A_layout_names_everything_that_decides_a_pipelines_stores_and_nothing_else()
     {
         var spec = Spec("p", "enrich", "in", "out", settings: """{ "minQuantity": 2 }""", version: "v1") with

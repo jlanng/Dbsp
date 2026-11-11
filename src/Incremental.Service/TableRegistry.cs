@@ -757,6 +757,21 @@ internal sealed class TableRegistry(ServiceContext context) : ITableRegistry
             if (context.PipelineSpecs().FirstOrDefault(p => p.Writes.Contains(spec.Name)) is { } writer)
                 throw ServiceException.Conflict($"Table '{spec.Name}' is written by pipeline '{writer.Id}'; it cannot also have a loader.");
             RequireSourceKind(loader);
+
+            // A host's factory serves the tables it serves: ask it now, for this table's
+            // types, rather than learn it from a loader that faults at every start.
+            if (context.Registrations.TableSources.ContainsKey(loader.Kind))
+            {
+                try
+                {
+                    ((ITableDefinitionInternal)definition).CheckSource(this, loader);
+                }
+                catch (Exception ex) when (ex is not ServiceException and not OperationCanceledException)
+                {
+                    throw ServiceException.Invalid(
+                        $"The {loader.Kind} loader cannot load table '{spec.Name}' ({definition.KeyType.Name} → {definition.RowType.Name}): {ex.Message}");
+                }
+            }
         }
         return (definition.KeyType.Name, definition.RowType.Name);
     }

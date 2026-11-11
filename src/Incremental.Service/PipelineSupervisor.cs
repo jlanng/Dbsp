@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
@@ -139,8 +140,10 @@ internal sealed class PipelineRuntime(PipelineSpec spec, ServiceOptions options)
     public DateTimeOffset WarmRetryAt;
     public long WarmFaultGeneration = -1;
 
-    /// <summary>A table the pipeline reads was opened again since <see cref="Warm"/> was built.</summary>
-    public volatile bool WarmStale;
+    /// <summary>How many times a table the pipeline reads or writes has been opened again
+    /// on this node. A standby's circuit records the count from before it was built: a
+    /// later one says it may hold a table instance that no longer follows.</summary>
+    public long TableReopens;
 
     /// <summary>The provider's store epoch when the pipeline's typed stores were bound: a
     /// later one says they have been given up since.</summary>
@@ -148,7 +151,7 @@ internal sealed class PipelineRuntime(PipelineSpec spec, ServiceOptions options)
 }
 
 /// <summary>A circuit a standby built ahead of a takeover, and what it was built on.</summary>
-internal sealed record WarmGeneration(Generation Generation, string Layout, long StoreEpoch, long SpecGeneration);
+internal sealed record WarmGeneration(Generation Generation, string Layout, long StoreEpoch, long SpecGeneration, long TableReopens);
 
 /// <summary>
 /// Runs one circuit per pipeline and changes them one at a time while the others run:
@@ -271,7 +274,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             IReadOnlyList<string>? secret = null;
             try
             {
-                secret = TryConnector(config)?.Describe(config).SecretProperties;
+                secret = Secrets(config);
             }
             catch
             {
@@ -312,7 +315,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             IReadOnlyList<string>? secret = null;
             try
             {
-                secret = TryConnector(config)?.Describe(config).SecretProperties;
+                secret = Secrets(config);
             }
             catch
             {
@@ -459,7 +462,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             ex = DefinitionBinding.Cause(ex);
             throw ServiceException.Invalid($"Definition '{spec.Definition}' threw while describing its circuit: {ex.GetType().Name}: {ex.Message}");
         }
-        CheckBindings(spec, pipeline);
+        CheckBindings(spec, pipeline, claims: true);
         IReadOnlyList<string> problems = [];
         if (againstState)
         {
@@ -543,10 +546,64 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
     private static string Flat(string problem) =>
         string.Join(" ", problem.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
 
-    private void CheckBindings(PipelineSpec spec, PipelineBuilder pipeline)
+    /// <summary>
+    /// What a sink claims for itself (<see cref="ConnectorDescription.Owns"/>) is one sink
+    /// slot's: not another slot's of this spec, and not a sink's of another pipeline. A
+    /// stored spec whose config its connector no longer accepts claims nothing.
+    /// </summary>
+    private void RequireUnowned(PipelineSpec spec, string slot, string claim, Dictionary<string, string> owned)
+    {
+        if (!owned.TryAdd(claim, slot))
+            throw new InvalidOperationException($"it would write what this spec's sink slot '{owned[claim]}' writes ({claim}); a sink has that to itself");
+        foreach (var other in Specs)
+        {
+            if (other.Id == spec.Id)
+                continue;
+            var sinks = other.DeadLetters is { } letters ? other.Sinks.Append(new(PipelineSpec.DeadLetterSlot, letters)) : other.Sinks;
+            foreach (var (name, config) in sinks)
+            {
+                string? theirs = null;
+                try
+                {
+                    theirs = TryConnector(config)?.Describe(config).Owns;
+                }
+                catch
+                {
+                    // Not a config that binds any more.
+                }
+                if (theirs == claim)
+                    throw new InvalidOperationException(
+                        $"it would write what pipeline '{other.Id}' writes from its sink slot '{name}' ({claim}); a sink has that to itself");
+            }
+        }
+    }
+
+    /// <summary>The claims of every sink of <paramref name="spec"/>, checked again where
+    /// specs are committed one at a time: two deploys that passed their dry runs side by
+    /// side cannot both take one prefix.</summary>
+    private void RequireSinksUnowned(PipelineSpec spec)
+    {
+        var owned = new Dictionary<string, string>(StringComparer.Ordinal);
+        var sinks = spec.DeadLetters is { } letters ? spec.Sinks.Append(new(PipelineSpec.DeadLetterSlot, letters)) : spec.Sinks;
+        foreach (var (slot, config) in sinks)
+        {
+            try
+            {
+                if (context.Connector(config).Describe(config).Owns is { } claim)
+                    RequireUnowned(spec, slot, claim, owned);
+            }
+            catch (InvalidOperationException ex)
+            {
+                throw ServiceException.Invalid($"Pipeline '{spec.Id}' does not bind.", [$"sink slot '{slot}': {ex.Message}"]);
+            }
+        }
+    }
+
+    private void CheckBindings(PipelineSpec spec, PipelineBuilder pipeline, bool claims = false)
     {
         var errors = new List<string>();
-        void Check(string slot, SlotKind kind, IReadOnlyDictionary<string, JsonElement> bindings, string what)
+        var owned = new Dictionary<string, string>(StringComparer.Ordinal);
+        void Check(string slot, SlotKind kind, (Type Record, Type? Key) clr, IReadOnlyDictionary<string, JsonElement> bindings, string what)
         {
             if (!bindings.TryGetValue(slot, out var config))
             {
@@ -557,10 +614,13 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             try
             {
                 connector = context.Connector(config);
-                connector.Describe(config);
+                var described = connector.Describe(config);
                 (connector as KafkaConnector)?.RequireKind(config, kind);
                 if (connector is FileConnector)
                     FileConnector.RequireKind(config, kind);
+                (connector as ITypedConnector)?.RequireTypes(kind, clr.Record, clr.Key);
+                if (claims && kind is SlotKind.UpsertSink or SlotKind.AppendSink && described.Owns is { } claim)
+                    RequireUnowned(spec, slot, claim, owned);
             }
             catch (Exception ex)
             {
@@ -579,9 +639,9 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         }
 
         foreach (var input in pipeline.Inputs)
-            Check(input.Name, input.Kind, spec.Inputs, "input");
+            Check(input.Name, input.Kind, input.Clr, spec.Inputs, "input");
         foreach (var sink in pipeline.Sinks)
-            Check(sink.Name, sink.Kind, spec.Sinks, "sink");
+            Check(sink.Name, sink.Kind, sink.Clr, spec.Sinks, "sink");
         foreach (var bound in spec.Inputs.Keys.Where(k => pipeline.Inputs.All(i => i.Name != k)))
             errors.Add($"The spec binds input slot '{bound}', which definition '{spec.Definition}' does not declare.");
         foreach (var bound in spec.Sinks.Keys.Where(k => pipeline.Sinks.All(s => s.Name != k)))
@@ -589,7 +649,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 ? "The dead-letter sink is bound by the spec's own \"deadLetters\" member, not under \"sinks\"."
                 : $"The spec binds sink slot '{bound}', which definition '{spec.Definition}' does not declare.");
         if (spec.DeadLetters is { } deadLetters)
-            Check(PipelineSpec.DeadLetterSlot, SlotKind.AppendSink, One(deadLetters), "dead-letter");
+            Check(PipelineSpec.DeadLetterSlot, SlotKind.AppendSink, (typeof(DeadLetterEnvelope), null), One(deadLetters), "dead-letter");
         if (errors.Count > 0)
             throw ServiceException.Invalid($"Pipeline '{spec.Id}' does not bind.", errors);
     }
@@ -803,6 +863,13 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             }
 
             var reset = existing is not null && options.State == StateChoice.Reset;
+
+            // The spec that wrote the state: the one being replaced, unless that one is
+            // itself a keep that has not run yet — then the state is still its
+            // predecessor's, whatever this deploy changes or does not change.
+            var origin = existing?.Previous ?? existing;
+            var goBack = origin is not null && !reset
+                && (existing!.Previous is null ? changes.Count : StateChanges(origin, spec).Count) > 0;
             var (shape, graph, stateProblems, stateShape) = DryRun(spec, lease, againstState: existing is not null && !reset, describeState: true);
             if (stateProblems.Count > 0)
                 throw StateIncompatible(spec.Id, stateProblems);
@@ -821,9 +888,10 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 steps.AddRange(evidence);
                 steps.Add(reset ? "state dropped: a new incarnation; sources start again from their start position; upsert sinks keep rows the new run does not produce"
                     : changes.Count > 0 ? "state kept: the new generation reads the old one's entries as its own types"
+                    : goBack ? $"state kept: nothing that touches it changed since generation {existing.Generation}, which has not run; the state is still generation {origin!.Generation}'s"
                     : "state kept: nothing that touches it changed");
-                if (!reset && changes.Count > 0)
-                    steps.Add($"if the new generation cannot read the state it is given, the spec of generation {(existing.Previous ?? existing).Generation} is put back and started");
+                if (goBack)
+                    steps.Add($"if the new generation cannot read the state it is given, the spec of generation {origin!.Generation} is put back and started");
             }
             steps.Add(spec.Desired == DesiredState.Running ? "start" : "leave stopped");
             var plan = new ActionPlan(existing is null ? "pipeline.deploy" : "pipeline.replace", spec.Id, options.DryRun, steps);
@@ -842,11 +910,12 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
 
                 // What to go back to if the kept state turns out not to fit. A spec that
                 // itself never ran is not it: the state is still its predecessor's.
-                Previous = existing is not null && !reset && changes.Count > 0 ? (existing.Previous ?? existing) with { Previous = null } : null,
+                Previous = goBack ? origin! with { Previous = null } : null,
             };
             using (await context.LockReferencesAsync(cancellationToken).ConfigureAwait(false))
             {
                 RequireReferences(spec, shape);
+                RequireSinksUnowned(spec);
                 await CommitAsync(runtime, spec, plan.Action, options.Caller, steps, cancellationToken).ConfigureAwait(false);
             }
 
@@ -864,7 +933,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                     ReleaseBinding(runtime);
                 if (runtime.Lease is null)
                 {
-                    Bind(runtime, lease);
+                    Bind(runtime, lease, runtime.Spec);
                     lease = null;
                 }
                 ClearFaults(runtime);
@@ -1055,6 +1124,32 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         return plan;
     }
 
+    /// <summary>The properties of a slot's config that are secret: the ones its
+    /// connector's description names and the ones its config schema marks. Either
+    /// declaration is enough, and the schema's holds for a config the connector refuses.</summary>
+    private IReadOnlyList<string>? Secrets(JsonElement config)
+    {
+        if (TryConnector(config) is not { } connector)
+            return null;
+        List<string>? secret = null;
+        if (connector is IConfigDescribed { ConfigSchema: { } schema })
+            foreach (var property in schema.Properties)
+                if (property.Secret)
+                    (secret ??= []).Add(property.Name);
+        try
+        {
+            if (connector.Describe(config).SecretProperties is { Count: > 0 } named)
+                foreach (var name in named)
+                    if (secret is null || !secret.Contains(name))
+                        (secret ??= []).Add(name);
+        }
+        catch
+        {
+            // A config its connector refuses: the dry run says so. What the schema marks is still hidden.
+        }
+        return secret;
+    }
+
     private IConnector? TryConnector(JsonElement config)
     {
         try
@@ -1180,12 +1275,12 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
 
     // ── state binding: the plugin version a pipeline's typed stores belong to ──────────
 
-    private void Bind(PipelineRuntime runtime, PluginLease lease)
+    private void Bind(PipelineRuntime runtime, PluginLease lease, PipelineSpec spec)
     {
         var provider = context.Storage.Pipeline(runtime.Id);
         provider.ReleaseStores();
         provider.UseSerializer(new JsonStateSerializer(lease.StateJson));
-        provider.UseLayout(LayoutOf(runtime.Spec));
+        provider.UseLayout(LayoutOf(spec));
         runtime.BoundEpoch = provider.StoreEpoch;
         runtime.Lease = lease;
     }
@@ -1244,7 +1339,6 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         {
             _logger.LogDebug(ex, "Pipeline {Pipeline}: dropping the standby's circuit failed", runtime.Id);
         }
-        runtime.WarmStale = false;
     }
 
     /// <summary>The standby's circuit, if it is still good for <paramref name="spec"/>:
@@ -1254,7 +1348,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
     {
         if (runtime.Warm is not { } warm)
             return null;
-        if (!runtime.WarmStale && warm.SpecGeneration == spec.Generation && warm.Layout == LayoutOf(spec)
+        if (warm.TableReopens == Interlocked.Read(ref runtime.TableReopens) && warm.SpecGeneration == spec.Generation && warm.Layout == LayoutOf(spec)
             && warm.StoreEpoch == provider.StoreEpoch && BoundFor(runtime, spec, provider)
             && ReferenceEquals(Interlocked.CompareExchange(ref runtime.Warm, null, warm), warm))
             return warm.Generation;
@@ -1294,7 +1388,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 // claim the table's writer while the table still follows.
                 var wanted = spec.Desired == DesiredState.Running && spec.Pending is null && spec.Writes.Count == 0;
                 if (runtime.Warm is { } warm
-                    && (!wanted || runtime.WarmStale || warm.SpecGeneration != spec.Generation || warm.Layout != layout
+                    && (!wanted || warm.TableReopens != Interlocked.Read(ref runtime.TableReopens) || warm.SpecGeneration != spec.Generation || warm.Layout != layout
                         || warm.StoreEpoch != provider.StoreEpoch || !BoundFor(runtime, spec, provider)))
                 {
                     DiscardWarm(runtime);
@@ -1313,14 +1407,27 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 try
                 {
                     var clock = Stopwatch.StartNew();
+                    // Everything from here is made from the spec read above. The node's
+                    // loop replaces runtime.Spec as the catalog moves, without this
+                    // queue: a store bound, or a circuit built, from a spec read again
+                    // could be another version's types under this version's lease.
                     if (!BoundFor(runtime, spec, provider))
                     {
                         ReleaseBinding(runtime);
-                        Bind(runtime, await context.Plugins.AcquireAsync(spec.Plugin, spec.Version, cancellationToken).ConfigureAwait(false));
+                        var lease = await context.Plugins.AcquireAsync(spec.Plugin, spec.Version, cancellationToken).ConfigureAwait(false);
+                        if (context.Options.BeforeStandbyBind is { } beforeBind)
+                            await beforeBind(runtime.Id).ConfigureAwait(false);
+                        Bind(runtime, lease, spec);
                     }
                     var plugin = clock.Elapsed;
                     var epoch = provider.StoreEpoch;
-                    var generation = Build(runtime, 0);
+
+                    // Read before the build resolves its tables: a table opened again
+                    // from here on — while this builds, too — makes the count move.
+                    var reopens = Interlocked.Read(ref runtime.TableReopens);
+                    var generation = Build(runtime, 0, spec);
+                    if (context.Options.AfterStandbyBuild is { } afterBuild)
+                        await afterBuild(runtime.Id).ConfigureAwait(false);
                     if (provider.StoreEpoch != epoch)
                     {
                         // The state moved to another layout while this was built.
@@ -1334,9 +1441,8 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                         ReleaseBinding(runtime);
                         return 0;
                     }
-                    runtime.WarmStale = false;
                     runtime.WarmFault = null;
-                    runtime.Warm = new WarmGeneration(generation, layout, epoch, spec.Generation);
+                    runtime.Warm = new WarmGeneration(generation, layout, epoch, spec.Generation, reopens);
                     runtime.LastStart = new PipelineStartTimings(
                         DateTimeOffset.UtcNow, 0, plugin, clock.Elapsed - plugin, TimeSpan.Zero, TimeSpan.Zero, clock.Elapsed);
                     Set(runtime, PipelineState.Built);
@@ -1428,11 +1534,11 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             if (!warm && !BoundFor(runtime, spec, provider))
             {
                 ReleaseBinding(runtime);
-                Bind(runtime, await context.Plugins.AcquireAsync(spec.Plugin, spec.Version, CancellationToken.None).ConfigureAwait(false));
+                Bind(runtime, await context.Plugins.AcquireAsync(spec.Plugin, spec.Version, CancellationToken.None).ConfigureAwait(false), spec);
             }
             var plugin = clock.Elapsed;
             if (generation is null)
-                generation = Build(runtime, number);
+                generation = Build(runtime, number, spec);
             else
                 generation.Number = number;
             var built = clock.Elapsed;
@@ -1631,9 +1737,8 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private Generation Build(PipelineRuntime runtime, long number)
+    private Generation Build(PipelineRuntime runtime, long number, PipelineSpec spec)
     {
-        var spec = runtime.Spec;
         var lease = runtime.Lease!;
         var definition = lease.Definition(spec.Definition);
         var settings = definition.BindSettings(spec.Settings, lease.Json);
@@ -1825,6 +1930,13 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         // What each record of the batch being written was rendered as, for the ring and the envelope alike.
         var rendered = new Dictionary<DeadLetter, string?>(ReferenceEqualityComparer.Instance);
         IReadOnlyDictionary<string, long>? after = null;
+        IReadOnlyDictionary<string, string>? afterAt = null;
+
+        // Inputs whose position is not partition → offset to a person: their connector says it.
+        var worded = new List<(string Slot, IPositionDescribing Connector, JsonElement Config)>();
+        foreach (var (slot, config) in runtime.Spec.Inputs)
+            if (TryConnector(config) is IPositionDescribing describing)
+                worded.Add((slot, describing, config));
         try
         {
             var connector = context.Connector(start.Config) as IAppendSinkConnector
@@ -1836,7 +1948,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 observed,
                 letter => new DeadLetterEnvelope(
                     pipeline, specGeneration, letter.Step, DateTimeOffset.UtcNow, letter.Operator, letter.Weight,
-                    letter.Exception.GetType().Name, letter.Exception.Message, SourceOf(letter.Record), rendered.GetValueOrDefault(letter), after),
+                    letter.Exception.GetType().Name, letter.Exception.Message, SourceOf(letter.Record), rendered.GetValueOrDefault(letter), after, afterAt),
                 new SinkDeliveryOptions
                 {
                     MaxRetries = (context.Options.SinkDelivery ?? new SinkDeliveryOptions()).MaxRetries,
@@ -1851,7 +1963,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 batch =>
                 {
                     rendered.Clear();
-                    after = Committed(pipeline);
+                    (after, afterAt) = Committed(pipeline, worded);
                     foreach (var letter in batch.Letters)
                     {
                         var text = rendered[letter] = Render(letter.Record, json);
@@ -1872,16 +1984,63 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         }
     }
 
-    private IReadOnlyDictionary<string, long>? Committed(string pipeline)
+    /// <summary>Every input's position in the last checkpoint: partition → offset under
+    /// <c>{input}#p{n}</c>, and for an input whose connector words its position
+    /// (<see cref="IPositionDescribing"/>) that wording under the input's name instead.</summary>
+    private (IReadOnlyDictionary<string, long>? After, IReadOnlyDictionary<string, string>? At) Committed(
+        string pipeline, IReadOnlyList<(string Slot, IPositionDescribing Connector, JsonElement Config)> worded)
     {
         try
         {
             var committed = context.Storage.Pipeline(pipeline).CommittedOffsets;
-            return committed.Count == 0 ? null : new Dictionary<string, long>(committed.Where(c => c.Key != "$step"), StringComparer.Ordinal);
+            if (committed.Count == 0)
+                return (null, null);
+            var after = new Dictionary<string, long>(StringComparer.Ordinal);
+            Dictionary<string, Dictionary<int, long>>? perSlot = null;
+            foreach (var (key, offset) in committed)
+            {
+                if (key == "$step")
+                    continue;
+                var mark = key.LastIndexOf("#p", StringComparison.Ordinal);
+                if (mark > 0 && worded.Any(w => key.AsSpan(0, mark).SequenceEqual(w.Slot))
+                    && int.TryParse(key.AsSpan(mark + 2), NumberStyles.None, CultureInfo.InvariantCulture, out var partition))
+                {
+                    perSlot ??= new Dictionary<string, Dictionary<int, long>>(StringComparer.Ordinal);
+                    if (!perSlot.TryGetValue(key[..mark], out var partitions))
+                        perSlot[key[..mark]] = partitions = [];
+                    partitions[partition] = offset;
+                }
+                else
+                    after[key] = offset;
+            }
+            Dictionary<string, string>? at = null;
+            if (perSlot is not null)
+            {
+                foreach (var (slot, connector, config) in worded)
+                {
+                    if (!perSlot.TryGetValue(slot, out var partitions))
+                        continue;
+                    string? words = null;
+                    try
+                    {
+                        words = connector.DescribePosition(config, partitions);
+                    }
+                    catch
+                    {
+                        // Left unworded below: the numbers are better than nothing.
+                    }
+                    if (words is not null)
+                        (at ??= new Dictionary<string, string>(StringComparer.Ordinal))[slot] = words;
+                    else
+                        foreach (var (partition, offset) in partitions)
+                            after[string.Create(CultureInfo.InvariantCulture, $"{slot}#p{partition}")] = offset;
+                }
+            }
+            return (after.Count == 0 ? null : after, at);
         }
         catch (ObjectDisposedException)
         {
-            return null;
+            return (null, null);
         }
     }
 
@@ -2317,9 +2476,11 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
     /// instance hold it, so they are rebuilt.</summary>
     internal void OnTableReopened(string table)
     {
-        // A circuit a standby built holds the old instance too; it is built again.
-        foreach (var runtime in _pipelines.Values.Where(p => p.Warm is not null && (p.Spec.Reads.Contains(table) || p.Spec.Writes.Contains(table))))
-            runtime.WarmStale = true;
+        // A circuit a standby built holds the old instance too; it is built again. So is
+        // one being built at this moment, which is why this counts and does not look for
+        // what is there to mark.
+        foreach (var runtime in _pipelines.Values.Where(p => p.Spec.Reads.Contains(table) || p.Spec.Writes.Contains(table)))
+            Interlocked.Increment(ref runtime.TableReopens);
         if (!Leads)
             return;
         foreach (var runtime in _pipelines.Values.Where(p => p.Spec.Reads.Contains(table) || p.Spec.Writes.Contains(table)))

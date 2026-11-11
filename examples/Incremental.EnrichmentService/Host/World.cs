@@ -172,11 +172,13 @@ public sealed class World
                 await Kafka.ProduceQuotesAsync(quotes);
             else
             {
-                await using (var file = await Lake.OpenWriteAsync($"quotes/{next:D8}.jsonl", default))
-                    await file.WriteAsync(System.Text.Encoding.UTF8.GetBytes(string.Concat(quotes.Select(q => JsonSerializer.Serialize(q, Web) + "\n"))));
+                var bytes = System.Text.Encoding.UTF8.GetBytes(string.Concat(quotes.Select(q => JsonSerializer.Serialize(q, Web) + "\n")));
+                await Lake.WriteAsync($"quotes/{next:D8}.jsonl", (file, ct) => file.WriteAsync(bytes, ct), default);
                 // The source's position outlives the files it names: old ones can go.
                 if (next >= KeptQuoteFiles)
                     await Lake.DeleteAsync($"quotes/{next - KeptQuoteFiles:D8}.jsonl", default);
+                if (next % 10 == 0)
+                    await TrimSinkObjectsAsync();
             }
             Interlocked.Exchange(ref _quoteIntervals, next + 1);
         }
@@ -184,6 +186,34 @@ public sealed class World
     }
 
     public const int KeptQuoteFiles = 30;
+
+    /// <summary>How many of the newest objects each files sink's prefix keeps.</summary>
+    public const int KeptSinkObjects = 200;
+
+    /// <summary>
+    /// The files sinks write an object per step and never delete one below their
+    /// checkpoint: retention is the bucket's business (a lifecycle rule, in production).
+    /// This directory has no such rule, so the example is its own: under each prefix of
+    /// <c>alerts/</c> and <c>dead-letters/</c> only the newest objects stay. Without it a
+    /// process left running fills the directory with a few objects a second.
+    /// </summary>
+    public async Task TrimSinkObjectsAsync()
+    {
+        foreach (var root in new[] { "alerts/", "dead-letters/" })
+        {
+            var perPrefix = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            await foreach (var info in Lake.ListAsync(root, default))      // in name order: oldest step first
+            {
+                var prefix = info.Path[..(info.Path.LastIndexOf('/') + 1)];
+                if (!perPrefix.TryGetValue(prefix, out var names))
+                    perPrefix[prefix] = names = [];
+                names.Add(info.Path);
+            }
+            foreach (var names in perPrefix.Values)
+                for (var i = 0; i < names.Count - KeptSinkObjects; i++)
+                    await Lake.DeleteAsync(names[i], default);
+        }
+    }
 }
 
 /// <summary>The example's table and pipeline specs. A spec is data: it names a definition,

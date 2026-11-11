@@ -177,7 +177,7 @@ public sealed class PipelineBuilder
             (connector, start) => connector is IAppendSourceConnector append
                 ? append.StartAsync(new SourceContext<T>(start, stream), start.Cancellation)
                 : throw Mismatch(slot, connector, "an append input (Input<T>)"))
-        { Stream = stream });
+        { Stream = stream, Clr = (typeof(T), null) });
         return stream;
     }
 
@@ -192,7 +192,7 @@ public sealed class PipelineBuilder
             (connector, start) => connector is IKeyedSourceConnector keyed
                 ? keyed.StartAsync(new KeyedSourceContext<TKey, TValue>(start, stream), start.Cancellation)
                 : throw Mismatch(slot, connector, "a keyed input (KeyedInput<TKey, TValue>)"))
-        { KeyType = typeof(TKey).Name, Stream = stream });
+        { KeyType = typeof(TKey).Name, Stream = stream, Clr = (typeof(TValue), typeof(TKey)) });
         return stream;
     }
 
@@ -215,7 +215,7 @@ public sealed class PipelineBuilder
                 return start.Circuit.Handle(output).DeliverToAsync(observed, start.Delivery);
             },
             circuit => circuit.Handle(output).Abandon())
-        { KeyType = typeof(TKey).Name });
+        { KeyType = typeof(TKey).Name, Clr = (typeof(TRow), typeof(TKey)) });
     }
 
     /// <summary>A result delivered as upserts keyed by <paramref name="key"/>. The stream
@@ -238,7 +238,7 @@ public sealed class PipelineBuilder
                 return start.Circuit.Handle(output).DeliverToAsync(observed, key, start.Delivery);
             },
             circuit => circuit.Handle(output).Abandon())
-        { KeyType = typeof(TKey).Name });
+        { KeyType = typeof(TKey).Name, Clr = (typeof(T), typeof(TKey)) });
     }
 
     /// <summary>An append-only result. A retraction on the stream faults the pipeline.</summary>
@@ -257,7 +257,8 @@ public sealed class PipelineBuilder
                 var observed = new ObservedAppendSink<T>(start.Leased(sink), start.Stats);
                 return start.Circuit.Handle(output).DeliverToAsync(observed, start.Delivery);
             },
-            circuit => circuit.Handle(output).Abandon()));
+            circuit => circuit.Handle(output).Abandon())
+        { Clr = (typeof(T), null) });
     }
 
     /// <summary>Writes the stream into a declared table (a derived table): this pipeline
@@ -298,11 +299,17 @@ internal sealed record InputSlot(string Name, SlotKind Kind, string Type, IReadO
     /// <summary>The input as the definition declared it: an <c>InputStream&lt;T&gt;</c> or a
     /// <c>KeyedInputStream&lt;TKey, TValue&gt;</c>.</summary>
     public required object Stream { get; init; }
+
+    /// <summary>The record type and, for a keyed input, the key type.</summary>
+    public required (Type Record, Type? Key) Clr { get; init; }
 }
 
 internal sealed record SinkSlot(string Name, SlotKind Kind, string Type, IReadOnlyList<string> Members, Func<IConnector, SlotStart, Task> Start, Action<Circuit> Abandon)
 {
     public string? KeyType { get; init; }
+
+    /// <summary>The record type and, for an upsert sink, the key type.</summary>
+    public required (Type Record, Type? Key) Clr { get; init; }
 }
 
 /// <summary>What a slot's typed closure needs to start its source or delivery.</summary>
@@ -457,12 +464,16 @@ public sealed record DeadLetterRecord(
 /// <c>Source</c> is where the record lies in its source when the source itself rejected
 /// it (a topic, partition and offset; an object and line); for a record an operator
 /// dropped it is null, and <c>After</c> — each input's position in the last checkpoint
-/// before the step — says where in the inputs to look. <c>Record</c> is the record as
-/// JSON text, cut at 4,096 characters.
+/// before the step, as <c>{input}#p{partition}</c> → offset — says where in the inputs
+/// to look. An input whose position is not a partition and an offset to a person (the
+/// <c>files</c> source's is an object and a line) is under its own name in
+/// <c>AfterAt</c> instead, in its connector's words. <c>Record</c> is the record as JSON
+/// text, cut at 4,096 characters.
 /// </summary>
 public sealed record DeadLetterEnvelope(
     string Pipeline, long Generation, long Step, DateTimeOffset Time, string Operator, long Weight,
-    string ExceptionType, string Message, string? Source, string? Record, IReadOnlyDictionary<string, long>? After = null);
+    string ExceptionType, string Message, string? Source, string? Record, IReadOnlyDictionary<string, long>? After = null,
+    IReadOnlyDictionary<string, string>? AfterAt = null);
 
 /// <summary>
 /// The pipeline's dead-letter sink as this node sees it. <c>Delivered</c> counts records

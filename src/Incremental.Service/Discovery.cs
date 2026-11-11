@@ -49,7 +49,9 @@ public sealed record TableSlotShape(string Slot, string Table, string Access, st
 /// and the tables it reads and writes. Slots are found by running the definition's
 /// <c>Build</c> against nothing — no table need be declared, no connector bound — with the
 /// settings given, or with the settings class's defaults. <c>Notes</c> says when that was
-/// not possible and why.
+/// not possible and why. A note that quotes an exception's message puts it after the
+/// note's first colon, and a note has no colon otherwise: the admin API cuts a note there
+/// when it may not show row data, since a message can quote a value.
 /// </summary>
 public sealed record DefinitionDescription(
     string Plugin, string Version, string Definition, string? Description, IReadOnlyList<SettingInfo> Settings,
@@ -313,8 +315,8 @@ internal sealed class ServiceDiscovery(ServiceContext context) : IServiceDiscove
                     members.AddRange(Compare("table",
                         x.Tables.GroupBy(t => t.Slot, StringComparer.Ordinal).ToDictionary(g => g.Key, g => string.Join("; ", g.Select(Table)), StringComparer.Ordinal),
                         y.Tables.GroupBy(t => t.Slot, StringComparer.Ordinal).ToDictionary(g => g.Key, g => string.Join("; ", g.Select(Table)), StringComparer.Ordinal)));
-                    definitionNotes.AddRange(x.Notes.Select(n => $"{Short(from)}: {n}"));
-                    definitionNotes.AddRange(y.Notes.Select(n => $"{Short(to)}: {n}"));
+                    definitionNotes.AddRange(x.Notes.Select(n => $"In {Short(from)} — {n}"));
+                    definitionNotes.AddRange(y.Notes.Select(n => $"In {Short(to)} — {n}"));
                 }
                 catch (ServiceException ex)
                 {
@@ -335,15 +337,22 @@ internal sealed class ServiceDiscovery(ServiceContext context) : IServiceDiscove
     public async Task<DefinitionDescription> DescribeDefinitionAsync(
         string plugin, string? version, string definition, JsonElement? settings, CancellationToken cancellationToken)
     {
-        context.RequireLeader();
+        var (lease, resolved) = await LeaseAsync(plugin, version, cancellationToken).ConfigureAwait(false);
+        using (lease)
+            return Describe(plugin, resolved, definition, settings, lease, out _);
+    }
+
+    private async Task<(PluginLease Lease, string Version)> LeaseAsync(string plugin, string? version, CancellationToken cancellationToken)
+    {
+        context.RequireLeader("a definition is described by running its Build, which only the leader does: ask the leader");
         ServiceNames.Validate(plugin, "plugin name");
         var resolved = context.Plugins.ResolveVersion(plugin, version);
-        using var lease = await context.Plugins.AcquireAsync(plugin, resolved, cancellationToken).ConfigureAwait(false);
-        return Describe(plugin, resolved, definition, settings, lease);
+        return (await context.Plugins.AcquireAsync(plugin, resolved, cancellationToken).ConfigureAwait(false), resolved);
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private DefinitionDescription Describe(string plugin, string version, string name, JsonElement? settings, PluginLease lease)
+    private DefinitionDescription Describe(
+        string plugin, string version, string name, JsonElement? settings, PluginLease lease, out Dictionary<string, (Type Record, Type? Key)> slotTypes)
     {
         var definition = lease.Definition(name);
         var info = definition.Describe();
@@ -367,7 +376,7 @@ internal sealed class ServiceDiscovery(ServiceContext context) : IServiceDiscove
             catch (Exception inner)
             {
                 built = false;
-                notes.Add($"The slots are not known: the settings have required members and no defaults to try ({DefinitionBinding.Cause(inner).Message}). Describe the definition with settings.");
+                notes.Add($"The slots are not known, because the settings have required members and no defaults to try; describe the definition with settings: {DefinitionBinding.Cause(inner).Message}");
             }
         }
 
@@ -384,10 +393,17 @@ internal sealed class ServiceDiscovery(ServiceContext context) : IServiceDiscove
             catch (Exception ex)
             {
                 ex = DefinitionBinding.Cause(ex);
-                notes.Add($"The slots may be incomplete: the definition threw while describing its circuit ({ex.GetType().Name}: {ex.Message}).");
+                notes.Add($"The slots may be incomplete, because the definition threw {ex.GetType().Name} while describing its circuit: {ex.Message}");
             }
         }
 
+        // The slots' types, for whoever holds the lease: a connector that carries only
+        // some types is asked with them.
+        slotTypes = new Dictionary<string, (Type Record, Type? Key)>(StringComparer.Ordinal);
+        foreach (var input in pipeline?.Inputs ?? [])
+            slotTypes[input.Name] = input.Clr;
+        foreach (var sink in pipeline?.Sinks ?? [])
+            slotTypes[sink.Name] = sink.Clr;
         return new DefinitionDescription(
             plugin, version, info.Name, info.Description, info.Settings,
             pipeline?.Shape.Inputs ?? [], pipeline?.Shape.Sinks ?? [], pipeline?.Shape.TableSlots ?? [], notes);
@@ -395,7 +411,9 @@ internal sealed class ServiceDiscovery(ServiceContext context) : IServiceDiscove
 
     public async Task<SpecTemplate> TemplateAsync(string plugin, string? version, string definition, string? id, CancellationToken cancellationToken)
     {
-        var described = await DescribeDefinitionAsync(plugin, version, definition, null, cancellationToken).ConfigureAwait(false);
+        var (lease, resolved) = await LeaseAsync(plugin, version, cancellationToken).ConfigureAwait(false);
+        using var held = lease;
+        var described = Describe(plugin, resolved, definition, null, lease, out var slotTypes);
         id ??= ServiceNames.IsValid(described.Definition) ? described.Definition : "pipeline";
         ServiceNames.Validate(id, "pipeline id");
         var notes = new List<string>(described.Notes);
@@ -410,14 +428,15 @@ internal sealed class ServiceDiscovery(ServiceContext context) : IServiceDiscove
             if (setting.Default is { } value)
                 settings[setting.Name] = JsonNode.Parse(value.GetRawText());
             else if (setting.Required)
-                notes.Add($"Setting '{setting.Name}' ({setting.JsonType}) is required and has no default: give it a value.");
+                notes.Add($"Setting '{setting.Name}' ({setting.JsonType}) is required and has no default; give it a value.");
         }
 
         JsonElement Binding(SlotShape slot)
         {
-            // A connector the host registered for this kind of slot, the host's own before
-            // the built-in ones, and of those the first whose config needs nothing more.
-            var able = connectors.Where(c => c.Kinds.Contains(slot.Kind)).Select(c => c.Name).ToList();
+            // A connector the host registered for this kind of slot and — where it says
+            // (ITypedConnector) — for the slot's types; the host's own before the built-in
+            // ones, and of those the first whose config needs nothing more.
+            var able = connectors.Where(c => c.Kinds.Contains(slot.Kind) && Carries(c.Name, slot)).Select(c => c.Name).ToList();
             forSlot[slot.Name] = able;
             var ordered = able.OrderBy(n => n is "memory" ? 1 : n is "kafka" ? 2 : n is "files" ? 3 : 0).ThenBy(n => n, StringComparer.Ordinal).ToList();
             foreach (var name in ordered)
@@ -447,6 +466,22 @@ internal sealed class ServiceDiscovery(ServiceContext context) : IServiceDiscove
             return JsonSerializer.SerializeToElement(placeholder);
         }
 
+        bool Carries(string connector, SlotShape slot)
+        {
+            if (!slotTypes.TryGetValue(slot.Name, out var clr))
+                return true;
+            try
+            {
+                var element = JsonSerializer.SerializeToElement(new Dictionary<string, string> { ["connector"] = connector });
+                (context.Connector(element) as ITypedConnector)?.RequireTypes(slot.Kind, clr.Record, clr.Key);
+                return true;
+            }
+            catch (InvalidOperationException)
+            {
+                return false;
+            }
+        }
+
         // Tables: a slot binds to the declared table of its own name; where there is none
         // of that name, to a declared table of the same definition if there is exactly one.
         var tables = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -460,8 +495,8 @@ internal sealed class ServiceDiscovery(ServiceContext context) : IServiceDiscove
                 tables[slot.Slot] = sameDefinition[0];
             else
                 notes.Add(sameDefinition.Count == 0
-                    ? $"No table is declared for the slot '{slot.Slot}' ({slot.Definition}): declare one, or bind the slot under \"tables\"."
-                    : $"The table slot '{slot.Slot}' could be any of {string.Join(", ", sameDefinition)}: bind it under \"tables\".");
+                    ? $"No table is declared for the slot '{slot.Slot}' ({slot.Definition}); declare one, or bind the slot under \"tables\"."
+                    : $"The table slot '{slot.Slot}' could be any of {string.Join(", ", sameDefinition)}; bind it under \"tables\".");
         }
 
         var spec = new PipelineSpec
