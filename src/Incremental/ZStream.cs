@@ -290,10 +290,12 @@ public class ZStream<T> where T : notnull
         var tableName = table.TableName;
         return new ZStream<TOut>(
             Builder,
-            Builder.AddNode(
-                "tableLookupAppendOnly",
-                [NodeId],
-                ctx => new TableLookupAppendOnlyOperator<T, TKey, TRow, TOut>(probe, tableName, keySelector, matched, missing, ctx.Errors)));
+            Builder.SetProbes(
+                Builder.AddNode(
+                    "tableLookupAppendOnly",
+                    [NodeId],
+                    ctx => new TableLookupAppendOnlyOperator<T, TKey, TRow, TOut>(probe, tableName, keySelector, matched, missing, ctx.Errors)),
+                table.TableNodeId));
     }
 
     /// <summary>

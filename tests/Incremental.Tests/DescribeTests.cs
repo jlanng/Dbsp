@@ -57,6 +57,40 @@ public class DescribeTests
     }
 
     [Fact]
+    public void Describe_connects_a_lookup_to_the_table_it_probes()
+    {
+        var listings = new SharedTable<int, Listing>("listings", l => l.Id);
+        var venues = new SharedTable<int, Listing>("venues", l => l.Id);
+        var builder = new CircuitBuilder(new CircuitOptions { Workers = 2 });
+        var quotes = builder.Input<(int Id, int Listing)>("quotes");
+        var listingsRef = builder.Table(listings);
+        var remembered = quotes.Lookup(listingsRef, q => q.Listing, (q, l) => l.Symbol);
+        var appendOnly = quotes.LookupAppendOnly(builder.Table(venues), q => q.Id, (q, l) => l.Venue);
+        var byIndex = quotes.LookupAppendOnly(listingsRef.By("symbol", l => l.Symbol), q => "A", (q, l) => l.Venue);
+        var joined = quotes.GroupBy(q => q.Listing).Join(listingsRef, (_, q, l) => l.Symbol);
+        remembered.ToOutput();
+        appendOnly.ToOutput();
+        byIndex.ToOutput();
+        joined.ToOutput();
+
+        var graph = builder.Describe();
+
+        var listingsNode = Assert.Single(graph.Nodes, n => n.Kind == "table[listings]").Id;
+        var venuesNode = Assert.Single(graph.Nodes, n => n.Kind == "table[venues]").Id;
+        // A lookup probes: the table is no input of its execution, and is named as probed.
+        var lookup = Assert.Single(graph.Nodes, n => n.Kind == "tableLookup");
+        Assert.Equal([listingsNode], lookup.Probes);
+        Assert.DoesNotContain(listingsNode, lookup.Inputs);
+        var appends = graph.Nodes.Where(n => n.Kind == "tableLookupAppendOnly").ToList();
+        Assert.Equal([venuesNode], appends[0].Probes);
+        // Through an index it is still that table.
+        Assert.Equal([listingsNode], appends[1].Probes);
+        // A join consumes the table's changes: an input edge, and nothing probed.
+        Assert.All(graph.Nodes.Where(n => !n.Kind.StartsWith("tableLookup", StringComparison.Ordinal)), n => Assert.Empty(n.Probes));
+        Assert.Equal(graph.Nodes[graph.Outputs[0].NodeId].Kind, lookup.Kind);
+    }
+
+    [Fact]
     public void Describe_reports_a_recursion_region_and_the_circuit_error_policy()
     {
         var builder = new CircuitBuilder(new CircuitOptions { ErrorPolicy = RecordErrorPolicy.DeadLetter });

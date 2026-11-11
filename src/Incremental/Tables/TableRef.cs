@@ -23,6 +23,10 @@ public abstract class TableView<TKey, TRow>
     /// <summary>The table's name, for error messages.</summary>
     internal abstract string TableName { get; }
 
+    /// <summary>The node the table's changes enter the circuit at: the table's node in
+    /// <see cref="CircuitBuilder.Describe"/>.</summary>
+    internal abstract int TableNodeId { get; }
+
     /// <summary>Reads the rows under a key as of the version the running step pinned.</summary>
     internal abstract TableGroupProbe<TKey, TRow> GroupProbe { get; }
 
@@ -109,6 +113,8 @@ public sealed class TableRef<TKey, TRow> : TableView<TKey, TRow>
 
     internal override string TableName => Table.Name;
 
+    internal override int TableNodeId => ChangesNodeId;
+
     internal override TableGroupProbe<TKey, TRow> GroupProbe => Probe;
 
     /// <summary>
@@ -174,6 +180,8 @@ internal sealed class TableIndexView<TIndexKey, TKey, TRow>(TableRef<TKey, TRow>
     private readonly TableIndexProbe<TIndexKey, TKey, TRow> _probe = new(table.Table, index, table.Probe);
 
     internal override string TableName => table.Table.Name;
+
+    internal override int TableNodeId => table.ChangesNodeId;
 
     internal override TableGroupProbe<TIndexKey, TRow> GroupProbe => _probe;
 

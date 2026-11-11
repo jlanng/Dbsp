@@ -25,6 +25,10 @@ internal sealed class NodeDefinition
     /// instead. Null for every other node.</summary>
     public int[]? ErrorPolicyTargets { get; set; }
 
+    /// <summary>The table nodes this node probes without consuming their changes (a
+    /// <c>Lookup</c>): edges of the picture, not of the execution. Null for every other node.</summary>
+    public int[]? Probes { get; set; }
+
     /// <summary>The keyed input whose state this node holds, or null. A keyed input's state
     /// is identified by the input's name — already the durable identity of its feed — so it
     /// survives topology edits without a <see cref="ZStream{T}.Named"/>.</summary>
@@ -61,9 +65,16 @@ internal sealed class LoopRegion
 /// it. <c>Kind</c> is the operator kind (<c>input[trades]</c>, <c>table[instruments]</c>,
 /// <c>where</c>, <c>join</c>, <c>exchange</c> …); <c>StateName</c> is the root of the names
 /// its state stores would get; <c>Name</c> is what pins that root (<c>.Named()</c>, or a keyed
-/// input's name), null when it is positional.</summary>
+/// input's name), null when it is positional. <c>Probes</c> are the table nodes it reads
+/// rows from without consuming their changes — a <c>Lookup</c> or
+/// <c>LookupAppendOnly</c> probes its table at the step's pinned version, so the table's
+/// node is not among its <c>Inputs</c>; a table <c>Join</c> does consume the changes and
+/// lists them there.</summary>
 public sealed record CircuitGraphNode(
-    int Id, string Kind, string StateName, IReadOnlyList<int> Inputs, bool IsExchange, string? Name, RecordErrorPolicy ErrorPolicy);
+    int Id, string Kind, string StateName, IReadOnlyList<int> Inputs, bool IsExchange, string? Name, RecordErrorPolicy ErrorPolicy)
+{
+    public IReadOnlyList<int> Probes { get; init; } = [];
+}
 
 public enum CircuitOutputKind { Stream, Acknowledged, Table }
 
@@ -323,6 +334,14 @@ public sealed class CircuitBuilder
                 _nodes[target].ErrorPolicy = policy;
     }
 
+    /// <summary>Records that <paramref name="nodeId"/> probes the table whose changes
+    /// enter at <paramref name="tableNode"/>; returns <paramref name="nodeId"/>.</summary>
+    internal int SetProbes(int nodeId, int tableNode)
+    {
+        _nodes[nodeId].Probes = [tableNode];
+        return nodeId;
+    }
+
     /// <summary>Makes <c>OnError</c> on <paramref name="nodeId"/> — the last node of an
     /// operator built from several — set the policy of the nodes that run its delegates.</summary>
     internal void SetErrorPolicyTargets(int nodeId, params int[] targets) =>
@@ -431,7 +450,10 @@ public sealed class CircuitBuilder
             var node = _nodes[i];
             nodes[i] = new CircuitGraphNode(
                 node.Id, node.Kind, node.Name, [.. node.Inputs], node.IsExchange, node.StateId ?? node.InputStateOf,
-                node.ErrorPolicy ?? Options.ErrorPolicy);
+                node.ErrorPolicy ?? Options.ErrorPolicy)
+            {
+                Probes = node.Probes is { } probes ? [.. probes] : [],
+            };
         }
         var outputs = new CircuitGraphOutput[_outputs.Count];
         for (var i = 0; i < outputs.Length; i++)

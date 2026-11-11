@@ -167,10 +167,12 @@ public class GroupedZStream<TKey, TValue>
         var eviction = Eviction;
         return new ZStream<TOut>(
             Builder,
-            Builder.AddNode(
-                "tableLookup",
-                [NodeId],
-                ctx => new TableLookupOperator<TKey, TValue, TRow, TOut>(ctx, probe, matched, missing, eviction)));
+            Builder.SetProbes(
+                Builder.AddNode(
+                    "tableLookup",
+                    [NodeId],
+                    ctx => new TableLookupOperator<TKey, TValue, TRow, TOut>(ctx, probe, matched, missing, eviction)),
+                table.TableNodeId));
     }
 
     /// <summary>
