@@ -326,6 +326,15 @@ public sealed record PipelineSpec
     /// finds it finishes the act before it does anything else with the pipeline.</summary>
     public string? Pending { get; init; }
 
+    /// <summary>
+    /// The spec this one replaced, while this one has not yet run. Assigned by the leader
+    /// when a replace keeps the pipeline's state across a change, and cleared when the new
+    /// generation first runs. If instead the new generation cannot be built on the state
+    /// or its circuit refuses the checkpoint, the leader — this one, or one that takes
+    /// over in the middle — puts this spec back and runs it. Never returned by the admin API.
+    /// </summary>
+    public PipelineSpec? Previous { get; init; }
+
     /// <summary>The declared tables the definition reads and writes, as the last dry run
     /// resolved them. Assigned by the leader.</summary>
     public IReadOnlyList<string> Reads { get; init; } = [];
@@ -338,6 +347,13 @@ public sealed record DeployOptions(
     StateChoice State = StateChoice.Unspecified, long? ExpectedGeneration = null, bool DryRun = false, string? Caller = null);
 
 public sealed record DeployResult(PipelineSpec Spec, PipelineShape Shape, ActionPlan Plan);
+
+/// <summary>A replace that was undone: generation <c>From</c> could not start on the state
+/// it was told to keep, so the spec of generation <c>Restored</c> was put back as
+/// generation <c>Now</c>. Kept on the node that did it until the pipeline is next
+/// deployed; the audit entry <c>pipeline.replace.rolled-back</c> is the durable record.</summary>
+public sealed record PipelineRollback(
+    DateTimeOffset Time, long From, long Restored, long Now, string Plugin, string Version, string Definition, IReadOnlyList<string> Problems);
 
 public enum PipelineState { Built, Starting, Running, Stopping, Stopped, Backoff, Blocked, Failed, NeedsReset, Unbuilt, Wedged }
 
@@ -356,7 +372,9 @@ public sealed record PipelineStatus(
     long? CommittedStep, IReadOnlyDictionary<string, long> CommittedOffsets,
     IReadOnlyList<PipelineFault> Faults, PipelineShape? Shape,
     IReadOnlyList<SourceSlotStatus> Sources, IReadOnlyList<SinkSlotStatus> Sinks,
-    IReadOnlyList<PipelineTransition>? History = null);
+    IReadOnlyList<PipelineTransition>? History = null,
+    PipelineRollback? RolledBack = null,
+    bool ReplaceUnconfirmed = false);
 
 public interface IPipelineSupervisor
 {
@@ -367,7 +385,13 @@ public interface IPipelineSupervisor
     /// <summary>Deploys a new pipeline, or replaces the one of that id. A replace whose
     /// plugin version, definition, non-<see cref="StateNeutralAttribute"/> settings, input
     /// or table bindings or worker count differ is refused with <c>state-choice-required</c>
-    /// unless <see cref="DeployOptions.State"/> says keep or reset.</summary>
+    /// unless <see cref="DeployOptions.State"/> says keep or reset. A replace that keeps
+    /// state is refused with <c>state-incompatible</c>, before anything stops and at the
+    /// dry run too, when the new circuit could not resume the committed checkpoint (another
+    /// worker count, a committed store with no home, a table recreated). What only shows
+    /// when the state is read — a value that does not fit its new type — is found when the
+    /// new generation is built: the previous spec is then put back and started, and the
+    /// call fails with <c>state-incompatible</c> saying so.</summary>
     Task<DeployResult> DeployAsync(PipelineSpec spec, DeployOptions options, CancellationToken cancellationToken);
 
     /// <summary>A dry run of a spec that need not be deployed: binds its settings, runs

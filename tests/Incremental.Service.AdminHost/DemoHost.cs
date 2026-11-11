@@ -65,7 +65,9 @@ public sealed class DemoHost : IAsyncDisposable
     private DemoHost(string work) => _work = work;
 
     public List<DemoNode> Nodes { get; } = [];
-    public MemoryConnector Memory { get; } = new();
+    // The feeds are memory logs, which by default keep every record so that a test can
+    // replay them; a host left running keeps the newest 100,000 of each instead.
+    public MemoryConnector Memory { get; } = new() { RetainLast = 100_000 };
     public DemoOptions Options { get; private set; } = new();
 
     public DemoNode Leader => Nodes.First(n => n.Node.IsLeader);

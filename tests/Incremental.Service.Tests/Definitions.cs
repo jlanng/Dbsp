@@ -113,3 +113,23 @@ public sealed class BrokenConstructor : IPipelineDefinition
 public sealed record IsinRequest(string Isin);
 
 public sealed record IsinAnswer(string Isin, string Symbol);
+
+/// <summary><c>counts</c> grouped by another key under the same operator name: the store
+/// names are the same, so the state layout matches, and the committed keys (trader names)
+/// cannot be read as the keys this declares (instrument ids). What no comparison of
+/// layouts can see.</summary>
+[Pipeline("counts-by-instrument")]
+public sealed class CountsByInstrument : IPipelineDefinition
+{
+    public void Build(PipelineBuilder p) =>
+        p.UpsertSink("out", p.Input<Trade>("trades").GroupBy(t => t.InstrumentId).Count().Named("count"));
+}
+
+/// <summary><c>counts</c> with its stateful operator under another name: the committed
+/// store has no home in this circuit, which a comparison of layouts does see.</summary>
+[Pipeline("counts-renamed")]
+public sealed class CountsRenamed : IPipelineDefinition
+{
+    public void Build(PipelineBuilder p) =>
+        p.UpsertSink("out", p.Input<Trade>("trades").GroupBy(t => t.Trader).Count().Named("count-v2"));
+}

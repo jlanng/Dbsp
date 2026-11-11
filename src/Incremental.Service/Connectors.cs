@@ -222,13 +222,17 @@ public sealed class MemoryConnector : IAppendSourceConnector, IKeyedSourceConnec
         type.IsGenericType ? $"{type.Name[..type.Name.IndexOf('`')]}<{string.Join(", ", type.GetGenericArguments().Select(a => a.Name))}>" : type.Name;
 
     /// <summary>The log an append input bound to <paramref name="name"/> reads.</summary>
-    public MemoryLog<T> Log<T>(string name) where T : notnull => Typed(_logs, name, () => new MemoryLog<T>());
+    public MemoryLog<T> Log<T>(string name) where T : notnull => Typed(_logs, name, () => new MemoryLog<T> { RetainLast = RetainLast });
+
+    /// <summary><see cref="MemoryLog{T}.RetainLast"/> for the logs this connector creates
+    /// from now on. Null, the default, keeps every record.</summary>
+    public int? RetainLast { get; set; }
 
     /// <summary>The log a keyed input bound to <paramref name="name"/> reads.</summary>
     public MemoryKeyedLog<TKey, TValue> KeyedLog<TKey, TValue>(string name)
         where TKey : notnull
         where TValue : notnull =>
-        Typed(_logs, name, () => new MemoryKeyedLog<TKey, TValue>());
+        Typed(_logs, name, () => new MemoryKeyedLog<TKey, TValue> { Entries = { RetainLast = RetainLast } });
 
     public InMemoryUpsertSink<TKey, TRow> UpsertSink<TKey, TRow>(string name) where TKey : notnull =>
         Typed(_sinks, name, () => new InMemoryUpsertSink<TKey, TRow>());
@@ -287,7 +291,8 @@ public sealed class MemoryConnector : IAppendSourceConnector, IKeyedSourceConnec
                 var next = from;
                 while (!_stop.IsCancellationRequested)
                 {
-                    var (records, appended) = log.ReadFrom(next);
+                    var (records, first, appended) = log.ReadFrom(next);
+                    next = first;
                     foreach (var record in records)
                     {
                         await send(record, next, _stop.Token).ConfigureAwait(false);
@@ -330,7 +335,30 @@ public class MemoryLog<T> where T : notnull
     private TaskCompletionSource _appended = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private Exception? _failure;
 
+    // The offset of _records[0]: above 0 once RetainLast has dropped records.
+    private long _first;
+
+    /// <summary>
+    /// Null (the default) keeps every record, so a pipeline can always be replayed from
+    /// offset 0 — what a test wants. With a number the log keeps about that many of the
+    /// newest records and drops the rest, as a topic with retention does, so a host left
+    /// running stays small; a source that asks for a record already dropped is given the
+    /// oldest one held, with its true offset (a consumer's <c>auto.offset.reset=earliest</c>).
+    /// </summary>
+    public int? RetainLast { get; set; }
+
+    /// <summary>Records ever appended: the offset the next one gets.</summary>
     public long Count
+    {
+        get
+        {
+            lock (_records)
+                return _first + _records.Count;
+        }
+    }
+
+    /// <summary>Records held now.</summary>
+    public int Retained
     {
         get
         {
@@ -339,12 +367,23 @@ public class MemoryLog<T> where T : notnull
         }
     }
 
+    // Dropped in blocks, so that removing from the front costs O(1) per record appended.
+    private void Trim()
+    {
+        if (RetainLast is not { } retain || _records.Count < 2L * Math.Max(retain, 1))
+            return;
+        var drop = _records.Count - Math.Max(retain, 1);
+        _records.RemoveRange(0, drop);
+        _first += drop;
+    }
+
     public void Append(T record)
     {
         TaskCompletionSource signal;
         lock (_records)
         {
             _records.Add(record);
+            Trim();
             signal = _appended;
             _appended = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         }
@@ -357,6 +396,7 @@ public class MemoryLog<T> where T : notnull
         lock (_records)
         {
             _records.AddRange(records);
+            Trim();
             signal = _appended;
             _appended = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         }
@@ -384,14 +424,18 @@ public class MemoryLog<T> where T : notnull
             _failure = null;
     }
 
-    internal (IReadOnlyList<T> Records, Task Appended) ReadFrom(long offset)
+    /// <summary>Up to 1024 records from <paramref name="offset"/>, and the offset of the
+    /// first of them: <paramref name="offset"/> itself unless that record has been dropped.</summary>
+    internal (IReadOnlyList<T> Records, long First, Task Appended) ReadFrom(long offset)
     {
         lock (_records)
         {
             if (_failure is { } failure)
                 throw failure;
-            var available = _records.Count - (int)offset;
-            return (available > 0 ? _records.GetRange((int)offset, Math.Min(available, 1024)) : [], _appended.Task);
+            var first = Math.Max(offset, _first);
+            var index = (int)(first - _first);
+            var available = _records.Count - index;
+            return (available > 0 ? _records.GetRange(index, Math.Min(available, 1024)) : [], first, _appended.Task);
         }
     }
 }

@@ -87,6 +87,11 @@ public sealed class ServiceOptions
     /// <summary>Whether losing leadership (fenced: exit code 3; resigned: 4) stops the
     /// host application. A process supervisor then restarts it as a standby.</summary>
     public bool ExitOnLeadershipLoss { get; set; } = true;
+
+    /// <summary>A test hook: awaited, with the pipeline's id, after a generation has been
+    /// found not to fit the kept state and before the catalog commit that puts the previous
+    /// spec back.</summary>
+    internal Func<string, Task>? BeforeRollbackCommit { get; set; }
 }
 
 /// <summary>Something that happened on this node: a role change, a pipeline or table

@@ -1420,6 +1420,13 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
     {
         if (context.PipelineSpecs().FirstOrDefault(p => p.Plugin == manifest.Name && p.Version == manifest.Version) is { } user)
             throw ServiceException.Conflict($"Plugin '{manifest.Name}' version {manifest.Version} is named by pipeline '{user.Id}'.");
+
+        // The version a replace would be rolled back to is still needed until that
+        // replace has run.
+        if (context.PipelineSpecs().FirstOrDefault(p => p.Previous is { } previous && previous.Plugin == manifest.Name && previous.Version == manifest.Version) is { } unconfirmed)
+            throw ServiceException.Conflict(
+                $"Plugin '{manifest.Name}' version {manifest.Version} is what pipeline '{unconfirmed.Id}' goes back to if its replacement cannot start; " +
+                "it can be deleted once the pipeline has run.");
         if (manifest.Kind != PluginKind.Contract)
             return;
         var assembly = manifest.MainAssemblyName;

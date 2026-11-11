@@ -11,6 +11,21 @@ public sealed class InMemoryBackendOptions
     /// version holds its old and new rows, so this is small.</summary>
     public int RetainedHistoryVersions { get; init; } = 1024;
 
+    /// <summary>Row changes each table log keeps across those versions: the bound that
+    /// holds when single versions are large (a first load is one version per chunk, or one
+    /// for the whole table). The newest version is kept whatever its size.</summary>
+    public long RetainedHistoryChanges { get; init; } = 1_000_000;
+
+    /// <summary>
+    /// Records a partition of the state changelog may hold before it compacts itself: the
+    /// last record of every key is kept, and a tombstone goes once every follower has read
+    /// it. After a compaction the next is due at twice what survived, so the log holds at
+    /// most about twice the live entries of the pipelines' state plus this number per
+    /// partition — it does not grow with the time a node has been up. 0 turns it off:
+    /// every record ever committed is then kept.
+    /// </summary>
+    public int StateCompactAbove { get; init; } = 8192;
+
     /// <summary>Partitions of the in-memory state changelog (when the cluster is created
     /// by the backend rather than passed in).</summary>
     public int StatePartitions { get; init; } = 4;
@@ -45,7 +60,7 @@ public sealed class InMemoryServiceCluster
     public InMemoryServiceCluster(InMemoryBackendOptions? options = null)
     {
         Options = options ?? new InMemoryBackendOptions();
-        State = new InMemoryStateChangelog(Options.StatePartitions);
+        State = new InMemoryStateChangelog(Options.StatePartitions, Options.StateCompactAbove);
     }
 
     public InMemoryBackendOptions Options { get; }
@@ -99,6 +114,8 @@ public sealed class InMemoryServiceBackend : IServiceBackend, ICatalogMirror
         new Dictionary<string, string>
         {
             ["retainedHistoryVersions"] = RetainedHistoryVersions.ToString(),
+            ["retainedHistoryChanges"] = _cluster.Options.RetainedHistoryChanges.ToString(),
+            ["stateCompactAbove"] = _cluster.Options.StateCompactAbove.ToString(),
             ["statePartitions"] = _cluster.State.PartitionCount.ToString(),
             ["catalogDirectory"] = _cluster.Options.CatalogDirectory ?? "",
         },
@@ -107,6 +124,7 @@ public sealed class InMemoryServiceBackend : IServiceBackend, ICatalogMirror
             ["stateRecordsAppended"] = _cluster.State.RecordsAppended,
             ["stateTransactionsCommitted"] = _cluster.State.TransactionsCommitted,
             ["stateRecords"] = _cluster.State.RecordCount,
+            ["stateCompactions"] = _cluster.State.Compactions,
         });
 
     public async Task<ITableLog<TKey, TRow>> OpenTableLogAsync<TKey, TRow>(string name, CancellationToken cancellationToken)
@@ -133,7 +151,7 @@ public sealed class InMemoryServiceBackend : IServiceBackend, ICatalogMirror
                 }
                 if (writer)
                 {
-                    var log = new InMemoryTableLog<TKey, TRow>(RetainedHistoryVersions);
+                    var log = new InMemoryTableLog<TKey, TRow>(RetainedHistoryVersions, _cluster.Options.RetainedHistoryChanges);
                     _cluster.TableLogs[name] = log;
                     _connections.Add(log.TakeOver);
                     var signal = _cluster.TableCreated;

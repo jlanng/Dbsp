@@ -107,6 +107,9 @@ internal sealed class PipelineRuntime(PipelineSpec spec, ServiceOptions options)
     public CancellationTokenSource? Retry;
     public volatile bool Wedged;
     public long Generations;
+
+    /// <summary>The last replace of this pipeline that was undone here.</summary>
+    public volatile PipelineRollback? RolledBack;
 }
 
 /// <summary>
@@ -188,16 +191,18 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         return new PipelineStatus(
             runtime.Id, runtime.State, spec.Desired, spec.Generation, spec.Plugin, spec.Version, spec.Definition,
             blockedOn, runtime.Since, runtime.Operation, runtime.Restarts, runtime.DeadLetters.Total,
-            generation?.Circuit.CommittedStep, committed, faults, runtime.Shape, sources, sinks, runtime.History.After());
+            generation?.Circuit.CommittedStep, committed, faults, runtime.Shape, sources, sinks, runtime.History.After(),
+            runtime.RolledBack, spec.Previous is not null);
     }
 
     public PipelineGraph? Graph(string id) => Require(id).Graph;
 
-    public PipelineSpec RedactedSpec(string id)
-    {
-        var spec = Require(id).Spec;
-        return spec with { Inputs = Redact(spec.Inputs), Sinks = Redact(spec.Sinks) };
-    }
+    public PipelineSpec RedactedSpec(string id) => Shown(Require(id).Spec);
+
+    /// <summary>A spec as it may leave the service: secrets as <c>***</c>, and without the
+    /// spec it replaced, which is the service's own note.</summary>
+    private PipelineSpec Shown(PipelineSpec spec) =>
+        spec with { Inputs = Redact(spec.Inputs), Sinks = Redact(spec.Sinks), Previous = null };
 
     private IReadOnlyDictionary<string, JsonElement> Redact(IReadOnlyDictionary<string, JsonElement> bindings)
     {
@@ -342,7 +347,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         var (resolved, lease) = await ResolveAsync(spec, cancellationToken).ConfigureAwait(false);
         using (lease)
         {
-            var (shape, graph) = DryRun(resolved, lease);
+            var (shape, graph, _) = DryRun(resolved, lease);
             return new PipelineValidation(resolved, shape, graph);
         }
     }
@@ -359,9 +364,13 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
 
     /// <summary>Runs the definition against a builder that is never built: the slots and
     /// tables it declares, with every binding checked. No side effects — a table is claimed
-    /// only at <c>Circuit.Build()</c>.</summary>
+    /// only at <c>Circuit.Build()</c>. With <paramref name="againstState"/> it also asks
+    /// whether the circuit could resume the pipeline's committed checkpoint
+    /// (<see cref="CircuitBuilder.CheckState"/>): what <c>Circuit.Start()</c> would refuse,
+    /// known before anything is stopped.</summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private (PipelineShape Shape, PipelineGraph Graph) DryRun(PipelineSpec spec, PluginLease lease)
+    private (PipelineShape Shape, PipelineGraph Graph, IReadOnlyList<string> StateProblems) DryRun(
+        PipelineSpec spec, PluginLease lease, bool againstState = false)
     {
         var definition = lease.Definition(spec.Definition);
         var settings = definition.BindSettings(spec.Settings, lease.Json);
@@ -381,8 +390,32 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             throw ServiceException.Invalid($"Definition '{spec.Definition}' threw while describing its circuit: {ex.GetType().Name}: {ex.Message}");
         }
         CheckBindings(spec, pipeline);
-        return (pipeline.Shape, pipeline.Graph);
+        IReadOnlyList<string> problems = [];
+        if (againstState)
+        {
+            try
+            {
+                problems = builder.CheckState(context.Storage.Pipeline(spec.Id));
+            }
+            catch (Exception ex)
+            {
+                // Not decided here, then: the start decides, and a refusal there rolls back.
+                _logger.LogDebug(ex, "Pipeline {Pipeline}: the state layout of the dry run could not be described", spec.Id);
+            }
+        }
+        return (pipeline.Shape, pipeline.Graph, problems);
     }
+
+    private static ServiceException StateIncompatible(string id, IReadOnlyList<string> problems) => new(
+        "state-incompatible",
+        $"Pipeline '{id}' cannot keep its state across this change: the new circuit could not resume the committed checkpoint. " +
+        "Nothing was changed. Deploy it with state=reset to start it from empty state, or leave out what the checkpoint cannot follow " +
+        "(a worker count, a renamed or removed stateful operator).",
+        409, [.. problems.Select(Flat)]);
+
+    /// <summary>A problem on one line: the core lists store names one per line.</summary>
+    private static string Flat(string problem) =>
+        string.Join(" ", problem.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
 
     private void CheckBindings(PipelineSpec spec, PipelineBuilder pipeline)
     {
@@ -627,14 +660,29 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             (spec, lease) = await ResolveAsync(spec, cancellationToken).ConfigureAwait(false);
             var changes = existing is null ? [] : StateChanges(existing, spec);
             if (changes.Count > 0 && options.State == StateChoice.Unspecified)
+            {
+                // The choice is the caller's, but one of the two may already be closed:
+                // say so with the question, not after it has been answered.
+                try
+                {
+                    if (DryRun(spec, lease, againstState: true).StateProblems is { Count: > 0 } closed)
+                        changes = [.. changes, .. closed.Select(p => "keep is not possible: " + Flat(p))];
+                }
+                catch (ServiceException)
+                {
+                    // A spec that does not bind is refused for that once a choice is made.
+                }
                 throw new ServiceException(
                     "state-choice-required",
                     $"This change to pipeline '{spec.Id}' can change what its state means; say whether to keep the state or reset it.", 409, changes);
-
-            var (shape, graph) = DryRun(spec, lease);
-            RequireReferences(spec, shape);
+            }
 
             var reset = existing is not null && options.State == StateChoice.Reset;
+            var (shape, graph, stateProblems) = DryRun(spec, lease, againstState: existing is not null && !reset);
+            if (stateProblems.Count > 0)
+                throw StateIncompatible(spec.Id, stateProblems);
+            RequireReferences(spec, shape);
+
             var steps = new List<string>();
             if (existing is null)
                 steps.Add($"deploy generation 1 of '{spec.Definition}' from {spec.Plugin}@{spec.Version}; state starts empty");
@@ -645,11 +693,13 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 steps.Add(reset ? "state dropped: a new incarnation; sources start again from their start position; upsert sinks keep rows the new run does not produce"
                     : changes.Count > 0 ? "state kept: the new generation reads the old one's entries as its own types"
                     : "state kept: nothing that touches it changed");
+                if (!reset && changes.Count > 0)
+                    steps.Add($"if the new generation cannot read the state it is given, the spec of generation {(existing.Previous ?? existing).Generation} is put back and started");
             }
             steps.Add(spec.Desired == DesiredState.Running ? "start" : "leave stopped");
             var plan = new ActionPlan(existing is null ? "pipeline.deploy" : "pipeline.replace", spec.Id, options.DryRun, steps);
             if (options.DryRun)
-                return new DeployResult(spec with { Generation = existing?.Generation ?? 0 }, shape, plan);
+                return new DeployResult(Shown(spec with { Generation = existing?.Generation ?? 0 }), shape, plan);
 
             // Intent first: from here a successor knows everything. The tables and the
             // plugin version the spec names are checked again under the lock their removal
@@ -660,6 +710,10 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 Reads = shape.TablesRead,
                 Writes = shape.TablesWritten,
                 Pending = reset ? "reset" : null,
+
+                // What to go back to if the kept state turns out not to fit. A spec that
+                // itself never ran is not it: the state is still its predecessor's.
+                Previous = existing is not null && !reset && changes.Count > 0 ? (existing.Previous ?? existing) with { Previous = null } : null,
             };
             using (await context.LockReferencesAsync(cancellationToken).ConfigureAwait(false))
             {
@@ -671,6 +725,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             // the caller, so nothing below takes its token.
             runtime.Shape = shape;
             runtime.Graph = graph;
+            runtime.RolledBack = null;
             if (runtime.Current is not null || existing is not null)
                 await StopCurrentAsync(runtime, context.Options.StopTimeout).ConfigureAwait(false);
             if (!runtime.Wedged)
@@ -685,7 +740,19 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 ClearFaults(runtime);
                 await ReconcileAsync(runtime).ConfigureAwait(false);
             }
-            return new DeployResult(runtime.Spec, shape, plan);
+
+            // The replace happened and was undone: the caller is told it did not take,
+            // with what the state would not accept, rather than handed a plan that reads
+            // as done.
+            if (runtime.RolledBack is { } undone && undone.From == spec.Generation)
+                throw new ServiceException(
+                    "state-incompatible",
+                    $"Pipeline '{spec.Id}' could not keep its state across this change, so the change was rolled back: generation {undone.From} " +
+                    $"({undone.Plugin}@{undone.Version}, '{undone.Definition}') could not be started on the state, the spec of generation " +
+                    $"{undone.Restored} was put back as generation {undone.Now}, and the pipeline is {runtime.State}. " +
+                    "Deploy the change with state=reset to start it from empty state.",
+                    409, undone.Problems);
+            return new DeployResult(Shown(runtime.Spec), shape, plan);
         }
         finally
         {
@@ -1045,6 +1112,8 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             runtime.Starting = null;
             Set(runtime, PipelineState.Running);
             Watch(runtime, generation);
+            if (runtime.Spec.Previous is not null)
+                await ConfirmReplaceAsync(runtime).ConfigureAwait(false);
         }
         catch (NoLongerLeadingException)
         {
@@ -1066,6 +1135,16 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             Set(runtime, PipelineState.Blocked, ex.Message);
             ScheduleRetry(runtime, context.Options.BlockedRetryInterval, PipelineState.Blocked);
         }
+        catch (Exception ex) when (StateMismatch(ex) is { } mismatch)
+        {
+            // The circuit cannot be built on the committed state, or refuses to resume it.
+            // Nothing ran and nothing was written, and trying again would find the same.
+            runtime.Starting = null;
+            if (generation is not null)
+                await TeardownAsync(runtime, generation, context.Options.StopTimeout).ConfigureAwait(false);
+            if (!runtime.Wedged)
+                await OnStateMismatchAsync(runtime, mismatch, number).ConfigureAwait(false);
+        }
         catch (Exception ex)
         {
             runtime.Starting = null;
@@ -1077,6 +1156,117 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
     }
 
     private sealed class NoLongerLeadingException : Exception;
+
+    private static CircuitStateMismatchException? StateMismatch(Exception? ex)
+    {
+        for (; ex is not null; ex = ex.InnerException)
+            if (ex is CircuitStateMismatchException mismatch)
+                return mismatch;
+        return null;
+    }
+
+    /// <summary>The new generation of a replace that kept state is running: the spec it
+    /// replaced is no longer needed. The entry's generation does not move — nothing a
+    /// caller sent has changed. A failure leaves the note, which is cleared at the next
+    /// start; until then a state mismatch would still roll back, and there can be none,
+    /// because the state is now this spec's.</summary>
+    private async Task ConfirmReplaceAsync(PipelineRuntime runtime)
+    {
+        try
+        {
+            var spec = runtime.Spec;
+            await CommitAsync(runtime, spec with { Previous = null }, "pipeline.replace.confirmed", "service", null, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Pipeline {Pipeline}: the replace runs, but recording that failed; it is recorded at the next start", runtime.Id);
+        }
+    }
+
+    /// <summary>
+    /// A generation that cannot start on the pipeline's committed state. If the spec is a
+    /// replace that kept state and has not run, the spec it replaced is put back — one
+    /// catalog commit — and started: the pipeline is down for the length of two starts,
+    /// not until someone repairs it. A leader that dies before that commit leaves the
+    /// unconfirmed spec, and its successor comes through here and does the same.
+    /// With nothing to go back to the pipeline is <c>NeedsReset</c>: retrying would find
+    /// the same state. Caller holds the queue.
+    /// </summary>
+    private async Task OnStateMismatchAsync(PipelineRuntime runtime, CircuitStateMismatchException mismatch, long number)
+    {
+        var spec = runtime.Spec;
+        IReadOnlyList<string> problems = [.. mismatch.Problems.Select(Flat)];
+        var reason = string.Join("; ", problems);
+        lock (runtime.Faults)
+        {
+            runtime.Faults.Enqueue(new PipelineFault(DateTimeOffset.UtcNow, number, mismatch.GetType().Name, reason, null));
+            while (runtime.Faults.Count > context.Options.FaultBuffer)
+                runtime.Faults.Dequeue();
+        }
+
+        // The stores this attempt created go back to the bytes they were made of.
+        try
+        {
+            ReleaseBinding(runtime);
+        }
+        catch (Exception ex)
+        {
+            HandleFault(runtime, ex, number);
+            return;
+        }
+
+        if (spec.Previous is not { } previous)
+        {
+            _logger.LogError(
+                "Pipeline {Pipeline} generation {Generation} cannot start on its committed state and is not retried: {Reason}",
+                runtime.Id, spec.Generation, reason);
+            Set(runtime, PipelineState.NeedsReset,
+                $"the circuit cannot resume the committed state ({reason}); deploy the spec that wrote the state with state=keep, or reset the pipeline");
+            return;
+        }
+        if (!Leads)
+        {
+            Set(runtime, PipelineState.Stopped, "this node no longer leads");
+            return;
+        }
+
+        try
+        {
+            if (context.Options.BeforeRollbackCommit is { } hook)
+                await hook(runtime.Id).ConfigureAwait(false);
+            var restored = previous with { Generation = spec.Generation + 1, Previous = null, Pending = null };
+            List<string> steps =
+            [
+                $"generation {spec.Generation} ('{spec.Definition}' from {spec.Plugin}@{spec.Version}) could not start on the state it was to keep",
+                .. problems.Select(p => "state: " + p),
+                $"the spec of generation {previous.Generation} ('{previous.Definition}' from {previous.Plugin}@{previous.Version}) is put back as generation {restored.Generation}",
+                restored.Desired == DesiredState.Running ? "start" : "leave stopped",
+            ];
+            await CommitAsync(runtime, restored, "pipeline.replace.rolled-back", "service", steps, CancellationToken.None).ConfigureAwait(false);
+            runtime.RolledBack = new PipelineRollback(
+                DateTimeOffset.UtcNow, spec.Generation, previous.Generation, restored.Generation, spec.Plugin, spec.Version, spec.Definition, problems);
+            runtime.History.Add(new PipelineTransition(DateTimeOffset.UtcNow, PipelineState.Stopped, restored.Generation,
+                $"rolled back to the spec of generation {previous.Generation}: {reason}"));
+            _logger.LogWarning(
+                "Pipeline {Pipeline}: generation {Generation} could not start on the kept state ({Reason}); rolled back to the spec of generation {Previous} as generation {Restored}",
+                runtime.Id, spec.Generation, reason, previous.Generation, restored.Generation);
+
+            // The fact before the colon, the state's detail after it: what follows the
+            // first colon of an event is hidden where messages are.
+            context.Events.Publish("pipeline", runtime.Id, $"rolled back to the spec of generation {previous.Generation}: {reason}");
+        }
+        catch (Exception ex)
+        {
+            // The catalog would not take it, or the node is going: tried again like any
+            // other failure, and the next attempt comes through here again.
+            HandleFault(runtime, ex, number, "roll-back not finished");
+            return;
+        }
+
+        ClearFaults(runtime);
+        await ReconcileAsync(runtime).ConfigureAwait(false);
+    }
 
     private static void Abandon(Generation generation)
     {
