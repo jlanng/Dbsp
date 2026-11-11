@@ -88,6 +88,9 @@ public sealed class PipelineBuilder
     internal List<string> TablesRead { get; } = [];
     internal List<string> TablesWritten { get; } = [];
 
+    /// <summary>Declared table → the key and row types the definition reads or writes it as.</summary>
+    internal Dictionary<string, (Type Key, Type Row)> TableTypes { get; } = new(StringComparer.Ordinal);
+
     private readonly Dictionary<string, string> _sinkOutputs = new(StringComparer.Ordinal);
 
     /// <summary>The output just registered belongs to <paramref name="slot"/>.</summary>
@@ -122,6 +125,7 @@ public sealed class PipelineBuilder
         var shared = _tables.Get<TKey, TRow>(name);
         if (!TablesRead.Contains(name))
             TablesRead.Add(name);
+        TableTypes[name] = (typeof(TKey), typeof(TRow));
         return Circuit.Table(shared);
     }
 
@@ -225,6 +229,7 @@ public sealed class PipelineBuilder
         if (TablesWritten.Contains(name))
             throw new InvalidOperationException($"Table '{name}' is written twice by this definition.");
         TablesWritten.Add(name);
+        TableTypes[name] = (typeof(TKey), typeof(TRow));
         rows.ToTable(shared);
     }
 

@@ -110,6 +110,10 @@ internal sealed class PipelineRuntime(PipelineSpec spec, ServiceOptions options)
 
     /// <summary>The last replace of this pipeline that was undone here.</summary>
     public volatile PipelineRollback? RolledBack;
+
+    /// <summary>What the state of <see cref="Spec"/> is made of, as the last build or dry
+    /// run of that spec on this node described it; null where it never was.</summary>
+    public volatile StateShape? StateShape;
 }
 
 /// <summary>
@@ -347,7 +351,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         var (resolved, lease) = await ResolveAsync(spec, cancellationToken).ConfigureAwait(false);
         using (lease)
         {
-            var (shape, graph, _) = DryRun(resolved, lease);
+            var (shape, graph, _, _) = DryRun(resolved, lease);
             return new PipelineValidation(resolved, shape, graph);
         }
     }
@@ -369,8 +373,8 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
     /// (<see cref="CircuitBuilder.CheckState"/>): what <c>Circuit.Start()</c> would refuse,
     /// known before anything is stopped.</summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private (PipelineShape Shape, PipelineGraph Graph, IReadOnlyList<string> StateProblems) DryRun(
-        PipelineSpec spec, PluginLease lease, bool againstState = false)
+    private (PipelineShape Shape, PipelineGraph Graph, IReadOnlyList<string> StateProblems, StateShape? State) DryRun(
+        PipelineSpec spec, PluginLease lease, bool againstState = false, bool describeState = false)
     {
         var definition = lease.Definition(spec.Definition);
         var settings = definition.BindSettings(spec.Settings, lease.Json);
@@ -403,7 +407,63 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 _logger.LogDebug(ex, "Pipeline {Pipeline}: the state layout of the dry run could not be described", spec.Id);
             }
         }
-        return (pipeline.Shape, pipeline.Graph, problems);
+        return (pipeline.Shape, pipeline.Graph, problems, describeState ? TryDescribeState(pipeline) : null);
+    }
+
+    private StateShape? TryDescribeState(PipelineBuilder pipeline)
+    {
+        try
+        {
+            return StateShapes.Describe(pipeline.Circuit.DescribeState(), pipeline.TableTypes);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Pipeline {Pipeline}: its state could not be described", pipeline.PipelineId);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// What a person choosing between keep and reset has to go on: the state of the spec
+    /// that is running against the state of the one proposed — which stores are new or
+    /// gone, which types they hold changed, in which members, and whether a changed type
+    /// identifies entries or is only a value. Only what state depends on is compared; a
+    /// sink's row type gaining a column changes no line here.
+    /// </summary>
+    private async Task<List<string>> StateEvidenceAsync(PipelineRuntime runtime, PipelineSpec existing, StateShape? next)
+    {
+        var old = runtime.StateShape;
+        if (old is null)
+        {
+            // Never built here (Failed since this node took over, or stopped): describe it now.
+            try
+            {
+                var lease = runtime.Lease is { } bound && bound.Name == existing.Plugin && bound.Version == existing.Version
+                    ? null
+                    : await context.Plugins.AcquireAsync(existing.Plugin, existing.Version, CancellationToken.None).ConfigureAwait(false);
+                using (lease)
+                    old = DescribeExisting(existing, lease ?? runtime.Lease!);
+            }
+            catch (Exception ex)
+            {
+                return [$"state shapes: not compared — the spec that is deployed could not be described ({ex.GetType().Name}: {ex.Message})"];
+            }
+        }
+        if (old is null || next is null)
+            return ["state shapes: not compared — the circuit's state could not be described"];
+        var differences = StateShapes.Differences(old, next);
+        return differences.Count == 0 ? [StateShapes.Unchanged(next)] : [.. differences.Select(d => "state shapes: " + d)];
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private StateShape? DescribeExisting(PipelineSpec spec, PluginLease lease)
+    {
+        var definition = lease.Definition(spec.Definition);
+        var settings = definition.BindSettings(spec.Settings, lease.Json);
+        var builder = new CircuitBuilder(new CircuitOptions { Name = spec.Id + " (described)", Workers = spec.Circuit.Workers });
+        var pipeline = new PipelineBuilder(spec, builder, context.Tables, _logger, context.Services);
+        definition.Build(pipeline, settings);
+        return TryDescribeState(pipeline);
     }
 
     private static ServiceException StateIncompatible(string id, IReadOnlyList<string> problems) => new(
@@ -472,16 +532,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         if (old.Plugin != next.Plugin)
             changes.Add($"plugin: {old.Plugin} → {next.Plugin}");
         if (old.Version != next.Version)
-        {
-            var was = context.Plugins.Manifest(old.Plugin, old.Version)?.Fingerprint;
-            var now = context.Plugins.Manifest(next.Plugin, next.Version)?.Fingerprint;
-            // The fingerprint covers what the plugin's own assembly declares. A shape that
-            // exists only inside a delegate — a tuple, a type of a private dependency — is
-            // not in it, so "identical" is said of the declared shapes and no more.
-            changes.Add($"version: {old.Version} → {next.Version} ({(was == now
-                ? "declared data shapes identical; shapes used only inside delegates are not compared"
-                : "declared data shapes differ")})");
-        }
+            changes.Add($"version: {old.Version} → {next.Version}");
         if (old.Definition != next.Definition)
             changes.Add($"definition: {old.Definition} → {next.Definition}");
         if (old.Circuit.Workers != next.Circuit.Workers)
@@ -665,7 +716,9 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 // say so with the question, not after it has been answered.
                 try
                 {
-                    if (DryRun(spec, lease, againstState: true).StateProblems is { Count: > 0 } closed)
+                    var asked = DryRun(spec, lease, againstState: true, describeState: true);
+                    changes = [.. changes, .. await StateEvidenceAsync(runtime, existing!, asked.State).ConfigureAwait(false)];
+                    if (asked.StateProblems is { Count: > 0 } closed)
                         changes = [.. changes, .. closed.Select(p => "keep is not possible: " + Flat(p))];
                 }
                 catch (ServiceException)
@@ -678,10 +731,13 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             }
 
             var reset = existing is not null && options.State == StateChoice.Reset;
-            var (shape, graph, stateProblems) = DryRun(spec, lease, againstState: existing is not null && !reset);
+            var (shape, graph, stateProblems, stateShape) = DryRun(spec, lease, againstState: existing is not null && !reset, describeState: true);
             if (stateProblems.Count > 0)
                 throw StateIncompatible(spec.Id, stateProblems);
             RequireReferences(spec, shape);
+            var evidence = existing is not null && changes.Count > 0 && !reset
+                ? await StateEvidenceAsync(runtime, existing, stateShape).ConfigureAwait(false)
+                : [];
 
             var steps = new List<string>();
             if (existing is null)
@@ -690,6 +746,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             {
                 steps.Add($"stop generation {existing.Generation} (drain, commit)");
                 steps.AddRange(changes.Select(c => "changes " + c));
+                steps.AddRange(evidence);
                 steps.Add(reset ? "state dropped: a new incarnation; sources start again from their start position; upsert sinks keep rows the new run does not produce"
                     : changes.Count > 0 ? "state kept: the new generation reads the old one's entries as its own types"
                     : "state kept: nothing that touches it changed");
@@ -725,6 +782,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             // the caller, so nothing below takes its token.
             runtime.Shape = shape;
             runtime.Graph = graph;
+            runtime.StateShape = stateShape;
             runtime.RolledBack = null;
             if (runtime.Current is not null || existing is not null)
                 await StopCurrentAsync(runtime, context.Options.StopTimeout).ConfigureAwait(false);
@@ -1307,6 +1365,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         CheckBindings(spec, pipeline);
         runtime.Shape = pipeline.Shape;
         runtime.Graph = pipeline.Graph;
+        runtime.StateShape = TryDescribeState(pipeline);
         return new Generation { Number = number, Circuit = builder.Build(), Builder = pipeline, Logs = logs };
     }
 

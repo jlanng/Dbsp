@@ -148,7 +148,14 @@ public class PluginTests
         // service will not make silently.
         var refused = await Assert.ThrowsAsync<ServiceException>(() => service.DeployAsync(TraderCounts("old", v2.Version, "in", "old-out")));
         Assert.Equal("state-choice-required", refused.Code);
-        Assert.Contains(refused.Details, d => d.StartsWith("version:") && d.Contains("declared data shapes identical; shapes used only inside delegates are not compared"));
+        Assert.Contains(refused.Details, d => d == $"version: {v1.Version} → {v2.Version}");
+
+        // The evidence is about the state and nothing else: the two versions differ in a
+        // constant and in a sink row's member, neither of which any store holds.
+        var evidence = Assert.Single(refused.Details, d => d.StartsWith("state shapes:"));
+        Assert.StartsWith("state shapes: unchanged", evidence);
+        Assert.Contains("Acme.Pipelines.Seen", evidence);
+        Assert.DoesNotContain(refused.Details, d => d.Contains("keep is not possible"));
         await service.DeployAsync(TraderCounts("old", v2.Version, "in", "old-out"), StateChoice.Keep);
         await service.Running("old");
 

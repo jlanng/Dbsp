@@ -380,6 +380,13 @@ public sealed class Smoke(ExampleOptions options)
         await Claim("replacing trade-enrichment without saying what happens to its state is refused (409 state-choice-required)",
             () => Unless(undecided.Status == 409 && undecided.Body?["error"]?["code"]?.GetValue<string>() == "state-choice-required",
                 $"the replace answered {undecided.Status} {undecided.Body?.ToJsonString()}"));
+        await Claim("…and the refusal says the state's shapes are unchanged: version 2 adds a column to the sink's row, which no state store holds", () =>
+        {
+            var details = undecided.Body?["error"]?["details"]?.AsArray().Select(d => d!.GetValue<string>()).ToList() ?? [];
+            return Unless(details.Count(d => d.StartsWith("state shapes: unchanged") && d.Contains("Enrichment.Pipelines.Booked")) == 1
+                    && !details.Any(d => d.Contains("EnrichedTrade") || d.Contains("keep is not possible")),
+                $"the details were: {string.Join(" | ", details)}");
+        });
         var before = _model.Enrichments["trade-enrichment"].Expected(_model).Count;
         var kept = await _admin.PutAsync("pipelines/trade-enrichment?state=keep", enrichment);
         _model.Enrichments["trade-enrichment"].V2 = true;
