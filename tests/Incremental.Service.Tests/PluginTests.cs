@@ -564,6 +564,26 @@ public class PluginTests
     }
 
     [Fact]
+    public async Task A_cache_directory_given_relative_to_the_working_directory_still_loads_plugins()
+    {
+        var name = "incremental-relative-cache-" + Guid.NewGuid().ToString("N");
+        var relative = Path.GetRelativePath(Environment.CurrentDirectory, Path.Combine(Path.GetTempPath(), name));
+        Assert.False(Path.IsPathRooted(relative));
+        try
+        {
+            await using var service = await StartAsync(options: o => o.CacheDirectory = relative);
+            var plugin = await service.Plugins.ImportDirectoryAsync(PluginDirectory("Acme.Pipelines"), default);
+            await service.DeployAsync(TraderCounts("p", plugin.Version, "in", "out"));
+            await service.Running("p");
+            Assert.True(File.Exists(Path.Combine(Path.GetTempPath(), name, "plugins", plugin.Name, plugin.Version, "Acme.Pipelines.dll")));
+        }
+        finally
+        {
+            Directory.Delete(Path.Combine(Path.GetTempPath(), name), recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task The_cache_directory_holds_what_is_stored_and_a_default_one_goes_with_its_process()
     {
         var cache = Path.Combine(Path.GetTempPath(), "incremental-service-tests", Guid.NewGuid().ToString("N"));

@@ -647,8 +647,10 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
 
     private static string DefaultCacheBase => Path.Combine(Path.GetTempPath(), "incremental-service");
 
-    private string CacheRoot =>
-        context.Options.CacheDirectory ?? Path.Combine(DefaultCacheBase, Environment.ProcessId.ToString(), context.NodeId);
+    // Absolute: an assembly is loaded by its path, and a load context refuses a relative
+    // one — a host configured with "./data" would otherwise fail every deploy.
+    private string CacheRoot => Path.GetFullPath(
+        context.Options.CacheDirectory ?? Path.Combine(DefaultCacheBase, Environment.ProcessId.ToString(), context.NodeId));
 
     // ── the cache directory ────────────────────────────────────────────────────────────
 
