@@ -41,16 +41,20 @@
     const node = store.node;
     const by = (node && node.pipelinesByState) || {};
     const trouble = (by.Failed || 0) + (by.Wedged || 0) + (by.NeedsReset || 0) + (by.Blocked || 0) + (by.Backoff || 0);
+    // The total in the plain colour; how many are in trouble beside it, in the alert
+    // colour, as its own number: a total painted red reads as that many in trouble.
     const counts = {
-      pipelines: node ? [node.pipelines, trouble > 0] : null,
-      tables: node ? [node.tables, false] : null,
+      pipelines: node ? [node.pipelines, trouble] : null,
+      tables: node ? [node.tables, 0] : null,
     };
     const current = SECTION[store.route.name];
     morph($('nav'), h('nav', { class: 'nav', id: 'nav', 'aria-label': 'Sections' },
       NAV.map(([key, label, href]) => h('a', { href, 'aria-current': current === key ? 'page' : null },
         icon(key, 16), h('span', null, label),
-        counts[key] && h('span', { class: ['count', counts[key][1] && 'alert'], title: counts[key][1] ? `${trouble} need attention` : null },
-          counts[key][0], counts[key][1] && h('span', { class: 'sr' }, `, ${trouble} need attention`))))));
+        counts[key] && h('span', { class: 'counts' },
+          counts[key][1] > 0 && h('span', { class: 'count alert', title: `${counts[key][1]} of ${counts[key][0]} need attention` },
+            counts[key][1], h('span', { class: 'sr' }, ' need attention, of ')),
+          h('span', { class: 'count' }, counts[key][0]))))));
   }
 
   // ── header: who this node is, and whether what is shown is live ─────────────────────
@@ -72,13 +76,16 @@
     const banner = $('banner');
     if (feed === 'off') {
       banner.hidden = false;
+      const refused = store.feedRefused;
       morph(banner, h('div', { class: 'banner', id: 'banner', role: 'alert' },
         icon('alert', 18),
         h('div', null,
-          'Live feed disconnected. What this page shows is stale. ',
+          refused ? 'No live feed: this node already serves as many as it allows. What this page shows is stale. '
+            : 'Live feed disconnected. What this page shows is stale. ',
           h('span', { class: 'banner-detail' },
-            store.lastLiveAt ? `Last update at ${clock(store.lastLiveAt)} (${ago(store.lastLiveAt)}). ` : 'Nothing has been received yet. ',
-            'Trying to reconnect…'))));
+            refused ? `${refused} Close another tab of this admin UI, or reload this page for a fresh reading. `
+              : store.lastLiveAt ? `Last update at ${clock(store.lastLiveAt)} (${ago(store.lastLiveAt)}). ` : 'Nothing has been received yet. ',
+            refused ? 'Trying again every few seconds…' : 'Trying to reconnect…'))));
     } else {
       banner.hidden = true;
     }
@@ -279,16 +286,46 @@
     source.addEventListener('lagged', () => load(false));
     for (const kind of ['node', 'pipeline', 'table', 'catalog', 'deadletter', 'plugin'])
       source.addEventListener(kind, e => onEvent(JSON.parse(e.data)));
+    source.addEventListener('hello', () => { store.feedRefused = null; });
     // The browser reconnects by itself; until it has, what is on the page is stale.
-    source.onerror = () => setFeed('off');
+    source.onerror = () => { setFeed('off'); if (source.readyState === EventSource.CLOSED) whyClosed(); };
   }
   const API_EVENTS = new URL('api/events', document.baseURI).href;
 
+  // An EventSource that was refused says nothing of why: no status, no body. So when it
+  // closes for good the same address is asked once with fetch, which does say. A node
+  // that is serving its limit of feeds answers 503 too-many-clients; that is shown, and
+  // the next attempt waits a few seconds instead of one.
+  let asking = false, retryAt = 0;
+  async function whyClosed() {
+    if (asking) return;
+    asking = true;
+    const abort = new AbortController();
+    try {
+      const response = await fetch(API_EVENTS, { headers: { Accept: 'text/event-stream' }, signal: abort.signal });
+      if (response.ok) { store.feedRefused = null; retryAt = 0; }
+      else {
+        let body = null;
+        try { body = await response.json(); } catch { /* not ours */ }
+        const error = body && body.error;
+        store.feedRefused = error && error.code === 'too-many-clients' ? error.message : null;
+        retryAt = store.feedRefused ? Date.now() + 5000 : 0;
+      }
+    } catch { store.feedRefused = null; retryAt = 0; }
+    abort.abort(); // a stream that did open is not kept: the EventSource opens its own
+    asking = false;
+    drawHeader();
+  }
+
   // A feed that is open but silent is as stale as one that is closed.
+  let seconds = 0;
   setInterval(() => {
+    // A node that does not lead learns who does from its probe of the other node, which
+    // can answer a moment after the role changed: ask again until it is known.
+    if (++seconds % 3 === 0 && store.node && store.node.role !== 'Leader' && (!store.leader || store.leader.nodeId === store.node.nodeId)) refreshNode();
     if (store.feed === 'live' && store.tickAt && Date.now() - store.tickAt > 5000) setFeed('off');
     if (store.feed === 'off') drawHeader();
-    if (store.feed === 'off' && source && source.readyState === EventSource.CLOSED) connect();
+    if (store.feed === 'off' && source && source.readyState === EventSource.CLOSED && !asking && Date.now() >= retryAt) connect();
   }, 1000);
 
   async function refreshNode() {

@@ -31,11 +31,21 @@ internal sealed class AdminException(int status, string code, string message) : 
 
 internal static class AdminSecurity
 {
-    private static readonly string[] ForwardingHeaders = ["Forwarded", "X-Forwarded-For", "X-Forwarded-Host"];
+    private static readonly string[] ForwardingHeaders =
+    [
+        "Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Forwarded-Port", "X-Forwarded-Server", "X-Real-IP", "Via",
+    ];
 
-    /// <summary>With no authorization policy the package enforces loopback itself: it
-    /// cannot choose what the server binds, and an admin API that is reachable is an admin
-    /// API that is open.</summary>
+    /// <summary>
+    /// With no authorization policy the package enforces loopback itself: it cannot choose
+    /// what the server binds, and an admin API that is reachable is an admin API that is
+    /// open. The rule is a default for a developer's machine, not authentication. A
+    /// reverse proxy on the same machine makes every caller a loopback caller, and the
+    /// checks below catch only the proxies that say so — by a forwarding header, by the
+    /// host name they pass on, or by speaking HTTP/1.0 to their upstream as nginx does
+    /// unless told otherwise. A proxy that rewrites the host, adds no header and speaks
+    /// HTTP/1.1 looks exactly like a local client: behind any proxy, set a policy.
+    /// </summary>
     public static IResult? RefuseUnlessLoopback(HttpContext context, ServiceAdminOptions options)
     {
         if (options.AuthorizationPolicy is not null)
@@ -49,6 +59,11 @@ internal static class AdminSecurity
                 "The admin API answers loopback requests only until ServiceAdminOptions.AuthorizationPolicy is set.");
 
         // Behind a reverse proxy on the same machine every request arrives from loopback.
+        // No browser and no current HTTP client sends HTTP/1.0; nginx's proxy_pass does
+        // by default, and by default adds none of the headers looked for below.
+        if (HttpProtocol.IsHttp10(context.Request.Protocol))
+            return AdminErrors.Result(403, "forwarded",
+                "This request arrived over HTTP/1.0, as a reverse proxy's does; the admin API answers proxied requests only when ServiceAdminOptions.AuthorizationPolicy is set.");
         foreach (var header in ForwardingHeaders)
             if (context.Request.Headers.ContainsKey(header))
                 return AdminErrors.Result(403, "forwarded",

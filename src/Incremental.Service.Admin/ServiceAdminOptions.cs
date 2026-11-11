@@ -8,8 +8,12 @@ public sealed class ServiceAdminOptions
 {
     /// <summary>The authorization policy every endpoint requires. While it is null the
     /// package enforces loopback itself: a request is refused unless it arrives from a
-    /// loopback address, names a loopback host (or one in <see cref="AllowedHosts"/>) and
-    /// carries no forwarding header. Setting a policy lifts those checks.</summary>
+    /// loopback address, names a loopback host (or one in <see cref="AllowedHosts"/>),
+    /// carries no forwarding header and is not HTTP/1.0. Setting a policy lifts those
+    /// checks. The loopback rule is not authentication: a reverse proxy on the same
+    /// machine that rewrites the host, adds no forwarding header and speaks HTTP/1.1 to
+    /// this server makes every one of its callers a loopback caller, and nothing here can
+    /// tell. Set a policy before the admin surface is published through any proxy.</summary>
     public string? AuthorizationPolicy { get; set; }
 
     /// <summary>Required for pipeline mutations; defaults to <see cref="AuthorizationPolicy"/>.</summary>

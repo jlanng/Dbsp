@@ -176,6 +176,19 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         Assert.Empty(page["rows"].EnumerateArray().Select(r => r.GetProperty("key").GetInt32())
             .Intersect(next["rows"].EnumerateArray().Select(r => r.GetProperty("key").GetInt32())));
 
+        // A page says where the next one starts; following that reaches the last row.
+        Assert.Equal(5, page["next"].GetInt64());
+        var seen = new HashSet<int>();
+        for (long? from = 0; from is not null;)
+        {
+            var read = await Admin.Get($"tables/instruments/rows?limit=5&from={from}");
+            foreach (var row in read["rows"].EnumerateArray())
+                Assert.True(seen.Add(row.GetProperty("key").GetInt32()));
+            from = read.Body.TryGetProperty("next", out var cursor) && cursor.ValueKind == JsonValueKind.Number ? cursor.GetInt64() : null;
+            Assert.Equal(from is not null, read["more"].GetBoolean());
+        }
+        Assert.Equal(300, seen.Count);
+
         var byKey = await Admin.Get("tables/instruments/rows?key=42");
         Assert.Equal("SYM00042", byKey["rows"][0].GetProperty("row").GetProperty("symbol").GetString());
         Assert.Equal(0, (await Admin.Get("tables/instruments/rows?key=9999"))["rows"].GetArrayLength());
@@ -184,6 +197,16 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         var byCountry = await Admin.Get("tables/counterparties/rows?index=country&key=GB&limit=3");
         Assert.Equal(3, byCountry["rows"].GetArrayLength());
         Assert.True(byCountry["more"].GetBoolean());
+
+        // The rows under an index key are paged with skip, to the last of them.
+        var under = byCountry["scanned"].GetInt32();
+        Assert.True(under > 3, $"{under} counterparties in GB");
+        var second = await Admin.Get($"tables/counterparties/rows?index=country&key=GB&limit=3&skip={byCountry["next"].GetInt64()}");
+        Assert.Empty(byCountry["rows"].EnumerateArray().Select(r => r.GetProperty("key").GetRawText())
+            .Intersect(second["rows"].EnumerateArray().Select(r => r.GetProperty("key").GetRawText())));
+        var tail = await Admin.Get($"tables/counterparties/rows?index=country&key=GB&limit=5&skip={under - 1}");
+        Assert.Equal(1, tail["rows"].GetArrayLength());
+        Assert.False(tail["more"].GetBoolean());
         Assert.All(byCountry["rows"].EnumerateArray(), r => Assert.Equal("GB", r.GetProperty("row").GetProperty("country").GetString()));
 
         (await Admin.Get("tables/instruments/rows?index=nope&key=1")).IsError(400, "invalid");
@@ -199,6 +222,27 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         Assert.Equal(50, page["scanned"].GetInt64());
         Assert.True(page["truncated"].GetBoolean());
         Assert.True(page["rows"].GetArrayLength() <= 1);
+
+        // It says where it stopped, and a read from there carries on: the row is found
+        // however far into the table it is, six bounded reads later at most.
+        var found = page["rows"].GetArrayLength();
+        var reads = 1;
+        while (page.Body.TryGetProperty("next", out var next) && next.ValueKind == JsonValueKind.Number)
+        {
+            page = await admin.Get($"tables/instruments/rows?contains=SYM00299&limit=10&from={next.GetInt64()}");
+            Assert.True(page["scanned"].GetInt64() <= 50);
+            found += page["rows"].GetArrayLength();
+            reads++;
+        }
+        Assert.Equal(1, found);
+        Assert.Equal(6, reads);
+
+        // Browsing is not searching: rows passed over are not looked at, so the last
+        // rows of a table larger than the bound are a page like any other.
+        var last = await admin.Get("tables/instruments/rows?limit=10&skip=295");
+        Assert.Equal(5, last["rows"].GetArrayLength());
+        Assert.False(last["truncated"].GetBoolean());
+        Assert.False(last["more"].GetBoolean());
     }
 
     [Fact]
@@ -322,6 +366,22 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         (await Admin.Get("node", r => r.Headers.Add("X-Forwarded-For", "203.0.113.9"))).IsError(403, "forwarded");
         (await Admin.Get("node", r => r.Headers.Add("Forwarded", "for=203.0.113.9"))).IsError(403, "forwarded");
         (await Admin.Get("node", r => r.Headers.Add("X-Forwarded-Host", "admin.example"))).IsError(403, "forwarded");
+        (await Admin.Get("node", r => r.Headers.Add("X-Real-IP", "203.0.113.9"))).IsError(403, "forwarded");
+        (await Admin.Get("node", r => r.Headers.Add("Via", "1.1 proxy.example"))).IsError(403, "forwarded");
+        (await Admin.Get("node", r => r.Headers.Add("X-Forwarded-Proto", "https"))).IsError(403, "forwarded");
+
+        // A proxy that adds no header at all can still give itself away: nginx speaks
+        // HTTP/1.0 to its upstream unless it is told otherwise, and nothing else does.
+        (await Admin.Get("node", r =>
+        {
+            r.Version = HttpVersion.Version10;
+            r.VersionPolicy = HttpVersionPolicy.RequestVersionExact;
+        })).IsError(403, "forwarded");
+        Assert.Equal(200, (await Admin.Get("node", r =>
+        {
+            r.Version = HttpVersion.Version11;
+            r.VersionPolicy = HttpVersionPolicy.RequestVersionExact;
+        })).Code);
         (await Admin.Get("node", r => r.Headers.Host = "admin.example")).IsError(403, "host-not-allowed");
         Assert.Equal(200, (await Admin.Get("node", r => r.Headers.Host = "localhost:1")).Code);
         // The UI's own files are under the same rule.
@@ -511,6 +571,12 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         await TestService.Eventually(() => admin.Node.Node.Pipelines.Get("checked-orders").State == PipelineState.Failed, "the checked pipeline failed");
         Assert.Contains((await admin.Get("events/recent?limit=200"))["items"].EnumerateArray(),
             e => e.GetProperty("subject").GetString() == "checked-orders" && e.GetProperty("message").GetString() == "Failed");
+
+        // What is kept of a reason is everything before the exception's own text — the
+        // whole of the service's part, a length of time included.
+        var why = (await admin.Get("pipelines/checked-orders"))["history"].EnumerateArray()
+            .Last(t => t.GetProperty("state").GetString() == "Failed").GetProperty("why").GetString();
+        Assert.Matches(@"^\d+ faults within \d+ (ms|s|min|h|d)( \d+ (s|min|h))?; the last$", why);
         foreach (var path in new[] { "pipelines", "pipelines/checked-orders", "pipelines/lenient-orders/dead-letters", "tables/counterparties", "tables", "events/recent?limit=200", "audit?limit=200" })
         {
             var text = (await admin.Get(path)).Body.GetRawText();
@@ -869,6 +935,22 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         await TestService.Eventually(() => admin.Host.Nodes[1].Node.IsLeader, "node-b leads");
         var after = await admin.Get("node");
         Assert.Equal("Fenced", after["status"].GetProperty("leadership").GetProperty("role").GetString());
+
+        // The node that was replaced says who replaced it, and where that node is: from
+        // its probe of the other node, since the catalog it holds is the one it wrote
+        // and still names itself.
+        for (var attempt = 0; attempt < 100 && !(after.Body.TryGetProperty("leader", out var known) && known.ValueKind == JsonValueKind.Object); attempt++)
+        {
+            await Task.Delay(100);
+            after = await admin.Get("node");
+        }
+        Assert.Equal("node-b", after["leader"].GetProperty("nodeId").GetString());
+        Assert.False(after["leader"].GetProperty("isSelf").GetBoolean());
+        Assert.Equal("http://leader.example/admin/", after["leader"].GetProperty("adminUrl").GetString());
+        Assert.Equal("Leader", after["status"].GetProperty("peer").GetProperty("role").GetString());
+        var sentOn = await admin.Post("pipelines/trader-activity/stop");
+        sentOn.IsError(409, "not-leader");
+        Assert.Equal("node-b", sentOn.Body.GetProperty("error").GetProperty("leader").GetProperty("nodeId").GetString());
         Assert.Equal("Unhealthy", after["status"].GetProperty("health").GetProperty("level").GetString());
         Assert.Equal(503, (await admin.SendAsync(HttpMethod.Get, "ready", baseUrl: admin.Node.Url + "/health/")).Code);
         Assert.Equal(200, (await admin.SendAsync(HttpMethod.Get, "ready", baseUrl: admin.Host.Nodes[1].Url + "/health/")).Code);

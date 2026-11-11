@@ -13,6 +13,13 @@
   const tableLink = name => h('a', { class: 'id', href: '#/tables/' + enc(name) }, name);
   const STATE_FILL = { good: 'fill-good', warn: 'fill-warn', serious: 'fill-serious', crit: 'fill-crit', idle: 'fill-idle', info: 'fill-info' };
   const last = arr => (arr.length ? arr[arr.length - 1] : null);
+
+  // A link to the leader's admin UI, where this node knows of a leader that is not itself
+  // and of its address; nothing otherwise, so the sentence around it still reads.
+  const leaderLink = (before = '', after = '') => {
+    const leader = store.leader, node = store.node;
+    return leader && leader.adminUrl && node && leader.nodeId !== node.nodeId ? [before, h('a', { href: leader.adminUrl }, leader.nodeId), after] : null;
+  };
   const rate = v => (v == null ? '–' : fmtNum(v));
 
   const eventList = events => h('ul', { class: 'events', role: 'log', 'aria-label': 'Recent events' },
@@ -115,7 +122,11 @@
 
           h('div', { class: 'stack' },
             card('Needs attention', attention.length ? String(attention.length) : null,
-              attention.length ? h('ul', { class: 'attn' }, attention) : empty('Nothing needs attention', 'Every pipeline and table is where it was asked to be.')),
+              attention.length ? h('ul', { class: 'attn' }, attention)
+                : standby ? empty('Nothing on this node needs attention', ['A standby runs no pipelines and does not see how they are doing: whether one has failed is shown on the leader',
+                  leaderLink(' (', ')'), '. Here: the tables this node follows are open and it is ready to take over.'])
+                : role === 'Leader' ? empty('Nothing needs attention', 'Every pipeline and table is where it was asked to be.')
+                : empty('This node runs nothing', ['It no longer leads; what needs attention is shown on the leader', leaderLink(' (', ')'), '.'])),
             card('Recent events', 'this node, newest first',
               events.items.length ? h('div', { class: 'scroll' }, eventList(events.items)) : empty('No events yet', 'Role changes, pipeline and table transitions appear here as they happen.')))));
     },
@@ -142,7 +153,8 @@
   };
 
   function sortHeader(ctx, key, label, cls) {
-    const current = ctx.query.get('sort') || 'state', dir = ctx.query.get('dir') || 'asc';
+    const asked = ctx.query.get('sort');
+    const current = asked && Object.hasOwn(SORTS, asked) ? asked : 'state', dir = ctx.query.get('dir') || 'asc';
     const active = current === key;
     return h('th', { class: cls, 'aria-sort': active ? (dir === 'asc' ? 'ascending' : 'descending') : null },
       h('button', { class: 'sort', type: 'button', on: { click: () => ctx.setQuery({ ...Object.fromEntries(ctx.query), sort: key, dir: active && dir === 'asc' ? 'desc' : 'asc' }) } },
@@ -160,7 +172,9 @@
       const { pipelines, plugins } = ctx.data;
       const q = ctx.query.get('q') || '';
       const chosen = new Set((ctx.query.get('state') || '').split(',').filter(Boolean));
-      const sort = ctx.query.get('sort') || 'state', dir = ctx.query.get('dir') === 'desc' ? -1 : 1;
+      // A sort key comes from the address bar: one that names no column sorts by state.
+      const asked = ctx.query.get('sort');
+      const sort = asked && Object.hasOwn(SORTS, asked) ? asked : 'state', dir = ctx.query.get('dir') === 'desc' ? -1 : 1;
       const counts = {};
       for (const p of pipelines.items) counts[p.state] = (counts[p.state] || 0) + 1;
       const needle = q.toLowerCase();
@@ -434,8 +448,11 @@
     if (!letters) return card('Dead letters', null, A.skeleton());
     const hidden = !letters.rowDataExposed;
     const policy = detail && detail.pipeline.errorPolicy;
+    const elsewhere = !ctx.pageSaysSo && store.node && store.node.role !== 'Leader';
     return card('Dead letters', `${fmtInt(letters.total)} dropped; the newest ${fmtInt(letters.kept)} are kept on this node`,
       h('div', null,
+        elsewhere && h('div', { class: 'record' }, notice('info', ['This node does not run the pipeline, so it has no record of what the pipeline dropped: the count and the records are kept by the leader',
+          leaderLink(' (', ')'), ', in memory.'])),
         hidden && h('div', { class: 'record' }, notice('info', 'Records and messages are hidden: this admin API does not expose row data. The operator, the time and the exception type are shown.')),
         letters.items.length === 0
           ? empty(letters.total ? 'None kept on this node' : 'No dead letters',
@@ -729,38 +746,48 @@
       return card('Rows', null, empty('Row data is not exposed', 'This admin API is configured without row data (ServiceAdminOptions.ExposeRowData), so rows, records and exception messages are not returned.'));
     ui.mode = ui.mode || 'browse';
     ui.limit = ui.limit || 15;
-    const run = async (skip = 0) => {
-      ui.skip = skip; ui.busy = true; ui.rowError = null; ctx.render();
+    // A page is read at a cursor the server gave with the page before it: a position in
+    // the table's scan (from), or an offset under an index key (skip). The trail is the
+    // cursors of the pages passed, so Previous is a step back along it.
+    ui.trail = ui.trail || [0];
+    const run = async (trail = [0]) => {
+      ui.trail = trail; ui.busy = true; ui.rowError = null; ctx.render();
+      const at = trail[trail.length - 1];
       const params = new URLSearchParams({ limit: ui.limit });
-      if (ui.mode === 'browse') { params.set('skip', skip); if (ui.contains) params.set('contains', ui.contains); }
-      else { params.set('key', ui.key || ''); if (ui.mode.startsWith('index:')) params.set('index', ui.mode.slice(6)); }
+      if (ui.mode === 'browse') { params.set('from', at); if (ui.contains) params.set('contains', ui.contains); }
+      else {
+        params.set('key', ui.key || '');
+        if (ui.mode.startsWith('index:')) { params.set('index', ui.mode.slice(6)); params.set('skip', at); }
+      }
       try {
         ui.rows = await api(`tables/${enc(name)}/rows?${params}`);
         ui.rowsFor = ui.mode;
       } catch (e) { ui.rowError = e; ui.rows = null; }
       ui.busy = false; ctx.render();
     };
-    if (!ui.rows && !ui.busy && !ui.rowError && !ui.started && t.state !== 'Opening') { ui.started = true; setTimeout(() => run(0)); }
+    if (!ui.rows && !ui.busy && !ui.rowError && !ui.started && t.state !== 'Opening') { ui.started = true; setTimeout(() => run()); }
     const rows = ui.rows;
     const columns = rows ? [...new Set(rows.rows.flatMap(r => (r.row && typeof r.row === 'object' ? Object.keys(r.row) : ['value'])))].slice(0, 12) : [];
     const cell = v => (v == null ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v));
     const lookup = ui.mode !== 'browse';
+    const paged = ui.mode !== 'key';
+    const searching = ui.mode === 'browse' && !!ui.contains;
 
     return card('Rows', 'read from this node’s copy, at one version',
       h('div', null,
-        h('form', { class: 'toolbar', on: { submit: e => { e.preventDefault(); run(0); } } },
-          h('select', { class: 'input', 'aria-label': 'How to read', on: { change: e => { ui.mode = e.target.value; ui.rows = null; ui.rowError = null; if (e.target.value === 'browse') run(0); else ctx.render(); } } },
+        h('form', { class: 'toolbar', on: { submit: e => { e.preventDefault(); run(); } } },
+          h('select', { class: 'input', 'aria-label': 'How to read', on: { change: e => { ui.mode = e.target.value; ui.rows = null; ui.rowError = null; ui.trail = [0]; if (e.target.value === 'browse') run(); else ctx.render(); } } },
             h('option', { value: 'browse', selected: ui.mode === 'browse' }, 'Browse'),
             h('option', { value: 'key', selected: ui.mode === 'key' }, `By key (${t.keyType})`),
             t.indexes.map(i => h('option', { value: 'index:' + i.name, selected: ui.mode === 'index:' + i.name }, `By index ${i.name} (${i.keyType || '?'})`))),
           lookup
-            ? h('input', { class: 'input grow', id: 'row-key', placeholder: ui.mode === 'key' ? 'A key, e.g. 42 or CP0003' : 'An index key', 'aria-label': 'Key', value: ui.key || '', on: { input: e => { ui.key = e.target.value; } } })
+            ? h('input', { class: 'input grow', id: 'row-key', placeholder: ui.mode === 'key' ? 'A key, e.g. 42 or CP0003' : 'An index key', 'aria-label': 'Key', value: ui.key || '', on: { input: e => { const had = !!ui.key; ui.key = e.target.value; if (had !== !!ui.key) ctx.render(); } } })
             : h('input', { class: 'input grow', type: 'search', placeholder: 'Contains text (scans rows)', 'aria-label': 'Rows containing', value: ui.contains || '', on: { input: e => { ui.contains = e.target.value; } } }),
           h('button', { class: 'btn', type: 'submit', disabled: ui.busy || (lookup && !ui.key) }, ui.busy ? 'Reading…' : lookup ? 'Look up' : 'Read')),
         ui.rowError && h('div', { class: 'record' }, errorNotice(ui.rowError, 'The rows could not be read. ')),
         !rows && !ui.rowError && (lookup ? empty('Enter a key', 'A lookup reads one row by key, or the rows under one index key.') : A.skeleton()),
-        rows && rows.rows.length === 0 && empty(lookup ? 'No row under that key' : 'No rows',
-          rows.truncated ? `The scan stopped after ${fmtInt(rows.scanned)} of ${fmtInt(rows.tableRows)} rows, so a match may exist further on.`
+        rows && rows.rows.length === 0 && empty(lookup ? 'No row under that key' : rows.truncated ? 'No match yet' : 'No rows',
+          rows.truncated ? `This read looked at ${fmtInt(rows.scanned)} rows and stopped at its bound without a match. Keep scanning to look at the rows after them.`
             : rows.lagVersions ? `This node is ${plural(rows.lagVersions, 'version')} behind the table’s log: the row may not have arrived here yet.`
             : lookup ? `Not in version ${fmtInt(rows.version)} of the table.` : ui.contains ? 'No row contains that text.' : 'The table is empty.'),
         rows && rows.rows.length > 0 && h('div', { class: 'table-wrap' }, h('table', { class: 'data rowgrid' },
@@ -770,11 +797,15 @@
             columns.map(c => { const v = r.row && typeof r.row === 'object' ? r.row[c] : r.row; return h('td', { class: 'cell', title: cell(v) }, cell(v)); })))))),
         rows && h('div', { class: 'pager' },
           h('span', { class: 'info' },
-            `Version ${fmtInt(rows.version)} · ${fmtInt(rows.rows.length)} shown · scanned ${fmtInt(rows.scanned)} of ${fmtInt(rows.tableRows)}`,
+            `Version ${fmtInt(rows.version)} · ${fmtInt(rows.rows.length)} shown · `,
+            ui.mode === 'browse' ? (searching ? `looked at ${fmtInt(rows.scanned)} of ${fmtInt(rows.tableRows)} rows` : `of ${fmtInt(rows.tableRows)} rows`)
+              : ui.mode === 'key' ? 'read by key' : `${fmtInt(rows.scanned)} under this key`,
+            ui.trail.length > 1 && ` · page ${ui.trail.length}`,
             rows.truncated && ' · the scan stopped at its bound', rows.lagVersions ? ` · this node is ${plural(rows.lagVersions, 'version')} behind` : ''),
-          !lookup && h('button', { class: 'btn small', type: 'button', disabled: !ui.skip || ui.busy, on: { click: () => run(Math.max(0, ui.skip - ui.limit)) } }, 'Previous'),
-          !lookup && h('button', { class: 'btn small', type: 'button', disabled: !rows.more || ui.busy, on: { click: () => run(ui.skip + ui.limit) } }, 'Next'),
-          h('button', { class: 'btn small ghost', type: 'button', disabled: ui.busy, on: { click: () => run(ui.skip || 0) } }, 'Refresh'))),
+          paged && h('button', { class: 'btn small', type: 'button', disabled: ui.trail.length < 2 || ui.busy, on: { click: () => run(ui.trail.slice(0, -1)) } }, 'Previous'),
+          paged && h('button', { class: 'btn small', type: 'button', disabled: rows.next == null || ui.busy, on: { click: () => run([...ui.trail, rows.next]) } },
+            rows.truncated ? 'Keep scanning' : 'Next'),
+          h('button', { class: 'btn small ghost', type: 'button', disabled: ui.busy, on: { click: () => run(ui.trail) } }, 'Refresh'))),
       { flush: true });
   }
 
@@ -860,7 +891,7 @@
               h('div', { class: 'head' },
                 h('strong', { class: 'mono', title: p.version }, short(p.version, 16)),
                 h('span', { class: ['badge', p.loadState === 'loaded' || p.loadState === 'built-in' ? 'good' : p.loadState === 'pending' ? 'warn' : 'idle'],
-                  title: { 'built-in': 'Compiled into the host', loaded: 'Loaded on this node', stored: 'Stored; loaded when a pipeline needs it', pending: 'A newer contract version: loaded when the process restarts' }[p.loadState] }, p.loadState),
+                  title: { 'built-in': 'Compiled into the host', loaded: 'Loaded on this node', stored: 'Stored; loaded when a pipeline needs it', pending: 'A newer contract version: loaded when the process restarts', superseded: 'An older contract version: a newer one is loaded, and a restart loads the newest' }[p.loadState] }, p.loadState),
                 p.files != null && h('span', { class: 'muted' }, `${plural(p.files, 'file')} · ${fmtBytes(p.bytes)}`),
                 h('span', { class: 'muted' }, p.users ? `used by ${plural(p.users, 'pipeline')}` : 'unused'),
                 canAct() && !p.builtIn && h('button', { class: 'btn small danger', type: 'button', disabled: p.users > 0, title: p.users > 0 ? 'A pipeline names this version' : null, on: { click: () => A.pluginDelete(p, ctx.reload) } }, 'Delete…')),
@@ -887,10 +918,12 @@
       const { pipelines, id, letters } = ctx.data;
       return h('div', { class: 'stack' },
         pageHead({ title: 'Dead letters', lede: 'Records a pipeline dropped instead of faulting on them: the record, the error and where it came from. Kept per node, in memory, newest first.' }),
+        store.node && store.node.role !== 'Leader' && notice('info', ['This node runs no pipelines. Dropped records are counted and kept by the node that runs them — the leader',
+          leaderLink(' (', ')'), ' — so the zeroes here say nothing about what was dropped there.']),
         pipelines.length === 0
-          ? h('section', { class: 'card' }, empty('No dead letters', 'No pipeline has dropped a record, and none is deployed with the DeadLetter error policy.'))
+          ? h('section', { class: 'card' }, empty('No dead letters', store.node && store.node.role !== 'Leader' ? 'None is recorded on this node.' : 'No pipeline has dropped a record, and none is deployed with the DeadLetter error policy.'))
           : h('div', { class: 'split' },
-            h('div', null, letters ? lettersTab({ ...ctx, data: { letters, detail: { pipeline: pipelines.find(p => p.id === id) || {} } } }, id) : h('section', { class: 'card' }, empty('Choose a pipeline', 'Its dropped records appear here.'))),
+            h('div', null, letters ? lettersTab({ ...ctx, pageSaysSo: true, data: { letters, detail: { pipeline: pipelines.find(p => p.id === id) || {} } } }, id) : h('section', { class: 'card' }, empty('Choose a pipeline', 'Its dropped records appear here.'))),
             card('Pipelines', 'with dropped records, or able to drop them',
               h('table', { class: 'data' },
                 h('thead', null, h('tr', null, h('th', null, 'Pipeline'), h('th', { class: 'r' }, 'Dropped'))),

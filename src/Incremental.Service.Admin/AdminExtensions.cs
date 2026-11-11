@@ -25,11 +25,26 @@ internal sealed class AdminState(ServiceNode node, ServiceAdminOptions options, 
     public AdminEventHub Hub => hub;
     public ILogger Logger => logger;
 
+    /// <summary>
+    /// Who leads, as far as this node can tell. A leader and a standby read it from the
+    /// catalog. A node that led and no longer does (fenced, resigned) cannot: its catalog
+    /// is the copy it wrote, which still names itself and follows nothing. It answers
+    /// from its probe of the other node instead — that node, if it says it leads — and
+    /// with nothing when the probe has no such answer, never with itself.
+    /// </summary>
     public LeaderRecord? Leader()
     {
         try
         {
-            return node.Catalog.IsOpen ? node.Catalog.Get<LeaderRecord>("node/leader") : null;
+            var status = node.Status;
+            var record = node.Catalog.IsOpen ? node.Catalog.Get<LeaderRecord>("node/leader") : null;
+            if (status.Leadership.Role is NodeRole.Leader or NodeRole.Promoting)
+                return record;
+            if (record is not null && record.NodeId != node.NodeId)
+                return record;
+            return status.Peer is { Role: NodeRole.Leader or NodeRole.Promoting } peer
+                ? new LeaderRecord(peer.NodeId, peer.Term, peer.AdminUrl, new Dictionary<string, string>())
+                : null;
         }
         catch
         {
@@ -197,6 +212,11 @@ public static class IncrementalAdminExtensions
         var group = endpoints.MapGroup(prefix.TrimEnd('/'));
         if (state.Options.AuthorizationPolicy is { } policy)
             group.RequireAuthorization(policy);
+        else
+            state.Logger.LogInformation(
+                "The admin API at {Prefix} has no authorization policy and answers loopback requests only. That is a default for a developer's " +
+                "machine, not authentication: a reverse proxy on this machine makes its callers loopback callers. Set " +
+                "ServiceAdminOptions.AuthorizationPolicy before publishing it through one.", prefix);
         AdminApi.Map(group, state);
         AdminUi.Map(group, state);
         return group;

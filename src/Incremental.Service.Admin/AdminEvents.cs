@@ -40,8 +40,6 @@ internal sealed class AdminEventHub : IDisposable
     private long _nextClient;
     private long _dropped;
     private long _aborted;
-    private long[]? _stateLag;
-    private int _measuring;
 
     public AdminEventHub(ServiceNode node, ServiceAdminOptions options, IHostApplicationLifetime? lifetime = null)
     {
@@ -62,10 +60,6 @@ internal sealed class AdminEventHub : IDisposable
 
     /// <summary>The deepest client queue right now: never more than the configured length.</summary>
     public int DeepestQueue => _clients.Values.Select(c => c.Queue.Reader.Count).DefaultIfEmpty(0).Max();
-
-    /// <summary>How far this node's copy of the state is behind, per state partition, as
-    /// last measured for a metrics tick; null on a leader.</summary>
-    public long[]? StateLag => Volatile.Read(ref _stateLag);
 
     private static Frame Format(string kind, long id, string json)
     {
@@ -97,25 +91,6 @@ internal sealed class AdminEventHub : IDisposable
 
     private void OnSampled()
     {
-        // The state lag is measured for whoever is watching, off the sampler's thread, one
-        // measurement at a time; the next tick carries it.
-        if (!_clients.IsEmpty && _node.Backend.Leadership.Status.Role == NodeRole.Standby && Interlocked.Exchange(ref _measuring, 1) == 0)
-            Task.Run(async () =>
-            {
-                try
-                {
-                    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-                    Volatile.Write(ref _stateLag, await _node.Backend.Leadership.MeasureStateLagAsync(timeout.Token).ConfigureAwait(false));
-                }
-                catch
-                {
-                    // Unknown is an honest answer.
-                }
-                finally
-                {
-                    Volatile.Write(ref _measuring, 0);
-                }
-            });
         if (_clients.IsEmpty)
             return;
         try

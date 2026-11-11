@@ -12,7 +12,9 @@ namespace Incremental.Service.Admin;
 /// The JSON API, under <c>{prefix}/api</c>. Every list is bounded by
 /// <see cref="ServiceAdminOptions.MaxRows"/> and paged; every refusal has one shape
 /// (<see cref="AdminErrors"/>); every duration is a number of milliseconds; specs are
-/// returned in the form they are accepted in.
+/// returned in the form they are accepted in, with one difference: a property a
+/// connector declares secret is returned as <c>***</c>. Sent back so, it means "the
+/// stored value" for the same slot and connector, and is refused where none is stored.
 /// </summary>
 internal static class AdminApi
 {
@@ -184,9 +186,10 @@ internal static class AdminApi
             var query = context.Request.Query;
             var limit = Int(context, "limit", Math.Min(50, options.MaxRows), 1, options.MaxRows);
             var skip = Int(context, "skip", 0, 0, int.MaxValue);
+            var from = long.TryParse(query["from"].FirstOrDefault(), out var asked) && asked > 0 ? asked : 0;
             var page = node.Tables.ReadRows(name, new TableRowQuery(
                 limit, skip, query["contains"].FirstOrDefault(), query["key"].FirstOrDefault(), query["index"].FirstOrDefault(),
-                options.MaxScannedRows));
+                options.MaxScannedRows, from));
             long? lag = null;
             if (!node.IsLeader)
                 lag = (await state.StatsAsync(name)).LagVersions;
@@ -197,6 +200,8 @@ internal static class AdminApi
                 scanned = page.Scanned,
                 truncated = page.Truncated,
                 more = page.More,
+                next = page.Next,
+                from,
                 skip,
                 limit,
                 lagVersions = lag,
@@ -539,9 +544,10 @@ internal static class AdminApi
             RequireConfirm(context, $"{name}/{version}", dryRun);
             var plugin = node.Plugins.Plugins.FirstOrDefault(p => p.Name == name && p.Version == version && !p.BuiltIn)
                 ?? throw ServiceException.NotFound($"Plugin '{name}' version {version}");
-            var users = PipelineSpecs(node).Where(p => p.Plugin == name && p.Version == version).Select(p => p.Id).ToList();
-            if (users.Count > 0)
-                throw ServiceException.Conflict($"Plugin '{name}' version {version} is named by pipeline(s) {string.Join(", ", users)}.");
+            // The same refusals the delete itself makes, so the dry run tells the truth:
+            // a pipeline that names the version, a declared table only this contract defines.
+            if (node.Plugins.Manifest(name, version) is { } manifest)
+                ((PluginCatalog)node.Plugins).RequireUnused(manifest);
             var plan = new ActionPlan("plugin.delete", $"{name}/{version}", dryRun,
             [
                 $"delete {plugin.Kind.ToString().ToLowerInvariant()} plugin '{name}' version {version} from the catalog",

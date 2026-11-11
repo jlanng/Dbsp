@@ -153,8 +153,9 @@ main:focus, h1:focus { outline: none; }
 }
 .nav a:hover { background: var(--sunken); text-decoration: none; color: var(--ink); }
 .nav a[aria-current="page"] { background: var(--accent-wash); color: var(--accent); font-weight: 650; }
-.nav a .count { margin-left: auto; font-size: 12px; font-variant-numeric: tabular-nums; color: var(--ink-3); min-width: 2ch; text-align: right; }
-.nav a .count.alert { color: var(--crit-ink); font-weight: 700; }
+.nav a .counts { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+.nav a .count { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--ink-3); min-width: 2ch; text-align: right; }
+.nav a .count.alert { color: var(--crit-ink); background: var(--crit-wash); font-weight: 700; min-width: 0; padding: 0 6px; border-radius: 999px; text-align: center; }
 .nav svg { flex: none; }
 main { padding: 24px 24px 64px; min-width: 0; max-width: 1480px; width: 100%; }
 main.stale .live-data, body.stale .node-chip, body.stale .nav .count { opacity: .55; }
@@ -164,7 +165,7 @@ main.stale .live-data, body.stale .node-chip, body.stale .nav .count { opacity: 
   .shell { background: none; }
   .nav { position: sticky; top: 52px; z-index: 18; height: auto; flex-direction: row; overflow-x: auto; background: var(--surface); border-bottom: 1px solid var(--line); padding: 6px 8px; gap: 4px; scrollbar-width: none; }
   .nav a { white-space: nowrap; padding: 6px 10px; }
-  .nav a .count { margin-left: 2px; }
+  .nav a .counts { margin-left: 2px; }
   main { padding: 16px 12px 48px; }
   .banner { top: 0; position: static; }
   .top { padding: 0 12px; gap: 10px; }

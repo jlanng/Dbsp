@@ -189,8 +189,14 @@
 
     const parse = () => {
       let value;
-      try { value = JSON.parse(st.text); } catch (e) { throw new A.ApiError(400, { error: { code: 'invalid-json', message: 'The spec is not valid JSON: ' + e.message } }); }
-      if (!value || typeof value !== 'object' || !value.id) throw new A.ApiError(400, { error: { code: 'invalid', message: 'The spec needs an "id".' } });
+      const local = message => Object.assign(new A.ApiError(400, { error: { code: 'invalid', message } }), { local: true });
+      try { value = JSON.parse(st.text); } catch (e) { throw local('The spec is not valid JSON: ' + e.message); }
+      if (!value || typeof value !== 'object' || !value.id) throw local('The spec needs an "id".');
+      // This dialog replaces one pipeline. The id in the JSON is where the request goes,
+      // and the generation sent with it is that pipeline's: another id would replace
+      // another pipeline under this one's title.
+      if (existing && value.id !== existing.id)
+        throw local(`This dialog replaces pipeline "${existing.id}"; its id cannot be changed here. To deploy "${value.id}", use Deploy on the pipelines page.`);
       return value;
     };
     const send = async dryRun => {
@@ -260,7 +266,9 @@
           h('textarea', {
             class: 'input', id: 'spec-text', rows: 16, spellcheck: 'false', value: st.text,
             on: { input: e => { st.text = e.target.value; if (st.checked) { st.checked = null; draw(); } } },
-          }, st.text)),
+          }, st.text),
+          existing && st.text.includes('"***"') && h('p', { class: 'muted' },
+            'A secret is shown as "***". Left as it is, the stored value is kept; type a value to change it.')),
         st.needsChoice && h('fieldset', { class: 'field' },
           h('legend', { class: 'label' }, 'This change can alter what the pipeline’s state means. Keep the state or reset it?'),
           st.changes.length > 0 && h('ul', { class: 'muted' }, st.changes.map(c => h('li', null, 'changes ' + c))),
@@ -274,7 +282,9 @@
         st.result && h('div', { class: 'field' }, h('div', { class: 'label' }, 'What will happen'), planList(st.result.plan)),
         st.result && h('p', { class: 'muted' },
           `Declares ${st.result.shape.inputs.length} input(s), ${st.result.shape.sinks.length} sink(s); reads ${st.result.shape.tablesRead.join(', ') || 'no table'}; writes ${st.result.shape.tablesWritten.join(', ') || 'no table'}.`),
-        st.error && errorNotice(st.error, 'The node refuses this spec. '),
+        // What this dialog itself refuses (JSON that does not parse, an id that is not this
+        // pipeline's) was never sent, so it is not the node's refusal.
+        st.error && errorNotice(st.error, st.error.local ? 'This was not sent. ' : 'The node refuses this spec. '),
       ], [
         h('button', { class: 'btn', type: 'button', on: { click: () => dlg.close() } }, 'Cancel'),
         h('button', { class: 'btn', type: 'button', disabled: st.busy || (st.needsChoice && !st.choice), on: { click: check } }, st.busy && !ready ? 'Checking…' : 'Check (dry run)'),

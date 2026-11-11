@@ -341,6 +341,7 @@
     tickAt: 0,
     feed: 'wait',        // wait | live | off
     feedSince: Date.now(),
+    feedRefused: null,   // why the node refused a feed, when it said (its cap on clients)
     lastLiveAt: 0,
     series: new Map(),   // pipeline id ('' = the node) → { in, out, stepMs, ackMs, lag, ckpt }
     events: [],          // newest last, bounded
