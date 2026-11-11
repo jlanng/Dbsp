@@ -1,7 +1,12 @@
 <Solution>
   <Folder Name="/benchmarks/">
     <Project Path="benchmarks/Incremental.Benchmarks/Incremental.Benchmarks.csproj" />
+    <Project Path="benchmarks/Incremental.Service.Scale/Incremental.Service.Scale.csproj" />
     <Project Path="benchmarks/Incremental.Torture/Incremental.Torture.csproj" />
+  </Folder>
+  <Folder Name="/benchmarks/plugins/">
+    <Project Path="benchmarks/Incremental.Service.Scale/Contracts/Scale.Contracts.csproj" />
+    <Project Path="benchmarks/Incremental.Service.Scale/Pipelines/Scale.Pipelines.csproj" />
   </Folder>
   <Folder Name="/examples/">
     <Project Path="examples/Incremental.EnrichmentService/Incremental.EnrichmentService.csproj" />

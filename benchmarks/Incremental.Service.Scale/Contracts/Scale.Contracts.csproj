@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The rig's contract assembly: the wide reference row, its table, the input record. -->
+  <Import Project="..\Plugin.props" />
+
+</Project>

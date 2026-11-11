@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The rig's pipeline plugin; the build copies it to the host's plugins/scale.pipelines/. -->
+  <Import Project="..\Plugin.props" />
+
+  <ItemGroup>
+    <ProjectReference Include="..\Contracts\Scale.Contracts.csproj" Private="false" />
+  </ItemGroup>
+
+</Project>

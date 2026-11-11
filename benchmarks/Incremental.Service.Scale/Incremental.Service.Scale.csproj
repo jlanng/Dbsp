@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>Incremental.Service.Scale</RootNamespace>
+    <!-- The examples' GC configuration (examples/Directory.Build.props), without a heap
+         count: a node runs twenty circuits, one worker each. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <GarbageCollectionAdaptationMode>0</GarbageCollectionAdaptationMode>
+    <DefaultItemExcludes>$(DefaultItemExcludes);Contracts/**;Pipelines/**</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Incremental.Service\Incremental.Service.csproj" />
+    <ProjectReference Include="Contracts\Scale.Contracts.csproj" />
+    <!-- Built, never referenced: the first leader imports it from plugins/ and the other
+         node gets it from the blob topic. -->
+    <ProjectReference Include="Pipelines\Scale.Pipelines.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <Target Name="PlacePlugin" AfterTargets="Build">
+    <ItemGroup>
+      <_Plugin Include="Pipelines\bin\$(Configuration)\net10.0\Scale.Pipelines.*" />
+    </ItemGroup>
+    <RemoveDir Directories="$(OutDir)plugins" />
+    <Copy SourceFiles="@(_Plugin)" DestinationFolder="$(OutDir)plugins\scale.pipelines" />
+  </Target>
+
+</Project>
