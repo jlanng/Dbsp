@@ -3537,8 +3537,9 @@ above, and it is not fully explained. While the partitions a broker led and the
 transaction coordinator it was are moving, the service's leader can commit nothing; its
 heartbeats are records in those commits; and a standby that reads none for
 `TakeoverCeiling` takes over whatever the probe says. The outcome is the designed one
-and loses nothing. What is not known is why the wait was sometimes 30 s when the
-cluster was whole again in 12: a producer `request.timeout.ms` of 5 s instead of 30 did
+and loses nothing. What is not known is why the wait was sometimes 30 to 50 s when
+the cluster was whole again in 12 (and why, in one such takeover, initialising the
+transactional id took 14.5 s): a producer `request.timeout.ms` of 5 s instead of 30 did
 not prevent it (one move in six runs), and the client's own log was not taken at debug
 level. On one machine with three brokers it is about one rolling restart in five; what
 it is on MSK, where a broker restart is slower and the brokers are not neighbours, is
@@ -3612,7 +3613,7 @@ node's principal the permissions and the rig's own clients run as another princi
 
 The whole run passes: first lead, table load, a `kafka` loader, twenty pipelines
 deployed, state, a cold standby, 45 s of steady input, `kill -9`, the standby's
-takeover (1.08 s, first record in the last sink 4.34 s after the kill), the killed node
+takeover (1.07 s, first record in the last sink 4.28 s after the kill), the killed node
 back, a takeover by hand, a cold start from the blob topic. In the minute before the kill the leader's clients were handed 200 tokens and the standby's 81 — every client several times over — and the broker denied the node nothing but the group lookups below. Two things
 broke on the way:
 

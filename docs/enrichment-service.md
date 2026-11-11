@@ -2048,7 +2048,8 @@ equivalences in the MSK documentation. The translation has not been run.
 | topics a sink writes | `Describe`, `Write` | `DescribeTopic`, `WriteData` | the service does not create them |
 | consumer groups | none | none | nothing joins a group. The client still asks for the coordinator of `{prefix}.reader`, `{prefix}.svc.blobs.{node}` and `incremental.source` about once a second per consumer, and the broker logs each refusal; `Describe` on those three (`DescribeGroup`) quiets its log and changes nothing else |
 
-`{prefix}.writer` is `KafkaLogOptions.TransactionalId` when you set one. On MSK the
+The IAM actions are all `kafka-cluster:…`. `{prefix}.writer` is
+`KafkaLogOptions.TransactionalId` when you set one. On MSK the
 resources are ARNs (`…:topic/<cluster>/<uuid>/{prefix}.*`,
 `…:transactional-id/<cluster>/<uuid>/{prefix}.writer`).
 
