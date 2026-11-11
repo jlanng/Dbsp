@@ -32,7 +32,6 @@ internal sealed class ServiceRegistrations
 internal sealed class ServiceContext
 {
     private readonly ConcurrentDictionary<string, IConnector> _connectors = new(StringComparer.Ordinal);
-    private readonly ConcurrentDictionary<string, IObjectStore> _objectStores = new(StringComparer.Ordinal);
 
     public required ServiceOptions Options { get; init; }
     public required IServiceBackend Backend { get; init; }
@@ -108,10 +107,10 @@ internal sealed class ServiceContext
     {
         if (string.IsNullOrEmpty(name))
             throw ServiceException.Invalid("The loader must name an object store connection.");
-        if (!Registrations.ObjectStores.TryGetValue(name, out var factory))
+        if (!Registrations.ObjectStores.ContainsKey(name))
             throw ServiceException.Invalid(
                 $"No object store named '{name}' is registered (registered: {string.Join(", ", Registrations.ObjectStores.Keys.Order())}).");
-        return _objectStores.GetOrAdd(name, _ => factory(Services));
+        return Services.GetRequiredService<ObjectStores>().Get(name);
     }
 }
 

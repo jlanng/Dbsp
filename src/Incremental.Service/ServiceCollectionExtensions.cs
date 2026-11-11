@@ -31,8 +31,10 @@ public static class IncrementalServiceCollectionExtensions
             registrations = new ServiceRegistrations();
             registrations.Connectors["memory"] = sp => sp.GetRequiredService<MemoryConnector>();
             registrations.Connectors["kafka"] = sp => new KafkaConnector(sp.GetRequiredService<KafkaConnections>());
+            registrations.Connectors["files"] = sp => new FileConnector(sp.GetRequiredService<ObjectStores>());
             services.AddSingleton(registrations);
             services.AddSingleton(sp => new KafkaConnections(sp, registrations));
+            services.AddSingleton(sp => new ObjectStores(sp, registrations));
             services.TryAddSingleton<MemoryConnector>();
             services.AddSingleton(sp => new ServiceNode(sp, sp.GetRequiredService<IOptions<ServiceOptions>>().Value));
             services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<ServiceNode>());

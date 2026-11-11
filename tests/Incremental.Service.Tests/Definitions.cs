@@ -133,3 +133,25 @@ public sealed class CountsRenamed : IPipelineDefinition
     public void Build(PipelineBuilder p) =>
         p.UpsertSink("out", p.Input<Trade>("trades").GroupBy(t => t.Trader).Count().Named("count-v2"));
 }
+
+/// <summary>Trades above a quantity, as an append-only stream.</summary>
+[Pipeline("big-trades")]
+public sealed class BigTrades : IPipelineDefinition
+{
+    public const decimal Threshold = 4;
+
+    public void Build(PipelineBuilder p) =>
+        p.AppendSink("out", p.Input<Trade>("trades")
+            .Select(t => t.Quantity < 0 ? throw new InvalidOperationException($"negative quantity on trade {t.Id}") : t)
+            .Where(t => t.Quantity >= Threshold));
+
+    public static List<Trade> Model(IEnumerable<Trade> trades) => trades.Where(t => t.Quantity >= Threshold).ToList();
+}
+
+/// <summary>The latest trade per id: a keyed input straight to an upsert sink.</summary>
+[Pipeline("latest-trades")]
+public sealed class LatestTrades : IPipelineDefinition
+{
+    public void Build(PipelineBuilder p) =>
+        p.UpsertSink("out", p.KeyedInput<long, Trade>("trades", t => t.Id), t => t.Id);
+}

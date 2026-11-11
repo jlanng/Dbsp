@@ -504,4 +504,80 @@ public class KafkaServiceTests(ITestOutputHelper output)
         Assert.Contains("outside what this connection allows", loader.Message);
         Assert.Empty(a.Tables.Tables);
     }
+
+    [Fact]
+    public async Task Dead_letters_go_to_a_topic_with_their_source_positions_and_keep_arriving_after_a_takeover()
+    {
+        await using var env = KafkaTestEnv.Create();
+        var tradesTopic = await env.CreateTopicAsync("trades");
+        var countsTopic = await env.CreateTopicAsync("counts", compacted: true);
+        var deadTopic = await env.CreateTopicAsync("dead");
+
+        // One trade in eight has a negative quantity, which the definition throws on; and
+        // two records are not trades at all, which the source rejects.
+        var trades = Trades(0, 240);
+        for (var i = 7; i < trades.Count; i += 8)
+            trades[i] = trades[i] with { Quantity = -1 };
+        void Produce(IEnumerable<Trade> some)
+        {
+            foreach (var trade in some)
+                env.ProduceJson(tradesTopic, trade.Id, trade);
+        }
+        Produce(trades.Take(60));
+        env.Producer.Produce(tradesTopic, new Confluent.Kafka.Message<byte[], byte[]> { Key = KafkaTestEnv.Json(-1), Value = "not json"u8.ToArray() });
+        Produce(trades.Skip(60).Take(60));
+        await env.FlushAsync();
+
+        var spec = Spec("fragile", "fragile") with
+        {
+            Circuit = new PipelineCircuitOptions { ErrorPolicy = RecordErrorPolicy.DeadLetter },
+            Inputs = new Dictionary<string, JsonElement> { ["trades"] = KafkaBinding(tradesTopic) },
+            Sinks = new Dictionary<string, JsonElement> { ["out"] = KafkaBinding(countsTopic) },
+            DeadLetters = KafkaBinding(deadTopic),
+        };
+        await using var a = await env.StartNodeAsync("a", lead: true);
+        var deployed = await a.DeployAsync(spec);
+
+        static List<DeadLetterEnvelope> Read(string topic) =>
+            KafkaTestEnv.ReadTopic(topic).Select(r => JsonSerializer.Deserialize<DeadLetterEnvelope>(r.Message.Value, JsonSerializerOptions.Web)!).ToList();
+        static long? TradeId(DeadLetterEnvelope e) =>
+            e.Source is null ? JsonDocument.Parse(e.Record!).RootElement.GetProperty("id").GetInt64() : null;
+        var poisonFirst = trades.Take(120).Where(t => t.Quantity < 0).Select(t => (long?)t.Id).ToList();
+        await Eventually(() => Read(deadTopic).Count >= poisonFirst.Count + 1, "the first half's dead letters on the topic");
+        await KafkaTestEnv.TopicEqualsAsync(countsTopic, Counts.Model(trades.Take(120).Where(t => t.Quantity >= 0)), "the first half counted");
+
+        var first = Read(deadTopic);
+        Assert.Equal(poisonFirst, first.Where(e => e.Source is null).Select(TradeId).Distinct().Order());
+        var rejected = Assert.Single(first, e => e.Source is not null);
+        Assert.Equal($"{tradesTopic}[0]@60", rejected.Source);
+        Assert.Equal("input[trades]", rejected.Operator);
+        Assert.Contains("not json", rejected.Record);
+        Assert.All(first, e =>
+        {
+            Assert.Equal("fragile", e.Pipeline);
+            Assert.Equal(deployed.Spec.Generation, e.Generation);
+            Assert.InRange(e.Step, 1, long.MaxValue);
+        });
+        Assert.Equal(first.Count, a.Pipelines.Get("fragile").DeadLetterSink!.Delivered);
+        Assert.Equal("kafka", a.Pipelines.Get("fragile").DeadLetterSink!.Connector);
+
+        // Leadership moves with more poison on its way.
+        await using var b = await env.StartNodeAsync("b");
+        await WarmStandbyAsync(b);
+        Produce(trades.Skip(120));
+        env.Producer.Produce(tradesTopic, new Confluent.Kafka.Message<byte[], byte[]> { Key = KafkaTestEnv.Json(-2), Value = "{ nor this"u8.ToArray() });
+        await env.FlushAsync();
+        await b.Node.TakeOverAsync(new NodeActionOptions(), default).WaitAsync(Timeout);
+        await b.Running("fragile");
+
+        await KafkaTestEnv.TopicEqualsAsync(countsTopic, Counts.Model(trades.Where(t => t.Quantity >= 0)), "everything counted after the takeover");
+        var poison = trades.Where(t => t.Quantity < 0).Select(t => (long?)t.Id).ToList();
+        await Eventually(() => Read(deadTopic).Count(e => e.Source is not null) >= 2, "the second rejected record on the topic");
+        var all = Read(deadTopic);
+        // At least once: every dropped record is there; one dropped by a step the old
+        // leader had not committed may be there twice.
+        Assert.Equal(poison, all.Where(e => e.Source is null).Select(TradeId).Distinct().Order());
+        Assert.Equal([$"{tradesTopic}[0]@241", $"{tradesTopic}[0]@60"], all.Where(e => e.Source is not null).Select(e => e.Source).Distinct().Order());
+        Assert.True(all.Count <= poison.Count + 2 + 8, $"{all.Count} dead letters for {poison.Count + 2} dropped records");
+    }
 }

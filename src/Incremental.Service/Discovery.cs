@@ -251,7 +251,7 @@ internal sealed class ServiceDiscovery(ServiceContext context) : IServiceDiscove
             // the built-in ones, and of those the first whose config needs nothing more.
             var able = connectors.Where(c => c.Kinds.Contains(slot.Kind)).Select(c => c.Name).ToList();
             forSlot[slot.Name] = able;
-            var ordered = able.OrderBy(n => n is "memory" ? 1 : n is "kafka" ? 2 : 0).ThenBy(n => n, StringComparer.Ordinal).ToList();
+            var ordered = able.OrderBy(n => n is "memory" ? 1 : n is "kafka" ? 2 : n is "files" ? 3 : 0).ThenBy(n => n, StringComparer.Ordinal).ToList();
             foreach (var name in ordered)
             {
                 var config = new JsonObject { ["connector"] = name };

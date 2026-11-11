@@ -670,6 +670,16 @@ internal static class AdminApi
             operation = p.Operation,
             restarts = p.Restarts,
             deadLetters = p.DeadLetters,
+            deadLetterSink = p.DeadLetterSink is null ? null : new
+            {
+                connector = p.DeadLetterSink.Connector,
+                delivered = p.DeadLetterSink.Delivered,
+                batches = p.DeadLetterSink.Batches,
+                writeInFlightSince = p.DeadLetterSink.WriteInFlightSince,
+                lastError = p.DeadLetterSink.LastError is null ? null : state.Message(p.DeadLetterSink.LastError),
+                lastErrorTime = p.DeadLetterSink.LastErrorTime,
+                failedWrites = p.DeadLetterSink.FailedWrites,
+            },
             committedStep = p.CommittedStep,
             pending = spec?.Pending,
             workers = spec?.Circuit.Workers,

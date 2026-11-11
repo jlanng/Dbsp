@@ -60,6 +60,11 @@ public sealed class ServiceOptions
     /// a connector that connects without a deadline of its own is bounded by this one.</summary>
     public TimeSpan ConnectorTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
+    /// <summary>How a sink's failed writes are retried before the pipeline is treated as
+    /// faulted — every sink slot's, and the dead-letter sink's. Null: the core's default
+    /// (five retries, 100 ms doubling to 5 s).</summary>
+    public SinkDeliveryOptions? SinkDelivery { get; set; }
+
     /// <summary>A sink write in flight for longer than this shows as <c>sink-ack</c>.</summary>
     public TimeSpan StallAfter { get; set; } = TimeSpan.FromSeconds(10);
 

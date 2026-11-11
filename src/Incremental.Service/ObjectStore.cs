@@ -85,7 +85,15 @@ public sealed class LocalObjectStore : IObjectStore
         foreach (var file in new DirectoryInfo(_root).EnumerateFiles("*", SearchOption.AllDirectories).OrderBy(f => f.FullName, StringComparer.Ordinal))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var info = Info(file);
+            ObjectInfo info;
+            try
+            {
+                info = Info(file);
+            }
+            catch (FileNotFoundException)
+            {
+                continue;           // deleted while the directory was being listed
+            }
             if (info.Path.StartsWith(prefix, StringComparison.Ordinal) && !info.Path.EndsWith(".tmp", StringComparison.Ordinal))
                 yield return info;
         }

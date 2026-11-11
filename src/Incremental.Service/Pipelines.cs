@@ -72,6 +72,10 @@ public sealed class PipelineBuilder
     private readonly bool _detached;
     private readonly Dictionary<string, object> _standIns = new(StringComparer.Ordinal);
 
+    /// <summary>Detached only: the tables the definition was given, by name. The test
+    /// harness puts its tables here before <c>Build</c> and reads the rest after.</summary>
+    internal Dictionary<string, object> StandIns => _standIns;
+
     internal PipelineBuilder(
         PipelineSpec spec, CircuitBuilder circuit, ITableRegistry tables, ILogger logger, IServiceProvider services, bool detached = false)
     {
@@ -136,6 +140,9 @@ public sealed class PipelineBuilder
     private void Claim(string slot)
     {
         ArgumentException.ThrowIfNullOrEmpty(slot);
+        if (slot == PipelineSpec.DeadLetterSlot)
+            throw new InvalidOperationException(
+                $"Slot name '{slot}' is the pipeline's dead-letter sink, which the spec binds; a definition cannot declare it.");
         if (!_slots.Add(slot))
             throw new InvalidOperationException($"Slot '{slot}' is declared twice; slot names are unique within a definition.");
     }
@@ -167,7 +174,8 @@ public sealed class PipelineBuilder
         Inputs.Add(new InputSlot(slot, SlotKind.AppendInput, typeof(T).Name,
             (connector, start) => connector is IAppendSourceConnector append
                 ? append.StartAsync(new SourceContext<T>(start, stream), start.Cancellation)
-                : throw Mismatch(slot, connector, "an append input (Input<T>)")));
+                : throw Mismatch(slot, connector, "an append input (Input<T>)"))
+        { Stream = stream });
         return stream;
     }
 
@@ -182,7 +190,7 @@ public sealed class PipelineBuilder
             (connector, start) => connector is IKeyedSourceConnector keyed
                 ? keyed.StartAsync(new KeyedSourceContext<TKey, TValue>(start, stream), start.Cancellation)
                 : throw Mismatch(slot, connector, "a keyed input (KeyedInput<TKey, TValue>)"))
-        { KeyType = typeof(TKey).Name });
+        { KeyType = typeof(TKey).Name, Stream = stream });
         return stream;
     }
 
@@ -201,7 +209,7 @@ public sealed class PipelineBuilder
                     ? upsert.Create<TKey, TRow>(start.Sink)
                     : throw Mismatch(slot, connector, "an upsert sink");
                 start.Own(sink);
-                var observed = new ObservedUpsertSink<TKey, TRow>(start.Leadership.Leased(sink), start.Stats);
+                var observed = new ObservedUpsertSink<TKey, TRow>(start.Leased(sink), start.Stats);
                 return start.Circuit.Handle(output).DeliverToAsync(observed, start.Delivery);
             },
             circuit => circuit.Handle(output).Abandon())
@@ -224,7 +232,7 @@ public sealed class PipelineBuilder
                     ? upsert.Create<TKey, T>(start.Sink)
                     : throw Mismatch(slot, connector, "an upsert sink");
                 start.Own(sink);
-                var observed = new ObservedUpsertSink<TKey, T>(start.Leadership.Leased(sink), start.Stats);
+                var observed = new ObservedUpsertSink<TKey, T>(start.Leased(sink), start.Stats);
                 return start.Circuit.Handle(output).DeliverToAsync(observed, key, start.Delivery);
             },
             circuit => circuit.Handle(output).Abandon())
@@ -244,7 +252,7 @@ public sealed class PipelineBuilder
                     ? append.Create<T>(start.Sink)
                     : throw Mismatch(slot, connector, "an append sink");
                 start.Own(sink);
-                var observed = new ObservedAppendSink<T>(start.Leadership.Leased(sink), start.Stats);
+                var observed = new ObservedAppendSink<T>(start.Leased(sink), start.Stats);
                 return start.Circuit.Handle(output).DeliverToAsync(observed, start.Delivery);
             },
             circuit => circuit.Handle(output).Abandon()));
@@ -284,6 +292,10 @@ public sealed class PipelineBuilder
 internal sealed record InputSlot(string Name, SlotKind Kind, string Type, Func<IConnector, SlotStart, Task<IRunningSource>> Start)
 {
     public string? KeyType { get; init; }
+
+    /// <summary>The input as the definition declared it: an <c>InputStream&lt;T&gt;</c> or a
+    /// <c>KeyedInputStream&lt;TKey, TValue&gt;</c>.</summary>
+    public required object Stream { get; init; }
 }
 
 internal sealed record SinkSlot(string Name, SlotKind Kind, string Type, Func<IConnector, SlotStart, Task> Start, Action<Circuit> Abandon)
@@ -301,7 +313,13 @@ internal sealed class SlotStart
     public required JsonSerializerOptions Json { get; init; }
     public required ILogger Logger { get; init; }
     public required IServiceProvider Services { get; init; }
-    public required INodeLeadership Leadership { get; init; }
+    /// <summary>Null in the test harness, which has no node: sinks are then written unleased.</summary>
+    public required INodeLeadership? Leadership { get; init; }
+
+    public IUpsertSink<TKey, TRow> Leased<TKey, TRow>(IUpsertSink<TKey, TRow> sink) where TKey : notnull =>
+        Leadership is { } leadership ? leadership.Leased(sink) : sink;
+
+    public IAppendSink<T> Leased<T>(IAppendSink<T> sink) => Leadership is { } leadership ? leadership.Leased(sink) : sink;
     public required CancellationToken Cancellation { get; init; }
     public SinkSlotStats Stats { get; init; } = new();
 
@@ -364,6 +382,21 @@ public sealed record PipelineSpec
     /// <summary>Input slot → connector config: <c>{ "connector": "memory", … }</c>.</summary>
     public IReadOnlyDictionary<string, JsonElement> Inputs { get; init; } = new Dictionary<string, JsonElement>();
     public IReadOnlyDictionary<string, JsonElement> Sinks { get; init; } = new Dictionary<string, JsonElement>();
+
+    /// <summary>
+    /// Where the records this pipeline drops are kept: the config of any append sink
+    /// connector (<c>{ "connector": "kafka", "connection": "…", "topic": "…" }</c>,
+    /// <c>{ "connector": "files", … }</c>). Each dropped record is delivered as a
+    /// <see cref="DeadLetterEnvelope"/>, at least once, before the checkpoint that passes
+    /// it — so it survives a crash and a takeover. Null: dropped records are counted and
+    /// the newest are kept in memory on the leader, and nowhere else. It only has
+    /// something to deliver when the circuit or one of its operators has the
+    /// <c>DeadLetter</c> error policy.
+    /// </summary>
+    public JsonElement? DeadLetters { get; init; }
+
+    /// <summary>The name the dead-letter sink goes by where slots are named.</summary>
+    public const string DeadLetterSlot = "deadLetters";
     public RestartPolicy? Restart { get; init; }
 
     /// <summary><c>reset</c> or <c>remove</c> while that act is unfinished: a leader that
@@ -406,6 +439,35 @@ public sealed record PipelineFault(DateTimeOffset Time, long Generation, string 
 public sealed record DeadLetterRecord(
     long Sequence, DateTimeOffset Time, string Operator, long Weight, string ExceptionType, string Message, string? Record);
 
+/// <summary>
+/// A dropped record as the pipeline's dead-letter sink (<see cref="PipelineSpec.DeadLetters"/>)
+/// stores it. <c>Generation</c> is the spec's generation and <c>Step</c> the sequence
+/// number of the step that dropped the record: a record delivered twice (a step run again
+/// after a crash or a takeover) usually repeats both and its content, so
+/// (pipeline, generation, step, operator, record, weight) is what a reader deduplicates
+/// on — "usually" because a re-run may cut its input into other steps. <c>Weight</c> is
+/// the record's weight in the delta it was dropped from: negative for a retraction.
+/// <c>Source</c> is where the record lies in its source when the source itself rejected
+/// it (a topic, partition and offset; an object and line); for a record an operator
+/// dropped it is null, and <c>After</c> — each input's position in the last checkpoint
+/// before the step — says where in the inputs to look. <c>Record</c> is the record as
+/// JSON text, cut at 4,096 characters.
+/// </summary>
+public sealed record DeadLetterEnvelope(
+    string Pipeline, long Generation, long Step, DateTimeOffset Time, string Operator, long Weight,
+    string ExceptionType, string Message, string? Source, string? Record, IReadOnlyDictionary<string, long>? After = null);
+
+/// <summary>
+/// The pipeline's dead-letter sink as this node sees it. <c>Delivered</c> counts records
+/// the sink has confirmed since this generation started; <c>WriteInFlightSince</c> is set
+/// while a batch waits for the sink, and the pipeline's checkpoint waits with it;
+/// <c>LastError</c> is the last failed write. A sink that keeps failing faults the
+/// pipeline — nothing is dropped and no checkpoint passes an unstored dead letter.
+/// </summary>
+public sealed record DeadLetterSinkStatus(
+    string Connector, long Delivered, long Batches, DateTimeOffset? WriteInFlightSince,
+    string? LastError, DateTimeOffset? LastErrorTime, long FailedWrites);
+
 public sealed record SinkSlotStatus(string Slot, long Batches, long Upserts, long Deletes, long Appends, DateTimeOffset? WriteInFlightSince);
 
 public sealed record SourceSlotStatus(string Slot, SourceStats Stats);
@@ -418,7 +480,8 @@ public sealed record PipelineStatus(
     IReadOnlyList<SourceSlotStatus> Sources, IReadOnlyList<SinkSlotStatus> Sinks,
     IReadOnlyList<PipelineTransition>? History = null,
     PipelineRollback? RolledBack = null,
-    bool ReplaceUnconfirmed = false);
+    bool ReplaceUnconfirmed = false,
+    DeadLetterSinkStatus? DeadLetterSink = null);
 
 public interface IPipelineSupervisor
 {

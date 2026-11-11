@@ -44,7 +44,12 @@ public interface IRunningSource : IAsyncDisposable
 
 public sealed record SourceStats(
     long Records = 0, long Unreadable = 0, IReadOnlyDictionary<int, long>? Positions = null, long? Lag = null,
-    DateTimeOffset? PausedSince = null);
+    DateTimeOffset? PausedSince = null)
+{
+    /// <summary>Where the source stands, in its own words, when a partition and an offset
+    /// do not say it: the <c>files</c> source's object and line.</summary>
+    public string? At { get; init; }
+}
 
 public interface IUpsertSinkConnector : IConnector
 {
@@ -129,7 +134,7 @@ public sealed class SinkContext : SlotContext
     internal SinkContext(SlotStart start) : base(start) => _start = start;
 
     /// <summary>The leader term this node writes under.</summary>
-    public long Term => _start.Leadership.Term;
+    public long Term => _start.Leadership?.Term ?? 0;
 
     /// <summary>The step the circuit's checkpoint covers; batches above it are delivered
     /// again after a restart. Null before the first commit, and at a reset.</summary>

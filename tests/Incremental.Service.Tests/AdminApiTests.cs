@@ -406,7 +406,7 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         Assert.Equal("my-risk/orders", spec.GetProperty("inputs").GetProperty("orders").GetProperty("name").GetString());
         Assert.Equal(["by-country", "by-symbol", "by-tier", "largest"], spec.GetProperty("sinks").EnumerateObject().Select(s => s.Name).Order());
         Assert.DoesNotContain("<", spec.ToString());        // no placeholder anywhere
-        Assert.Equal(["kafka", "memory"], template["connectorsForSlot"].GetProperty("orders").EnumerateArray().Select(c => c.GetString()));
+        Assert.Equal(["files", "kafka", "memory"], template["connectorsForSlot"].GetProperty("orders").EnumerateArray().Select(c => c.GetString()));
 
         // Sent back unchanged, the dry run of a deploy accepts it.
         var dry = await Admin.SendAsync(HttpMethod.Put, "pipelines/my-risk?dryRun=true", spec.GetRawText());
@@ -423,7 +423,7 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
     public async Task Connectors_connections_and_table_sources_are_listed_with_their_config_and_no_secrets()
     {
         var connectors = await Admin.Get("connectors");
-        Assert.Equal(2, connectors["total"].GetInt32());
+        Assert.Equal(3, connectors["total"].GetInt32());
         var byName = connectors["items"].EnumerateArray().ToDictionary(c => c.GetProperty("name").GetString()!);
         Assert.Equal(["AppendInput", "KeyedInput", "UpsertSink", "AppendSink"], byName["memory"].GetProperty("kinds").EnumerateArray().Select(k => k.GetString()));
         Assert.True(byName["memory"].GetProperty("resettable").GetBoolean());
@@ -453,7 +453,7 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
 
         // Lists like every other: paged and clamped.
         var page = await Admin.Get("connectors?limit=1&skip=1");
-        Assert.Equal((1, 2, "memory"), (page["items"].GetArrayLength(), page["total"].GetInt32(), page["items"][0].GetProperty("name").GetString()));
+        Assert.Equal((1, 3, "kafka"), (page["items"].GetArrayLength(), page["total"].GetInt32(), page["items"][0].GetProperty("name").GetString()));
     }
 
     [Fact]
@@ -1049,7 +1049,7 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         // What there is to deploy with is the host's, so a standby lists it; describing a
         // definition runs plugin code, which only the leader does.
         var connectors = await admin.SendAsync(HttpMethod.Get, "connectors", baseUrl: standby);
-        Assert.Equal(["kafka", "memory"], connectors["items"].EnumerateArray().Select(c => c.GetProperty("name").GetString()));
+        Assert.Equal(["files", "kafka", "memory"], connectors["items"].EnumerateArray().Select(c => c.GetProperty("name").GetString()));
         var version = (await admin.Get("plugins"))["items"].EnumerateArray().First(p => p.GetProperty("name").GetString() == DemoHost.Plugin).GetProperty("version").GetString();
         (await admin.SendAsync(HttpMethod.Get, $"plugins/{DemoHost.Plugin}/{version}/definitions/enrich-orders", baseUrl: standby)).IsError(409, "not-leader");
 

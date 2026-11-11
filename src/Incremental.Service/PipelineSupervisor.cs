@@ -19,6 +19,10 @@ internal sealed class Generation
     public Dictionary<string, SinkSlotStats> SinkStats { get; } = new(StringComparer.Ordinal);
     public List<object> OwnedSinks { get; } = [];
     public Task DeadLetters { get; set; } = Task.CompletedTask;
+
+    /// <summary>The dead-letter sink's counters, when the spec binds one. Apart from the
+    /// slots' because what it delivers is not the pipeline's output.</summary>
+    public SinkSlotStats? DeadLetterStats { get; set; }
     public CancellationTokenSource Stop { get; } = new();
     public volatile bool Stopping;
 
@@ -102,6 +106,10 @@ internal sealed class PipelineRuntime(PipelineSpec spec, ServiceOptions options)
     public Queue<DateTimeOffset> FaultTimes { get; } = new();
     public int Restarts;
     public Ring<DeadLetterRecord> DeadLetters { get; } = new(options.DeadLetterBuffer);
+
+    /// <summary>The dead-letter sink's last failed write, kept across generations.</summary>
+    public volatile Tuple<string, DateTimeOffset>? DeadLetterSinkError;
+    public long DeadLetterSinkFailures;
     public volatile string? BlockedOn;
     public DateTimeOffset? BackoffUntil;
     public CancellationTokenSource? Retry;
@@ -176,6 +184,9 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             PipelineState.Blocked => runtime.BlockedOn,
             PipelineState.Running when sinks.FirstOrDefault(s => s.WriteInFlightSince is { } since && DateTimeOffset.UtcNow - since > context.Options.StallAfter) is { } stalled
                 => $"sink-ack:{stalled.Slot}",
+            PipelineState.Running when generation?.DeadLetterStats?.Status(PipelineSpec.DeadLetterSlot).WriteInFlightSince is { } since
+                && DateTimeOffset.UtcNow - since > context.Options.StallAfter
+                => $"sink-ack:{PipelineSpec.DeadLetterSlot}",
             PipelineState.Running when sources.FirstOrDefault(s => s.Stats.PausedSince is not null) is { } paused => $"source-paused:{paused.Slot}",
             _ => null,
         };
@@ -196,7 +207,18 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             runtime.Id, runtime.State, spec.Desired, spec.Generation, spec.Plugin, spec.Version, spec.Definition,
             blockedOn, runtime.Since, runtime.Operation, runtime.Restarts, runtime.DeadLetters.Total,
             generation?.Circuit.CommittedStep, committed, faults, runtime.Shape, sources, sinks, runtime.History.After(),
-            runtime.RolledBack, spec.Previous is not null);
+            runtime.RolledBack, spec.Previous is not null, DeadLetterSink(runtime, spec, generation));
+    }
+
+    private DeadLetterSinkStatus? DeadLetterSink(PipelineRuntime runtime, PipelineSpec spec, Generation? generation)
+    {
+        if (spec.DeadLetters is not { } config)
+            return null;
+        var stats = generation?.DeadLetterStats?.Status(PipelineSpec.DeadLetterSlot);
+        var error = runtime.DeadLetterSinkError;
+        return new DeadLetterSinkStatus(
+            ConnectorName(config), stats?.Appends ?? 0, stats?.Batches ?? 0, stats?.WriteInFlightSince,
+            error?.Item1, error?.Item2, Interlocked.Read(ref runtime.DeadLetterSinkFailures));
     }
 
     public PipelineGraph? Graph(string id) => Require(id).Graph;
@@ -206,7 +228,14 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
     /// <summary>A spec as it may leave the service: secrets as <c>***</c>, and without the
     /// spec it replaced, which is the service's own note.</summary>
     private PipelineSpec Shown(PipelineSpec spec) =>
-        spec with { Inputs = Redact(spec.Inputs), Sinks = Redact(spec.Sinks), Previous = null };
+        spec with
+        {
+            Inputs = Redact(spec.Inputs), Sinks = Redact(spec.Sinks), Previous = null,
+            DeadLetters = spec.DeadLetters is { } config ? Redact(One(config))[PipelineSpec.DeadLetterSlot] : null,
+        };
+
+    private static Dictionary<string, JsonElement> One(JsonElement deadLetters) =>
+        new(StringComparer.Ordinal) { [PipelineSpec.DeadLetterSlot] = deadLetters };
 
     private IReadOnlyDictionary<string, JsonElement> Redact(IReadOnlyDictionary<string, JsonElement> bindings)
     {
@@ -241,6 +270,9 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         {
             Inputs = RestoreSecrets(spec.Inputs, stored?.Inputs, "input"),
             Sinks = RestoreSecrets(spec.Sinks, stored?.Sinks, "sink"),
+            DeadLetters = spec.DeadLetters is { } config
+                ? RestoreSecrets(One(config), stored?.DeadLetters is { } old ? One(old) : null, "sink")[PipelineSpec.DeadLetterSlot]
+                : null,
         };
 
     private IReadOnlyDictionary<string, JsonElement> RestoreSecrets(
@@ -501,6 +533,8 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 connector = context.Connector(config);
                 connector.Describe(config);
                 (connector as KafkaConnector)?.RequireKind(config, kind);
+                if (connector is FileConnector)
+                    FileConnector.RequireKind(config, kind);
             }
             catch (Exception ex)
             {
@@ -525,7 +559,11 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         foreach (var bound in spec.Inputs.Keys.Where(k => pipeline.Inputs.All(i => i.Name != k)))
             errors.Add($"The spec binds input slot '{bound}', which definition '{spec.Definition}' does not declare.");
         foreach (var bound in spec.Sinks.Keys.Where(k => pipeline.Sinks.All(s => s.Name != k)))
-            errors.Add($"The spec binds sink slot '{bound}', which definition '{spec.Definition}' does not declare.");
+            errors.Add(bound == PipelineSpec.DeadLetterSlot
+                ? "The dead-letter sink is bound by the spec's own \"deadLetters\" member, not under \"sinks\"."
+                : $"The spec binds sink slot '{bound}', which definition '{spec.Definition}' does not declare.");
+        if (spec.DeadLetters is { } deadLetters)
+            Check(PipelineSpec.DeadLetterSlot, SlotKind.AppendSink, One(deadLetters), "dead-letter");
         if (errors.Count > 0)
             throw ServiceException.Invalid($"Pipeline '{spec.Id}' does not bind.", errors);
     }
@@ -1349,6 +1387,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 // Abandoning is best effort.
             }
         }
+        generation.Circuit.AbandonDeadLetters();
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -1368,6 +1407,9 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             CheckpointMaxDelay = spec.Circuit.CheckpointMaxDelay,
             ErrorPolicy = spec.Circuit.ErrorPolicy,
             MaxStepItemsPerInput = spec.Circuit.MaxStepItemsPerInput ?? 8192,
+            // With a dead-letter sink bound, a dropped record is in the sink before the
+            // checkpoint that passes it.
+            AcknowledgeDeadLetters = spec.DeadLetters is not null,
             LoggerFactory = logs,
         });
         var pipeline = new PipelineBuilder(spec, builder, context.Tables, _logger, context.Services);
@@ -1400,6 +1442,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             Cancellation = generation.Stop.Token,
             Stats = generation.SinkStats.TryGetValue(slot, out var stats) ? stats : new SinkSlotStats(),
             Owned = generation.OwnedSinks,
+            Delivery = context.Options.SinkDelivery,
         };
 
         foreach (var sink in generation.Builder.Sinks)
@@ -1411,17 +1454,37 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             generation.Observe(delivery);
         }
 
-        ChannelReader<DeadLetter>? deadLetters = null;
-        try
+        if (spec.DeadLetters is { } deadLetterConfig)
         {
-            deadLetters = circuit.DeadLetters;
+            ChannelReader<DeadLetterBatch>? batches = null;
+            try
+            {
+                batches = circuit.DeadLetterBatches;
+            }
+            catch (InvalidOperationException)
+            {
+                // No operator of this circuit has the DeadLetter policy: nothing to deliver.
+            }
+            if (batches is not null)
+            {
+                generation.DeadLetters = DeliverDeadLettersAsync(runtime, generation, For(PipelineSpec.DeadLetterSlot, deadLetterConfig));
+                generation.Observe(generation.DeadLetters);
+            }
         }
-        catch (InvalidOperationException)
+        else
         {
-            // No operator of this circuit has the DeadLetter policy.
+            ChannelReader<DeadLetter>? deadLetters = null;
+            try
+            {
+                deadLetters = circuit.DeadLetters;
+            }
+            catch (InvalidOperationException)
+            {
+                // No operator of this circuit has the DeadLetter policy.
+            }
+            if (deadLetters is not null)
+                generation.DeadLetters = Task.Run(() => ReadDeadLettersAsync(runtime, deadLetters, runtime.Lease!.Json));
         }
-        if (deadLetters is not null)
-            generation.DeadLetters = Task.Run(() => ReadDeadLettersAsync(runtime, deadLetters, runtime.Lease!.Json));
 
         // A connector's StartAsync is tenant code that may connect somewhere: it runs off
         // this thread and within a bound. A start that passes the bound fails the
@@ -1467,25 +1530,11 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
     /// supervisor always reads it: into a ring per pipeline, and a count.</summary>
     private async Task ReadDeadLettersAsync(PipelineRuntime runtime, ChannelReader<DeadLetter> reader, JsonSerializerOptions json)
     {
-        var lastLogged = DateTimeOffset.MinValue;
-        var sinceLogged = 0;
+        var noted = new DeadLetterNotes();
         try
         {
             await foreach (var letter in reader.ReadAllAsync().ConfigureAwait(false))
-            {
-                runtime.DeadLetters.Add(sequence => new DeadLetterRecord(
-                    sequence, DateTimeOffset.UtcNow, letter.Operator, letter.Weight,
-                    letter.Exception.GetType().Name, letter.Exception.Message, Render(letter.Record, json)));
-                sinceLogged++;
-                var now = DateTimeOffset.UtcNow;
-                if (now - lastLogged >= TimeSpan.FromSeconds(10))
-                {
-                    _logger.LogWarning("Pipeline {Pipeline} dropped {Count} record(s) to its dead letters; the last at {Operator}: {Message}",
-                        runtime.Id, sinceLogged, letter.Operator, letter.Exception.Message);
-                    context.Events.Publish("deadletter", runtime.Id, $"{sinceLogged} record(s) dropped at {letter.Operator}");
-                    (lastLogged, sinceLogged) = (now, 0);
-                }
-            }
+                Remember(runtime, letter, Render(letter.Record, json), noted);
         }
         catch
         {
@@ -1493,12 +1542,126 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         }
     }
 
+    private sealed class DeadLetterNotes
+    {
+        public DateTimeOffset LastLogged = DateTimeOffset.MinValue;
+        public int SinceLogged;
+    }
+
+    /// <summary>The ring, the count, and a line in the log every ten seconds at most.</summary>
+    private void Remember(PipelineRuntime runtime, DeadLetter letter, string? record, DeadLetterNotes noted)
+    {
+        runtime.DeadLetters.Add(sequence => new DeadLetterRecord(
+            sequence, DateTimeOffset.UtcNow, letter.Operator, letter.Weight,
+            letter.Exception.GetType().Name, letter.Exception.Message, record));
+        noted.SinceLogged++;
+        var now = DateTimeOffset.UtcNow;
+        if (now - noted.LastLogged < TimeSpan.FromSeconds(10))
+            return;
+        _logger.LogWarning("Pipeline {Pipeline} dropped {Count} record(s) to its dead letters; the last at {Operator}: {Message}",
+            runtime.Id, noted.SinceLogged, letter.Operator, letter.Exception.Message);
+        context.Events.Publish("deadletter", runtime.Id, $"{noted.SinceLogged} record(s) dropped at {letter.Operator}");
+        (noted.LastLogged, noted.SinceLogged) = (now, 0);
+    }
+
+    /// <summary>
+    /// With a dead-letter sink bound: every step's dropped records go to the sink as
+    /// <see cref="DeadLetterEnvelope"/>s and are acknowledged when it has them, which is
+    /// what the circuit's checkpoint waits for. The ring is filled on the way, so the
+    /// newest are still to be read on this node. A write that keeps failing ends here,
+    /// which faults the generation: the pipeline restarts from its checkpoint and drops
+    /// and delivers the records again, and after too many faults it is Failed. That is
+    /// the choice made for a sink that will not take dead letters — the pipeline stops
+    /// and says why, rather than losing the one kind of record that has no other trace,
+    /// or waiting without a word.
+    /// </summary>
+    private async Task DeliverDeadLettersAsync(PipelineRuntime runtime, Generation generation, SlotStart start)
+    {
+        var json = runtime.Lease!.Json;
+        var noted = new DeadLetterNotes();
+        var pipeline = runtime.Id;
+        var specGeneration = runtime.Spec.Generation;
+        var stats = generation.DeadLetterStats = new SinkSlotStats();
+        // What each record of the batch being written was rendered as, for the ring and the envelope alike.
+        var rendered = new Dictionary<DeadLetter, string?>(ReferenceEqualityComparer.Instance);
+        IReadOnlyDictionary<string, long>? after = null;
+        try
+        {
+            var connector = context.Connector(start.Config) as IAppendSinkConnector
+                ?? throw ServiceException.Invalid($"The dead-letter sink's connector '{ConnectorName(start.Config)}' is not an append sink.");
+            var sink = connector.Create<DeadLetterEnvelope>(start.Sink);
+            start.Own(sink);
+            var observed = new ObservedAppendSink<DeadLetterEnvelope>(context.Backend.Leadership.Leased(sink), stats);
+            await generation.Circuit.DeliverDeadLettersToAsync(
+                observed,
+                letter => new DeadLetterEnvelope(
+                    pipeline, specGeneration, letter.Step, DateTimeOffset.UtcNow, letter.Operator, letter.Weight,
+                    letter.Exception.GetType().Name, letter.Exception.Message, SourceOf(letter.Record), rendered.GetValueOrDefault(letter), after),
+                new SinkDeliveryOptions
+                {
+                    MaxRetries = (context.Options.SinkDelivery ?? new SinkDeliveryOptions()).MaxRetries,
+                    InitialBackoff = (context.Options.SinkDelivery ?? new SinkDeliveryOptions()).InitialBackoff,
+                    MaxBackoff = (context.Options.SinkDelivery ?? new SinkDeliveryOptions()).MaxBackoff,
+                    OnFailedAttempt = (ex, _) =>
+                    {
+                        Interlocked.Increment(ref runtime.DeadLetterSinkFailures);
+                        runtime.DeadLetterSinkError = Tuple.Create($"{ex.GetType().Name}: {ex.Message}", DateTimeOffset.UtcNow);
+                    },
+                },
+                batch =>
+                {
+                    rendered.Clear();
+                    after = Committed(pipeline);
+                    foreach (var letter in batch.Letters)
+                    {
+                        var text = rendered[letter] = Render(letter.Record, json);
+                        Remember(runtime, letter, text, noted);
+                    }
+                }).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // The circuit faults too, at its commit, and says the same: whichever of the
+            // two the watcher sees first names the dead-letter sink and its failure.
+            generation.Circuit.AbandonDeadLetters(ex);
+            var root = ex is SinkDeliveryException { InnerException: { } last } ? last : ex;
+            throw new InvalidOperationException(
+                $"The circuit's dead letters could not be stored ({root.GetType().Name}: {root.Message}), so the pipeline stops rather " +
+                $"than commit past records it dropped with no trace. Its dead-letter sink is '{ConnectorName(start.Config)}'; the " +
+                "records are dropped and delivered again when it restarts.", ex);
+        }
+    }
+
+    private IReadOnlyDictionary<string, long>? Committed(string pipeline)
+    {
+        try
+        {
+            var committed = context.Storage.Pipeline(pipeline).CommittedOffsets;
+            return committed.Count == 0 ? null : new Dictionary<string, long>(committed.Where(c => c.Key != "$step"), StringComparer.Ordinal);
+        }
+        catch (ObjectDisposedException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Where a record a source rejected lies in that source; null for a record
+    /// an operator dropped.</summary>
+    private static string? SourceOf(object? record) => record switch
+    {
+        Incremental.Kafka.KafkaRecord kafka => $"{kafka.Topic}[{kafka.Partition}]@{kafka.Offset}",
+        FileRecord file => $"{file.Object}:{file.Line + 1}",
+        _ => null,
+    };
+
     private static string? Render(object? record, JsonSerializerOptions json)
     {
         if (record is null)
             return null;
 
         // A record a Kafka source could not decode: where it is, then what it holds.
+        if (record is FileRecord line)
+            return line.ToString();
         if (record is Incremental.Kafka.KafkaRecord unreadable)
         {
             var value = unreadable.Value is { } bytes ? System.Text.Encoding.UTF8.GetString(bytes, 0, Math.Min(bytes.Length, 4096)) : "(no value)";
