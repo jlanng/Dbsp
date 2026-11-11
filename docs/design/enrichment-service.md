@@ -1679,6 +1679,39 @@ Each has a default this design is built on.
 17. **The example references OpenTelemetry** (S6: two packages, for `--otlp`), so that
     the guide's monitoring snippet is compiled code. *Alternative:* the snippet as prose
     in the guide and no dependency; nothing then checks that it still builds.
+18. **A dead-letter sink that cannot be written stops the pipeline** (S6): retries, a
+    fault, the restart policy, `Failed`. *Alternative:* count the failure, keep the
+    records in the ring only, and carry on — the pipeline's results keep flowing and
+    the records that were dropped have no durable trace, which is the gap the sink was
+    built to close.
+19. **`deadLetters` is a member of the spec, not a slot under `sinks`** (S6).
+    *Alternative:* a reserved slot name under `sinks`. One list fewer in the spec; a
+    definition could then never name a slot `deadLetters`, and every place that walks a
+    definition's sinks would have to step over one that is not the definition's.
+20. **`PipelineTestHarness` ships inside `Incremental.Service`**, namespace
+    `Incremental.Service.Testing` (S6). *Alternative:* a package
+    `Incremental.Service.Testing`. It would keep about 350 lines of test-only surface
+    out of the service's assembly, at the cost of one more package to version and of
+    `InternalsVisibleTo` for it; the harness references no test framework, so the
+    service gains no dependency by carrying it.
+21. **The files sink's reader rule is "highest term per step"** (S6), which a late
+    write by a replaced leader can defeat when the new leader writes nothing for that
+    step. *Alternative:* a marker object per term, written when a generation starts and
+    naming the step it starts at, so that a reader discards older terms' objects at or
+    above it. Exact; one more object per generation start, and every reader — the
+    owner's included — has to read the markers first.
+22. **A files source's position is encoded into the checkpoint's partition → offset
+    map** (S6: up to 2 + 2·64 entries per input, name limited to 256 bytes).
+    *Alternative:* an opaque position per input in the checkpoint, which is a change to
+    the core's checkpoint marker and a format-version bump for every circuit, to serve
+    one connector.
+23. **The example generates poison by default** (S6: one trade in 200), so that the
+    dead-letter page and sink are not empty in the mode a newcomer runs. *Alternative:*
+    off unless `--poison N`; the dead-letter page is then empty until asked for.
+24. **A reset starts a files dead-letter sink again**: step numbers begin at 1, so the
+    old objects are deleted at the first write, while a topic keeps everything.
+    *Alternative:* the incarnation in the object name. Dead letters would then survive
+    a reset, and a reader would have to know which incarnation is the live one.
 
 ## Not verified
 
@@ -2848,3 +2881,208 @@ misnamed; dead letters from the wrong source; the template's memory name; a tabl
 access; a setting's default; a definition described on a standby; the memory log never
 trimming; `state-choice-required` not saying keep is closed.
 
+#### Connectors, dead letters, the harness and the example: G4, G5, G6, G15
+
+**The `files` connector (G4).** `FileConnector` (`FileConnectors.cs`) is registered as
+the built-in connector `files` and implements all four slot kinds over a named
+`IObjectStore`, so whatever store the host registers — a directory, the owner's S3 —
+is what it reads and writes. Its config is a closed record (`store`, `prefix`, and for
+sources `suffix` and `pollInterval`, for sinks `minInterval`); a prefix that is rooted
+or climbs out is refused. `ObjectStores` is the registry of the host's stores, public
+and resolvable from DI, as `KafkaConnections` is.
+
+*The source* reads objects in ordinal name order, a record per line, and polls the
+prefix for names above the last one read. It keeps one line and at most 1,024 names in
+memory. Its position is an object name and a line, and the checkpoint has room for one
+non-decreasing number per partition per input, each record stamped with one of them.
+`FilePosition` fits the one into the other:
+
+| partition | holds |
+|---|---|
+| 0 | `ordinal · 2³² + line`, stamped on every record of the object |
+| 1 | `ordinal · 2³² + length` of the object's name in UTF-8 bytes |
+| `2 + bank · 64 + i` | `ordinal · 2³² + ` bytes `4i…4i+3` of the name; `bank` is the ordinal's parity |
+
+The ordinal counts the objects the source has moved to, so every number only rises,
+which is what the input's replay filter requires. Moving to an object sends the name's
+parts (`AdvanceAsync`), then partition 1, then the object's records, all through the
+input's channel; a checkpoint can fall after any of them. Whatever prefix it holds,
+partition 1 names an object whose name is whole — the two banks keep the last name
+intact while the next is written — and partition 0 either carries that ordinal and a
+line, or a lower one, meaning the object has not been started. A unit test walks every
+prefix of the sends for three objects and decodes each. The position does not need the
+object it names: a restart with the object deleted carries on with the names above it.
+Names are limited to 256 bytes, and the checkpoint carries up to 2 + 2·64 entries for
+the input, normally about a dozen. A keyed input takes every line as an upsert; a line
+that is not a record goes through `RejectAsync` with a `FileRecord` (object, line,
+text), and its message carries `object:line`, because the offset says nothing to a
+person. `SourceStats.At` shows the position as `name:line`.
+
+*The sinks* write one object per step with output, `{prefix}{step:D19}-{term:D6}.jsonl`,
+through the store's write-then-replace stream. The same step writes the same name; the
+first write of a generation deletes the step objects above `CommittedStep` — the core's
+rule for an append sink that can drop. An append sink's lines are records; an upsert
+sink's are `{"key":…,"row":…}` and `{"key":…,"deleted":true}`. `FileSinkFormat` is the
+reader's half (names, `StepObjectsAsync`, `ReadAppendsAsync`, `ReadUpsertsAsync`): the
+latest row of a key is the last line that names it in name order, and where a step was
+written under two terms the higher term's object is the step. `minInterval` was added
+when the example showed one object per step to be several small files a second: the
+sink writes the object and then holds its acknowledgement for the interval, the commit
+gate waits with it, and steps grow. The wait is after the write and not before it, so
+that the write follows the lease check at once.
+
+**The dead-letter sink (G4).** `PipelineSpec.DeadLetters` is a connector config for any
+`IAppendSinkConnector`. With it set the supervisor builds the circuit with the core's
+new `CircuitOptions.AcknowledgeDeadLetters`: the dead-letter port becomes an acknowledged
+output that publishes one `DeadLetterBatch` per step and gates the commit on the
+reader's acknowledgement, exactly as `ToAcknowledgedOutput` does. The supervisor
+delivers each batch as `DeadLetterEnvelope`s (pipeline, spec generation, step, time,
+operator, weight, exception type and message, the record as JSON text, the source
+position for a record a source rejected, and every input's last committed position)
+through `SinkDelivery.DeliverDeadLettersToAsync`, with the sink wrapped in the
+leadership's lease like every sink, and fills the in-memory ring on the way. Without a
+sink bound nothing changed: the ring, the count.
+
+*A sink that will not take dead letters.* Decided: the pipeline stops and says why.
+The write is retried (`ServiceOptions.SinkDelivery`, new, for every sink); then the
+dead letters are abandoned, the circuit faults at its commit, and the fault — from the
+circuit or from the delivery, whichever the watcher sees first — reads `The circuit's
+dead letters could not be stored (IOException: …)`. The pipeline restarts from its
+checkpoint under its restart policy, drops and delivers the records again, and ends
+`Failed`. `PipelineStatus.DeadLetterSink` (`deadLetterSink` in the API) carries what
+was delivered, the write in flight, the last error and the failed writes, and
+`blockedOn` reads `sink-ack:deadLetters` while a write is stalled. The alternatives
+were to drop to the ring and carry on (loses the one class of record with no other
+trace, which is what the gap was) and to retry for ever (a pipeline that looks healthy
+and has stopped).
+
+**The harness (G6).** `Incremental.Service.Testing.PipelineTestHarness`, in the
+`Incremental.Service` assembly. It goes through `DefinitionBinding` and
+`PipelineBuilder` — the supervisor's own path — with a manual-stepping circuit over an
+in-memory checkpoint store, so a step returns only when the sinks (the memory
+connector's) and the dead-letter reader have acknowledged. Tables are `SharedTable`s
+built from the definitions; a table the definition names and the test does not give is
+an empty stand-in. Inputs are the core's handles. It references no test framework.
+
+**The example (G5, G15).** Two definitions more:
+
+- `execution-quality`: two append inputs with event time, joined on (instrument, quote
+  interval) with a stream `LeftJoin` under `EvictWhen`, a remembered `Lookup` of the
+  instrument, a hopping window, and a linear aggregate the plugin defines. In memory its
+  quotes are files under `quotes/` read by `files` (the generator writes one per minute
+  of event time and deletes those older than thirty); on Kafka a second topic.
+- `watchlist-alerts`: an append input, a computed column that throws on a trade with no
+  quantity, `LookupAppendOnly`, `AppendSink` to files. Seeded twice — `sanctions-alerts`
+  and `credit-alerts` — with the table slot `watchlist` bound to two tables declared
+  from one `WatchlistTable`, under `errorPolicy: DeadLetter`, with a dead-letter sink
+  (files in memory, a topic on Kafka).
+
+The generator's `--poison N` (200 by default) gives one trade in N no quantity. Trade
+prices are now within half a percent of a level per instrument, so that slippage
+against a quote is a number worth reading. The smoke test's model covers both
+definitions; its acts add the quality windows after every publish, the alert files
+(every alert once, read with `FileSinkFormat`), the dead letters (files: once; topic:
+at least once), an addition to a watchlist, a replace of `execution-quality` on kept
+state with both inputs resuming, and all of it again after the takeover.
+`Pipelines.Tests` is an xunit v3 project of eleven tests on the harness, in the
+solution and in CI.
+
+**Deviations, and what was found on the way.**
+
+- `deadLetters` is a member of the spec, not an entry under `sinks`. The design's
+  sketch had it as a slot; a definition's slot of that name would have collided, so the
+  name is reserved (`p.AppendSink("deadLetters", …)` is refused) and a binding under
+  `sinks` is refused with a message that says where it goes.
+- The files sink writes one object per *step*, not per committed range of steps. A sink
+  is told of batches, not of commits; `minInterval` is the knob for object size.
+- The term is in the object name. Without it a replaced leader finishing a write late
+  would overwrite the new leader's object for the same step.
+- `LocalObjectStore.ListAsync` threw when a file was deleted while it listed; it skips
+  it now. `FileSinkFormat` readers skip an object listed and then deleted. Both showed
+  as a flaky test of the sink's clean-up.
+- The first dead-letter delivery wrapped the circuit's own fault as "the dead-letter
+  sink could not be written". `DeliverDeadLettersToAsync` now ends quietly when the
+  output is completed by a fault and abandons only on a failed write.
+- The files sinks first read `CommittedStep` at their first write. By then the new
+  generation may have committed steps that gave the sink nothing, and an object an
+  earlier generation had left for one of those steps passed for committed. The step is
+  now read when the sink is made; a mutation that puts the late read back is killed by
+  two tests.
+- `ServiceContext.ObjectStore` resolves through `ObjectStores`; one cache, not two.
+- `PipelineBuilder` exposes its stand-in tables internally and `InputSlot` carries its
+  stream, for the harness; `SlotStart.Leadership` is nullable (no node in a harness).
+- The keyed files source has upserts only. A delete line was not designed.
+- Existing tests changed: three in `AdminApiTests` list connectors and now include
+  `files`.
+
+**Public API added.** Core: `CircuitOptions.AcknowledgeDeadLetters`,
+`Circuit.DeadLetterBatches`, `Circuit.AbandonDeadLetters`, `DeadLetterBatch`,
+`SinkDelivery.DeliverDeadLettersToAsync`. Service: `FileConnector`, `FileSinkFormat`,
+`FileRecord`, `ObjectStores`; `PipelineSpec.DeadLetters` and `.DeadLetterSlot`,
+`DeadLetterEnvelope`, `DeadLetterSinkStatus`, `PipelineStatus.DeadLetterSink`;
+`SourceStats.At`; `ServiceOptions.SinkDelivery`;
+`Incremental.Service.Testing.PipelineTestHarness` (and its `Builder`) and
+`HarnessTable<TKey, TRow>`. Admin API: `deadLetterSink` on a pipeline, `at` on a
+source, `deadLetters` in a spec. Example: `--poison`; the contract's `Quote`,
+`WatchlistEntry`, `WatchlistTable`.
+
+**Tests.** Core: `AcknowledgedDeadLetterTests` (5: the commit waits; a step that dropped
+nothing does not; a batch read and not acknowledged before a crash is reported again
+from the checkpoint; abandoning faults with the cause; the two readers are exclusive).
+Service, 26 more, 146 in all: `FileConnectorTests` (13: the position at every prefix of
+its sends; name order, new objects and a late name; a restart with the objects it stood
+in deleted, reading exactly the new lines; a restart inside an object; a bad line as a
+dead letter with `object:line`, not met again, and a fault under `Fault`; keyed
+upserts; the append sink holding each record once across a restart with a stale object
+above the checkpoint planted before each start; the upsert sink with deletes and a
+reset; `minInterval`; two terms for one step; a takeover with objects landing
+throughout; the closed config), `DeadLetterSinkTests` (5: every field of the envelope;
+a write held by the sink keeps the checkpoint behind the record and `blockedOn` says
+so, and a takeover in that state delivers it from the new leader; a failing sink ends
+in `Failed` with the cause, nothing committed past the record, and the records
+delivered once mended; the binding's checks and its secret redacted and restored; the
+reserved slot name), one in `KafkaServiceTests` (a topic as the dead-letter sink, an
+operator's drops and two records the source rejected with `topic[partition]@offset`,
+across a takeover), `HarnessTests` (5) and `TwoInputTests` (2: a restart after which
+each of two sources has read exactly what was new on its own input; a takeover with
+both feeds moving). Example: the smoke test is 47, 59 and 58 claims in its three modes
+(from 32, 40 and 39), and `Pipelines.Tests` is 11.
+
+**Mutation checks.** 34, all killed (`scratchpad/r3/mutations.py` and
+`mutations2.py`). Core: the commit not waiting for dead letters; abandoning not failing
+the gate (this one first hung the test at disposal rather than failing it — the tests
+now bound their disposal and refuse a timeout as the expected fault); the delivery
+acknowledging before the write; a failed write swallowed and acknowledged. Service: the
+supervisor not asking for acknowledged dead letters; the files sink never cleaning,
+cleaning everything, and reading the checkpoint late; the source resuming a line early,
+ignoring its position, and reading names below it; one bank for the name; the reader
+taking the lower term, and ignoring deletes; `minInterval` ignored; a rejected line
+sent on; the slot name not reserved; the dead-letter binding unchecked, and its secret
+shown; the envelope's generation; the sink's failures not in the status; the stall not
+shown; the harness not waiting for sinks, ignoring table bindings, and ignoring the
+error policy; the memory source ignoring committed offsets (the two-input tests); a
+Kafka rejection without its position. Example, against `Pipelines.Tests`: an unmatched
+execution counted as priced; an inner join for the left join; the join on the
+instrument alone; a retraction not subtracted; the alerts' minimum ignored; a zero
+quantity sized; the enrichment's filter gone; an unknown counterparty dropped.
+
+**Left undone.**
+
+- A replaced leader's late write can leave a files-sink object for a step the new
+  leader produces nothing for (*Open for James* 21). Not reproduced; reasoned.
+- The files source lists its whole prefix at every poll, and a sink's clean-up lists
+  it at every generation start. `IObjectStore.ListAsync` has no "after this name".
+- No compression, no Parquet, no time-partitioned paths, no delete line for a keyed
+  files input, no compaction of an upsert sink's objects.
+- The dead-letter sink's state is in the API and not in the UI; the deploy form has no
+  field for `deadLetters`. The UI is another step's.
+- A dead letter of an operator carries no source position of its own, only the
+  inputs' positions at the last checkpoint: the engine does not track which input
+  record a derived row came from.
+- `EvictWhen` in `execution-quality` has no test of its own. A record for a closed key
+  is necessarily older than the watermark and is dropped at the input, so eviction
+  cannot be seen from outside; the harness has no view of state size.
+- The harness does not restart a circuit from its checkpoint or replace a definition
+  on kept state.
+- Not soaked: the example was run for seconds, not hours, with its new pipelines. The
+  alert and dead-letter prefixes grow by one object per pipeline every two seconds.
