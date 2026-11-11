@@ -12,6 +12,13 @@ public class AcknowledgedDeadLetterTests
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan Settle = TimeSpan.FromMilliseconds(100);
 
+    /// <summary>Disposes a circuit at the end of a test, but not for ever: a test that has
+    /// failed with a step still held at its commit gate must end as a failure.</summary>
+    private sealed class Bounded(Circuit circuit) : IAsyncDisposable
+    {
+        public async ValueTask DisposeAsync() => await circuit.DisposeAsync().AsTask().WaitAsync(Timeout);
+    }
+
     private static (CircuitBuilder Builder, InputStream<int> Numbers) Halves(IStorageProvider storage, bool acknowledge = true)
     {
         var builder = new CircuitBuilder(new CircuitOptions
@@ -30,7 +37,8 @@ public class AcknowledgedDeadLetterTests
     public async Task Checkpoint_waits_until_the_step_s_dead_letters_are_acknowledged()
     {
         var (builder, numbers) = Halves(new InMemoryCheckpointStorageProvider());
-        await using var circuit = builder.Build();
+        var circuit = builder.Build();
+        await using var cleanup = new Bounded(circuit);
         circuit.Start();
         var input = circuit.Handle(numbers);
 
@@ -58,7 +66,8 @@ public class AcknowledgedDeadLetterTests
     public async Task A_step_that_dropped_nothing_commits_without_an_acknowledgement()
     {
         var (builder, numbers) = Halves(new InMemoryCheckpointStorageProvider());
-        await using var circuit = builder.Build();
+        var circuit = builder.Build();
+        await using var cleanup = new Bounded(circuit);
         circuit.Start();
         await circuit.Handle(numbers).InsertAsync(4, offset: 0);
         await circuit.StepAsync().WaitAsync(Timeout);
@@ -88,11 +97,12 @@ public class AcknowledgedDeadLetterTests
             await Task.Delay(Settle);
             Assert.False(second.IsCompleted);
             crashed.AbandonDeadLetters();
-            await Assert.ThrowsAnyAsync<Exception>(() => second.WaitAsync(Timeout));
+            Assert.IsNotType<TimeoutException>(await Assert.ThrowsAnyAsync<Exception>(() => second.WaitAsync(Timeout)));
         }
 
         var (rebuilt, again) = Halves(storage);
-        await using var circuit = rebuilt.Build();
+        var circuit = rebuilt.Build();
+        await using var cleanup = new Bounded(circuit);
         circuit.Start();
         Assert.Equal(0L, circuit.CommittedOffset("numbers"));   // the checkpoint stands before record 7
         var resumed = circuit.Handle(again);
@@ -111,14 +121,16 @@ public class AcknowledgedDeadLetterTests
     public async Task Abandoning_the_dead_letters_faults_the_circuit_with_the_cause()
     {
         var (builder, numbers) = Halves(new InMemoryCheckpointStorageProvider());
-        await using var circuit = builder.Build();
+        var circuit = builder.Build();
+        await using var cleanup = new Bounded(circuit);
         circuit.Start();
         await circuit.Handle(numbers).InsertAsync(1, offset: 0);
         var step = circuit.StepAsync();
         await circuit.DeadLetterBatches.ReadAsync().AsTask().WaitAsync(Timeout);
         circuit.AbandonDeadLetters(new IOException("the dead-letter store is full"));
         var fault = await Assert.ThrowsAnyAsync<Exception>(() => step.WaitAsync(Timeout));
-        Assert.Contains("dead-letter", fault.ToString());
+        Assert.IsNotType<TimeoutException>(fault);
+        Assert.Contains("dead letters could not be stored", fault.ToString());
         Assert.Contains("the dead-letter store is full", fault.ToString());
         Assert.Null(circuit.CommittedStep);
     }
