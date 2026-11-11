@@ -1381,7 +1381,9 @@ app.MapIncrementalHealth("/health");        // /live, /ready, /status: for a loa
 | GET | `plugins`, `plugins/{name}` | versions, definitions and their settings, which pipelines use which |
 | GET | `plugins/{name}/{version}/definitions/{definition}` | leader: its settings with defaults, ranges and enum values; its input and sink slots with kinds and types; the tables it reads and writes. `settings=` describes it under those |
 | GET | `plugins/{name}/{version}/definitions/{definition}/template` | leader: a starting spec with the real slot names bound to this host's connectors, and whether the dry run accepts it. `id=` |
-| GET | `connectors`, `connections`, `table-sources` | what a spec may name: connectors with the slot kinds they support and their config; Kafka connections and object stores by name and kind, nothing else; loader kinds with their config |
+| GET | `connectors`, `connections`, `table-sources`, `table-definitions` | what a spec may name: connectors with the slot kinds they support and their config; Kafka connections and object stores by name and kind, nothing else; loader kinds with their config; the table definitions in the loaded contracts with their key and row types and the tables declared from each |
+| GET | `plugins/{name}/diff?from=&to=` | what two stored versions declare differently: definitions, settings and — on the leader — slots, tables and the members of the slots' record types |
+| GET | `whoami` | the caller as the audit would record it, whether the host verified it, and the header a caller may state a name in |
 | POST | `plugins` (a zip), `plugins/rescan`; DELETE `plugins/{name}/{version}` | |
 | GET | `audit`, `events/recent`, `events` | who changed what; this node's event ring; the live feed |
 

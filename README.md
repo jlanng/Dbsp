@@ -451,13 +451,17 @@ so implementations never see cross-thread access to one store.
   every table with its loader, its readers and who holds its retention floor, plugins,
   the cluster and the audit trail. It is fed by one server-sent event stream and says so
   when that stream is gone. Every action asks the node what it will do first and shows
-  the plan; a reset or a removal also asks for the id to be typed.
+  the plan; a reset or a removal also asks for the id to be typed. A pipeline is deployed
+  or replaced, and a table declared, from a form built from what the node describes —
+  plugin versions, a definition's settings and slots, the connectors and connections the
+  host registered — with the spec's JSON one click away.
 
   | | |
   |---|---|
-  | ![A pipeline: live metrics, sources, sinks, committed table versions](docs/images/admin/pipeline.png) | ![The circuit of a pipeline, sixty operators, dark theme](docs/images/admin/topology-dark.png) |
+  | ![A pipeline: live metrics, sources, sinks, committed table versions](docs/images/admin/pipeline.png) | ![The circuit of a pipeline, sixty operators in bands, lookups dashed to their tables, dark theme](docs/images/admin/topology-dark.png) |
   | ![A table: loader, indexes, readers, rows](docs/images/admin/table.png) | ![Reset asks for the pipeline's id](docs/images/admin/reset-dialog.png) |
   | ![A standby's cluster page: readiness and lag](docs/images/admin/cluster-standby.png) | ![Dead letters: the record, the error, the operator](docs/images/admin/dead-letters.png) |
+  | ![Deploying from a form: settings, slots, connectors](docs/images/admin/deploy-form.png) | ![Plugin versions: when imported, by whom, what uses them](docs/images/admin/plugins.png) |
 
   It is cautious until told otherwise. With no `AuthorizationPolicy` it answers loopback
   requests only — it refuses another host name and what it can tell a proxy forwarded

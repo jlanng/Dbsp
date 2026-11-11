@@ -40,7 +40,10 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   Postgres through Debezium, Kafka sinks; everything named after `--prefix`, default
   `enrich`; `-- --kafka --clean` removes it). `-- --headless [--nodes 2 | --kafka]` is the
   smoke test: it drives the admin API, checks every sink against `Host/Model.cs`, and
-  exits 1 on a claim that does not hold — run it after changing the service; CI does not.
+  exits 1 on a claim that does not hold — run it after changing the service. CI runs the two
+  in-memory ones (job `build-and-test`) and the Kafka one (job `connector-stack`, which starts
+  the compose stack and fails if a Kafka or service test was skipped). `-- --ui-dir
+  src/Incremental.Service.Admin/wwwroot` serves the admin UI from the checkout.
   `-- --otlp` exports both meters over OTLP (`OTEL_EXPORTER_OTLP_ENDPOINT`); the example is
   the only project that references OpenTelemetry. To leave it running in the background,
   run the built binary and stop it with SIGTERM (a backgrounded `dotnet run` ignores SIGINT).
@@ -169,6 +172,9 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   is fencing, never the election or the probe. Every node starts as a standby; `Fenced`
   and `Resigned` are final (the process exits) — no demotion in place. Takeover order:
   writer, tables, storage, circuits. A node that cannot lead must stop heartbeating.
+- `CircuitBuilder.Describe` reports a `Lookup`'s table as `Probes`, not among `Inputs`:
+  the lookup probes the table and does not consume its changes, so the edge belongs to
+  the picture and must never become an execution input.
 - Checkpointed state identity is covered by the state manifest (committed with every
   checkpoint, validated at `Start()`); store names are positional unless pinned with
   `.Named()` — changing store naming or the manifest format needs a format-version bump.
@@ -311,12 +317,21 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   - Exception messages, stacks, rows and records pass through `AdminState.Message`,
     `Fault`, `Head` or `Event` on their way out: with `ExposeRowData` off none of them may
     leave, and a service event's text after its first colon counts as a message.
-  - The UI is six files in `wwwroot`, no build step, no dependency, no request to another
+  - The UI is seven files in `wwwroot`, no build step, no dependency, no request to another
     origin, and a content security policy without `unsafe-inline`: no inline script, no
     `style` attribute (set styles through the CSSOM), no `innerHTML` with data. Every
     render goes through `morph`, and handlers are `on:` properties found by the delegated
     listener — `addEventListener` on a rendered node is lost at the next patch. A path the
     scripts call must be a route the API maps: `The_UI_is_served_whole…` checks it.
+  - The deploy and declare forms (`forms.js`) are drawn from the discovery routes
+    (`plugins`, a definition's description and template, `connectors`, `connections`,
+    `table-definitions`, `table-sources`) and edit one spec object, which the JSON view
+    shows: a member the form does not model stays in the spec untouched. Nothing is sent
+    for real until a dry run of exactly that spec has passed; a plain deploy carries
+    `If-Match: "0"` and a replace the generation it replaces.
+  - Who made a change comes from `AdminSecurity.Caller` and nowhere else: the host's
+    `CallerName` hook, then the authenticated identity, then the name a caller states in
+    `X-Incremental-Operator` (recorded as `name (self-declared)`), then `local`.
 - Public API is fluent delegates with LINQ-dialect names (`Select`/`Where`/`GroupBy`),
   intentionally not LINQ/expression trees. The 0.2 surface is specced in `docs/intro.md`:
   windows exist only on groupings of an `EventTimeStream`; grouping types are staging types

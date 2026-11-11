@@ -162,6 +162,7 @@ var service = builder.Services.AddIncrementalService(o =>
 | `--port N`, `--probe-port N`, `--peer-probe-port N` | |
 | `--rate N` | trades per second (50) |
 | `--poison N` | one trade in N has no quantity (200); 0 for none |
+| `--ui-dir DIR` | serve the admin UI's files from DIR (`src/Incremental.Service.Admin/wwwroot`) instead of the embedded copies |
 | `--otlp` | export the meters `Incremental.Service` and `Incremental` over OTLP; the endpoint is `OTEL_EXPORTER_OTLP_ENDPOINT` (the guide's *Operating it: monitoring*) |
 | `--no-generate`, `--no-pipelines` | start with no generator; seed no pipelines |
 | `--bootstrap`, `--postgres`, `--connect`, `--postgres-host-for-connect` | where the stack is, if not the compose file's |

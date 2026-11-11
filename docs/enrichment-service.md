@@ -1248,6 +1248,12 @@ that much later.
 dotnet run --project examples/Incremental.EnrichmentService
 ```
 
+Stop it with Ctrl+C. Started in the background — by a script, a test harness, an agent —
+`dotnet run` does not pass SIGINT on to the host, and a signal sent to the `dotnet run`
+wrapper does not stop the host either: there, run the built binary
+(`examples/Incremental.EnrichmentService/bin/Debug/net10.0/Incremental.EnrichmentService`)
+and stop it with SIGTERM. A host left behind keeps its ports and its memory.
+
 One node on the in-memory backend, no docker. Open <http://127.0.0.1:5180/admin/>. Seven
 tables are loaded — instruments by the positions source, traders and desks by the
 snapshot source, counterparties and the two watchlists from files, `trader-desks` by a
@@ -1273,6 +1279,7 @@ directory the program prints as `files:`.
 | `-- --kafka --clean` | removes what the Kafka mode made under its prefix |
 | `--otlp` | export the meters over OTLP ([monitoring](#operating-it-monitoring)) |
 | `--poison N` | one generated trade in N has no quantity, which `watchlist-alerts` refuses: the dead letters. Default 200; 0 for none |
+| `--ui-dir src/Incremental.Service.Admin/wwwroot` | serve the admin UI's files from the checkout: an edit is a browser reload away |
 | `--port N`, `--rate N`, `--prefix name`, `--no-generate`, `--no-pipelines`, `--verbose` | |
 
 It can be left running. Trade ids come round again after 20,000, so the pipelines'
@@ -1280,9 +1287,7 @@ state is bounded, and the in-memory backend compacts its state log as it goes
 (`InMemoryBackendOptions.StateCompactAbove`): a Release build at the default rate
 settles at about 690 MB of resident memory within twenty minutes and stays there, and
 at `--rate 5000` between 540 and 650 MB from the first minute to the tenth — the
-numbers are under *As built*, S6, in the design document. Stop it with Ctrl+C, or with
-SIGTERM if it runs in the background: a backgrounded `dotnet run` does not pass SIGINT
-on to the host, so run the built binary (`bin/…/Incremental.EnrichmentService`) there.
+numbers are under *As built*, S6, in the design document.
 
 Things to try in the UI, in the default mode:
 
@@ -1292,7 +1297,10 @@ Things to try in the UI, in the default mode:
    this node's copy at one version; *Look up* reads by an index.
 3. **Plugins → upload** `bin/Debug/net10.0/plugin-packages/enrichment.pipelines-v2.zip`
    from the example's output directory. It is stored as a second version.
-4. **Pipelines → trade-enrichment → Edit spec…**, set `"version"` to the new version.
+   **Compare two versions** on the plugin's card says what the new one declares
+   differently: one member, `Size`, on the row of `trade-enrichment`'s sink.
+4. **Pipelines → trade-enrichment → Edit spec…**, and choose the new version in the
+   *Version* list, which says when each was imported and by whom.
    The dry run says a state choice is required, and what the choice has to go on:
 
    ```
@@ -1320,6 +1328,15 @@ Things to try in the UI, in the default mode:
 8. **Pipelines → execution-quality → Topology.** Two inputs, the join between them, the
    table lookup, the window. Its `quotes` input is the files under `quotes/`: its
    source's position reads as a file name and a line.
+9. **Pipelines → Deploy.** Give it an id (`quality-eu`), choose `execution-quality`, and
+   the form shows the definition's settings at their defaults and a block per slot.
+   Bind `quotes` to the connector `files`, store `lake`, prefix `quotes/` — the trade
+   feed is offered for it too, since a connector is not asked what record type it
+   carries until it starts — check, deploy. No JSON is typed; *JSON (advanced)* shows
+   the spec the form has written.
+10. **Tables → Declare.** Choose `WatchlistTable`, name it `pep-watch`, loader `file`,
+    connection `refdata`, a path. `watchlist-alerts` can then be deployed a third time
+    with its `watchlist` slot bound to it.
 
 ### On Kafka, with a standby
 
@@ -1390,7 +1407,11 @@ keeping state (one of them the two-input pipeline), a replace resetting it, a re
 and — with two nodes — a takeover. The alert files and the dead letters are read back
 with `FileSinkFormat` and compared too: every alert once, every dropped record there.
 A claim that does not hold exits 1 (47 claims in memory, 59 with two nodes, 58 on
-Kafka). CI does not run it (it runs no example); run it after changing the service.
+Kafka). CI runs the two in-memory ones on every build, and the Kafka one in a job of its
+own that starts the connector stack from `docker-compose.yml` and also runs the Kafka
+and Kafka-backed service tests, failing if any of them was skipped
+(`.github/workflows/ci.yml`, job `connector-stack`). That job was written and its
+commands run here against the local stack; it has not yet run on GitHub.
 
 ## The admin UI
 
@@ -1399,7 +1420,8 @@ use ([intro.md](intro.md#looking-at-it-the-admin-api-and-ui) has the endpoint ta
 The screenshots are of the example.
 
 **Overview.** The node's role and health, rates across all pipelines, what needs
-attention, tables, and the node's recent events.
+attention, tables, and the node's recent events. A long event — an exception message —
+is cut short with *show all*.
 
 ![Overview](images/enrichment-service/overview.png)
 
@@ -1407,38 +1429,102 @@ attention, tables, and the node's recent events.
 input lag; per source the position read and the position committed; per sink what was
 delivered; per table the version the pipeline's checkpoint has committed beside the
 table's current one. The buttons are the actions: each shows its plan first, and reset
-and remove want the id typed.
+and remove want the id typed. *Generation* is the generation of the pipeline's spec
+everywhere — the header, the timeline, the audit, `If-Match`; a fault also says which
+*run* it was, since a restart builds the same generation again.
 
 ![A pipeline](images/enrichment-service/pipeline.png)
 
-**Topology.** The circuit, node by node, with the names of its state stores. On a
-standby, which runs no plugin code, it is the declared edges only.
+**Deploy, and Edit spec.** One dialog, built from what the node says exists. A new
+deployment starts with an empty id; then the plugin, its version — each listed with when
+it was imported, by whom and what the build calls itself, not as a bare hash — and the
+definition. The definition's settings appear with their defaults and ranges, each input
+and sink slot with the connectors that can be bound to it and that connector's config
+fields, each table slot with the declared tables of its definition, and how it runs:
+workers, the error policy, a dead-letter sink. *JSON (advanced)* is the same spec as
+text; a change in either is in the other.
+
+![The deploy form](images/enrichment-service/deploy-form.png)
+
+Typing the id of a pipeline that is already deployed turns the dialog into *Replace
+pipeline X*, says so in a warning that shows the pipeline, and sends the request as a
+replace of the generation shown. A new id is sent so that the server refuses it if a
+pipeline of that id has appeared meanwhile. Nothing is deployed until a dry run of
+exactly the spec on screen has passed, and any change to the spec — the id included —
+clears what the last dry run said. A replace that could alter what the state means asks
+*keep or reset* with the node's evidence beside the question.
+
+![Replacing, with the evidence](images/enrichment-service/replace.png)
+
+**Topology.** The circuit, node by node. A solid edge is records flowing; a dashed green
+one is rows looked up — a `Lookup` or `LookupAppendOnly` drawn to the table it probes,
+where a `Join` has the table's changes flowing into it. It opens fitted to the width
+there is at a size that can be read: a long circuit continues in a band below. Select a
+node for its kind and what that kind does, its state stores, what it reads and feeds,
+and — for an input, a sink or a table — its numbers. Records and time per operator are
+not collected, and the page says so: it is the circuit as declared, not a live view. On
+a standby, which runs no plugin code, it is the declared edges only.
 
 ![Topology](images/enrichment-service/topology.png)
 
-**A table.** Rows, version, who writes it, its loader's state and position, its indexes,
-and its readers — the pipeline furthest behind holds the retention floor, and "until cut
-loose" says how much history is left before a stopped reader would need a reset.
+**Tables, and a table.** *Declare* on the list is a form like the deploy form: the
+definition from the loaded contracts, a name, the loader kind with its connection and
+config, what to do with an unreadable record; dry run, then declare.
+
+![Declaring a table](images/enrichment-service/declare-table.png)
+
+A table's page has its rows, version, who writes it, its loader's state and position,
+its indexes, and its readers — the pipeline furthest behind holds the retention floor,
+and "until cut loose" says how much history is left before a stopped reader would need a
+reset. *Estimated size* is the bytes of row data the table and its retained history
+hold, and how the number was made: the mean JSON size of a sample of 256 rows times the
+row count (and times the row changes of the retained history, where the history is in
+this process — on Kafka it is on the brokers). It is the size of the data, not of the
+process's memory, which is usually a few times more.
 
 ![A table](images/enrichment-service/table.png)
 
-**Plugins.** Stored versions, what each defines with its settings, which pipelines use
-which, and the upload.
+**Plugins.** Each stored version with when it was imported, by whom, its sequence, the
+build's informational version, its files, and what uses it — the pipelines that name
+it, or for a contract the tables declared from its definitions. *Compare two versions*
+lists what differs in what the two declare: definitions, settings, slots and the members
+of the record types the slots carry. What a definition computes is not compared.
 
 ![Plugins](images/enrichment-service/plugins.png)
 
-**Cluster, on a standby.** How ready it is to lead, and why not if it is not.
+**Dead letters.** Per pipeline: where its dropped records are stored for good — the
+connector and the place, how many were written, whether a write is in flight or failing
+— or that there is no durable sink and they are in memory only; then the newest of them
+with the operator, the exception, the weight and the record.
+
+![Dead letters](images/enrichment-service/dead-letters.png)
+
+**Cluster.** Both nodes with their role and what their process holds — working set, GC
+heap, the share of its life spent in GC pauses; in memory the two nodes are one process
+and the page says so. On a standby, how ready it is to lead, and why not if it is not.
 
 ![A standby](images/enrichment-service/standby.png)
 
 **Cluster, after a takeover** (Kafka backend). The peer does not answer, so the node is
-Degraded; the bar is the last takeover's time by stage.
+Degraded. *Last takeover* is the service's part by stage — catalog, tables, the leader
+record, the plugin directory, seeds, pipelines, finishing — measured on one clock, so
+the stages add up to the whole with nothing unexplained; the leadership's own total,
+with the silence it waited out, is the last row.
 
 ![After a takeover](images/enrichment-service/takeover.png)
 
-*Dead letters* and *Audit* are the other two pages: records a pipeline under
-`errorPolicy: DeadLetter` dropped, with the operator that dropped them; and every change
-to the catalog with who made it.
+A node that has been fenced or has resigned still shows the pipelines as it last saw
+them, each marked *last known*, with a link to the leader.
+
+**Audit.** Every change to the catalog with who made it. *Who* is the identity the host
+authenticated (`AuthorizationPolicy`), or what `ServiceAdminOptions.CallerName` returns
+for the request — a claim, a gateway's header. With neither, as on a loopback admin
+surface, it is `local`; the button in the header takes a name, which the UI then sends
+as `X-Incremental-Operator` and the audit records as `name (self-declared)`: a courtesy
+between colleagues, not evidence, and switched off with `AcceptOperatorHeader = false`.
+
+The theme and that name are kept per node, since each node is its own origin; the links
+from one node's pages to the other's carry both.
 
 ## Operating it
 

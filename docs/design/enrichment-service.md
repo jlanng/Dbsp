@@ -1713,6 +1713,30 @@ Each has a default this design is built on.
     *Alternative:* the incarnation in the object name. Dead letters would then survive
     a reset, and a reader would have to know which incarnation is the live one.
 
+25. **A caller nobody authenticated may name itself** (S6: `AcceptOperatorHeader`, on
+    by default; the audit records `name (self-declared)`). It makes the default,
+    loopback configuration's audit tell operators apart, on their word.
+    *Alternative:* off by default, so the audit says `local` until the host
+    authenticates or sets `CallerName`. Nothing in the audit is then anyone's word, and
+    two colleagues on one loopback surface cannot be told apart.
+26. **The CI job for the connector stack starts the repository's compose file**, not
+    `services:` containers (S6). Postgres must be started with `-c wal_level=logical`
+    and a service container takes no command; and CI then runs the stack a developer
+    runs. *Alternative:* service containers with an image that has logical decoding
+    configured (`quay.io/debezium/postgres`), which is a second definition of the stack
+    to keep in step with the first.
+27. **A long circuit is drawn in bands, at a readable size** (S6), rather than scaled
+    down until it fits one row. *Alternative:* one row, scaled; the whole shape is
+    visible at once and nothing can be read past a dozen operators.
+28. **A table's size is an estimate of its data, not of its memory** (S6: the mean JSON
+    size of a sample times the row count). *Alternative:* account for bytes as rows are
+    written — a counter in `SharedTable`'s write path and a size function per row type,
+    which is core work on the hot path of every table writer for a number that the
+    working set already bounds from above.
+29. **A file loader without a `path` is refused when the table is declared** (S6); it
+    used to be accepted and fault the loader at its first run. *Alternative:* as
+    before, which lets a table be declared ahead of knowing its file.
+
 ## Not verified
 
 - That a collectible context unloads once state, connectors and settings use
@@ -3086,3 +3110,179 @@ quantity sized; the enrichment's filter gone; an unknown counterparty dropped.
   on kept state.
 - Not soaked: the example was run for seconds, not hours, with its new pipelines. The
   alert and dead-letter prefixes grow by one object per pipeline every two seconds.
+
+#### The admin UI and CI: G7 (the UI half), G8, G10, G13, G14, G16, G17
+
+**Deploy and Edit spec (G7, G8).** One dialog, in a seventh UI file (`forms.js`), drawn
+from the discovery routes: `plugins` for the plugins, their versions and definitions;
+`plugins/{name}/{version}/definitions/{definition}` for the settings and slots;
+`…/template` for a starting spec; `connectors` for what can be bound to a slot and each
+connector's config fields; `tables` for what a table slot can be bound to. The dialog
+edits one spec object. The form writes into it and the *JSON (advanced)* view shows it,
+so a member the form does not model — `restart`, an open connector's extra properties —
+stays where it is. A version is listed with its import time, who imported it, the
+build's informational version and the first eight characters of its hash.
+
+- The id starts empty. `If-Match: "0"` goes with a plain deploy, which the supervisor
+  already read as "there must be no such pipeline": a pipeline that appeared between
+  the dry run and the deploy is a 412, not a replace.
+- An id that is deployed turns the dialog into *Replace pipeline X* — title, a warning
+  with the pipeline's state, definition and generation, the button's label — and the
+  request carries that generation.
+- Any change to the spec clears the last dry run's plan, its error, the keep-or-reset
+  question and the answer given to it. The critic's stale panel is gone with that.
+- For a replace the dialog calls `pipelines/validate` before the dry run, because the
+  dry run of a replace stops at `state-choice-required` before it has looked at the
+  bindings: the binding errors now come first.
+- Choosing another version of the same definition keeps every setting and binding
+  whose name still exists and fills in what is new from the template.
+- The *Check* button is not disabled while it is busy. A button that disables itself
+  drops keyboard focus out of the dialog, and the next Tab and Enter land somewhere
+  else; found by deploying with the keyboard alone.
+
+**Declaring a table (G14).** *Declare* on the tables page: the definition from
+`table-definitions` (new: the `TableDefinition` classes of the loaded contracts with
+their key and row types and the tables declared from each), a name, a loader kind from
+`table-sources` with a connection of the kind it takes and its config fields, and the
+unreadable-record policy. The dry run of `POST tables` was a fixed two-line plan that
+checked nothing; it is now `ITableRegistry.PlanDeclare`, which makes every check the
+declare makes before it opens a log: the name, that it is free, that the definition is
+found, the loader's kind, connection and required config. A definition that is not
+found used to leave `DeclareAsync` as an `InvalidOperationException` (a 500); it is a
+400 now.
+
+**Sizes and memory (G14).** `ITableRegistry.EstimateSize`: the first 256 rows of a
+snapshot are written as JSON, and the mean length times the row count is `RowsBytes`;
+times the row changes the in-memory log retains it is `HistoryBytes`, which is null on
+Kafka, where history is on the brokers. Kept for 30 s per table. The page says how the
+number is made and that it is the data's size, not the heap's. `GET node` has `memory`
+(working set, GC heap in use and committed, the GC's pause share of the process's life,
+full collections), and `PeerInfo.Memory` carries the same for the other node: in memory
+from its `DescribeSelf`, on Kafka as a fifth part of the probe line's detail
+(`;mem=…`), which an older node ignores and whose absence a newer one reads as "it did
+not say".
+
+**Topology (G10).** `CircuitGraphNode.Probes` (core): the table nodes a `Lookup` or
+`LookupAppendOnly` reads rows from. They are not among `Inputs`, and must not be — the
+lookup probes the table and does not consume its changes — so the edge was simply
+missing from `Describe`. The admin API passes it on as `probes`; the UI draws it dashed
+and lays the table out beside the lookup. A circuit that does not fit the width is cut
+into bands, one below the other, at full size (*Open for James* 27). A selected node
+shows its kind with a sentence on what that kind does (join against lookup above all),
+its state stores, what it reads, looks up and feeds, and for an input, a sink or a
+table the numbers that exist per slot. The card says that per-operator counts and
+timings are not collected.
+
+**Plugins (G16).** `PluginManifest` gained `ImportedAt`, `ImportedBy` and
+`InformationalVersion` (all optional: a manifest stored before them reads as null).
+`SlotShape.Members` spells out the record type of a slot, type by type.
+`IServiceDiscovery.DiffAsync` and `GET plugins/{name}/diff` compare two stored versions:
+definitions, settings (type, required, default, values, range, state-neutral), and on
+the leader the input, sink and table slots with the members of their record types. For
+the example's two versions it reports one change: `Size: String` on `EnrichedTrade`,
+the row of `trade-enrichment`'s sink. A contract shows the tables declared from its
+definitions and cannot be deleted from the page while there are any.
+
+**Small defects (G17).** (1) An event's text over 180 characters is cut with *show
+all*. (2) On a fenced or resigned node every pipeline state is drawn as *last known*,
+the list and the overview say so, and nothing is counted as needing attention there.
+(3) `ServiceTakeoverTimings` gained `LeaderRecord`, `PluginDirectory`, `TableSeeds`,
+`PipelineSeeds` and `Finish`, stamped on the clock `StartLeading` already ran; with
+`Pipelines` they are all of it. On the example's first lead the 281 ms the critic saw
+under "Everything else" is the seed pipelines being deployed (about 200 ms) and the
+plugin directory being imported (about 65 ms). (4) `ServiceAdminOptions.CallerName`
+and `AcceptOperatorHeader`, `GET whoami`, and a button in the header (*Open for James*
+25). (5) `PipelineFault.Generation` was the count of circuits built on the node, under
+the same word as the spec's generation; it is the spec's generation now and the count
+is `Run`. (6) The theme and the operator's name ride on the links between the two
+nodes' pages.
+
+**Dead letters.** The page and the pipeline's tab show the durable sink — connector and
+place, records and batches stored, a write in flight, failed writes and the last error
+— or say that there is none. The deploy form binds one under *Running it*.
+
+**CI (G13).** `build-and-test` runs the two in-memory smokes and `TradeEnrichment`
+after the tests. A new job, `connector-stack`, starts `docker compose --profile
+connectors up -d --wait`, builds, runs `Incremental.Kafka.Tests` and
+`Incremental.Service.Tests` and fails if either reports a skipped test, runs the Kafka
+smoke under a prefix of the run's id, prints the measured failover times and takes the
+stack down. **It has not run on GitHub.** What was checked here: the file's structure
+by a script (no YAML library or `actionlint` on this machine), `docker compose config`,
+and each `run:` line executed by hand against the local stack in Release.
+
+**Deviations.**
+
+- The connector-stack job uses the compose file, not `services:` (*Open for James* 26).
+- The UI is seven files, not six; `CLAUDE.md` says so.
+- `The_UI_is_served_whole…` used to see only the first `api(…)` call of a statement;
+  it now sees each, and requires the discovery routes to be among them.
+- G12 (MSK, three brokers, IAM) is not touched: see *Left undone*.
+
+**Public API added.** Core: `CircuitGraphNode.Probes`. Service: `ProcessMemory`,
+`PeerInfo.Memory`; `ServiceTakeoverTimings.LeaderRecord`, `.PluginDirectory`,
+`.TableSeeds`, `.PipelineSeeds`, `.Finish`; `PipelineFault.Run`;
+`PluginManifest.ImportedAt`, `.ImportedBy`, `.InformationalVersion`;
+`SlotShape.Members`; `TableSizeEstimate`, `ITableRegistry.EstimateSize` and
+`.PlanDeclare`; `TableDefinitionInfo`, `MemberChange`, `DefinitionChange`,
+`PluginDiff`, `IServiceDiscovery.TableDefinitions` and `.DiffAsync`. Admin:
+`ServiceAdminOptions.CallerName` and `.AcceptOperatorHeader`; routes `whoami`,
+`table-definitions`, `plugins/{name}/diff`; `memory` and `processShared` on `node`,
+`size` on a table, `probes` on a graph node, `run` on a fault, `sequence`, `importedAt`,
+`importedBy`, `informationalVersion` and `tables` on a plugin, `binding` on a
+dead-letter sink, `deadLettersBound` on a pipeline. Example: `--ui-dir`.
+
+**Tests.** Core: `DescribeTests` +1 (a remembered lookup, an append-only one and one
+through an index each name their table; a join names none). Service: `AdminApiTests`
++3 and additions to three more (memory, the stages adding up, the size estimate, a
+contract's tables; table definitions and every refusal of a declare at its dry run; the
+caller as hook, header and `local`; probes in the graph; a fault's generation and run;
+the UI's routes, each call now seen), `PluginTests` additions (import time, who, build
+name, the diff of two versions, a slot's members), `StateShapeTests` +2 (a record type
+spelled out; the probe answer's memory, written and read back, and read when absent or
+malformed), `DiscoveryDiffTests` 2, a `NodeTests` assertion. One Kafka test
+(`Topics_are_created_compacted…`) asked the broker about topics a moment after creating
+them and failed twice on a busy broker; it now asks until the broker knows.
+
+**Mutation checks.** 28, all killed after two tests were tightened
+(`scratchpad/r4/mutations.py`, `mutations2.py`): a lookup naming no table or the wrong
+node; the API dropping probes; a stated name recorded as verified, honoured when
+switched off, beating the host's hook, or not cut; the declare's dry run not looking
+for the definition, the free name, the loader or the file's path; the size counting
+the sample only, or no history; a stage left over; a fault's generation and run; an
+import recording nobody; the build name unread; a contract used by no table; a slot
+not spelled out; the probe answer without memory or failing on a malformed one; the
+form no longer asking for connectors, or calling a route that is not mapped; a changed
+setting reported as unchanged.
+
+**In the browser.** Chromium through Playwright against the example (`--nodes 2`, and
+two processes on Kafka for the takeover) and against `AdminHost`: every changed view in
+light and dark, at 1440 and 390 pixels wide with no horizontal overflow of the page;
+a pipeline deployed from the form with the keyboard alone; the two-input pipeline
+deployed from the form with `quotes` bound to files, and seen running with both inputs
+read; a table declared from the form; a replace to version 2 on kept state through
+*Edit spec*; an id typed that exists, and then changed; a takeover, and the fenced
+node's pages. The console showed no script error: its entries were the browser's own
+lines for refused dry runs and for a node that had been stopped. The content security
+policy is unchanged and `The_UI_is_served_whole…` passes.
+
+**Left undone.**
+
+- **G12** (MSK, replication factor 3, broker restarts, IAM) is untouched. Nothing here
+  was run against more than one local broker.
+- **The connector-stack job has not run on GitHub**, and neither have the three smoke
+  steps added to the first job.
+- A connector is not told a slot's record type when it is described, so the form
+  offers the example's trade feed for a `Quote` input and the dry run passes it; it
+  fails when it starts. `IConnector.Describe` would need the slot's types.
+- The form describes a definition under its default settings (or, when editing, the
+  spec's). A definition whose slots depend on a setting is not described again as the
+  setting is edited; switching to the JSON view and back does it.
+- The diff compares what is declared. Two versions that declare the same and compute
+  differently read as the same, and the page says so.
+- The size estimate samples the first 256 rows in the table's own order, not a random
+  sample, and says nothing of the process's memory per table.
+- The peer's memory on the in-memory backend is this process's, which the page says.
+- The topology's bands route an edge that crosses more than one band down the left
+  gutter, where several such edges overlap.
+- `actionlint` could not be fetched on this machine; the workflow was checked by a
+  structural script and by running its commands.
