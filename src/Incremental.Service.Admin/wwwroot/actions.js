@@ -22,6 +22,7 @@
         morph(content, h('div', { class: 'content' }, contentKids));
         morph(footer, h('footer', null, footerKids));
       },
+      title(text) { if (heading.textContent !== text) heading.textContent = text; },
       close: () => el.open && el.close(),
     };
   }
@@ -174,125 +175,5 @@
     });
   }
 
-  /**
-   * Deploy or replace: a spec as JSON, checked by a dry run before the button unlocks. A
-   * change that can alter what the pipeline's state means is refused until the operator
-   * says keep or reset; the dialog shows what changed and asks.
-   */
-  function specDialog({ title, spec, existing, plugins, after }) {
-    const dlg = modal(title, { wide: true });
-    const st = {
-      text: JSON.stringify(spec, null, 2), choice: null, needsChoice: false, changes: [],
-      checked: null, result: null, error: null, busy: false, template: '',
-    };
-    const fingerprint = () => st.text + '|' + st.choice;
-
-    const parse = () => {
-      let value;
-      const local = message => Object.assign(new A.ApiError(400, { error: { code: 'invalid', message } }), { local: true });
-      try { value = JSON.parse(st.text); } catch (e) { throw local('The spec is not valid JSON: ' + e.message); }
-      if (!value || typeof value !== 'object' || !value.id) throw local('The spec needs an "id".');
-      // This dialog replaces one pipeline. The id in the JSON is where the request goes,
-      // and the generation sent with it is that pipeline's: another id would replace
-      // another pipeline under this one's title.
-      if (existing && value.id !== existing.id)
-        throw local(`This dialog replaces pipeline "${existing.id}"; its id cannot be changed here. To deploy "${value.id}", use Deploy on the pipelines page.`);
-      return value;
-    };
-    const send = async dryRun => {
-      const value = parse();
-      delete value.generation;
-      return api('pipelines/' + encodeURIComponent(value.id) + q({ dryRun, state: st.choice }), {
-        method: 'PUT', body: value, headers: existing ? ifMatch(existing.generation) : {},
-      });
-    };
-    const check = async () => {
-      st.busy = true; st.error = null; st.result = null; draw();
-      const mark = fingerprint();
-      try {
-        st.result = await send(true);
-        st.checked = mark;
-      } catch (e) {
-        st.error = e;
-        st.checked = null;
-        if (e.code === 'state-choice-required') { st.needsChoice = true; st.changes = e.details; st.error = null; }
-      }
-      st.busy = false; draw();
-    };
-    const deploy = async () => {
-      st.busy = true; st.error = null; draw();
-      try {
-        const result = await send(false);
-        dlg.close();
-        toast(existing ? 'Pipeline replaced.' : 'Pipeline deployed.');
-        if (after) after(result);
-      } catch (e) {
-        st.error = e; st.busy = false; st.checked = null; draw();
-      }
-    };
-    const useTemplate = value => {
-      st.template = value;
-      const [plugin, version, definition] = value.split('\u0000');
-      const found = (plugins || []).find(p => p.name === plugin && p.version === version);
-      const def = found && found.definitions.find(d => d.name === definition);
-      if (!def) return;
-      const settings = {};
-      for (const setting of def.settings || []) settings[setting.name] = setting.jsonType === 'number' ? 0 : setting.jsonType === 'boolean' ? false : setting.jsonType === 'array' ? [] : '';
-      st.text = JSON.stringify({
-        id: definition, plugin, version, definition, desired: 'Running',
-        settings: Object.keys(settings).length ? settings : undefined,
-        circuit: { workers: 1 },
-        tables: {},
-        inputs: { '<slot>': { connector: 'memory', name: '<name>' } },
-        sinks: { '<slot>': { connector: 'memory', name: '<name>' } },
-      }, null, 2);
-      st.checked = null; st.result = null; st.error = null;
-      draw();
-    };
-
-    function draw() {
-      const ready = st.checked === fingerprint() && st.result;
-      dlg.set([
-        !existing && plugins && plugins.length > 0 && h('div', { class: 'field' },
-          h('label', { for: 'spec-template' }, 'Start from a definition'),
-          h('select', { class: 'input', id: 'spec-template', on: { change: e => useTemplate(e.target.value) } },
-            h('option', { value: '', selected: st.template === '' }, 'Choose…'),
-            plugins.filter(p => p.kind === 'Pipeline').flatMap(p => p.definitions.map(d => {
-              const value = [p.name, p.version, d.name].join('\u0000');
-              return h('option', { value, selected: st.template === value }, `${d.name} — ${p.name}@${p.version.slice(0, 8)}`);
-            })))),
-        h('div', { class: 'field' },
-          h('label', { for: 'spec-text' }, 'Spec (JSON)'),
-          h('textarea', {
-            class: 'input', id: 'spec-text', rows: 16, spellcheck: 'false', value: st.text,
-            on: { input: e => { st.text = e.target.value; if (st.checked) { st.checked = null; draw(); } } },
-          }, st.text),
-          existing && st.text.includes('"***"') && h('p', { class: 'muted' },
-            'A secret is shown as "***". Left as it is, the stored value is kept; type a value to change it.')),
-        st.needsChoice && h('fieldset', { class: 'field' },
-          h('legend', { class: 'label' }, 'This change can alter what the pipeline’s state means. Keep the state or reset it?'),
-          st.changes.length > 0 && h('ul', { class: 'muted' }, st.changes.map(c => h('li', null, 'changes ' + c))),
-          h('div', { class: 'radio-row' },
-            ['keep', 'reset'].map(choice => h('label', null,
-              h('input', { type: 'radio', name: 'state-choice', value: choice, checked: st.choice === choice, on: { change: () => { st.choice = choice; st.checked = null; draw(); } } }),
-              h('span', null, h('strong', null, choice === 'keep' ? 'Keep the state' : 'Reset the state'),
-                h('small', null, choice === 'keep'
-                  ? 'The new generation reads the old one’s entries. Right only while the shapes of the types in its state are unchanged.'
-                  : 'State and input positions are dropped; sources start again. Upsert sinks keep rows the new run does not produce.')))))),
-        st.result && h('div', { class: 'field' }, h('div', { class: 'label' }, 'What will happen'), planList(st.result.plan)),
-        st.result && h('p', { class: 'muted' },
-          `Declares ${st.result.shape.inputs.length} input(s), ${st.result.shape.sinks.length} sink(s); reads ${st.result.shape.tablesRead.join(', ') || 'no table'}; writes ${st.result.shape.tablesWritten.join(', ') || 'no table'}.`),
-        // What this dialog itself refuses (JSON that does not parse, an id that is not this
-        // pipeline's) was never sent, so it is not the node's refusal.
-        st.error && errorNotice(st.error, st.error.local ? 'This was not sent. ' : 'The node refuses this spec. '),
-      ], [
-        h('button', { class: 'btn', type: 'button', on: { click: () => dlg.close() } }, 'Cancel'),
-        h('button', { class: 'btn', type: 'button', disabled: st.busy || (st.needsChoice && !st.choice), on: { click: check } }, st.busy && !ready ? 'Checking…' : 'Check (dry run)'),
-        h('button', { class: 'btn primary', type: 'button', disabled: !ready || st.busy, on: { click: deploy } }, existing ? 'Replace' : 'Deploy'),
-      ]);
-    }
-    draw();
-  }
-
-  Object.assign(A, { modal, confirmAction, pipelineAction, tableAction, pluginDelete, nodeAction, specDialog, planList });
+  Object.assign(A, { modal, confirmAction, pipelineAction, tableAction, pluginDelete, nodeAction, planList, query: q });
 })();

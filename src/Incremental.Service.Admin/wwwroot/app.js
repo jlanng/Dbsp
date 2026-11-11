@@ -152,6 +152,8 @@
     info: 'M8 2.5a5.5 5.5 0 1 0 0 11a5.5 5.5 0 0 0 0-11zM8 7.2v3.6M8 5v.2',
     plus: 'M8 3v10M3 8h10',
     down: 'M4 6l4 4 4-4',
+    user: 'M8 8.2a2.7 2.7 0 1 0 0-5.4a2.7 2.7 0 0 0 0 5.4zM3 13.5c.5-2.4 2.5-3.6 5-3.6s4.5 1.2 5 3.6',
+    diff: 'M5 2.5v7M2.5 6H7.5M9 12h5M11 4.5l3 0M3 13.5l10-11',
   };
   const FILLED = new Set(['play', 'stop']);
   function icon(name, size = 14) {
@@ -240,7 +242,12 @@
     const [cls, ic, hint] = table[state] || ['idle', 'circle', ''];
     return h('span', { class: ['badge', cls], title: hint }, icon(ic, 12), state || 'Unknown');
   };
-  const pipelineBadge = state => badge(PIPELINE_STATES, state);
+  /** A node that no longer leads runs nothing: what it shows of pipelines is what it last saw. */
+  const lastKnown = () => !!store.node && (store.node.role === 'Fenced' || store.node.role === 'Resigned');
+  const pipelineBadge = state => (lastKnown()
+    ? h('span', { class: 'badge last-known', title: `This node no longer leads and runs nothing. ${state} is the state it last saw; the leader has the current one.` },
+      icon('clock', 12), state || 'Unknown', h('span', { class: 'lk' }, 'last known'))
+    : badge(PIPELINE_STATES, state));
   const tableBadge = state => badge(TABLE_STATES, state);
 
   const ROLES = {
@@ -295,6 +302,10 @@
   async function api(path, { method = 'GET', body, headers = {}, raw } = {}) {
     const init = { method, headers: { Accept: 'application/json', ...headers }, cache: 'no-store' };
     if (method !== 'GET') init.headers['X-Incremental-Admin'] = '1';
+    // The name this browser's operator gave, for the audit. The node records it as the
+    // caller's own word, and ignores it where the host has verified who the caller is.
+    // A header carries Latin-1 only, so the name is sent percent-encoded when it needs it.
+    if (store.operator) init.headers['X-Incremental-Operator'] = /^[\x20-\x7e]*$/.test(store.operator) ? store.operator : encodeURIComponent(store.operator);
     if (raw) init.body = raw;
     else if (body !== undefined) {
       init.headers['Content-Type'] = 'application/json';
@@ -472,7 +483,30 @@
       h('strong', null, prefix || 'This did not load. '),
       error.message,
       error.details && error.details.length ? h('ul', null, error.details.map(d => h('li', null, d))) : null,
-      error.leader && error.leader.adminUrl ? h('div', null, 'The leader is ', h('a', { href: error.leader.adminUrl }, error.leader.nodeId), '.') : null);
+      error.leader && error.leader.adminUrl ? h('div', null, 'The leader is ', h('a', { href: peerHref(error.leader.adminUrl) }, error.leader.nodeId), '.') : null);
+  }
+
+  /**
+   * The address of another node's admin UI, carrying what this browser chose here — the
+   * theme, the operator's name — because the other node is another origin with its own
+   * storage: without this the two nodes of one cluster come up looking different.
+   */
+  function peerHref(url) {
+    try {
+      const u = new URL(url, document.baseURI);
+      if (store.theme && store.theme !== 'auto') u.searchParams.set('theme', store.theme);
+      if (store.operator) u.searchParams.set('as', store.operator);
+      return u.href;
+    } catch { return url; }
+  }
+
+  /** Text that can be long — an exception message in an event — shown short until asked for. */
+  function clamped(text, max = 180) {
+    if (!text || text.length <= max) return text;
+    const cut = text.lastIndexOf(' ', max);
+    return h('details', { class: 'clamp' },
+      h('summary', null, h('span', { class: 'short' }, text.slice(0, cut > max * 0.6 ? cut : max) + '… '), h('span', { class: 'toggle' })),
+      h('div', { class: 'full' }, text));
   }
 
   const skeleton = () => h('div', { class: 'loading', 'aria-busy': 'true' },
@@ -510,6 +544,6 @@
       actions && h('div', { class: 'actions' }, actions));
 
   window.__admin = { h, s, morph, icon, api, all, store, fmtNum, fmtInt, fmtMs, fmtBytes, ago, clock, stamp, timeEl, plural, short, pretty,
-    pipelineBadge, tableBadge, roleBadge, healthBadge, reasonText, spark, lineChart, chartWidth, card, empty, notice, errorNotice, skeleton,
+    pipelineBadge, lastKnown, peerHref, clamped, tableBadge, roleBadge, healthBadge, reasonText, spark, lineChart, chartWidth, card, empty, notice, errorNotice, skeleton,
     tile, kv, td, toast, can, canAct, isLeader, pageHead, seriesOf, ratesOf, seedSeries, pushSeries, ApiError, STATE_ORDER, PIPELINE_STATES, SLOTS, $ };
 })();

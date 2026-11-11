@@ -34,6 +34,7 @@ internal interface ITableHandle : IAsyncDisposable
     Task<TableStats> StatsAsync(IReadOnlyList<(string Pipeline, long Version)> readers, string writer);
     IReadOnlyList<UnreadableRecord> Unreadable(long afterSequence);
     TableRowPage ReadRows(TableRowQuery query);
+    TableSizeEstimate EstimateSize();
 }
 
 internal sealed class TableHandle<TKey, TRow>(TableRegistry registry, TableDefinition<TKey, TRow> definition, TableSpec spec) : ITableHandle
@@ -413,6 +414,38 @@ internal sealed class TableHandle<TKey, TRow>(TableRegistry registry, TableDefin
     // Rows are contract types, which never unload, so one options instance serves.
     private static readonly JsonSerializerOptions RowJson = TableKeys.Json;
 
+    private const int SizeSample = 256;
+    private static readonly TimeSpan SizeEstimateAge = TimeSpan.FromSeconds(30);
+    private volatile TableSizeEstimate? _size;
+
+    public TableSizeEstimate EstimateSize()
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (_size is { } recent && now - recent.At < SizeEstimateAge)
+            return recent;
+        var table = _table ?? throw new ServiceException("not-ready", $"Table '{Spec.Name}' is not open on this node.", 503);
+        var log = _log;
+        long bytes = 0;
+        var sampled = 0;
+        long rows;
+        using (var snapshot = table.Snapshot())
+        {
+            rows = table.Count;
+            foreach (var (_, row) in snapshot.Rows())
+            {
+                bytes += JsonSerializer.SerializeToUtf8Bytes(row, RowJson).Length;
+                if (++sampled >= SizeSample)
+                    break;
+            }
+        }
+        var mean = sampled == 0 ? 0 : (double)bytes / sampled;
+        var version = table.LatestVersion;
+        var retained = log is null ? 0 : Math.Max(0, version - log.OldestRetainedVersion + 1);
+        long? changes = log is InMemoryTableLog<TKey, TRow> memory ? memory.RetainedChanges : null;
+        return _size = new TableSizeEstimate(
+            sampled, rows, Math.Round(mean, 1), (long)(mean * rows), retained, changes, changes is { } c ? (long)(mean * c) : null, now);
+    }
+
     public TableRowPage ReadRows(TableRowQuery query)
     {
         var table = _table ?? throw new ServiceException("not-ready", $"Table '{Spec.Name}' is not open on this node.", 503);
@@ -589,6 +622,8 @@ internal sealed class TableRegistry(ServiceContext context) : ITableRegistry
         return Require(name).ReadRows(query);
     }
 
+    public TableSizeEstimate EstimateSize(string name) => Require(name).EstimateSize();
+
     public Task<TableStats> StatsAsync(string name)
     {
         var handle = Require(name);
@@ -696,24 +731,58 @@ internal sealed class TableRegistry(ServiceContext context) : ITableRegistry
 
     // ── actions ────────────────────────────────────────────────────────────────────────
 
-    public async Task DeclareAsync(TableSpec spec, CancellationToken cancellationToken, string? caller = null)
+    /// <summary>Every check a declare makes before it opens anything. Returns the
+    /// definition's key and row type names.</summary>
+    private (string KeyType, string RowType) CheckDeclare(TableSpec spec)
     {
         context.RequireLeader();
         ServiceNames.Validate(spec.Name, "table name");
         if (spec.Name.StartsWith("svc.", StringComparison.Ordinal))
             throw ServiceException.Invalid("Table names starting 'svc.' are reserved.");
+        if (string.IsNullOrWhiteSpace(spec.Definition))
+            throw ServiceException.Invalid("A table needs a definition: the full name of a TableDefinition class in a loaded contract.");
+        if (_tables.ContainsKey(spec.Name))
+            throw ServiceException.Conflict($"Table '{spec.Name}' is already declared.");
+        ITableDefinition definition;
+        try
+        {
+            definition = context.Plugins.ResolveTableDefinition(spec);
+        }
+        catch (InvalidOperationException ex)
+        {
+            throw ServiceException.Invalid(ex.Message);
+        }
+        if (spec.Loader is { } loader)
+        {
+            if (context.PipelineSpecs().FirstOrDefault(p => p.Writes.Contains(spec.Name)) is { } writer)
+                throw ServiceException.Conflict($"Table '{spec.Name}' is written by pipeline '{writer.Id}'; it cannot also have a loader.");
+            RequireSourceKind(loader);
+        }
+        return (definition.KeyType.Name, definition.RowType.Name);
+    }
+
+    public ActionPlan PlanDeclare(TableSpec spec)
+    {
+        var (keyType, rowType) = CheckDeclare(spec);
+        return new ActionPlan("table.declare", spec.Name, true,
+        [
+            $"create the log of table '{spec.Name}' ({keyType} → {rowType}) and open it as its writer; if a log of that name exists, its rows come back",
+            "record the table in the catalog: a standby opens it and follows",
+            spec.Loader is { } loader
+                ? $"start its {loader.Kind} loader{(loader.Connection is { Length: > 0 } connection ? $" on connection '{connection}'" : "")}; a record it cannot read {(spec.OnUnreadable == UnreadablePolicy.Skip ? "is counted and skipped" : "faults the loader")}"
+                : "no loader: a pipeline (ToTable) or the host writes it",
+        ]);
+    }
+
+    public async Task DeclareAsync(TableSpec spec, CancellationToken cancellationToken, string? caller = null)
+    {
+        CheckDeclare(spec);
 
         await _declare.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             if (_tables.ContainsKey(spec.Name))
                 throw ServiceException.Conflict($"Table '{spec.Name}' is already declared.");
-            if (spec.Loader is { } loader)
-            {
-                if (context.PipelineSpecs().FirstOrDefault(p => p.Writes.Contains(spec.Name)) is { } writer)
-                    throw ServiceException.Conflict($"Table '{spec.Name}' is written by pipeline '{writer.Id}'; it cannot also have a loader.");
-                RequireSourceKind(loader);
-            }
 
             // The log is created before the entry is written: a table the catalog names
             // can then always be followed.
@@ -826,6 +895,9 @@ internal sealed class TableRegistry(ServiceContext context) : ITableRegistry
         {
             case "file":
                 context.ObjectStore(loader.Connection);
+                if (loader.Config is not { ValueKind: JsonValueKind.Object } file || !file.TryGetProperty("path", out var path)
+                    || path.ValueKind != JsonValueKind.String || path.GetString() is not { Length: > 0 })
+                    throw ServiceException.Invalid("The file loader needs a config with a \"path\".");
                 break;
             case "kafka" or "debezium":
                 try

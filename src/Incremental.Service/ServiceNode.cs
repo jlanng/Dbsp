@@ -135,11 +135,18 @@ public sealed record StandbyReadiness(
 /// <remarks><c>Catalog</c>: opening or promoting the catalog and loading stored contracts.
 /// <c>Tables</c>: promoting or opening every table, concurrently. <c>Pipelines</c>:
 /// finishing pending resets and removals, then building and starting every pipeline from
-/// its committed state, in parallel. <c>StartLeading</c>: all of <c>StartLeadingAsync</c> —
-/// the leader record, the plugin directory, seeds and the pipelines.</remarks>
+/// its committed state, in parallel. <c>StartLeading</c>: all of <c>StartLeadingAsync</c>,
+/// which is the five stages measured inside it and <c>Pipelines</c>, with nothing left
+/// over: <c>LeaderRecord</c> (restoring the catalog from its mirror where there is one,
+/// and writing <c>node/leader</c>), <c>PluginDirectory</c> (importing what the plugin
+/// directory holds and the catalog lacks), <c>TableSeeds</c> (declaring the host's seed
+/// tables, the first time), <c>Pipelines</c>, <c>PipelineSeeds</c> (deploying the host's
+/// seed pipelines, the first time — each is built and started) and <c>Finish</c> (the
+/// seed record, the plugin cache, the loaders).</remarks>
 public sealed record ServiceTakeoverTimings(
     long Term, DateTimeOffset At, TimeSpan Catalog, TimeSpan Tables, int TableCount, TimeSpan Pipelines, int PipelineCount,
-    TimeSpan StartLeading);
+    TimeSpan StartLeading, TimeSpan LeaderRecord = default, TimeSpan PluginDirectory = default, TimeSpan TableSeeds = default,
+    TimeSpan PipelineSeeds = default, TimeSpan Finish = default);
 
 /// <summary>A node at a glance. <c>Peer</c> is what the other node last answered (null when
 /// none is configured or none answered); <c>LastTakeover</c> is how this node's takeover
@@ -395,7 +402,9 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
                 await write.CommitAsync(cancellationToken).ConfigureAwait(false);
             }
 
+            var leaderRecord = clock.Elapsed;
             await Contained("importing the plugin directory", () => _context.Plugins.ImportPluginDirectoryAsync(cancellationToken), cancellationToken).ConfigureAwait(false);
+            var pluginDirectory = clock.Elapsed - leaderRecord;
 
             // A seed is applied once per deployment, and the catalog records that it was:
             // a key that is absent is otherwise the same for a seed never applied and for
@@ -418,6 +427,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
             await _context.Supervisor.StartLeadingAsync(catalog.Read(), cancellationToken).ConfigureAwait(false);
             var pipelines = clock.Elapsed - beforePipelines;
             var pipelineCount = _context.Supervisor.Specs.Count;
+            var beforePipelineSeeds = clock.Elapsed;
             foreach (var seed in _context.Registrations.Pipelines)
             {
                 if (seededPipelines.Contains(seed.Id))
@@ -427,6 +437,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
                         () => _context.Supervisor.DeployAsync(seed, new DeployOptions(Caller: "seed"), cancellationToken), cancellationToken).ConfigureAwait(false))
                     seededPipelines.Add(seed.Id);
             }
+            var pipelineSeeds = clock.Elapsed - beforePipelineSeeds;
             if (seededTables.Count != seeded.Tables.Count || seededPipelines.Count != seeded.Pipelines.Count)
             {
                 await Contained("recording the seeds", async () =>
@@ -440,13 +451,17 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
             await Contained("pruning the plugin cache", () => _context.Plugins.PruneCacheAsync(null, cancellationToken), cancellationToken).ConfigureAwait(false);
             _context.Tables.StartLoaders();
             _catalogApplied = catalog.Version;
+            // Each stage ends where the next begins, on one clock: they add up to the whole.
+            var total = clock.Elapsed;
             _lastTakeover = new ServiceTakeoverTimings(
-                term, DateTimeOffset.UtcNow, _prepared.Catalog, _prepared.Tables, _prepared.TableCount, pipelines, pipelineCount, clock.Elapsed);
+                term, DateTimeOffset.UtcNow, _prepared.Catalog, _prepared.Tables, _prepared.TableCount, pipelines, pipelineCount, total,
+                leaderRecord, pluginDirectory, beforePipelines - leaderRecord - pluginDirectory, pipelineSeeds,
+                total - beforePipelineSeeds - pipelineSeeds);
             ServiceMeter.Takeovers.Add(1, ServiceMeter.Tag("node", NodeId));
             ServiceMeter.RecordTakeover(NodeId, "catalog", _prepared.Catalog);
             ServiceMeter.RecordTakeover(NodeId, "tables", _prepared.Tables);
             ServiceMeter.RecordTakeover(NodeId, "pipelines", pipelines);
-            ServiceMeter.RecordTakeover(NodeId, "start_leading", clock.Elapsed);
+            ServiceMeter.RecordTakeover(NodeId, "start_leading", total);
             _logger.LogInformation(
                 "Service node {Node} leads, term {Term}: catalog {Catalog} ms, {Tables} table(s) {TablesMs} ms, {Pipelines} pipeline(s) {PipelinesMs} ms",
                 NodeId, term, (long)_prepared.Catalog.TotalMilliseconds, _prepared.TableCount, (long)_prepared.Tables.TotalMilliseconds,
@@ -494,9 +509,11 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         var admin = _context.Options.AdvertisedAdminUrl;
         if (status.Role != NodeRole.Standby)
             return new PeerInfo(
-                NodeId, status.Role, status.Term, status.Role == NodeRole.Leader, status.Role == NodeRole.Leader ? null : status.Role.ToString(), admin);
+                NodeId, status.Role, status.Term, status.Role == NodeRole.Leader, status.Role == NodeRole.Leader ? null : status.Role.ToString(), admin,
+                ProcessMemory.Read());
         var readiness = Readiness();
-        return new PeerInfo(NodeId, status.Role, status.Term, readiness.TakeoverWouldBeWarm, readiness.NotWarmBecause.FirstOrDefault(), admin);
+        return new PeerInfo(
+            NodeId, status.Role, status.Term, readiness.TakeoverWouldBeWarm, readiness.NotWarmBecause.FirstOrDefault(), admin, ProcessMemory.Read());
     }
 
     // ── the loop: reconcile on a standby, trim and mirror on the leader ────────────────

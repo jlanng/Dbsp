@@ -33,8 +33,10 @@ public sealed class PipelineAttribute(string name) : Attribute
 public enum SlotKind { AppendInput, KeyedInput, UpsertSink, AppendSink }
 
 /// <summary>An input or sink slot: its kind and the type of its records; for a keyed input
-/// and an upsert sink also the type of the key.</summary>
-public sealed record SlotShape(string Name, SlotKind Kind, string Type, string? KeyType = null);
+/// and an upsert sink also the type of the key. <c>Members</c> spells the record type
+/// out — one line per type it is made of, <c>Name { member: Type; … }</c> — so that two
+/// versions of a slot can be compared by what they carry, not only by a type's name.</summary>
+public sealed record SlotShape(string Name, SlotKind Kind, string Type, string? KeyType = null, IReadOnlyList<string>? Members = null);
 
 /// <summary>What a definition's <c>Build</c> declared: its slots and the tables it reads
 /// and writes, by declared table name. Known for any pipeline that has ever validated.</summary>
@@ -133,8 +135,8 @@ public sealed class PipelineBuilder
     internal PipelineGraph Graph => new(Circuit.Describe(), new Dictionary<string, string>(_sinkOutputs, StringComparer.Ordinal));
 
     internal PipelineShape Shape => new(
-        Inputs.Select(i => new SlotShape(i.Name, i.Kind, i.Type, i.KeyType)).ToList(),
-        Sinks.Select(s => new SlotShape(s.Name, s.Kind, s.Type, s.KeyType)).ToList(),
+        Inputs.Select(i => new SlotShape(i.Name, i.Kind, i.Type, i.KeyType, i.Members)).ToList(),
+        Sinks.Select(s => new SlotShape(s.Name, s.Kind, s.Type, s.KeyType, s.Members)).ToList(),
         [.. TablesRead], [.. TablesWritten], [.. TableSlots]);
 
     private void Claim(string slot)
@@ -171,7 +173,7 @@ public sealed class PipelineBuilder
     {
         Claim(slot);
         var stream = Circuit.Input<T>(slot);
-        Inputs.Add(new InputSlot(slot, SlotKind.AppendInput, typeof(T).Name,
+        Inputs.Add(new InputSlot(slot, SlotKind.AppendInput, typeof(T).Name, StateShapes.Members(typeof(T)),
             (connector, start) => connector is IAppendSourceConnector append
                 ? append.StartAsync(new SourceContext<T>(start, stream), start.Cancellation)
                 : throw Mismatch(slot, connector, "an append input (Input<T>)"))
@@ -186,7 +188,7 @@ public sealed class PipelineBuilder
     {
         Claim(slot);
         var stream = Circuit.KeyedInput(slot, key);
-        Inputs.Add(new InputSlot(slot, SlotKind.KeyedInput, typeof(TValue).Name,
+        Inputs.Add(new InputSlot(slot, SlotKind.KeyedInput, typeof(TValue).Name, StateShapes.Members(typeof(TValue)),
             (connector, start) => connector is IKeyedSourceConnector keyed
                 ? keyed.StartAsync(new KeyedSourceContext<TKey, TValue>(start, stream), start.Cancellation)
                 : throw Mismatch(slot, connector, "a keyed input (KeyedInput<TKey, TValue>)"))
@@ -202,7 +204,7 @@ public sealed class PipelineBuilder
         Claim(slot);
         var output = rows.ToAcknowledgedOutput();
         MarkSink(slot);
-        Sinks.Add(new SinkSlot(slot, SlotKind.UpsertSink, typeof(TRow).Name,
+        Sinks.Add(new SinkSlot(slot, SlotKind.UpsertSink, typeof(TRow).Name, StateShapes.Members(typeof(TRow)),
             (connector, start) =>
             {
                 var sink = connector is IUpsertSinkConnector upsert
@@ -225,7 +227,7 @@ public sealed class PipelineBuilder
         Claim(slot);
         var output = rows.ToAcknowledgedOutput();
         MarkSink(slot);
-        Sinks.Add(new SinkSlot(slot, SlotKind.UpsertSink, typeof(T).Name,
+        Sinks.Add(new SinkSlot(slot, SlotKind.UpsertSink, typeof(T).Name, StateShapes.Members(typeof(T)),
             (connector, start) =>
             {
                 var sink = connector is IUpsertSinkConnector upsert
@@ -245,7 +247,7 @@ public sealed class PipelineBuilder
         Claim(slot);
         var output = rows.ToAcknowledgedOutput();
         MarkSink(slot);
-        Sinks.Add(new SinkSlot(slot, SlotKind.AppendSink, typeof(T).Name,
+        Sinks.Add(new SinkSlot(slot, SlotKind.AppendSink, typeof(T).Name, StateShapes.Members(typeof(T)),
             (connector, start) =>
             {
                 var sink = connector is IAppendSinkConnector append
@@ -289,7 +291,7 @@ public sealed class PipelineBuilder
         ServiceException.Invalid($"Slot '{slot}' is {kind}; connector {connector.GetType().Name} does not support that kind.");
 }
 
-internal sealed record InputSlot(string Name, SlotKind Kind, string Type, Func<IConnector, SlotStart, Task<IRunningSource>> Start)
+internal sealed record InputSlot(string Name, SlotKind Kind, string Type, IReadOnlyList<string> Members, Func<IConnector, SlotStart, Task<IRunningSource>> Start)
 {
     public string? KeyType { get; init; }
 
@@ -298,7 +300,7 @@ internal sealed record InputSlot(string Name, SlotKind Kind, string Type, Func<I
     public required object Stream { get; init; }
 }
 
-internal sealed record SinkSlot(string Name, SlotKind Kind, string Type, Func<IConnector, SlotStart, Task> Start, Action<Circuit> Abandon)
+internal sealed record SinkSlot(string Name, SlotKind Kind, string Type, IReadOnlyList<string> Members, Func<IConnector, SlotStart, Task> Start, Action<Circuit> Abandon)
 {
     public string? KeyType { get; init; }
 }
@@ -434,7 +436,12 @@ public sealed record PipelineRollback(
 
 public enum PipelineState { Built, Starting, Running, Stopping, Stopped, Backoff, Blocked, Failed, NeedsReset, Unbuilt, Wedged }
 
-public sealed record PipelineFault(DateTimeOffset Time, long Generation, string ExceptionType, string Message, string? Stack);
+/// <summary>A fault of a pipeline on this node. <c>Generation</c> is the generation of
+/// the spec it ran — the number the catalog, the audit and <c>If-Match</c> use;
+/// <c>Run</c> counts the circuits this node has built for the pipeline since it started
+/// leading, so two faults of one generation can be told apart (a restart is a new run of
+/// the same generation).</summary>
+public sealed record PipelineFault(DateTimeOffset Time, long Generation, string ExceptionType, string Message, string? Stack, long Run = 0);
 
 public sealed record DeadLetterRecord(
     long Sequence, DateTimeOffset Time, string Operator, long Weight, string ExceptionType, string Message, string? Record);

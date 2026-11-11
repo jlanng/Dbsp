@@ -19,10 +19,74 @@
     button.setAttribute('aria-label', label);
     button.title = label;
   }
-  $('theme').addEventListener('click', () => applyTheme(THEMES[(THEMES.indexOf(store.theme) + 1) % THEMES.length]));
+  // Links to the other node carry the theme, so the page is drawn again with it.
+  $('theme').addEventListener('click', () => { applyTheme(THEMES[(THEMES.indexOf(store.theme) + 1) % THEMES.length]); if (store.view) render(); });
   let saved = 'auto';
   try { saved = localStorage.getItem('incremental-admin-theme') || 'auto'; } catch { /* private mode */ }
+  try { store.operator = localStorage.getItem('incremental-admin-operator') || ''; } catch { store.operator = ''; }
+  // Arriving from the other node's admin UI: its links carry the theme and the
+  // operator's name chosen there, since each node is an origin with storage of its own.
+  const carried = new URLSearchParams(location.search);
+  if (carried.has('theme') || carried.has('as')) {
+    if (THEMES.includes(carried.get('theme'))) saved = carried.get('theme');
+    if (carried.has('as')) setOperator(carried.get('as'));
+    history.replaceState(null, '', location.pathname + location.hash);
+  }
   applyTheme(THEMES.includes(saved) ? saved : 'auto');
+
+  // ── who the audit will say did it ───────────────────────────────────────────────────
+
+  function setOperator(name) {
+    store.operator = (name || '').trim().slice(0, 64);
+    try {
+      if (store.operator) localStorage.setItem('incremental-admin-operator', store.operator);
+      else localStorage.removeItem('incremental-admin-operator');
+    } catch { /* private mode */ }
+  }
+
+  async function refreshWho() {
+    try { store.who = await api('whoami'); } catch { store.who = null; }
+    drawWho();
+  }
+
+  function drawWho() {
+    const button = $('who'), who = store.who;
+    if (!who) { button.hidden = true; return; }
+    const named = who.caller !== 'local';
+    const editable = !who.verified && !!who.operatorHeader;
+    button.hidden = !named && !editable;
+    button.disabled = !editable;
+    button.replaceChildren(icon('user', 14), h('span', { class: 'who-name' }, named ? who.caller.replace(' (self-declared)', '') : 'Unnamed'));
+    const label = who.verified ? `Signed in as ${who.caller}: the audit records changes under this name.`
+      : named ? `Changes are recorded as “${who.caller}”. Change the name`
+      : 'Changes made here are recorded as “local”: nobody is signed in. Give a name for the audit';
+    button.setAttribute('aria-label', label);
+    button.title = label;
+  }
+
+  $('who').addEventListener('click', () => {
+    const who = store.who;
+    if (!who || who.verified) return;
+    const dlg = A.modal('Your name, for the audit');
+    let text = store.operator || '';
+    const save = async () => { setOperator(text); dlg.close(); await refreshWho(); if (store.view) render(); };
+    const draw = () => dlg.set([
+      h('p', null, 'This admin surface has no sign-in, so the audit cannot know who made a change: it records ',
+        h('code', null, 'local'), '. A name given here is sent with every change from this browser and recorded as ',
+        h('code', null, `${text.trim() || 'name'} (self-declared)`), '.'),
+      h('p', { class: 'muted' }, 'It is your word, not a check: anyone who can reach this page can give any name. Where the host signs operators in, the audit uses that identity and this is ignored.'),
+      h('div', { class: 'field' },
+        h('label', { for: 'operator-name' }, 'Name'),
+        h('input', { class: 'input', id: 'operator-name', autocomplete: 'name', spellcheck: 'false', maxlength: 64, value: text,
+          on: { input: e => { text = e.target.value; draw(); }, keydown: e => { if (e.key === 'Enter') { e.preventDefault(); save(); } } } })),
+    ], [
+      h('button', { class: 'btn', type: 'button', on: { click: () => dlg.close() } }, 'Cancel'),
+      store.operator && h('button', { class: 'btn', type: 'button', on: { click: () => { text = ''; save(); } } }, 'Forget the name'),
+      h('button', { class: 'btn primary', type: 'button', on: { click: save } }, 'Use this name'),
+    ]);
+    draw();
+    document.getElementById('operator-name').focus();
+  });
 
   // ── navigation ──────────────────────────────────────────────────────────────────────
 
@@ -40,7 +104,8 @@
   function drawNav() {
     const node = store.node;
     const by = (node && node.pipelinesByState) || {};
-    const trouble = (by.Failed || 0) + (by.Wedged || 0) + (by.NeedsReset || 0) + (by.Blocked || 0) + (by.Backoff || 0);
+    // A node that no longer leads has nothing in trouble: its states are history.
+    const trouble = A.lastKnown() ? 0 : (by.Failed || 0) + (by.Wedged || 0) + (by.NeedsReset || 0) + (by.Blocked || 0) + (by.Backoff || 0);
     // The total in the plain colour; how many are in trouble beside it, in the alert
     // colour, as its own number: a total painted red reads as that many in trouble.
     const counts = {
@@ -100,16 +165,16 @@
       content = [
         icon('follow', 15), h('strong', null, 'This node is a standby.'),
         ` It follows the leader${node.leader ? ' ' + node.leader : ''} and runs no pipelines; changes are made on the leader.`,
-        leader && leader.adminUrl && leader.nodeId !== node.nodeId && h('a', { class: 'btn small', href: leader.adminUrl }, icon('link', 12), `Open ${leader.nodeId}`),
+        leader && leader.adminUrl && leader.nodeId !== node.nodeId && h('a', { class: 'btn small', href: A.peerHref(leader.adminUrl) }, icon('link', 12), `Open ${leader.nodeId}`),
       ];
     } else if (node && (node.role === 'Fenced' || node.role === 'Resigned')) {
       cls = node.role.toLowerCase();
       content = [
         icon('lock', 15), h('strong', null, `This node is ${node.role.toLowerCase()}.`),
         node.role === 'Fenced'
-          ? ' Another node took over; this process runs nothing and cannot lead again. Restart it to rejoin as a standby.'
-          : ' It stepped down; this process runs nothing and cannot lead again. Restart it to rejoin as a standby.',
-        leader && leader.adminUrl && leader.nodeId !== node.nodeId && h('a', { class: 'btn small', href: leader.adminUrl }, icon('link', 12), `Open ${leader.nodeId}`),
+          ? ' Another node took over; this process runs nothing and cannot lead again. Pipeline states shown here are the last it saw. Restart it to rejoin as a standby.'
+          : ' It stepped down; this process runs nothing and cannot lead again. Pipeline states shown here are the last it saw. Restart it to rejoin as a standby.',
+        leader && leader.adminUrl && leader.nodeId !== node.nodeId && h('a', { class: 'btn small', href: A.peerHref(leader.adminUrl) }, icon('link', 12), `Open ${leader.nodeId}`),
       ];
     } else if (store.info && store.info.readOnly) {
       cls = 'readonly';
@@ -354,6 +419,7 @@
       store.infoError = e;
     }
     await refreshNode();
+    await refreshWho();
     window.addEventListener('hashchange', navigate);
     window.addEventListener('resize', () => store.view && render());
     document.addEventListener('visibilitychange', () => { if (!document.hidden) load(false); });

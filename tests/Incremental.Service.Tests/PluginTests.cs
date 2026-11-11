@@ -45,6 +45,12 @@ public class PluginTests
         Assert.Matches("^[0-9a-f]{16}$", v1.Version);
         Assert.Equal(["Acme.Contracts.dll", "Acme.Pipelines.deps.json", "Acme.Pipelines.dll"], v1.Files.Select(f => f.Path));
         Assert.Equal(["trade-enrichment", "trader-counts"], v1.Definitions.Select(d => d.Name));
+        // What tells this version from the next for a person: when, by whom, and what the
+        // build calls itself.
+        Assert.InRange(v1.ImportedAt!.Value, DateTimeOffset.UtcNow.AddMinutes(-1), DateTimeOffset.UtcNow);
+        Assert.Equal("tester", v1.ImportedBy);
+        Assert.StartsWith("1.0.0", v1.InformationalVersion);
+        Assert.True(v1.Sequence > 0);
 
         // The settings schema a form is built from.
         var enrichment = v1.Definitions[0];
@@ -66,6 +72,22 @@ public class PluginTests
         Assert.NotEqual(v1.Version, v2.Version);
         Assert.Equal(v1.Fingerprint, v2.Fingerprint); // the two versions' data shapes are identical
         Assert.Equal(2, service.Plugins.Plugins.Count(p => p.Name == Plugin));
+        Assert.True(v2.Sequence > v1.Sequence && v2.ImportedAt >= v1.ImportedAt);
+        Assert.Equal("local", v2.ImportedBy);
+        Assert.Equal(v1.ImportedAt, service.Plugins.Manifest(Plugin, v1.Version)!.ImportedAt); // stored, not recomputed
+
+        // The two versions declare the same: every definition is there on both sides with
+        // the same settings and the same slots, and the slots are spelled out, so a
+        // version that added a member to a record would show it.
+        var diff = await service.Node.Discovery.DiffAsync(Plugin, v1.Version, v2.Version, default);
+        Assert.True(diff.ShapesCompared);
+        Assert.Equal(["trade-enrichment", "trader-counts"], diff.Definitions.Select(d => d.Definition));
+        Assert.All(diff.Definitions, d => { Assert.Equal("unchanged", d.Change); Assert.Empty(d.Members); });
+        Assert.Empty(diff.TableDefinitions);
+        var described = await service.Node.Discovery.DescribeDefinitionAsync(Plugin, v2.Version, "trade-enrichment", null, default);
+        Assert.Contains(described.Sinks.Single().Members!, m => m.StartsWith("Acme.Pipelines.EnrichedTrade { ") || m.Contains("EnrichedTrade { "));
+        Assert.Contains(described.Inputs.Single().Members!, m => m.Contains("Trade { ") && m.Contains("Quantity: "));
+        await Assert.ThrowsAsync<ServiceException>(() => service.Node.Discovery.DiffAsync(Plugin, v1.Version, "0000000000000000", default));
         Assert.Contains(service.Node.Catalog.Audit(), a => a is { Action: "plugin.import", Caller: "tester" });
 
         // A zip of the same files is the same version, so nothing new is stored.

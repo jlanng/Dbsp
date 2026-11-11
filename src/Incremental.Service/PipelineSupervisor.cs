@@ -1305,7 +1305,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         ServiceMeter.PipelineFaults.Add(1, ServiceMeter.Tag("node", context.NodeId), ServiceMeter.Tag("pipeline", runtime.Id));
         lock (runtime.Faults)
         {
-            runtime.Faults.Enqueue(new PipelineFault(DateTimeOffset.UtcNow, number, mismatch.GetType().Name, reason, null));
+            runtime.Faults.Enqueue(new PipelineFault(DateTimeOffset.UtcNow, spec.Generation, mismatch.GetType().Name, reason, null, number));
             while (runtime.Faults.Count > context.Options.FaultBuffer)
                 runtime.Faults.Dequeue();
         }
@@ -1710,7 +1710,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
     {
         lock (runtime.Faults)
         {
-            runtime.Faults.Enqueue(new PipelineFault(DateTimeOffset.UtcNow, generation, ex.GetType().Name, ex.Message, ex.StackTrace));
+            runtime.Faults.Enqueue(new PipelineFault(DateTimeOffset.UtcNow, runtime.Spec.Generation, ex.GetType().Name, ex.Message, ex.StackTrace, generation));
             while (runtime.Faults.Count > context.Options.FaultBuffer)
                 runtime.Faults.Dequeue();
         }

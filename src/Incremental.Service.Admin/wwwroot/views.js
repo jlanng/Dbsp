@@ -4,7 +4,7 @@
   'use strict';
   const A = window.__admin;
   const { h, s, icon, api, all, store, fmtNum, fmtInt, fmtMs, fmtBytes, ago, clock, stamp, timeEl, plural, short, pretty,
-    pipelineBadge, tableBadge, roleBadge, healthBadge, reasonText, spark, lineChart, chartWidth, card, empty, notice, errorNotice,
+    pipelineBadge, lastKnown, peerHref, clamped, tableBadge, roleBadge, healthBadge, reasonText, spark, lineChart, chartWidth, card, empty, notice, errorNotice,
     tile, kv, td, toast, canAct, pageHead, seriesOf, ratesOf, seedSeries, STATE_ORDER, PIPELINE_STATES } = A;
 
   const views = A.views = {};
@@ -18,7 +18,7 @@
   // and of its address; nothing otherwise, so the sentence around it still reads.
   const leaderLink = (before = '', after = '') => {
     const leader = store.leader, node = store.node;
-    return leader && leader.adminUrl && node && leader.nodeId !== node.nodeId ? [before, h('a', { href: leader.adminUrl }, leader.nodeId), after] : null;
+    return leader && leader.adminUrl && node && leader.nodeId !== node.nodeId ? [before, h('a', { href: peerHref(leader.adminUrl) }, leader.nodeId), after] : null;
   };
   const rate = v => (v == null ? '–' : fmtNum(v));
 
@@ -30,7 +30,7 @@
         e.kind === 'pipeline' || e.kind === 'deadletter' ? h('a', { class: 'subject', href: '#/pipelines/' + enc(e.subject) }, e.subject)
           : e.kind === 'table' ? h('a', { class: 'subject', href: '#/tables/' + enc(e.subject) }, e.subject)
           : h('span', { class: 'subject' }, e.subject),
-        e.message))));
+        clamped(e.message)))));
 
   // ── overview ────────────────────────────────────────────────────────────────────────
 
@@ -70,7 +70,8 @@
 
       const attention = [];
       for (const p of pipelines.items) {
-        if (['Failed', 'Wedged', 'NeedsReset', 'Blocked', 'Backoff'].includes(p.state))
+        // On a node that no longer leads these are history, not something to act on here.
+        if (!lastKnown() && ['Failed', 'Wedged', 'NeedsReset', 'Blocked', 'Backoff'].includes(p.state))
           attention.push(h('li', { key: 'p' + p.id }, pipelineBadge(p.state),
             h('div', { class: 'text' }, pipelineLink(p.id),
               h('span', { class: 'sub' }, p.blockedOn ? blockedText(p.blockedOn) : p.lastFault ? `${p.lastFault.exceptionType}${p.lastFault.message ? ': ' + p.lastFault.message : ''}` : PIPELINE_STATES[p.state][2]))));
@@ -99,7 +100,7 @@
 
         h('div', { class: 'split' },
           h('div', { class: 'stack' },
-            card('Pipelines', plural(count, 'pipeline'),
+            card('Pipelines', lastKnown() ? `${plural(count, 'pipeline')}, as this node last saw them` : plural(count, 'pipeline'),
               count === 0 ? empty('No pipelines are deployed', canAct() ? h('a', { href: '#/pipelines' }, 'Deploy one from the pipelines page.') : 'Nothing has been deployed to this service yet.')
                 : h('div', { class: 'stack' },
                   h('div', { class: 'statebar', role: 'img', 'aria-label': states.map(x => `${byState[x]} ${x}`).join(', ') },
@@ -165,11 +166,10 @@
     title: () => 'Pipelines',
     kinds: ['pipeline', 'deadletter', 'node', 'catalog'],
     async load() {
-      const [pipelines, plugins] = await Promise.all([all('pipelines'), all('plugins')]);
-      return { pipelines, plugins };
+      return { pipelines: await all('pipelines') };
     },
     render(ctx) {
-      const { pipelines, plugins } = ctx.data;
+      const { pipelines } = ctx.data;
       const q = ctx.query.get('q') || '';
       const chosen = new Set((ctx.query.get('state') || '').split(',').filter(Boolean));
       // A sort key comes from the address bar: one that names no column sorts by state.
@@ -195,8 +195,10 @@
       return h('div', { class: 'stack' },
         pageHead({
           title: 'Pipelines', lede: 'One circuit each. Deployed, replaced and restarted one at a time while the others run.',
-          actions: canAct() && h('button', { class: 'btn primary', type: 'button', on: { click: () => A.specDialog({ title: 'Deploy a pipeline', spec: { id: '', plugin: '', definition: '' }, plugins: plugins.items, after: ctx.reload }) } }, icon('plus', 14), 'Deploy'),
+          actions: canAct() && h('button', { class: 'btn primary', type: 'button', on: { click: () => A.deployDialog({ after: ctx.reload }) } }, icon('plus', 14), 'Deploy'),
         }),
+        lastKnown() && notice('warn', h('strong', null, 'These states are the last this node saw. '),
+          'It no longer leads and runs no pipeline; what each is doing now is on the leader', leaderLink(' (', ')'), '.'),
         h('section', { class: 'card' },
           h('div', { class: 'toolbar', role: 'search' },
             h('input', { class: 'input grow', type: 'search', placeholder: 'Filter by id, definition or plugin', 'aria-label': 'Filter pipelines', value: q, on: { input: e => set({ q: e.target.value }) } }),
@@ -278,7 +280,8 @@
           crumbs: h('a', { href: '#/pipelines' }, 'Pipelines'),
           title: [h('span', { class: 'mono' }, id), pipelineBadge(p.state)],
           lede: [
-            `${p.definition} from ${p.plugin}@${short(p.version)} · generation ${p.generation}`,
+            `${p.definition} from ${p.plugin}@${short(p.version)} · `,
+            h('span', { title: 'The generation of its spec: it goes up with every change to the pipeline’s catalog entry, and is what the audit and the faults name. A restart builds the same generation again.' }, `generation ${p.generation}`),
             p.operation && ` · ${p.operation} in progress`,
             p.blockedOn && ` · ${blockedText(p.blockedOn)}`,
             p.pending && ` · unfinished ${p.pending}`,
@@ -286,7 +289,7 @@
           actions: acting && [
             stopped ? button('start', 'Start', 'play') : button('stop', 'Stop', 'stop'),
             button('restart', 'Restart', 'restart'),
-            h('button', { class: 'btn', type: 'button', on: { click: () => A.specDialog({ title: `Replace ${id}`, spec: detail.spec, existing: p, after: ctx.reload }) } }, 'Edit spec…'),
+            h('button', { class: 'btn', type: 'button', on: { click: () => A.deployDialog({ existing: p, spec: detail.spec, after: ctx.reload }) } }, 'Edit spec…'),
             button('reset', 'Reset…', 'reset', 'danger'),
             button('remove', 'Remove…', 'trash', 'danger'),
           ],
@@ -317,6 +320,11 @@
         h('strong', null, PIPELINE_STATES[p.state] ? PIPELINE_STATES[p.state][2] + '. ' : ''),
         fault ? `${fault.exceptionType}${fault.message ? ': ' + fault.message : ''} ` : '',
         fault && h('a', { href: `#/pipelines/${enc(id)}/faults` }, 'See the faults')),
+      p.rolledBack && notice('warn', h('strong', null, 'The last replace was rolled back. '),
+        `Generation ${p.rolledBack.from} (${p.rolledBack.definition} from ${p.rolledBack.plugin}@${short(p.rolledBack.version)}) could not start on the state it was to keep, so the spec of generation ${p.rolledBack.restored} was put back as generation ${p.rolledBack.now}, `,
+        timeEl(p.rolledBack.time), '.',
+        p.rolledBack.problems && p.rolledBack.problems.length > 0 && h('ul', null, p.rolledBack.problems.map(x => h('li', null, x)))),
+      p.replaceUnconfirmed && notice('info', 'A replace that kept state has not finished its first start yet: if it cannot read the state, the previous spec is put back.'),
       p.state === 'Unbuilt' && notice('info', 'This node is a standby: it holds this pipeline’s state as bytes and builds the circuit only when it takes over. Rates and topology are on the leader.'),
 
       h('div', { class: 'tiles' },
@@ -413,11 +421,11 @@
     const hidden = store.info && !store.info.exposeRowData;
     if (detail.faults.length === 0)
       return card('Faults', null, empty('No faults', 'This pipeline has not faulted on this node since it started leading.'));
-    return card('Faults', `the last ${detail.faults.length} on this node, newest first`,
+    return card('Faults', `the last ${detail.faults.length} on this node, newest first · a restart is a new run of the same generation`,
       h('div', null,
         hidden && h('div', { class: 'record' }, notice('info', 'Messages and stacks are hidden: this admin API does not expose row data, and an exception message can quote a row.')),
         detail.faults.map((f, i) => h('div', { class: 'record', key: f.time + i },
-          h('div', { class: 'head' }, h('strong', { class: 'mono' }, f.exceptionType), h('span', { class: 'when' }, timeEl(f.time, `${stamp(f.time)} · ${ago(f.time)}`)), h('span', { class: 'tag' }, `generation ${f.generation}`)),
+          h('div', { class: 'head' }, h('strong', { class: 'mono' }, f.exceptionType), h('span', { class: 'when' }, timeEl(f.time, `${stamp(f.time)} · ${ago(f.time)}`)), h('span', { class: 'tag', title: 'The generation of the spec that faulted, and which of the circuits this node has built for the pipeline it was' }, `generation ${f.generation}${f.run ? ' · run ' + f.run : ''}`)),
           f.message && h('div', { class: 'err' }, f.message),
           f.stack && h('details', { class: 'more', open: i === 0 || null }, h('summary', null, 'Stack'), h('pre', { class: 'code' }, f.stack))))));
   }
@@ -443,20 +451,47 @@
       l.record ? recordBlock(l.record) : hiddenNote && h('div', { class: 'muted' }, 'Record hidden.')));
   }
 
+  /** Where a pipeline's dropped records go to stay, and how that is going. */
+  function deadLetterSink(p) {
+    const sink = p.deadLetterSink;
+    if (!sink) {
+      if (p.errorPolicy !== 'DeadLetter') return null;
+      return notice(p.deadLettersBound ? 'info' : 'warn',
+        p.deadLettersBound ? ['A durable sink is bound; its counts appear while the pipeline runs on this node.']
+          : [h('strong', null, 'No durable sink. '), 'What this pipeline drops is kept only here, in memory, the newest few: a failover or a restart of the leader loses it. Bind one under ',
+            h('code', null, 'deadLetters'), ' in its spec (Edit spec, Running it).']);
+    }
+    const failing = sink.failedWrites > 0 && sink.lastError;
+    return h('div', { class: 'sinkstate' },
+      h('div', { class: 'head' },
+        h('span', { class: ['badge', failing ? 'crit' : sink.writeInFlightSince ? 'info' : 'good'] }, icon(failing ? 'alert' : sink.writeInFlightSince ? 'dots' : 'check', 12),
+          failing ? 'Write failing' : sink.writeInFlightSince ? 'Writing' : 'Stored'),
+        h('strong', null, 'Durable sink'), h('span', { class: 'mono' }, sink.binding || sink.connector)),
+      kv([
+        ['Stored', `${plural(sink.delivered, 'record')} in ${plural(sink.batches, 'batch', 'batches')} since this generation started`],
+        ['Write', sink.writeInFlightSince ? ['in flight since ', timeEl(sink.writeInFlightSince), ' — the checkpoint waits for it'] : 'none in flight'],
+        ['Failed writes', sink.failedWrites ? [fmtInt(sink.failedWrites), sink.lastErrorTime && [', the last ', timeEl(sink.lastErrorTime)]] : 'none'],
+        sink.lastError && ['Last error', h('span', { class: 'err' }, sink.lastError)],
+      ]),
+      h('p', { class: 'help' }, 'Each dropped record is written here before the checkpoint that passes it, with its pipeline, generation, step and source position. A sink that keeps failing stops the pipeline: nothing is dropped unrecorded.'));
+  }
+
   function lettersTab(ctx, id) {
     const { letters, detail } = ctx.data;
     if (!letters) return card('Dead letters', null, A.skeleton());
     const hidden = !letters.rowDataExposed;
     const policy = detail && detail.pipeline.errorPolicy;
     const elsewhere = !ctx.pageSaysSo && store.node && store.node.role !== 'Leader';
-    return card('Dead letters', `${fmtInt(letters.total)} dropped; the newest ${fmtInt(letters.kept)} are kept on this node`,
+    const durable = detail && detail.pipeline.id ? deadLetterSink(detail.pipeline) : null;
+    return card('Dead letters', `${fmtInt(letters.total)} dropped; the newest ${fmtInt(letters.kept)} are kept on this node to look at`,
       h('div', null,
+        durable && h('div', { class: 'record' }, durable),
         elsewhere && h('div', { class: 'record' }, notice('info', ['This node does not run the pipeline, so it has no record of what the pipeline dropped: the count and the records are kept by the leader',
           leaderLink(' (', ')'), ', in memory.'])),
         hidden && h('div', { class: 'record' }, notice('info', 'Records and messages are hidden: this admin API does not expose row data. The operator, the time and the exception type are shown.')),
         letters.items.length === 0
           ? empty(letters.total ? 'None kept on this node' : 'No dead letters',
-            letters.total ? 'The ring is per node and in memory: a new leader starts it empty.'
+            letters.total ? 'What is shown here is per node and in memory: a new leader starts it empty. A durable sink, where one is bound, has them all.'
               : policy === 'DeadLetter' ? 'Records its operators cannot process are dropped here instead of faulting the pipeline.'
               : 'This pipeline faults on a bad record instead of dropping it (its error policy is Fault).')
           : letterList(letters, hidden),
@@ -469,12 +504,36 @@
   // ── topology: a layered drawing of the circuit ──────────────────────────────────────
 
   const NODE_H = 42, GAP_Y = 12, GAP_X = 34, PAD = 20;
+  // What an operator kind does, for the ones where the name does not say: the choice
+  // between Join and Lookup is the one a pipeline's author makes per table.
+  const KIND_HELP = {
+    tableJoin: 'Join against a table (retroactive): it holds its records per key and consumes the table’s changes, so a row that changes later revises what was already emitted.',
+    tableIndexJoin: 'Join against a table through an index (retroactive): a row that changes later revises what was already emitted.',
+    tableLookup: 'Lookup (enrich on arrival): each record is enriched from the table’s row as of the step it arrives in; a later change to the row does not revise it. It remembers what it emitted, so a retraction cancels exactly that.',
+    tableLookupAppendOnly: 'Append-only lookup (enrich on arrival): one probe per record and no state. Its input may only insert.',
+    tableRows: 'The table itself as a stream: every change as the old row retracted and the new row asserted.',
+    join: 'Join of two streams on a key (retroactive): it holds both sides, and either side changing revises the output.',
+    antiJoin: 'The records of the first stream whose key has no match in the second.',
+    exchange: 'Repartitions records across workers by key.',
+    eventTime: 'Declares the event-time field and the lateness; advances the watermark and drops records older than it.',
+    window: 'Assigns records to event-time windows.',
+    aggregate: 'One result per key, kept up to date as records arrive and are retracted.',
+    aggregateLinear: 'One result per key from a linear aggregate: updated from the delta alone.',
+    upsert: 'A keyed input: the latest value per key, with the previous one retracted.',
+  };
   const ROLE_TAG = { input: 'input', table: 'table', sink: 'sink', 'table-out': 'writes table', circuit: 'circuit' };
   const clip = (text, max) => (text.length > max ? text.slice(0, max - 1) + '…' : text);
   /** The second line of a node: what kind of edge it is and what it is bound to. */
   const subText = n => clip(n.role === 'operator' || n.role === 'circuit' ? (n.detail || '') : [ROLE_TAG[n.role].toLowerCase(), n.role === 'table' || n.role === 'table-out' ? null : n.detail].filter(Boolean).join(' · '), 28);
 
-  function layout(nodes) {
+  const BAND_GAP = 40, GUTTER = 9;
+
+  /**
+   * A layered drawing, left to right — and, where the layers do not fit in `avail`, in
+   * bands one below the other, read like lines of text: a circuit of twenty operators is
+   * then as legible as one of five instead of being shrunk to fit.
+   */
+  function layout(nodes, avail) {
     const byId = new Map(nodes.map(n => [n.id, n]));
     const outs = new Map(nodes.map(n => [n.id, []]));
     for (const n of nodes) for (const i of n.inputs) if (outs.has(i)) outs.get(i).push(n.id);
@@ -505,8 +564,10 @@
     const tallest = Math.max(...cols.map(c => c.length));
     const step = NODE_H + GAP_Y;
     const height = PAD * 2 + tallest * step - GAP_Y;
+    const colX = [], colW = [];
     cols.forEach(col => {
       const w = Math.max(...col.map(id => width(byId.get(id))), 30);
+      colX.push(x); colW.push(w);
       col.forEach((id, i) => {
         const n = byId.get(id), nw = width(n);
         // Spread each column over the full height: a fan-out then reads as a tree.
@@ -548,26 +609,57 @@
         settle(col);
       }
     }
-    return { pos, width: x - GAP_X + PAD, height, outs };
+    // Cut the layers into bands that fit, and stack the bands.
+    const bands = [];
+    let band = { cols: [], width: 0 };
+    cols.forEach((col, i) => {
+      const add = (band.cols.length ? GAP_X : 0) + colW[i];
+      if (band.cols.length && PAD * 2 + GUTTER + band.width + add > avail) { bands.push(band); band = { cols: [], width: 0 }; }
+      band.width += (band.cols.length ? GAP_X : 0) + colW[i];
+      band.cols.push(i);
+    });
+    bands.push(band);
+    if (bands.length === 1) return { pos, width: x - GAP_X + PAD, height, bandOf: () => 0, bands: [{ top: 0, bottom: height }] };
+
+    const bandOf = new Map();
+    let top = PAD;
+    for (const [b, each] of bands.entries()) {
+      const ids = each.cols.flatMap(i => cols[i]);
+      const minY = Math.min(...ids.map(id => pos.get(id).y)), maxY = Math.max(...ids.map(id => pos.get(id).y + NODE_H));
+      const shiftX = PAD + GUTTER - colX[each.cols[0]], shiftY = top - minY;
+      for (const id of ids) { const p = pos.get(id); p.x += shiftX; p.y += shiftY; bandOf.set(id, b); }
+      each.top = top; each.bottom = top + (maxY - minY);
+      top = each.bottom + BAND_GAP;
+    }
+    return { pos, width: Math.max(...bands.map(each => each.width)) + PAD * 2 + GUTTER, height: top - BAND_GAP + PAD, bandOf: id => bandOf.get(id), bands };
+  }
+
+  /** An edge that leaves one band for another: down into the gap below its own band, along it, and in from the left. */
+  function crossBand(a, b, from, to, bands, entry) {
+    const x1 = a.x + a.w, y1 = a.y + a.h / 2, x2 = entry ? entry.x : b.x, y2 = entry ? entry.y : b.y + b.h / 2;
+    const below = bands[from].bottom + BAND_GAP / 2, above = bands[to].top - BAND_GAP / 2;
+    const into = entry ? `V${y2}` : `H${x2 - 12} V${y2} H${x2}`;
+    const along = entry ? x2 : x2 - 12;
+    if (to === from + 1) return `M${x1},${y1} h10 V${below} H${along} ${entry ? into : `V${y2} H${x2}`}`;
+    return `M${x1},${y1} h10 V${below} H${GUTTER} V${above} H${along} ${entry ? into : `V${y2} H${x2}`}`;
   }
 
   function topologyTab(ctx) {
     const { graph, detail } = ctx.data;
     if (!graph) return card('Topology', null, A.skeleton());
     const ui = ctx.ui;
-    const { pos, width, height } = layout(graph.nodes);
-    const byId = new Map(graph.nodes.map(n => [n.id, n]));
+    // A lookup probes its table rather than consuming its changes: an edge of the
+    // picture all the same, so the layout places the table beside what reads it.
+    // It opens fitted to the width there is, at a size that can be read: layers that do
+    // not fit side by side continue in a band below.
     const avail = Math.max(280, A.$('main').clientWidth - 50);
-    const fit = Math.min(1, avail / width);
-    const zoom = ui.zoom || (fit >= 0.85 ? fit : 1);
+    const { pos, width, height, bandOf, bands } = layout(graph.nodes.map(n => ({ ...n, inputs: [...n.inputs, ...(n.probes || [])] })), avail);
+    const byId = new Map(graph.nodes.map(n => [n.id, n]));
+    const fit = Math.max(0.5, Math.min(1, avail / width));
+    const zoom = ui.zoom || fit;
     const selected = ui.node && byId.get(ui.node);
-    const related = new Set();
-    if (selected) {
-      related.add(selected.id);
-      selected.inputs.forEach(i => related.add(i));
-      graph.nodes.filter(n => n.inputs.includes(selected.id)).forEach(n => related.add(n.id));
-    }
     const dead = graph.deadLetters || {};
+    const nameOf = i => (byId.get(i) ? byId.get(i).label : i);
     const select = id => { ui.node = ui.node === id ? null : id; ctx.render(); };
 
     const edges = [];
@@ -576,13 +668,28 @@
         const a = pos.get(from), b = pos.get(n.id);
         if (!a || !b) continue;
         const x1 = a.x + a.w, y1 = a.y + a.h / 2, x2 = b.x, y2 = b.y + b.h / 2, bend = Math.max(18, (x2 - x1) / 2);
-        edges.push(s('path', { class: ['g-edge', selected && (from === selected.id || n.id === selected.id) && 'hl'], d: `M${x1},${y1} C${x1 + bend},${y1} ${x2 - bend},${y2} ${x2},${y2}`, 'marker-end': 'url(#arrow)' }));
+        const within = bandOf(from) === bandOf(n.id);
+        edges.push(s('path', { class: ['g-edge', !within && 'cross', selected && (from === selected.id || n.id === selected.id) && 'hl'],
+          d: within ? `M${x1},${y1} C${x1 + bend},${y1} ${x2 - bend},${y2} ${x2},${y2}` : crossBand(a, b, bandOf(from), bandOf(n.id), bands), 'marker-end': 'url(#arrow)' }));
+      }
+      for (const from of n.probes || []) {
+        const a = pos.get(from), b = pos.get(n.id);
+        if (!a || !b) continue;
+        // Into the top or the bottom of the lookup, whichever side the table is on: its
+        // left side is where the records it enriches come in.
+        const above = a.y < b.y;
+        const x1 = a.x + a.w, y1 = a.y + a.h / 2, x2 = b.x + Math.min(22, b.w / 2), y2 = above ? b.y : b.y + b.h;
+        const within = bandOf(from) === bandOf(n.id) && x2 > x1;
+        edges.push(s('path', { class: ['g-edge', 'probe', !within && 'cross', selected && (from === selected.id || n.id === selected.id) && 'hl'],
+          d: within ? `M${x1},${y1} C${x1 + Math.max(14, (x2 - x1) * 0.6)},${y1} ${x2},${y2 + (above ? -26 : 26)} ${x2},${y2}`
+            : bandOf(from) < bandOf(n.id) ? crossBand(a, b, bandOf(from), bandOf(n.id), bands, { x: x2, y: b.y })
+            : `M${x1},${y1} L${x2},${y2}`, 'marker-end': 'url(#arrow)' }));
       }
     }
 
     const drawn = graph.nodes.map(n => {
       const p = pos.get(n.id);
-      const describe = `${ROLE_TAG[n.role] ? ROLE_TAG[n.role].toLowerCase() : n.role} ${n.label}${n.detail ? ', ' + n.detail : ''}${n.inputs.length ? '. Reads ' + n.inputs.map(i => byId.get(i) ? byId.get(i).label : i).join(', ') : ''}`;
+      const describe = `${ROLE_TAG[n.role] ? ROLE_TAG[n.role].toLowerCase() : n.role} ${n.label}${n.detail ? ', ' + n.detail : ''}${n.inputs.length ? '. Reads ' + n.inputs.map(nameOf).join(', ') : ''}${(n.probes || []).length ? '. Looks up rows in table ' + n.probes.map(nameOf).join(', ') : ''}`;
       const common = {
         class: ['g-node', n.role, n.name && 'named', ui.node === n.id && 'sel'], tabindex: 0, role: 'button', 'aria-label': describe, 'aria-pressed': String(ui.node === n.id),
         transform: `translate(${p.x.toFixed(1)},${p.y.toFixed(1)})`, key: n.id,
@@ -607,6 +714,14 @@
       s('g', null, edges), s('g', null, drawn));
 
     const zoomTo = z => () => { ui.zoom = Math.min(2, Math.max(0.3, z)); ctx.render(); };
+    const consumers = selected ? graph.nodes.filter(n => n.inputs.includes(selected.id)).map(n => n.label) : [];
+    const lookers = selected ? graph.nodes.filter(n => (n.probes || []).includes(selected.id)).map(n => n.label) : [];
+    const kind = selected ? (selected.kind || selected.role).split('[')[0] : '';
+    const pid = enc(detail.pipeline.id);
+    // The numbers that do exist: per input slot, per sink slot, per table.
+    const source = selected && selected.role === 'input' ? detail.sources.find(x => x.slot === selected.label) : null;
+    const sink = selected && selected.role === 'sink' ? detail.sinks.find(x => x.slot === selected.label) : null;
+    const tableUse = selected && (selected.role === 'table' || selected.role === 'table-out') ? detail.tables.find(x => x.name === selected.label) : null;
     return h('div', { class: 'stack' },
       graph.source === 'declared' && notice('info', 'This node has not built this pipeline’s circuit (a standby builds at takeover), so this is the declared edges only: its input slots, tables and sinks around one box. The leader shows the operators.'),
       card('Topology', `${graph.nodes.length} nodes · ${graph.source === 'circuit' ? 'the circuit as its definition declares it' : 'declared edges'}`,
@@ -615,20 +730,33 @@
           h('div', { class: 'graph-side', 'aria-live': 'polite' },
             selected ? kv([
               ['Node', h('strong', null, selected.label)],
-              ['Kind', h('span', { class: 'mono' }, selected.kind || selected.role)],
+              ['Kind', h('span', null, h('span', { class: 'mono' }, selected.kind || selected.role), KIND_HELP[kind] && h('span', { class: 'kind-help' }, KIND_HELP[kind]))],
               selected.detail && (selected.role === 'input' || selected.role === 'sink') && ['Bound to', selected.detail],
-              selected.stateName && ['State stores', h('span', null, h('span', { class: 'mono' }, selected.stateName), selected.name ? ' — named, so it survives changes to the circuit around it' : ' — positional: an upstream change renumbers it')],
+              source && ['Read so far', `${plural(source.records, 'record')} · lag ${source.lag == null ? 'not reported' : fmtInt(source.lag)} · ${plural(source.unreadable, 'unreadable record')}`],
+              source && source.at && ['At', h('span', { class: 'mono' }, source.at)],
+              sink && ['Delivered', `${plural(sink.batches, 'batch', 'batches')}: ${fmtInt(sink.upserts)} upserts, ${fmtInt(sink.deletes)} deletes, ${fmtInt(sink.appends)} appends${sink.writeInFlightSince ? ' · a write is in flight' : ''}`],
+              (selected.role === 'table' || selected.role === 'table-out') && ['Table', [tableLink(selected.label),
+                tableUse && tableUse.committedVersion != null && ` · this pipeline has committed version ${fmtInt(tableUse.committedVersion)} of ${fmtInt(tableUse.currentVersion)}`]],
+              selected.stateName && selected.role === 'operator' && ['State stores', h('span', null, h('span', { class: 'mono' }, selected.stateName), selected.name ? ' — named, so it survives changes to the circuit around it' : ' — positional: an upstream change renumbers it')],
               selected.errorPolicy && ['On a record error', selected.errorPolicy === 'DeadLetter' ? 'drop the record to the dead letters' : 'fault the pipeline'],
-              selected.stateName && dead[selected.stateName] && ['Dead letters', h('a', { href: `#/pipelines/${enc(detail.pipeline.id)}/dead-letters` }, `${dead[selected.stateName]} of those kept came from here`)],
-              ['Reads', selected.inputs.length ? selected.inputs.map(i => byId.get(i) ? byId.get(i).label : i).join(', ') : 'nothing: it is a source'],
-            ]) : h('span', { class: 'muted' }, 'Select a node to see its kind, its state stores and what it reads. Tab moves between nodes.'))),
+              selected.stateName && dead[selected.stateName] && ['Dead letters', h('a', { href: `#/pipelines/${pid}/dead-letters` }, `${dead[selected.stateName]} of those kept came from here`)],
+              ['Reads', selected.inputs.length ? selected.inputs.map(nameOf).join(', ') : selected.role === 'table' ? 'the shared table, outside this circuit' : 'nothing: it is a source'],
+              (selected.probes || []).length > 0 && ['Looks up', ['rows of ', selected.probes.map((i, k) => [k > 0 && ', ', tableLink(nameOf(i))]), ' at each step’s pinned version; the table’s changes do not flow into it']],
+              consumers.length > 0 && ['Feeds', consumers.join(', ')],
+              lookers.length > 0 && ['Looked up by', lookers.join(', ')],
+              selected.role === 'operator' || selected.role === 'exchange' ? ['Live counts', h('span', { class: 'muted' }, 'not collected per operator')] : null,
+            ]) : h('span', { class: 'muted' }, 'Select a node to see its kind, what it reads and feeds, its state stores, and — for an input, a sink or a table — its numbers. Tab moves between nodes.')),
+          h('p', { class: 'graph-note' }, icon('info', 13),
+            h('span', null, 'This is the circuit as declared, not a live view: the engine measures a step as a whole, so records and time per operator are not collected. The pipeline’s rates are on its ',
+              h('a', { href: `#/pipelines/${pid}` }, 'Overview'), '; an input, a sink or a table shows its own numbers when selected.'))),
         { extra: [
           h('ul', { class: 'legend' },
             h('li', null, h('span', { class: 'swatch in' }), 'input'), h('li', null, h('span', { class: 'swatch tbl' }), 'table'),
-            h('li', null, h('span', { class: 'swatch out' }), 'sink'), h('li', null, '⇄ exchange')),
+            h('li', null, h('span', { class: 'swatch out' }), 'sink'), h('li', null, '⇄ exchange'),
+            h('li', null, h('span', { class: 'edge-key' }), 'records flow'), h('li', null, h('span', { class: 'edge-key probe' }), 'rows looked up')),
           h('div', { class: 'seg', role: 'group', 'aria-label': 'Zoom' },
             h('button', { type: 'button', 'aria-label': 'Zoom out', on: { click: zoomTo(zoom - 0.15) } }, '−'),
-            h('button', { type: 'button', 'aria-label': 'Fit to width', on: { click: zoomTo(fit) } }, 'Fit'),
+            h('button', { type: 'button', 'aria-label': 'Fit to the view', 'aria-pressed': String(!ui.zoom), on: { click: () => { ui.zoom = null; ctx.render(); } } }, 'Fit'),
             h('button', { type: 'button', 'aria-label': 'Actual size', on: { click: zoomTo(1) } }, '100%'),
             h('button', { type: 'button', 'aria-label': 'Zoom in', on: { click: zoomTo(zoom + 0.15) } }, '+')),
         ] }));
@@ -646,9 +774,12 @@
       const { tables } = data;
       const standby = store.node && store.node.role === 'Standby';
       return h('div', { class: 'stack' },
-        pageHead({ title: 'Tables', lede: 'Shared reference tables: held once per node, read by any number of pipelines.' }),
+        pageHead({
+          title: 'Tables', lede: 'Shared reference tables: held once per node, read by any number of pipelines.',
+          actions: canAct() && h('button', { class: 'btn primary', type: 'button', on: { click: () => A.declareTableDialog({ after: r => { location.hash = '#/tables/' + enc(r.table.name); } }) } }, icon('plus', 14), 'Declare'),
+        }),
         h('section', { class: 'card' },
-          tables.items.length === 0 ? empty('No tables are declared', 'Tables are declared by the host or through the API (POST api/tables).')
+          tables.items.length === 0 ? empty('No tables are declared', canAct() ? 'Use Declare to add the first one; a host can also seed them.' : 'Tables are declared on the leader, or seeded by the host.')
             : h('div', { class: 'table-wrap' }, h('table', { class: 'data cards' },
               h('thead', null, h('tr', null, h('th', null, 'Table'), h('th', null, 'State'), h('th', { class: 'r' }, 'Rows'), h('th', { class: 'r' }, 'Version'),
                 h('th', { class: 'r' }, standby ? 'Behind' : 'Versions /s'), h('th', null, 'Written by'), h('th', null, 'Loader'), h('th', { class: 'r' }, 'Readers'), h('th', null, 'Floor held by'))),
@@ -716,6 +847,8 @@
                 h('tbody', null, t.indexes.map(i => h('tr', { key: i.name }, h('td', { class: 'id' }, i.name), h('td', { class: 'mono' }, i.keyType || '–'),
                   h('td', { class: 'r' }, exposing && h('button', { class: 'btn small ghost', type: 'button', on: { click: () => { ui.mode = 'index:' + i.name; ui.key = ''; ctx.render(); document.getElementById('row-key')?.focus(); } } }, 'Look up')))))))),
 
+        sizeCard(detail),
+
         card('Readers and writers', 'the version each pipeline’s checkpoint has committed; the furthest behind holds the retention floor',
           detail.pipelines.length === 0 ? empty('No pipeline names this table', 'It can be removed, or read by the next pipeline deployed.')
             : h('div', { class: 'table-wrap' }, h('table', { class: 'data cards' },
@@ -739,6 +872,26 @@
         rowBrowser(ctx, name, t, exposing));
     },
   };
+
+  /** What the table holds, estimated — and said to be. */
+  function sizeCard(detail) {
+    const z = detail.size;
+    if (!z) return card('Estimated size', null, empty('Not estimated', 'The table is not open on this node.'));
+    const total = z.rowsBytes + (z.historyBytes || 0);
+    return card('Estimated size', `about ${fmtBytes(Math.round(total))} of row data on this node`,
+      h('div', { class: 'stack' },
+        h('div', { class: 'tiles plain' },
+          tile('Rows', '≈ ' + fmtBytes(Math.round(z.rowsBytes)), '', `${fmtInt(z.rows)} rows × ${fmtNum(z.meanRowBytes)} B`),
+          tile('Retained history', z.historyBytes == null ? 'not here' : '≈ ' + fmtBytes(Math.round(z.historyBytes)), '',
+            z.historyBytes == null ? `${fmtInt(z.retainedVersions)} versions, held by the log’s brokers` : `${fmtInt(z.historyChanges)} row changes in ${plural(z.retainedVersions, 'version')}`),
+          tile('Mean row', fmtNum(z.meanRowBytes), 'B', `as JSON, over ${plural(z.sampledRows, 'sampled row')}`)),
+        h('p', { class: 'help' },
+          `How this is estimated: the first ${fmtInt(z.sampledRows)} rows in the table’s own order are written as JSON, and their mean length in UTF-8 bytes is multiplied by the row count`,
+          z.historyChanges != null ? ' and by the row changes the retained history holds' : '',
+          '. It is the size of the data, not of the process’s memory: a row is held as a .NET object beside the key map and the indexes, which is usually a few times more and is not measured. ',
+          'The process’s memory as a whole is on the ', h('a', { href: '#/cluster' }, 'cluster page'), '. Estimated ', timeEl(z.at), '; kept for half a minute.')),
+      { flush: false });
+  }
 
   function rowBrowser(ctx, name, t, exposing) {
     const ui = ctx.ui;
@@ -815,7 +968,7 @@
     if (p.definitions.length === 0) return null;
     const settings = d => (d.settings.length === 0 ? h('span', { class: 'muted' }, 'none')
       : d.settings.map(st => h('div', { key: st.name, title: st.description || null },
-        h('span', { class: 'mono' }, st.name), h('span', { class: 'muted' }, `: ${st.jsonType}`),
+        h('span', { class: 'mono' }, st.name), h('span', { class: 'muted' }, `: ${st.jsonType}${st.default != null ? ' = ' + (typeof st.default === 'string' ? st.default : JSON.stringify(st.default)) : ''}${st.values && st.values.length ? ' (' + st.values.join(' | ') + ')' : ''}${st.minimum != null || st.maximum != null ? ` [${st.minimum ?? ''}..${st.maximum ?? ''}]` : ''}`),
         st.required && [' ', h('span', { class: 'tag' }, 'required')],
         st.stateNeutral && [' ', h('span', { class: 'tag', title: 'Changing it keeps the pipeline’s state without being asked' }, 'state-neutral')])));
     const row = d => h('tr', { key: d.name },
@@ -827,9 +980,78 @@
       h('tbody', null, p.definitions.map(row))));
   }
 
+  const diffMark = { added: ['good', '+ added'], removed: ['crit', '− removed'], changed: ['warn', '~ changed'], unchanged: ['idle', 'unchanged'] };
+  const changeBadge = change => h('span', { class: ['badge', (diffMark[change] || diffMark.unchanged)[0]] }, (diffMark[change] || [null, change])[1]);
+
+  /**
+   * One side of a difference. A slot's text is its kind and then a line per type its
+   * record is made of, `Name { member: Type; … }`: the lines both sides share are shown
+   * quietly, and in a line that differs the members the other side lacks are marked.
+   */
+  function shapeCell(text, other) {
+    if (!text) return h('span', { class: 'muted' }, '–');
+    const lines = text.split('\n'), theirs = (other || '').split('\n');
+    if (lines.length === 1) return text;
+    const membersOf = line => { const m = /^(.*?) \{ (.*) \}$/.exec(line); return m ? [m[1], m[2].split('; ')] : [line, null]; };
+    const byType = new Map(theirs.map(membersOf));
+    return h('div', { class: 'shape' }, lines.map((line, i) => {
+      if (theirs.includes(line)) return h('div', { key: 'l' + i, class: i === 0 ? null : 'same' }, line);
+      const [type, members] = membersOf(line);
+      if (!members) return h('div', { key: 'l' + i }, h('mark', null, line));
+      const had = byType.get(type);
+      if (!had) return h('div', { key: 'l' + i }, h('mark', null, line));
+      return h('div', { key: 'l' + i }, type, ' { ', members.map((m, k) => [k > 0 && '; ', had.includes(m) ? m : h('mark', null, m)]), ' }');
+    }));
+  }
+
+  /** Two versions of one plugin, side by side in words: what was added, removed, changed. */
+  function diffView(ctx, name, versions) {
+    const ui = ctx.ui;
+    const cmp = (ui.diff = ui.diff || {})[name] = ui.diff[name] || { from: versions[1].version, to: versions[0].version };
+    const run = async () => {
+      cmp.busy = true; cmp.error = null; ctx.render();
+      try { cmp.result = await api(`plugins/${enc(name)}/diff?from=${enc(cmp.from)}&to=${enc(cmp.to)}`); }
+      catch (e) { cmp.error = e; cmp.result = null; }
+      cmp.busy = false; ctx.render();
+    };
+    const pick = (key, label) => h('label', { class: 'field inline' }, h('span', { class: 'label' }, label),
+      h('select', { class: 'input', 'aria-label': `${label} version of ${name}`, on: { change: e => { cmp[key] = e.target.value; cmp.result = null; ctx.render(); } } },
+        versions.map(p => h('option', { value: p.version, selected: p.version === cmp[key] }, A.versionLabel(p)))));
+    const r = cmp.result;
+    const changedDefs = r ? r.definitions.filter(d => d.change !== 'unchanged') : [];
+    return h('details', { class: 'more diff', key: 'diff' },
+      h('summary', null, 'Compare two versions'),
+      h('div', { class: 'stack' },
+        h('div', { class: 'toolbar bare' }, pick('from', 'From'), pick('to', 'To'),
+          h('button', { class: 'btn', type: 'button', disabled: cmp.busy || cmp.from === cmp.to, on: { click: run } }, cmp.busy ? 'Comparing…' : 'Compare')),
+        cmp.from === cmp.to && h('p', { class: 'help' }, 'Choose two different versions.'),
+        cmp.error && errorNotice(cmp.error, 'The versions could not be compared. '),
+        r && h('div', { class: 'stack' },
+          r.notes.map(n => notice('info', n)),
+          changedDefs.length === 0 && r.tableDefinitions.length === 0 && notice('info', h('strong', null, 'Nothing declared differs. '),
+            r.shapesCompared ? 'The definitions, their settings, their input, sink and table slots and the types those carry are the same.' : 'The definitions and their settings are the same.',
+            ' What a definition computes is not compared: two versions can declare the same and do different things.'),
+          (changedDefs.length > 0 || r.tableDefinitions.length > 0) && h('div', { class: 'table-wrap' }, h('table', { class: 'data difftable' },
+            h('thead', null, h('tr', null, h('th', null, 'What'), h('th', null, 'Change'), h('th', null, short(r.from, 8)), h('th', null, short(r.to, 8)))),
+            h('tbody', null,
+              r.definitions.filter(d => d.change !== 'unchanged').flatMap(d => [
+                h('tr', { key: 'd' + d.definition, class: 'group' }, h('td', { class: 'id' }, 'definition ', h('strong', null, d.definition)), h('td', null, changeBadge(d.change)), h('td', null), h('td', null)),
+                ...d.members.map(m => h('tr', { key: 'm' + d.definition + m.kind + m.name },
+                  h('td', { class: 'member' }, h('span', { class: 'tag' }, m.kind), ' ', h('span', { class: 'mono' }, m.name)), h('td', null, changeBadge(m.change)),
+                  h('td', { class: 'wrap' }, shapeCell(m.from, m.to)), h('td', { class: 'wrap' }, shapeCell(m.to, m.from)))),
+                ...d.notes.map((n, i) => h('tr', { key: 'n' + d.definition + i }, h('td', { colspan: 4, class: 'muted wrap' }, n))),
+              ]),
+              r.tableDefinitions.map(m => h('tr', { key: 't' + m.name }, h('td', { class: 'member' }, h('span', { class: 'tag' }, 'table definition'), ' ', h('span', { class: 'mono' }, m.name.split('.').pop())),
+                h('td', null, changeBadge(m.change)), h('td', null, m.from || h('span', { class: 'muted' }, '–')), h('td', null, m.to || h('span', { class: 'muted' }, '–'))))))),
+          (changedDefs.length > 0) && h('p', { class: 'help' },
+            `${plural(r.definitions.length - changedDefs.length, 'other definition')} unchanged. `,
+            r.shapesCompared ? 'Settings, slots and the types they carry are compared; ' : 'Settings are compared; ',
+            'what a definition computes, and the shape of its state, are not — a replace compares the state when it is planned.'))));
+  }
+
   views.plugins = {
     title: () => 'Plugins',
-    kinds: ['plugin', 'pipeline', 'catalog'],
+    kinds: ['plugin', 'pipeline', 'catalog', 'table'],
     every: 5000,
     load: async () => ({ plugins: await all('plugins'), node: await api('node') }),
     render(ctx) {
@@ -837,6 +1059,8 @@
       const ui = ctx.ui, info = store.info || {};
       const groups = new Map();
       for (const p of plugins.items) groups.set(p.name, [...(groups.get(p.name) || []), p]);
+      // Newest first: the import sequence is the order on every node.
+      for (const versions of groups.values()) versions.sort((a, b) => (b.sequence || 0) - (a.sequence || 0) || a.version.localeCompare(b.version));
 
       const upload = async file => {
         if (!file) return;
@@ -859,6 +1083,15 @@
           ctx.reload();
         } catch (e) { ui.rescan = { error: e }; ctx.render(); }
       };
+
+      const usedBy = p => {
+        const parts = [];
+        if (p.pipelines.length) parts.push(['runs ', p.pipelines.map((x, i) => [i > 0 && ', ', pipelineLink(x.id)])]);
+        if (p.tables.length) parts.push([`${p.pipelines.length ? 'defines' : 'Defines'} ${p.tables.length === 1 ? 'table' : 'tables'} `, p.tables.map((x, i) => [i > 0 && ', ', tableLink(x)])]);
+        if (!parts.length) return h('span', { class: 'muted' }, p.kind === 'Contract' ? 'No declared table is defined by it.' : 'No pipeline names this version.');
+        return h('span', null, p.pipelines.length ? 'It ' : '', parts.map((x, i) => [i > 0 && '; ', x]), '.');
+      };
+      const inUse = p => p.users > 0 || p.tables.length > 0;
 
       return h('div', { class: 'stack' },
         pageHead({
@@ -886,18 +1119,30 @@
           : notice('info', 'Uploading plugins over this API is switched off (ServiceAdminOptions.AllowPluginUpload). Plugins come from the host’s plugin directory.')),
 
         plugins.items.length === 0 ? h('section', { class: 'card' }, empty('No plugins', 'Nothing is compiled into the host or stored in the catalog.'))
-          : [...groups].map(([name, versions]) => card(h('span', { class: 'mono' }, name), `${versions[0].kind === 'Contract' ? 'contract' : 'pipeline plugin'} · ${plural(versions.length, 'version')}`,
-            h('div', null, versions.map(p => h('div', { class: 'record', key: p.version },
-              h('div', { class: 'head' },
-                h('strong', { class: 'mono', title: p.version }, short(p.version, 16)),
-                h('span', { class: ['badge', p.loadState === 'loaded' || p.loadState === 'built-in' ? 'good' : p.loadState === 'pending' ? 'warn' : 'idle'],
-                  title: { 'built-in': 'Compiled into the host', loaded: 'Loaded on this node', stored: 'Stored; loaded when a pipeline needs it', pending: 'A newer contract version: loaded when the process restarts', superseded: 'An older contract version: a newer one is loaded, and a restart loads the newest' }[p.loadState] }, p.loadState),
-                p.files != null && h('span', { class: 'muted' }, `${plural(p.files, 'file')} · ${fmtBytes(p.bytes)}`),
-                h('span', { class: 'muted' }, p.users ? `used by ${plural(p.users, 'pipeline')}` : 'unused'),
-                canAct() && !p.builtIn && h('button', { class: 'btn small danger', type: 'button', disabled: p.users > 0, title: p.users > 0 ? 'A pipeline names this version' : null, on: { click: () => A.pluginDelete(p, ctx.reload) } }, 'Delete…')),
-              p.pipelines.length > 0 && h('div', null, h('span', { class: 'muted' }, 'Pipelines: '), p.pipelines.map((x, i) => [i > 0 && ', ', pipelineLink(x.id)])),
-              definitionsTable(p),
-              p.tableDefinitions.length > 0 && h('div', null, h('span', { class: 'muted' }, 'Table definitions: '), h('span', { class: 'mono' }, p.tableDefinitions.map(x => x.split('.').pop()).join(', ')))))))));
+          : [...groups].map(([name, versions]) => card(h('span', { class: 'mono' }, name), `${versions[0].kind === 'Contract' ? 'contract' : 'pipeline plugin'} · ${plural(versions.length, 'version')}${versions.length > 1 ? ', newest first' : ''}`,
+            h('div', null,
+              versions.length > 1 && h('div', { class: 'record' }, diffView(ctx, name, versions)),
+              versions.map((p, i) => h('div', { class: 'record', key: p.version },
+                h('div', { class: 'head' },
+                  h('strong', { class: 'mono', title: `Version ${p.version}: the hash of the plugin’s files` }, short(p.version, 16)),
+                  versions.length > 1 && i === 0 && h('span', { class: 'tag' }, 'newest'),
+                  h('span', { class: ['badge', p.loadState === 'loaded' || p.loadState === 'built-in' ? 'good' : p.loadState === 'pending' ? 'warn' : 'idle'],
+                    title: { 'built-in': 'Compiled into the host', loaded: 'Loaded on this node', stored: 'Stored; loaded when a pipeline needs it', pending: 'A newer contract version: loaded when the process restarts', superseded: 'An older contract version: a newer one is loaded, and a restart loads the newest' }[p.loadState] }, p.loadState),
+                  h('span', { class: 'spacer' }),
+                  canAct() && !p.builtIn && h('button', { class: 'btn small danger', type: 'button', disabled: inUse(p), title: p.users > 0 ? 'A pipeline names this version' : p.tables.length ? 'A declared table is defined by it' : null, on: { click: () => A.pluginDelete(p, ctx.reload) } }, 'Delete…')),
+                kv([
+                  ['Imported', p.builtIn ? h('span', { class: 'muted' }, 'never: it is compiled into the host, and is whatever build the host is')
+                    : p.importedAt ? [timeEl(p.importedAt, stamp(p.importedAt)), h('span', { class: 'muted' }, ` · ${ago(p.importedAt)}`), p.importedBy && [' by ', h('strong', null, p.importedBy)]]
+                    : h('span', { class: 'muted' }, 'before import times were recorded')],
+                  p.sequence != null && ['Sequence', [h('span', { class: 'num' }, '#' + p.sequence), h('span', { class: 'muted' }, ' · its place among everything the catalog has recorded; a later import has a higher one on every node')]],
+                  ['Build', p.informationalVersion ? h('span', { class: 'mono', title: p.informationalVersion }, A.buildName(p.informationalVersion))
+                    : h('span', { class: 'muted' }, p.builtIn ? 'the host’s' : 'the assembly carries no informational version')],
+                  p.files != null && ['Files', `${plural(p.files, 'file')} · ${fmtBytes(p.bytes)} · main assembly ${p.mainAssembly}`],
+                  ['Used by', usedBy(p)],
+                ]),
+                definitionsTable(p),
+                p.tableDefinitions.length > 0 && h('div', null, h('span', { class: 'muted' }, 'Table definitions: '), h('span', { class: 'mono' }, p.tableDefinitions.map(x => x.split('.').pop()).join(', ')))))),
+            { flush: true })));
     },
   };
 
@@ -917,7 +1162,7 @@
     render(ctx) {
       const { pipelines, id, letters } = ctx.data;
       return h('div', { class: 'stack' },
-        pageHead({ title: 'Dead letters', lede: 'Records a pipeline dropped instead of faulting on them: the record, the error and where it came from. Kept per node, in memory, newest first.' }),
+        pageHead({ title: 'Dead letters', lede: 'Records a pipeline dropped instead of faulting on them: the record, the error and where it came from. A pipeline with a dead-letter sink stores every one durably; the newest are also kept here, per node and in memory, to look at.' }),
         store.node && store.node.role !== 'Leader' && notice('info', ['This node runs no pipelines. Dropped records are counted and kept by the node that runs them — the leader',
           leaderLink(' (', ')'), ' — so the zeroes here say nothing about what was dropped there.']),
         pipelines.length === 0
@@ -926,9 +1171,11 @@
             h('div', null, letters ? lettersTab({ ...ctx, pageSaysSo: true, data: { letters, detail: { pipeline: pipelines.find(p => p.id === id) || {} } } }, id) : h('section', { class: 'card' }, empty('Choose a pipeline', 'Its dropped records appear here.'))),
             card('Pipelines', 'with dropped records, or able to drop them',
               h('table', { class: 'data' },
-                h('thead', null, h('tr', null, h('th', null, 'Pipeline'), h('th', { class: 'r' }, 'Dropped'))),
+                h('thead', null, h('tr', null, h('th', null, 'Pipeline'), h('th', null, 'Stored in'), h('th', { class: 'r' }, 'Dropped'))),
                 h('tbody', null, pipelines.map(p => h('tr', { key: p.id, 'aria-current': p.id === id ? 'true' : null },
                   h('td', { class: 'id' }, h('a', { href: '#/dead-letters/' + enc(p.id), 'aria-current': p.id === id ? 'page' : null }, p.id), p.id === id && h('span', { class: 'sub' }, 'shown')),
+                  h('td', null, p.deadLetterSink ? [h('span', { class: 'tag' }, p.deadLetterSink.connector), p.deadLetterSink.failedWrites > 0 && p.deadLetterSink.lastError && h('span', { class: 'sub err' }, 'a write failed')]
+                    : p.deadLettersBound ? h('span', { class: 'tag' }, 'bound') : h('span', { class: 'muted', title: 'No durable sink: kept in memory on the leader only' }, 'memory only')),
                   h('td', { class: 'r' }, fmtNum(p.deadLetters)))))))));
     },
   };
@@ -949,8 +1196,24 @@
       const st = node.status, lead = st.leadership, role = lead.role, kafka = lead.kafka, peer = st.peer, standby = st.standby;
       const acting = store.info && !store.info.readOnly;
       const take = st.lastTakeover;
-      const stages = take ? [['Catalog', take.catalog], ['Tables', take.tables], ['Pipelines', take.pipelines], ['Everything else', Math.max(0, take.startLeading - take.pipelines)]] : [];
+      // Every stage is measured on one clock, each ending where the next begins: they add
+      // up to the service's part of the takeover with nothing left over.
+      const stages = take ? [
+        ['Catalog', take.catalog, 'promote or open the catalog, load the stored contracts'],
+        ['Tables', take.tables, `promote or open ${plural(take.tableCount, 'table')}, concurrently`],
+        ['Leader record', take.leaderRecord, 'restore the catalog from its mirror where there is one; write who leads'],
+        ['Plugin directory', take.pluginDirectory, 'import what the directory holds and the catalog lacks'],
+        ['Seed tables', take.tableSeeds, 'declare the host’s seed tables, the first time only'],
+        ['Pipelines', take.pipelines, `build and start ${plural(take.pipelineCount, 'pipeline')} from committed state`],
+        ['Seed pipelines', take.pipelineSeeds, 'deploy the host’s seed pipelines, the first time only: each is built and started'],
+        ['Finishing', take.finish, 'record the seeds, prune the plugin cache, start the loaders'],
+      ].filter(([, v]) => v != null) : [];
       const stageTotal = stages.reduce((a, [, v]) => a + v, 0) || 1;
+      const memoryRows = m => (m ? [
+        ['Working set', [h('strong', { class: 'num' }, fmtBytes(m.workingSetBytes)), h('span', { class: 'muted' }, ' · what the operating system counts for the process')]],
+        ['GC heap', [h('strong', { class: 'num' }, fmtBytes(m.gcHeapBytes)), h('span', { class: 'muted' }, ` in use · ${fmtBytes(m.gcCommittedBytes)} committed`)]],
+        ['GC pauses', [h('strong', { class: 'num' }, fmtNum(m.gcPausePercent) + ' %'), h('span', { class: 'muted' }, ` of the process’s life · ${plural(m.gen2Collections, 'full collection')}`)]],
+      ] : []);
 
       const selfCard = h('section', { class: 'card nodecard self', 'aria-label': 'This node' },
         h('div', { class: 'who' }, roleBadge(role, true), h('span', { class: 'node-name' }, st.nodeId), h('span', { class: 'tag' }, 'this node')),
@@ -959,6 +1222,7 @@
           ['Health', h('span', null, healthBadge(st.health.level), st.health.reasons.length > 0 && h('ul', { class: 'muted' }, st.health.reasons.map(r => h('li', null, reasonText(r)))))],
           ['Ready', st.health.ready ? 'yes' : 'no'],
           ['Admin address', st.advertisedAdminUrl ? h('a', { href: st.advertisedAdminUrl }, st.advertisedAdminUrl) : h('span', { class: 'muted' }, 'not advertised')],
+          ...memoryRows(node.memory),
           kafka && ['Heartbeat', role === 'Leader' ? 'sending' : `${fmtMs(kafka.heartbeatAge)} since the leader’s last`],
           kafka && ['Lease', kafka.holdsLease ? 'held' : 'not held'],
           kafka && kafka.fault && ['Fence cause', h('span', { class: 'err' }, kafka.fault)],
@@ -973,14 +1237,18 @@
             ['Term', fmtInt(peer.term)],
             ['Ready', peer.role === 'Standby' ? (peer.ready ? h('span', { class: 'badge good' }, icon('check', 12), 'ready to take over') : h('span', { class: 'badge warn' }, icon('alert', 12), 'not ready')) : peer.ready ? 'yes' : 'no'],
             peer.notReadyReason && ['Because', reasonText(peer.notReadyReason)],
-            leaderElsewhere && node.leader.adminUrl && ['Admin address', h('a', { href: node.leader.adminUrl }, node.leader.adminUrl)],
-          ]))
+            peer.adminUrl ? ['Admin address', h('a', { href: peerHref(peer.adminUrl) }, peer.adminUrl)]
+              : leaderElsewhere && node.leader.adminUrl && ['Admin address', h('a', { href: peerHref(node.leader.adminUrl) }, node.leader.adminUrl)],
+            ...memoryRows(peer.memory),
+            !peer.memory && ['Memory', h('span', { class: 'muted' }, 'it did not say')],
+          ]),
+          node.processShared && peer.memory && h('p', { class: 'help' }, 'In memory the two nodes are one process, so these are the same process’s figures as this node’s, read a moment apart.'))
         : h('section', { class: 'card nodecard', 'aria-label': 'The other node' },
           h('div', { class: 'who' }, h('span', { class: 'role unknown big' }, icon('circle', 16), node.peerExpected ? 'No answer' : 'No peer'), h('span', { class: 'tag' }, 'peer')),
           h('p', { class: 'muted' }, node.peerExpected
             ? 'A second node is configured and does not answer. If this node fails, nothing takes over.'
             : 'This node was not told of another. A lone node is a valid deployment: there is just nothing to fail over to.'),
-          leaderElsewhere && kv([['Leader on record', node.leader.adminUrl ? h('a', { href: node.leader.adminUrl }, node.leader.nodeId) : node.leader.nodeId]]));
+          leaderElsewhere && kv([['Leader on record', node.leader.adminUrl ? h('a', { href: peerHref(node.leader.adminUrl) }, node.leader.nodeId) : node.leader.nodeId]]));
 
       const maxLag = Math.max(1, ...(node.stateLag || [0]));
       return h('div', { class: 'stack' },
@@ -1010,13 +1278,14 @@
                   h('td', { class: 'r' }, t.lagVersions == null ? h('span', { class: 'muted', title: 'The writer is never behind its own log' }, t.following ? '–' : 'writer') : fmtInt(t.lagVersions)))))))),
 
         h('div', { class: 'grid two' },
-          card('Last takeover', take ? `term ${take.term}, ${ago(take.at)}` : null,
+          card('Last takeover', take ? `term ${take.term}, ${ago(take.at)} · ${fmtMs(stageTotal)} in the service` : null,
             take ? h('div', { class: 'stack' },
               h('div', { class: 'stages', role: 'img', 'aria-label': stages.map(([k, v]) => `${k} ${fmtMs(v)}`).join(', ') },
                 stages.map(([k, v], i) => { const el = h('span', { class: 'stage-' + (i + 1), title: `${k}: ${fmtMs(v)}` }); el.style.flex = Math.max(v, stageTotal / 200); return el; })),
               h('table', { class: 'data' }, h('tbody', null,
-                stages.map(([k, v], i) => h('tr', { key: k }, h('td', null, h('span', { class: 'swatch stage-' + (i + 1) }), ' ', k, i === 1 && h('span', { class: 'muted' }, ` · ${take.tableCount}`), i === 2 && h('span', { class: 'muted' }, ` · ${take.pipelineCount}`)), h('td', { class: 'r' }, fmtMs(v)))),
-                kafka && kafka.lastTakeover && h('tr', null, h('td', null, 'Whole takeover, as the leadership timed it'), h('td', { class: 'r' }, fmtMs(kafka.lastTakeover.total ?? null))))))
+                stages.map(([k, v, what], i) => h('tr', { key: k }, h('td', null, h('span', { class: 'swatch stage-' + (i + 1) }), ' ', k, h('span', { class: 'sub' }, what)), h('td', { class: 'r' }, fmtMs(v)))),
+                h('tr', { class: 'total' }, h('td', null, h('strong', null, 'The service’s part'), h('span', { class: 'sub' }, 'the stages above, measured end to end on one clock')), h('td', { class: 'r' }, h('strong', null, fmtMs(stageTotal)))),
+                kafka && kafka.lastTakeover && h('tr', null, h('td', null, 'Whole takeover, as the leadership timed it', h('span', { class: 'sub' }, 'with the silence it waited out, the fencing and the storage’s promotion')), h('td', { class: 'r' }, fmtMs(kafka.lastTakeover.total ?? null))))))
               : empty('This node has not led', 'Timings of its takeover appear here once it has.'), { flush: !take }),
           card('Backend', st.backend.kind, kv([
             ...Object.entries(st.backend.settings).map(([k, v]) => [k, h('span', { class: 'mono' }, v || '–')]),
@@ -1029,6 +1298,16 @@
 
   // ── audit ───────────────────────────────────────────────────────────────────────────
 
+  /** Who made a change, and how far that is known. */
+  function callerCell(caller) {
+    const stated = ' (self-declared)';
+    if (caller === 'local') return h('span', { class: 'muted', title: 'An unauthenticated loopback caller who gave no name: nothing more is known. Set your name with the button in the header, or have the host authenticate operators.' }, 'local · unnamed');
+    if (caller === 'seed' || caller === 'service' || caller === 'plugin-directory')
+      return h('span', { class: 'muted', title: 'Done by the service itself, not by a person' }, caller);
+    if (caller.endsWith(stated)) return [h('strong', null, caller.slice(0, -stated.length)), ' ', h('span', { class: 'tag', title: 'The name the caller gave: nothing verified it' }, 'self-declared')];
+    return h('strong', { title: 'The identity the host authenticated' }, caller);
+  }
+
   views.audit = {
     title: () => 'Audit',
     kinds: ['catalog', 'pipeline', 'table', 'plugin', 'node'],
@@ -1037,7 +1316,9 @@
     render(ctx) {
       const { audit } = ctx.data;
       return h('div', { class: 'stack' },
-        pageHead({ title: 'Audit', lede: 'Every change made to this service, kept in the catalog: it survives a failover. Newest first.' }),
+        pageHead({ title: 'Audit', lede: [
+          'Every change made to this service, kept in the catalog: it survives a failover. Newest first. ',
+          store.who && !store.who.verified && 'Who is the name the host authenticated, where it does; here nobody is signed in, so it is the name a caller gave — marked self-declared — or “local”.'] }),
         h('section', { class: 'card' },
           audit.items.length === 0 ? empty('No entries', 'Deploys, resets, removals and role changes are recorded here with who asked for them.')
             : h('div', { class: 'table-wrap' }, h('table', { class: 'data cards' },
@@ -1045,7 +1326,7 @@
               h('tbody', null, audit.items.slice().reverse().map(a => h('tr', { key: 'a' + a.sequence },
                 td('#', 'r', a.sequence),
                 td('When', 'nowrap', timeEl(a.time, stamp(a.time))),
-                td('Who', null, a.caller),
+                td('Who', null, callerCell(a.caller)),
                 td('Action', null, h('span', { class: 'tag' }, a.action)),
                 td('Target', 'id wrap', a.action.startsWith('pipeline.') && a.action !== 'pipeline.remove' ? pipelineLink(a.target) : a.target),
                 td('Generation', 'nowrap', a.generationBefore == null && a.generationAfter == null ? '' : `${a.generationBefore ?? '–'} → ${a.generationAfter ?? '–'}`),

@@ -90,8 +90,55 @@ internal static class AdminSecurity
         return null;
     }
 
-    public static string Caller(HttpContext context) =>
-        context.User.Identity is { IsAuthenticated: true, Name: { Length: > 0 } name } ? name : "local";
+    /// <summary>The header a caller may state its name in when nothing verifies who it is.</summary>
+    public const string OperatorHeader = "X-Incremental-Operator";
+
+    /// <summary>Whether the host vouches for <see cref="Caller"/>: its hook answered, or
+    /// the request is authenticated under a name.</summary>
+    public static bool Verified(HttpContext context, ServiceAdminOptions options) =>
+        Clean(options.CallerName?.Invoke(context)) is not null
+        || context.User.Identity is { IsAuthenticated: true, Name: { Length: > 0 } };
+
+    /// <summary>
+    /// Who the audit records a change as. In order: what the host's hook says
+    /// (<see cref="ServiceAdminOptions.CallerName"/>); the authenticated identity's name;
+    /// the name the caller states in <see cref="OperatorHeader"/>, marked as its own word;
+    /// and <c>local</c>, which is all that is known of an unauthenticated loopback caller.
+    /// </summary>
+    public static string Caller(HttpContext context, ServiceAdminOptions options)
+    {
+        if (Clean(options.CallerName?.Invoke(context)) is { } hooked)
+            return hooked;
+        if (context.User.Identity is { IsAuthenticated: true, Name: { Length: > 0 } name })
+            return name;
+        if (options.AcceptOperatorHeader && Clean(Unescaped(context.Request.Headers[OperatorHeader].FirstOrDefault())) is { } stated)
+            return stated + " (self-declared)";
+        return "local";
+    }
+
+    /// <summary>A header carries Latin-1 only, so a name outside it arrives percent-encoded.</summary>
+    private static string? Unescaped(string? value)
+    {
+        if (value is null || !value.Contains('%'))
+            return value;
+        try
+        {
+            return Uri.UnescapeDataString(value);
+        }
+        catch (UriFormatException)
+        {
+            return value;
+        }
+    }
+
+    /// <summary>A name fit for the audit: trimmed, printable, at most 64 characters.</summary>
+    private static string? Clean(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return null;
+        var kept = new string([.. name.Trim().Where(c => !char.IsControl(c)).Take(64)]);
+        return kept.Length == 0 ? null : kept;
+    }
 }
 
 /// <summary>Wraps every endpoint: the loopback rule first, then the handler, with whatever

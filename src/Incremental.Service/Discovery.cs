@@ -63,6 +63,33 @@ public sealed record SpecTemplate(
     PipelineSpec Spec, bool Valid, IReadOnlyList<string> Problems, IReadOnlyList<string> Notes,
     IReadOnlyDictionary<string, IReadOnlyList<string>> ConnectorsForSlot);
 
+/// <summary>A table definition a declared table can name: a <see cref="TableDefinition{TKey,TRow}"/>
+/// class in a contract assembly this process has loaded. <c>DefaultName</c> is the name
+/// the definition gives itself (and the slot a pipeline reads it under);
+/// <c>DeclaredAs</c> are the tables declared from it so far.</summary>
+public sealed record TableDefinitionInfo(
+    string Definition, string Contract, string DefaultName, string KeyType, string RowType, IReadOnlyList<string> DeclaredAs);
+
+/// <summary>One difference between two versions of a plugin. <c>Kind</c> is
+/// <c>setting</c>, <c>input</c>, <c>sink</c>, <c>table</c> or <c>table-definition</c>;
+/// <c>Change</c> is <c>added</c>, <c>removed</c> or <c>changed</c>; <c>From</c> and
+/// <c>To</c> describe the member on each side in words.</summary>
+public sealed record MemberChange(string Kind, string Name, string Change, string? From, string? To);
+
+/// <summary>One definition across two versions of its plugin. <c>Change</c> is
+/// <c>added</c>, <c>removed</c>, <c>changed</c> or <c>unchanged</c> — unchanged in what is
+/// compared: its settings and, where they could be described, its slots and tables. What
+/// the definition computes is not compared.</summary>
+public sealed record DefinitionChange(string Definition, string Change, IReadOnlyList<MemberChange> Members, IReadOnlyList<string> Notes);
+
+/// <summary>What differs between two stored versions of one plugin, as far as it is
+/// declared: definitions, their settings, and — when <c>ShapesCompared</c> — their input,
+/// sink and table slots, which are found by running each definition's <c>Build</c> on the
+/// leader. State shapes are compared when a replace is planned, not here.</summary>
+public sealed record PluginDiff(
+    string Plugin, string From, string To, bool ShapesCompared, IReadOnlyList<DefinitionChange> Definitions,
+    IReadOnlyList<MemberChange> TableDefinitions, IReadOnlyList<string> Notes);
+
 /// <summary>What exists to deploy with, read from the host's registrations and the stored
 /// plugins. The lists answer on any node; describing a definition runs its <c>Build</c>,
 /// which only the leader does.</summary>
@@ -71,6 +98,13 @@ public interface IServiceDiscovery
     IReadOnlyList<ConnectorInfo> Connectors { get; }
     IReadOnlyList<ConnectionInfo> Connections { get; }
     IReadOnlyList<TableSourceInfo> TableSources { get; }
+
+    /// <summary>The table definitions in the contract assemblies loaded in this process.</summary>
+    IReadOnlyList<TableDefinitionInfo> TableDefinitions { get; }
+
+    /// <summary>What differs between two versions of a plugin. Any node answers with the
+    /// definitions and settings; the slots are compared on the leader only.</summary>
+    Task<PluginDiff> DiffAsync(string plugin, string from, string to, CancellationToken cancellationToken);
 
     /// <summary>The definition's settings, slots and tables. <paramref name="version"/>
     /// may be empty while the plugin has one stored version; <paramref name="settings"/>
@@ -111,13 +145,15 @@ internal sealed class ServiceDiscovery(ServiceContext context) : IServiceDiscove
             kinds.Add(SlotKind.AppendSink);
         var schema = (connector as IConfigDescribed)?.ConfigSchema;
         if (connector is KafkaConnector)
-            schema = WithConnections(schema!, context.KafkaConnections.Names);
+            schema = WithConnections(schema!, "connection", context.KafkaConnections.Names);
+        if (connector is FileConnector)
+            schema = WithConnections(schema!, "store", context.Registrations.ObjectStores.Keys);
         return new ConnectorInfo(name, kinds, connector is IResettableSinkConnector, schema, connector.GetType().Name);
     }
 
-    /// <summary>The schema with its <c>connection</c> property listing the names registered.</summary>
-    private static ConfigSchema WithConnections(ConfigSchema schema, IEnumerable<string> names) =>
-        schema with { Properties = [.. schema.Properties.Select(p => p.Name == "connection" ? p with { Values = [.. names.Order(StringComparer.Ordinal)] } : p)] };
+    /// <summary>The schema with the property that names a connection listing the names registered.</summary>
+    private static ConfigSchema WithConnections(ConfigSchema schema, string property, IEnumerable<string> names) =>
+        schema with { Properties = [.. schema.Properties.Select(p => p.Name == property ? p with { Values = [.. names.Order(StringComparer.Ordinal)] } : p)] };
 
     public IReadOnlyList<ConnectionInfo> Connections =>
     [
@@ -162,6 +198,138 @@ internal sealed class ServiceDiscovery(ServiceContext context) : IServiceDiscove
             }
             return sources;
         }
+    }
+
+    public IReadOnlyList<TableDefinitionInfo> TableDefinitions
+    {
+        get
+        {
+            var declared = context.Tables.Tables.ToLookup(t => t.Definition, t => t.Name, StringComparer.Ordinal);
+            var found = new List<TableDefinitionInfo>();
+            foreach (var assembly in ContractAssemblies.All)
+            {
+                Type[] types;
+                try
+                {
+                    types = assembly.GetTypes();
+                }
+                catch (System.Reflection.ReflectionTypeLoadException ex)
+                {
+                    types = [.. ex.Types.Where(t => t is not null)!];
+                }
+                foreach (var type in types.Where(t => !t.IsAbstract && typeof(ITableDefinition).IsAssignableFrom(t) && t.FullName is not null))
+                {
+                    try
+                    {
+                        if (Activator.CreateInstance(type) is ITableDefinition definition)
+                            found.Add(new TableDefinitionInfo(
+                                type.FullName!, assembly.GetName().Name!, definition.Name, definition.KeyType.Name, definition.RowType.Name,
+                                [.. declared[type.FullName!].Order(StringComparer.Ordinal)]));
+                    }
+                    catch
+                    {
+                        // A definition that cannot be constructed cannot be declared either.
+                    }
+                }
+            }
+            return [.. found.OrderBy(d => d.Definition, StringComparer.Ordinal).ThenBy(d => d.Contract, StringComparer.Ordinal)];
+        }
+    }
+
+    internal static string Text(SettingInfo setting)
+    {
+        var parts = new List<string> { setting.JsonType + (setting.Nullable ? "?" : "") };
+        if (setting.Required)
+            parts.Add("required");
+        if (setting.Default is { } value)
+            parts.Add("default " + value.GetRawText());
+        if (setting.Values is { Count: > 0 } values)
+            parts.Add("one of " + string.Join(" | ", values));
+        if (setting.Minimum is not null || setting.Maximum is not null)
+            parts.Add(string.Create(System.Globalization.CultureInfo.InvariantCulture, $"range {setting.Minimum}..{setting.Maximum}"));
+        if (setting.StateNeutral)
+            parts.Add("state-neutral");
+        return string.Join(", ", parts);
+    }
+
+    internal static List<MemberChange> Compare(string kind, IReadOnlyDictionary<string, string> from, IReadOnlyDictionary<string, string> to)
+    {
+        var changes = new List<MemberChange>();
+        foreach (var name in from.Keys.Union(to.Keys).Order(StringComparer.Ordinal))
+        {
+            var before = from.GetValueOrDefault(name);
+            var after = to.GetValueOrDefault(name);
+            if (before is null)
+                changes.Add(new MemberChange(kind, name, "added", null, after));
+            else if (after is null)
+                changes.Add(new MemberChange(kind, name, "removed", before, null));
+            else if (before != after)
+                changes.Add(new MemberChange(kind, name, "changed", before, after));
+        }
+        return changes;
+    }
+
+    public async Task<PluginDiff> DiffAsync(string plugin, string from, string to, CancellationToken cancellationToken)
+    {
+        ServiceNames.Validate(plugin, "plugin name");
+        PluginInfo Version(string version) =>
+            context.Plugins.Plugins.FirstOrDefault(p => p.Name == plugin && p.Version == version)
+            ?? throw ServiceException.NotFound($"Plugin '{plugin}' version {version}");
+        var before = Version(from);
+        var after = Version(to);
+        var notes = new List<string>();
+        var shapes = context.IsLeader && before.Kind == PluginKind.Pipeline;
+        if (!context.IsLeader && before.Kind == PluginKind.Pipeline)
+            notes.Add("Slots and tables are not compared here: finding them runs each definition's Build, which only the leader does.");
+
+        var definitions = new List<DefinitionChange>();
+        var old = before.Definitions.ToDictionary(d => d.Name, StringComparer.Ordinal);
+        var @new = after.Definitions.ToDictionary(d => d.Name, StringComparer.Ordinal);
+        foreach (var name in old.Keys.Union(@new.Keys).Order(StringComparer.Ordinal))
+        {
+            if (!old.TryGetValue(name, out var a))
+            {
+                definitions.Add(new DefinitionChange(name, "added", [], []));
+                continue;
+            }
+            if (!@new.TryGetValue(name, out var b))
+            {
+                definitions.Add(new DefinitionChange(name, "removed", [], []));
+                continue;
+            }
+            var members = Compare("setting", a.Settings.ToDictionary(s => s.Name, Text, StringComparer.Ordinal), b.Settings.ToDictionary(s => s.Name, Text, StringComparer.Ordinal));
+            var definitionNotes = new List<string>();
+            if (shapes)
+            {
+                try
+                {
+                    var x = await DescribeDefinitionAsync(plugin, from, name, null, cancellationToken).ConfigureAwait(false);
+                    var y = await DescribeDefinitionAsync(plugin, to, name, null, cancellationToken).ConfigureAwait(false);
+                    static string Slot(SlotShape s) =>
+                        $"{s.Kind}<{(s.KeyType is null ? "" : s.KeyType + ", ")}{s.Type}>" + (s.Members is { Count: > 0 } members ? "\n" + string.Join("\n", members) : "");
+                    static string Table(TableSlotShape t) => $"{t.Access} {t.KeyType} → {t.RowType} ({t.Definition})";
+                    members.AddRange(Compare("input", x.Inputs.ToDictionary(s => s.Name, Slot, StringComparer.Ordinal), y.Inputs.ToDictionary(s => s.Name, Slot, StringComparer.Ordinal)));
+                    members.AddRange(Compare("sink", x.Sinks.ToDictionary(s => s.Name, Slot, StringComparer.Ordinal), y.Sinks.ToDictionary(s => s.Name, Slot, StringComparer.Ordinal)));
+                    members.AddRange(Compare("table",
+                        x.Tables.GroupBy(t => t.Slot, StringComparer.Ordinal).ToDictionary(g => g.Key, g => string.Join("; ", g.Select(Table)), StringComparer.Ordinal),
+                        y.Tables.GroupBy(t => t.Slot, StringComparer.Ordinal).ToDictionary(g => g.Key, g => string.Join("; ", g.Select(Table)), StringComparer.Ordinal)));
+                    definitionNotes.AddRange(x.Notes.Select(n => $"{Short(from)}: {n}"));
+                    definitionNotes.AddRange(y.Notes.Select(n => $"{Short(to)}: {n}"));
+                }
+                catch (ServiceException ex)
+                {
+                    definitionNotes.Add($"Its slots could not be compared: {ex.Message}");
+                }
+            }
+            definitions.Add(new DefinitionChange(name, members.Count > 0 ? "changed" : "unchanged", members, definitionNotes));
+        }
+
+        var tables = Compare("table-definition",
+            before.TableDefinitions.ToDictionary(t => t, _ => "defined", StringComparer.Ordinal),
+            after.TableDefinitions.ToDictionary(t => t, _ => "defined", StringComparer.Ordinal));
+        return new PluginDiff(plugin, from, to, shapes, definitions, tables, notes);
+
+        static string Short(string version) => version.Length > 8 ? version[..8] : version;
     }
 
     public async Task<DefinitionDescription> DescribeDefinitionAsync(

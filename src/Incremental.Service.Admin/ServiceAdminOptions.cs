@@ -1,3 +1,5 @@
+using Microsoft.AspNetCore.Http;
+
 namespace Incremental.Service.Admin;
 
 /// <summary>
@@ -27,6 +29,18 @@ public sealed class ServiceAdminOptions
 
     /// <summary>Required for plugin upload, rescan and delete; defaults to <see cref="AuthorizationPolicy"/>.</summary>
     public string? PluginPolicy { get; set; }
+
+    /// <summary>Names the caller for the audit: return the operator's name from whatever
+    /// the host knows of the request (a claim, a client certificate, a gateway's header),
+    /// or null to fall back to the authenticated identity's name. What it returns is
+    /// recorded as it is, so return only what the host has verified.</summary>
+    public Func<HttpContext, string?>? CallerName { get; set; }
+
+    /// <summary>Whether a caller nobody has authenticated may state its own name in the
+    /// <c>X-Incremental-Operator</c> header. The audit records it as
+    /// <c>name (self-declared)</c>: a courtesy between colleagues who share a loopback
+    /// admin surface, not evidence. Ignored for a caller the host has named.</summary>
+    public bool AcceptOperatorHeader { get; set; } = true;
 
     /// <summary>Every mutating endpoint answers 403 and the UI shows no actions.</summary>
     public bool ReadOnly { get; set; }

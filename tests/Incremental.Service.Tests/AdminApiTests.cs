@@ -312,6 +312,11 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         Assert.Equal("InvalidOperationException", failed["faults"][0].GetProperty("exceptionType").GetString());
         Assert.Contains("negative quantity", failed["faults"][0].GetProperty("message").GetString());
         Assert.Contains("CheckedOrders", failed["faults"][0].GetProperty("stack").GetString());
+        // A fault names the spec's generation — the header's and the audit's number — and
+        // which of the circuits built for it on this node it was.
+        Assert.All(failed["faults"].EnumerateArray(), f => Assert.Equal(failed["pipeline"].GetProperty("generation").GetInt64(), f.GetProperty("generation").GetInt64()));
+        var runs = failed["faults"].EnumerateArray().Select(f => f.GetProperty("run").GetInt64()).ToList();
+        Assert.True(runs.Count > 1 && runs.Distinct().Count() == runs.Count && runs.All(r => r >= 1), string.Join(",", runs));
 
         var metrics = await Admin.Get("pipelines/enrich-orders/metrics");
         await TestService.Eventually(() => Admin.Get("pipelines/enrich-orders/metrics").Result["seconds"].GetArrayLength() > 0, "a metrics sample");
@@ -329,6 +334,120 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         Assert.Contains("negative quantity", letters["items"][0].GetProperty("message").GetString());
         Assert.Contains("\"quantity\":-1", letters["items"][0].GetProperty("record").GetString());
         Assert.Equal("n2.select", letters["items"][0].GetProperty("operator").GetString());
+    }
+
+    [Fact]
+    public async Task The_node_says_what_its_process_holds_and_where_its_takeover_went()
+    {
+        var node = await Admin.Get("node");
+        var memory = node["memory"];
+        Assert.True(memory.GetProperty("workingSetBytes").GetInt64() > 10 << 20);
+        Assert.True(memory.GetProperty("gcHeapBytes").GetInt64() > 1 << 20);
+        Assert.True(memory.GetProperty("gcCommittedBytes").GetInt64() > 0);
+        Assert.InRange(memory.GetProperty("gcPausePercent").GetDouble(), 0, 100);
+        Assert.True(node["processShared"].GetBoolean()); // in memory, a peer is this process
+
+        // The stages of StartLeading are measured on one clock and leave nothing over.
+        var take = node["status"].GetProperty("lastTakeover");
+        double Stage(string name) => take.GetProperty(name).GetDouble();
+        var stages = new[] { "leaderRecord", "pluginDirectory", "tableSeeds", "pipelines", "pipelineSeeds", "finish" };
+        Assert.All(stages, s => Assert.True(Stage(s) >= 0, s));
+        Assert.InRange(stages.Sum(Stage), Stage("startLeading") - 0.05, Stage("startLeading") + 0.05);
+        // This host deploys its pipelines as seeds: that is where its first lead went.
+        Assert.True(Stage("pipelineSeeds") > Stage("finish"));
+
+        // A table's size is an estimate from a sample, and says of how many rows.
+        var size = (await Admin.Get("tables/instruments"))["size"];
+        Assert.Equal(256, size.GetProperty("sampledRows").GetInt32());
+        Assert.Equal(300, size.GetProperty("rows").GetInt64());
+        Assert.InRange(size.GetProperty("meanRowBytes").GetDouble(), 30, 400);
+        // The mean of the sample times every row of the table, not times the sample.
+        Assert.InRange(size.GetProperty("rowsBytes").GetInt64(), 300 * (size.GetProperty("meanRowBytes").GetDouble() - 0.1), 300 * (size.GetProperty("meanRowBytes").GetDouble() + 0.1));
+        Assert.True(size.GetProperty("historyChanges").GetInt64() >= 300); // the in-memory log holds its history here
+        Assert.True(size.GetProperty("historyBytes").GetInt64() >= size.GetProperty("rowsBytes").GetInt64());
+
+        // A contract is used by the tables declared from its definitions.
+        var contract = (await Admin.Get("plugins?limit=5"))["items"].EnumerateArray().Single(p => p.GetProperty("kind").GetString() == "Contract");
+        Assert.Contains("instruments", contract.GetProperty("tables").EnumerateArray().Select(t => t.GetString()));
+        Assert.Contains("counterparties", contract.GetProperty("tables").EnumerateArray().Select(t => t.GetString()));
+    }
+
+    [Fact]
+    public async Task Table_definitions_are_listed_and_a_declare_is_checked_whole_at_its_dry_run()
+    {
+        var definitions = new List<JsonElement>();
+        for (int? skip = 0; skip is not null;)
+        {
+            var page = await Admin.Get($"table-definitions?skip={skip}&limit=5");
+            definitions.AddRange(page["items"].EnumerateArray());
+            skip = page.Body.TryGetProperty("next", out var next) ? next.GetInt32() : null;
+        }
+        var instruments = definitions.Single(d => d.GetProperty("defaultName").GetString() == "instruments");
+        Assert.Equal("Int32", instruments.GetProperty("keyType").GetString());
+        Assert.Equal("Instrument", instruments.GetProperty("rowType").GetString());
+        Assert.Equal("Acme.Contracts", instruments.GetProperty("contract").GetString());
+        Assert.Equal(["instruments"], instruments.GetProperty("declaredAs").EnumerateArray().Select(t => t.GetString()));
+        var definition = instruments.GetProperty("definition").GetString()!;
+
+        var tables = Admin.Node.Node.Tables.Tables.Count;
+        var plan = await Admin.Post("tables?dryRun=true", new { name = "instruments-eu", definition, loader = new { kind = "file", connection = "refdata", config = new { path = "eu.jsonl" } }, onUnreadable = "Skip" });
+        Assert.Equal(200, plan.Code);
+        var steps = plan["plan"].GetProperty("steps").EnumerateArray().Select(x => x.GetString()!).ToList();
+        Assert.Contains("Int32 → Instrument", steps[0]);
+        Assert.Contains("file loader on connection 'refdata'", steps[^1]);
+        Assert.Contains("skipped", steps[^1]);
+        Assert.Contains("no loader", (await Admin.Post("tables?dryRun=true", new { name = "instruments-eu", definition }))["plan"].GetProperty("steps")[2].GetString());
+
+        // Everything the declare itself would refuse, the dry run refuses.
+        (await Admin.Post("tables?dryRun=true", new { name = "instruments", definition })).IsError(409, "conflict");
+        (await Admin.Post("tables?dryRun=true", new { name = "Not Valid", definition })).IsError(400, "invalid");
+        (await Admin.Post("tables?dryRun=true", new { name = "svc.mine", definition })).IsError(400, "invalid");
+        (await Admin.Post("tables?dryRun=true", new { name = "x", definition = "Acme.Contracts.NoSuchTable" })).IsError(400, "invalid");
+        (await Admin.Post("tables?dryRun=true", new { name = "x", definition, contract = "Other.Contracts" })).IsError(400, "invalid");
+        (await Admin.Post("tables?dryRun=true", new { name = "x", definition, loader = new { kind = "carrier-pigeon" } })).IsError(400, "invalid");
+        (await Admin.Post("tables?dryRun=true", new { name = "x", definition, loader = new { kind = "file", connection = "nope", config = new { path = "a" } } })).IsError(400, "invalid");
+        (await Admin.Post("tables?dryRun=true", new { name = "x", definition, loader = new { kind = "file", connection = "refdata" } })).IsError(400, "invalid");
+        (await Admin.Post("tables?dryRun=true", new { name = "x", definition, loader = new { kind = "kafka", connection = "nope", config = new { topic = "t" } } })).IsError(400, "invalid");
+        // …and the same goes for the declare, as a refusal rather than a failure.
+        (await Admin.Post("tables", new { name = "x", definition = "Acme.Contracts.NoSuchTable" })).IsError(400, "invalid");
+        Assert.Equal(tables, Admin.Node.Node.Tables.Tables.Count);
+    }
+
+    [Fact]
+    public async Task The_audit_names_who_the_host_names_then_who_the_caller_says_it_is_then_local()
+    {
+        await using var admin = await AdminFixture.StartAsync();
+        var definition = Admin.Node.Node.Tables.Spec("instruments").Definition;
+        async Task<string> DeclaredBy(AdminFixture fixture, string table, Action<HttpRequestMessage>? configure)
+        {
+            var answer = await fixture.SendAsync(HttpMethod.Post, "tables", new { name = table, definition }, configure);
+            Assert.Equal(201, answer.Code);
+            return fixture.Node.Node.Catalog.Audit().Single(a => a.Action == "table.declare" && a.Target == table).Caller;
+        }
+
+        Assert.Equal("local", await DeclaredBy(admin, "t-anon", null));
+        Assert.Equal("ana (self-declared)", await DeclaredBy(admin, "t-ana", r => r.Headers.Add("X-Incremental-Operator", " ana ")));
+        // A header carries Latin-1, so the UI sends other names percent-encoded.
+        Assert.Equal("José (self-declared)", await DeclaredBy(admin, "t-jose", r => r.Headers.Add("X-Incremental-Operator", "Jos%C3%A9")));
+        Assert.Equal(new string('x', 64) + " (self-declared)", await DeclaredBy(admin, "t-long", r => r.Headers.Add("X-Incremental-Operator", new string('x', 500))));
+        var who = await admin.Get("whoami", r => r.Headers.Add("X-Incremental-Operator", "ana"));
+        Assert.Equal("ana (self-declared)", who["caller"].GetString());
+        Assert.False(who["verified"].GetBoolean());
+        Assert.Equal("X-Incremental-Operator", who["operatorHeader"].GetString());
+        Assert.Equal("local", (await admin.Get("whoami"))["caller"].GetString());
+
+        // A host that knows its callers names them, and then nobody names themselves.
+        await using var gated = await AdminFixture.StartAsync(o => o.Admin = a =>
+        {
+            a.CallerName = context => context.Request.Headers["X-Gateway-User"].FirstOrDefault();
+            a.AcceptOperatorHeader = false;
+        });
+        Assert.Equal("op-7", await DeclaredBy(gated, "t-gated", r => { r.Headers.Add("X-Gateway-User", "op-7"); r.Headers.Add("X-Incremental-Operator", "mallory"); }));
+        Assert.Equal("local", await DeclaredBy(gated, "t-unnamed", r => r.Headers.Add("X-Incremental-Operator", "mallory")));
+        var named = await gated.Get("whoami", r => r.Headers.Add("X-Gateway-User", "op-7"));
+        Assert.True(named["verified"].GetBoolean());
+        Assert.Equal("op-7", named["caller"].GetString());
+        Assert.False(named.Body.TryGetProperty("operatorHeader", out _));
     }
 
     // ── discovery: what a deploy needs to know ─────────────────────────────────────────
@@ -473,6 +592,19 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         Assert.Equal(["by-country", "by-symbol", "by-tier", "largest"], nodes.Where(n => n.GetProperty("role").GetString() == "sink").Select(n => n.GetProperty("label").GetString()).Order());
         Assert.Contains(nodes, n => n.GetProperty("role").GetString() == "exchange");
         Assert.Contains(nodes, n => n.TryGetProperty("name", out var name) && name.GetString() == "priced-rates");
+        // A lookup is drawn to the table it probes, though the table is no input of it;
+        // a join consumes the table's changes and is reached through its inputs.
+        var tableIds = nodes.Where(n => n.GetProperty("role").GetString() == "table").ToDictionary(n => n.GetProperty("id").GetString()!, n => n.GetProperty("label").GetString());
+        static bool IsLookup(JsonElement n) => n.TryGetProperty("kind", out var kind) && kind.GetString()!.StartsWith("tableLookup");
+        var lookups = nodes.Where(IsLookup).ToList();
+        Assert.NotEmpty(lookups);
+        Assert.All(lookups, n =>
+        {
+            var probed = Assert.Single(n.GetProperty("probes").EnumerateArray()).GetString()!;
+            Assert.Contains(probed, tableIds.Keys);
+            Assert.DoesNotContain(probed, n.GetProperty("inputs").EnumerateArray().Select(i => i.GetString()));
+        });
+        Assert.All(nodes.Where(n => !IsLookup(n)), n => Assert.False(n.TryGetProperty("probes", out _)));
 
         var keyed = await Admin.Get("pipelines/trader-activity/graph");
         Assert.Equal(["counts", "quantities"], keyed["nodes"].EnumerateArray().Where(n => n.GetProperty("role").GetString() == "sink").Select(n => n.GetProperty("label").GetString()).Order());
@@ -1156,9 +1288,10 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         var calls = new List<(string Path, string Method)>();
         foreach (var script in scripts)
         {
-            // api('…') and all('…') with a literal or template first argument, and — where
+            // api('…') and all('…') with a literal or template first argument — each call
+            // on its own, also where several stand in one statement — and, where
             // the path is built first — the `path` variables of the action dialogs.
-            foreach (Match call in Regex.Matches(script, "\\b(?:api|all)\\(\\s*(['`])((?:(?!\\1).)*)\\1([^;]*)"))
+            foreach (Match call in Regex.Matches(script, "\\b(?:api|all)\\(\\s*(['`])((?:(?!\\1).)*)\\1((?:(?!\\b(?:api|all)\\()[^;])*)"))
             {
                 var method = Regex.Match(call.Groups[3].Value, "method:\\s*'([A-Z]+)'") is { Success: true } m ? m.Groups[1].Value : "GET";
                 // 'pipelines/' + enc(id): a path with one more segment.
@@ -1179,14 +1312,23 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         // The check has teeth: a path the server does not map is not matched.
         Assert.DoesNotContain(endpoints, e => e.Pattern.IsMatch("pipelines/X/graphs"));
 
+        // The forms are built from these: a UI that stopped asking would be hand-written JSON again.
+        foreach (var needed in new[] { "connectors", "connections", "table-definitions", "table-sources", "whoami", "plugins/X/X/definitions/X", "plugins/X/X/definitions/X/template", "plugins/X/diff" })
+            Assert.Contains((needed, "GET"), shapes);
+        Assert.Contains(("pipelines/validate", "POST"), shapes);
+        Assert.Contains(("tables", "POST"), shapes);
+
         // And the read routes among them answer.
+        var pluginVersion = await PluginVersionAsync();
         foreach (var path in shapes.Where(s => s.Method == "GET" && s.Path != "events").Select(s => s.Path).Distinct())
         {
             var concrete = path.StartsWith("pipelines/X") ? path.Replace("pipelines/X", "pipelines/enrich-orders")
                 : path.StartsWith("tables/X") ? path.Replace("tables/X", "tables/instruments")
+                : path.StartsWith("plugins/X/X/definitions/X") ? path.Replace("plugins/X/X/definitions/X", $"plugins/{DemoHost.Plugin}/{pluginVersion}/definitions/desk-risk")
+                : path == "plugins/X/diff" ? $"plugins/{DemoHost.Plugin}/diff?from={pluginVersion}&to={pluginVersion}"
                 : path.StartsWith("plugins/X") ? path.Replace("plugins/X", "plugins/" + DemoHost.Plugin)
                 : path;
-            Assert.DoesNotContain("X", concrete.Split('/'));
+            Assert.DoesNotContain("X", concrete.Split('?')[0].Split('/'));
             var answer = await Admin.Get(concrete);
             Assert.True(answer.Code == 200, $"GET {concrete}: {answer.Code} {answer.ErrorCode}");
         }

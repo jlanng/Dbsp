@@ -53,11 +53,16 @@ public sealed record PluginDefinitionInfo(
 /// (null in a manifest stored before the two were told apart: the file's name then).
 /// <c>Sequence</c> orders the versions of one name by when they were imported — it is the
 /// audit sequence of the import, which only grows, whoever leads — and is what decides
-/// which stored version of a contract a starting process loads: the newest.</remarks>
+/// which stored version of a contract a starting process loads: the newest.
+/// <c>ImportedAt</c> and <c>ImportedBy</c> are when the version was stored and the caller
+/// the import was audited under; <c>InformationalVersion</c> is the main assembly's
+/// <c>AssemblyInformationalVersion</c> — what its author called the build — when it has
+/// one. All three are null in a manifest stored before they existed.</remarks>
 public sealed record PluginManifest(
     string Name, string Version, PluginKind Kind, string MainAssembly, IReadOnlyList<PluginFile> Files,
     IReadOnlyList<PluginDefinitionInfo> Definitions, IReadOnlyList<string> TableDefinitions, string Fingerprint,
-    string? AssemblyName = null, long Sequence = 0)
+    string? AssemblyName = null, long Sequence = 0, DateTimeOffset? ImportedAt = null, string? ImportedBy = null,
+    string? InformationalVersion = null)
 {
     public long Bytes => Files.Sum(f => f.Size);
 
@@ -786,7 +791,12 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
             name.ToLowerInvariant(), version, kind, mainFile ?? name + ".dll", files ?? [],
             definitions.Select(d => d.Describe()).OrderBy(d => d.Name, StringComparer.Ordinal).ToList(),
             assembly.GetTypes().Where(t => !t.IsAbstract && typeof(ITableDefinition).IsAssignableFrom(t)).Select(t => t.FullName!).Order().ToList(),
-            Fingerprint(assembly), name);
+            Fingerprint(assembly), name)
+        {
+            InformationalVersion = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion is { Length: > 0 } text
+                ? (text.Length > 128 ? text[..128] : text)
+                : null,
+        };
     }
 
     /// <summary>
@@ -1345,7 +1355,7 @@ internal sealed class PluginCatalog(ServiceContext context) : IPluginCatalog
                 // The audit entry's sequence is the version's place among the versions of
                 // its name: later imports sort after it on every node.
                 var sequence = write.Audit(context.NodeId, context.Term, caller, "plugin.import", $"{manifest.Name}/{version}", null, null);
-                manifest = manifest with { Sequence = sequence };
+                manifest = manifest with { Sequence = sequence, ImportedAt = DateTimeOffset.UtcNow, ImportedBy = caller ?? "local" };
                 write.Put($"plugin/{manifest.Name}/{version}", manifest);
                 await write.CommitAsync(cancellationToken).ConfigureAwait(false);
             }

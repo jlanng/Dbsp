@@ -215,15 +215,9 @@ public sealed class KafkaServiceBackend : IServiceBackend
             _ = inner.WhenFinished.ContinueWith(_ => _finished.TrySetResult(), TaskScheduler.Default);
 
             if (options.ProbeListen is { } listen)
-                _listener = LeadershipProbe.Listen(inner, listen, () => Detail(callbacks.DescribeSelf()));
+                _listener = LeadershipProbe.Listen(inner, listen, () => PeerDetail.Write(callbacks.DescribeSelf()));
             await inner.StartAsync(cancellationToken).ConfigureAwait(false);
         }
-
-        // The probe line's fourth token: no spaces, so the reason and the address are
-        // escaped. "ready" or "notready:{reason}", then ";admin={url}" when there is one.
-        private static string Detail(PeerInfo self) =>
-            (self.Ready ? "ready" : "notready:" + Uri.EscapeDataString(self.NotReadyReason ?? ""))
-            + (self.AdminUrl is { Length: > 0 } url ? ";admin=" + Uri.EscapeDataString(url) : "");
 
         private KafkaLeadership Started => Inner ?? throw new InvalidOperationException("The leadership has not been started.");
 
@@ -256,16 +250,7 @@ public sealed class KafkaServiceBackend : IServiceBackend
             }
             if (answer is null)
                 return null;
-            var parts = (answer.Detail ?? "").Split(';');
-            var ready = parts[0] == "ready";
-            string? reason = null;
-            if (!ready)
-                reason = parts[0].StartsWith("notready:", StringComparison.Ordinal)
-                    ? Uri.UnescapeDataString(parts[0]["notready:".Length..])
-                    : "the node gave no readiness";
-            var admin = parts.Skip(1).FirstOrDefault(p => p.StartsWith("admin=", StringComparison.Ordinal));
-            return new PeerInfo(
-                answer.NodeId, answer.Role, answer.Term, ready, reason, admin is null ? null : Uri.UnescapeDataString(admin["admin=".Length..]));
+            return PeerDetail.Read(answer.NodeId, answer.Role, answer.Term, answer.Detail);
         }
 
         public IUpsertSink<TKey, TRow> Leased<TKey, TRow>(IUpsertSink<TKey, TRow> sink) where TKey : notnull => Started.Leased(sink);
@@ -638,5 +623,34 @@ internal sealed class KafkaBlobStore : IBlobStore, IDisposable
         {
             _gate.Release();
         }
+    }
+}
+
+/// <summary>What a node says of itself in the leadership probe's answer, and how the
+/// other node reads it.</summary>
+internal static class PeerDetail
+{
+    // The probe line's fourth token: no spaces, so the reason and the address are
+    // escaped. "ready" or "notready:{reason}", then ";admin={url}" when there is one
+    // and ";mem={five numbers}". A reader skips the parts it does not know.
+    public static string Write(PeerInfo self) =>
+        (self.Ready ? "ready" : "notready:" + Uri.EscapeDataString(self.NotReadyReason ?? ""))
+        + (self.AdminUrl is { Length: > 0 } url ? ";admin=" + Uri.EscapeDataString(url) : "")
+        + (self.Memory is { } memory ? ";mem=" + memory.Encode() : "");
+
+    public static PeerInfo Read(string nodeId, NodeRole role, long term, string? detail)
+    {
+        var parts = (detail ?? "").Split(';');
+        var ready = parts[0] == "ready";
+        string? reason = null;
+        if (!ready)
+            reason = parts[0].StartsWith("notready:", StringComparison.Ordinal)
+                ? Uri.UnescapeDataString(parts[0]["notready:".Length..])
+                : "the node gave no readiness";
+        var admin = parts.Skip(1).FirstOrDefault(p => p.StartsWith("admin=", StringComparison.Ordinal));
+        var memory = parts.Skip(1).FirstOrDefault(p => p.StartsWith("mem=", StringComparison.Ordinal));
+        return new PeerInfo(
+            nodeId, role, term, ready, reason, admin is null ? null : Uri.UnescapeDataString(admin["admin=".Length..]),
+            memory is null ? null : ProcessMemory.Decode(memory["mem=".Length..]));
     }
 }

@@ -54,6 +54,15 @@ internal static class AdminApi
             backend = node.Backend.Describe().Kind,
         }));
 
+        // Who the audit would record a change made by this request as, and how that is
+        // known: a name the host verified, one the caller only stated, or nothing.
+        Get("/whoami", (HttpContext context) => Json(new
+        {
+            caller = AdminSecurity.Caller(context, options),
+            verified = AdminSecurity.Verified(context, options),
+            operatorHeader = options.AcceptOperatorHeader ? AdminSecurity.OperatorHeader : null,
+        }));
+
         // ── node ───────────────────────────────────────────────────────────────────────
 
         Get("/node", async (HttpContext context) =>
@@ -90,6 +99,8 @@ internal static class AdminApi
                     .Distinct(StringComparer.Ordinal)
                     .ToDictionary(n => n, n => ContractAssemblies.VersionOf(n) ?? "built-in", StringComparer.Ordinal),
                 liveContexts = node.Plugins.LiveContexts,
+                memory = ProcessMemory.Read(),
+                processShared = node.Backend.Describe().Kind == "in-memory",
                 stateLag,
                 rates = latest.TryGetValue("", out var total) ? AdminEventHub.Rates(total) : null,
                 events = new { clients = state.Hub.Clients, dropped = state.Hub.Dropped, aborted = state.Hub.Aborted },
@@ -101,7 +112,7 @@ internal static class AdminApi
             var dryRun = Flag(context, "dryRun");
             RequireConfirm(context, node.NodeId, dryRun);
             var plan = await node.TakeOverAsync(
-                new NodeActionOptions(Flag(context, "force"), dryRun, AdminSecurity.Caller(context)), context.RequestAborted);
+                new NodeActionOptions(Flag(context, "force"), dryRun, AdminSecurity.Caller(context, options)), context.RequestAborted);
             return Json(new { plan });
         }), options.NodePolicy);
 
@@ -110,7 +121,7 @@ internal static class AdminApi
             var dryRun = Flag(context, "dryRun");
             RequireConfirm(context, node.NodeId, dryRun);
             var plan = await node.StepDownAsync(
-                new NodeActionOptions(Flag(context, "force"), dryRun, AdminSecurity.Caller(context)), context.RequestAborted);
+                new NodeActionOptions(Flag(context, "force"), dryRun, AdminSecurity.Caller(context, options)), context.RequestAborted);
             return Json(new { plan });
         }), options.NodePolicy);
 
@@ -167,6 +178,7 @@ internal static class AdminApi
                         holdsFloor = stats.FloorHeldBy == p.Id,
                     }),
                 retainedHistoryVersions = node.Backend.RetainedHistoryVersions,
+                size = Size(node, name),
                 unreadable = node.Tables.Unreadable(name).TakeLast(options.MaxRows).Select(u => new
                 {
                     sequence = u.Sequence,
@@ -213,9 +225,8 @@ internal static class AdminApi
         {
             var spec = await ReadSpecAsync<TableSpec>(context, null);
             if (Flag(context, "dryRun"))
-                return Json(new { plan = new ActionPlan("table.declare", spec.Name, true,
-                    [$"create the log of table '{spec.Name}' and open it as its writer", spec.Loader is { } l ? $"start its {l.Kind} loader" : "no loader: a pipeline or the host writes it"]) });
-            await node.Tables.DeclareAsync(spec, context.RequestAborted, AdminSecurity.Caller(context));
+                return Json(new { plan = node.Tables.PlanDeclare(spec) });
+            await node.Tables.DeclareAsync(spec, context.RequestAborted, AdminSecurity.Caller(context, options));
             return Json(new { table = await TableItemAsync(state, node.Tables.Tables.First(t => t.Name == spec.Name)) }, 201);
         }), options.TablePolicy);
 
@@ -223,7 +234,7 @@ internal static class AdminApi
         {
             var dryRun = Flag(context, "dryRun");
             RequireConfirm(context, name, dryRun);
-            return Json(new { plan = await node.Tables.RestartLoaderAsync(name, Action(context, dryRun), context.RequestAborted) });
+            return Json(new { plan = await node.Tables.RestartLoaderAsync(name, Action(context, dryRun, options), context.RequestAborted) });
         }), options.TablePolicy);
 
         Mutation(api.MapPost("/tables/{name}/reopen", async (HttpContext context, string name) =>
@@ -249,7 +260,7 @@ internal static class AdminApi
         {
             var dryRun = Flag(context, "dryRun");
             RequireConfirm(context, name, dryRun);
-            return Json(new { plan = await node.Tables.RemoveAsync(name, Action(context, dryRun), context.RequestAborted) });
+            return Json(new { plan = await node.Tables.RemoveAsync(name, Action(context, dryRun, options), context.RequestAborted) });
         }), options.TablePolicy);
 
         // ── pipelines ──────────────────────────────────────────────────────────────────
@@ -326,6 +337,7 @@ internal static class AdminApi
                 {
                     time = f.Time,
                     generation = f.Generation,
+                    run = f.Run,
                     exceptionType = f.ExceptionType,
                     message = state.Message(f.Message),
                     stack = state.Message(f.Stack),
@@ -404,7 +416,7 @@ internal static class AdminApi
                 var other => throw new AdminException(400, "invalid-parameter", $"state must be keep or reset, not '{other}'."),
             };
             var result = await node.Pipelines.DeployAsync(
-                spec, new DeployOptions(choice, IfMatch(context), Flag(context, "dryRun"), AdminSecurity.Caller(context)), context.RequestAborted);
+                spec, new DeployOptions(choice, IfMatch(context), Flag(context, "dryRun"), AdminSecurity.Caller(context, options)), context.RequestAborted);
             return Json(new { spec = AdminJson.Spec(result.Spec), shape = result.Shape, plan = result.Plan });
         }), options.PipelinePolicy);
 
@@ -415,7 +427,7 @@ internal static class AdminApi
                 var dryRun = Flag(context, "dryRun");
                 if (action == "reset")
                     RequireConfirm(context, id, dryRun);
-                var actionOptions = Action(context, dryRun);
+                var actionOptions = Action(context, dryRun, options);
                 var plan = action switch
                 {
                     "start" => await node.Pipelines.StartAsync(id, actionOptions, context.RequestAborted),
@@ -431,7 +443,7 @@ internal static class AdminApi
         {
             var dryRun = Flag(context, "dryRun");
             RequireConfirm(context, id, dryRun);
-            return Json(new { plan = await node.Pipelines.RemoveAsync(id, Action(context, dryRun), context.RequestAborted) });
+            return Json(new { plan = await node.Pipelines.RemoveAsync(id, Action(context, dryRun, options), context.RequestAborted) });
         }), options.PipelinePolicy);
 
         // ── plugins ────────────────────────────────────────────────────────────────────
@@ -527,6 +539,40 @@ internal static class AdminApi
             return Json(Paged(connections.Skip(skip).Take(limit).Cast<object>().ToList(), connections.Count, skip, limit));
         });
 
+        Get("/table-definitions", (HttpContext context) =>
+        {
+            var definitions = node.Discovery.TableDefinitions;
+            var (skip, limit) = Page(context, options);
+            return Json(Paged(definitions.Skip(skip).Take(limit).Cast<object>().ToList(), definitions.Count, skip, limit));
+        });
+
+        // What differs between two stored versions of a plugin: definitions, settings and
+        // (on the leader) slots and tables.
+        Get("/plugins/{name}/diff", async (HttpContext context, string name) =>
+        {
+            var from = context.Request.Query["from"].FirstOrDefault();
+            var to = context.Request.Query["to"].FirstOrDefault();
+            if (string.IsNullOrEmpty(from) || string.IsNullOrEmpty(to))
+                throw new AdminException(400, "invalid-parameter", "A diff needs two versions: from and to.");
+            var diff = await node.Discovery.DiffAsync(name, from, to, context.RequestAborted);
+            return Json(new
+            {
+                diff.Plugin,
+                diff.From,
+                diff.To,
+                diff.ShapesCompared,
+                definitions = diff.Definitions.Take(options.MaxRows).Select(d => new
+                {
+                    d.Definition,
+                    d.Change,
+                    members = d.Members.Take(options.MaxRows),
+                    notes = d.Notes.Take(options.MaxRows).Select(n => state.Message(n) ?? "(hidden: ExposeRowData is off)"),
+                }),
+                tableDefinitions = diff.TableDefinitions.Take(options.MaxRows),
+                notes = diff.Notes.Take(options.MaxRows),
+            });
+        });
+
         Get("/table-sources", (HttpContext context) =>
         {
             var sources = node.Discovery.TableSources;
@@ -567,7 +613,7 @@ internal static class AdminApi
                 PluginManifest manifest;
                 try
                 {
-                    manifest = await node.Plugins.ImportZipAsync(file, context.RequestAborted, AdminSecurity.Caller(context));
+                    manifest = await node.Plugins.ImportZipAsync(file, context.RequestAborted, AdminSecurity.Caller(context, options));
                 }
                 catch (InvalidDataException ex)
                 {
@@ -628,7 +674,7 @@ internal static class AdminApi
                 plugin.LoadState == "loaded" ? "its load context stays until nothing uses it" : "it is not loaded on this node",
             ]);
             if (!dryRun)
-                await node.Plugins.DeleteAsync(name, version, context.RequestAborted, AdminSecurity.Caller(context));
+                await node.Plugins.DeleteAsync(name, version, context.RequestAborted, AdminSecurity.Caller(context, options));
             return Json(new { plan });
         }), options.PluginPolicy);
 
@@ -674,6 +720,7 @@ internal static class AdminApi
             deadLetterSink = p.DeadLetterSink is null ? null : new
             {
                 connector = p.DeadLetterSink.Connector,
+                binding = spec?.DeadLetters is { } deadLetters ? Binding(deadLetters) : null,
                 delivered = p.DeadLetterSink.Delivered,
                 batches = p.DeadLetterSink.Batches,
                 writeInFlightSince = p.DeadLetterSink.WriteInFlightSince,
@@ -683,6 +730,9 @@ internal static class AdminApi
             },
             committedStep = p.CommittedStep,
             pending = spec?.Pending,
+            deadLettersBound = spec?.DeadLetters is not null,
+            rolledBack = p.RolledBack,
+            replaceUnconfirmed = p.ReplaceUnconfirmed ? true : (bool?)null,
             workers = spec?.Circuit.Workers,
             errorPolicy = spec?.Circuit.ErrorPolicy,
             reads = spec?.Reads,
@@ -740,8 +790,16 @@ internal static class AdminApi
     private static object PluginItem(ServiceNode node, PluginInfo p, IReadOnlyList<PipelineSpec> specs)
     {
         var manifest = p.BuiltIn ? null : node.Plugins.Manifest(p.Name, p.Version);
+        // The declared tables whose definition this version holds: what a contract is used by.
+        var defined = p.TableDefinitions.ToHashSet(StringComparer.Ordinal);
+        var tables = defined.Count == 0 ? [] : node.Tables.Tables.Where(t => defined.Contains(t.Definition)).Select(t => t.Name).Order(StringComparer.Ordinal).ToList();
         return new
         {
+            sequence = manifest is { Sequence: > 0 } ? manifest.Sequence : (long?)null,
+            importedAt = manifest?.ImportedAt,
+            importedBy = manifest?.ImportedBy,
+            informationalVersion = manifest?.InformationalVersion,
+            tables,
             name = p.Name,
             version = p.Version,
             kind = p.Kind,
@@ -756,6 +814,18 @@ internal static class AdminApi
             bytes = manifest?.Bytes,
             mainAssembly = manifest?.MainAssembly,
         };
+    }
+
+    private static TableSizeEstimate? Size(ServiceNode node, string name)
+    {
+        try
+        {
+            return node.Tables.EstimateSize(name);
+        }
+        catch (ServiceException)
+        {
+            return null; // not open on this node: there is nothing to estimate
+        }
     }
 
     private static object Metrics(PipelineMetrics metrics)
@@ -783,7 +853,8 @@ internal static class AdminApi
 
     private sealed record GraphNode(
         string Id, string Role, string Label, string? Detail, IReadOnlyList<string> Inputs,
-        string? Kind = null, string? StateName = null, string? Name = null, string? ErrorPolicy = null, bool Back = false);
+        string? Kind = null, string? StateName = null, string? Name = null, string? ErrorPolicy = null, bool Back = false,
+        IReadOnlyList<string>? Probes = null);
 
     private static string? Connector(JsonElement config) =>
         config.ValueKind == JsonValueKind.Object && config.TryGetProperty("connector", out var kind) ? kind.GetString() : null;
@@ -793,7 +864,7 @@ internal static class AdminApi
         var connector = Connector(config);
         if (connector is null)
             return null;
-        foreach (var property in new[] { "topic", "name", "path" })
+        foreach (var property in new[] { "topic", "name", "path", "prefix" })
             if (config.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String)
                 return $"{connector}: {value.GetString()}";
         return connector;
@@ -817,7 +888,8 @@ internal static class AdminApi
             else
                 nodes.Add(new GraphNode(
                     "n" + node.Id, node.IsExchange ? "exchange" : "operator", node.Name ?? kind, node.Name is null ? null : kind, inputs,
-                    kind, node.StateName, node.Name, node.ErrorPolicy.ToString()));
+                    kind, node.StateName, node.Name, node.ErrorPolicy.ToString(),
+                    Probes: node.Probes.Count > 0 ? [.. node.Probes.Select(i => "n" + i)] : null));
         }
         foreach (var loop in graph.Circuit.Loops)
         {
@@ -920,8 +992,8 @@ internal static class AdminApi
         };
     }
 
-    private static ActionOptions Action(HttpContext context, bool dryRun) =>
-        new(IfMatch(context), dryRun, AdminSecurity.Caller(context));
+    private static ActionOptions Action(HttpContext context, bool dryRun, ServiceAdminOptions options) =>
+        new(IfMatch(context), dryRun, AdminSecurity.Caller(context, options));
 
     /// <summary><c>If-Match: "7"</c>: the generation the caller saw. A mismatch is 412.</summary>
     private static long? IfMatch(HttpContext context)

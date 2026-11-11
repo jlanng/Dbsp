@@ -43,6 +43,10 @@ public sealed class ExampleOptions
     public bool PrepareStack { get; init; } = true;
     public bool Verbose { get; init; }
 
+    /// <summary>For working on the admin UI: serve its files from this directory (the
+    /// package's <c>wwwroot</c> in a checkout) instead of the copies in the assembly.</summary>
+    public string? UiDirectory { get; init; }
+
     /// <summary>Export the meters over OTLP. Where to is the exporter's own configuration:
     /// <c>OTEL_EXPORTER_OTLP_ENDPOINT</c> and its companions.</summary>
     public bool Otlp { get; init; }
@@ -83,6 +87,7 @@ public sealed class ExampleOptions
             Generate = !headless && !args.Contains("--no-generate"),
             PrepareStack = !args.Contains("--no-prepare"),
             Verbose = args.Contains("--verbose"),
+            UiDirectory = Value("--ui-dir"),
             Otlp = args.Contains("--otlp"),
         };
     }

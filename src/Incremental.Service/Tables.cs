@@ -249,6 +249,22 @@ public sealed record TableStats(
     string? FloorHeldBy,
     IReadOnlyDictionary<string, string>? IndexKeyTypes = null);
 
+/// <summary>
+/// An estimate of what a table holds on this node, made from a sample: the first
+/// <c>SampledRows</c> rows in the table's own order (hash order, so not sorted by anything
+/// meaningful) are written as JSON and their mean length in UTF-8 bytes is
+/// <c>MeanRowBytes</c>; <c>RowsBytes</c> is that mean times the row count. It is the size
+/// of the data, not of the objects: the process holds each row as a .NET object plus the
+/// table's key map and indexes, which is usually a few times more and is not measured.
+/// <c>RetainedVersions</c> is how many versions of history the table's log can still
+/// replay. <c>HistoryChanges</c> is how many row changes those versions hold and
+/// <c>HistoryBytes</c> that count at the same mean — both null when the history is not
+/// in this process (a Kafka log keeps it on the brokers).
+/// </summary>
+public sealed record TableSizeEstimate(
+    int SampledRows, long Rows, double MeanRowBytes, long RowsBytes, long RetainedVersions, long? HistoryChanges, long? HistoryBytes,
+    DateTimeOffset At);
+
 /// <summary>What to read of a table's rows: one row by <see cref="Key"/>; a page of the
 /// rows under one key of <see cref="Index"/> (<see cref="Skip"/> passed over, then up to
 /// <see cref="Limit"/>); or, with neither, a page of one scan. A scan passes over the first
@@ -298,9 +314,20 @@ public interface ITableRegistry
     TableRowPage ReadRows(string name, TableRowQuery query);
     IReadOnlyList<UnreadableRecord> Unreadable(string name, long afterSequence = 0);
 
+    /// <summary>An estimate of the bytes the table's rows and retained history hold on
+    /// this node, from a sample of at most a few hundred rows; kept for half a minute, so
+    /// asking often costs nothing.</summary>
+    TableSizeEstimate EstimateSize(string name);
+
     /// <summary>Leader: opens the table's log as its writer, commits <c>table/{name}</c>
     /// and starts the loader.</summary>
     Task DeclareAsync(TableSpec spec, CancellationToken cancellationToken, string? caller = null);
+
+    /// <summary>Leader: what <see cref="DeclareAsync"/> would do, having made every check
+    /// it makes before it opens anything — the name, that it is free, that the definition
+    /// is found in a loaded contract, that the loader's kind and connection exist and its
+    /// config has what the kind requires.</summary>
+    ActionPlan PlanDeclare(TableSpec spec);
 
     /// <summary>Leader: refused while a pipeline names the table. Its log is left alone,
     /// so declaring the name again brings the rows back.</summary>

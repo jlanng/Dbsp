@@ -131,7 +131,9 @@ public class NodeTests
         Assert.True(b.Tables.Stats("instruments").Following);
         await Eventually(() => b.Tables.Stats("positions").Rows == a.Tables.Stats("positions").Rows, "the standby's copy of the derived table");
         Assert.Equal(HealthLevel.Healthy, b.Node.Health.Level);
-        Assert.Equal(new PeerInfo("b", NodeRole.Standby, 0, true, null), await a.Node.Backend.Leadership.ProbePeerAsync(default));
+        var probed = await a.Node.Backend.Leadership.ProbePeerAsync(default);
+        Assert.Equal(new PeerInfo("b", NodeRole.Standby, 0, true, null), probed! with { Memory = null });
+        Assert.True(probed.Memory!.WorkingSetBytes > 0); // a peer says what its process holds
 
         // Mutations go to the leader.
         var notLeader = await Assert.ThrowsAsync<ServiceException>(() => b.DeployAsync(Spec("x", "counts", "in", "out")));

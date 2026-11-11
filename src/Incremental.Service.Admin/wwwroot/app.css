@@ -404,7 +404,9 @@ details.more[open] > summary { margin-bottom: 6px; }
 .nodecard .node-name { font-family: var(--mono); font-size: 16px; font-weight: 650; }
 .stages { display: flex; height: 14px; gap: 2px; border-radius: 4px; overflow: hidden; }
 .stages span { min-width: 3px; }
-.stage-1 { background: #2a78d6; } .stage-2 { background: #eb6834; } .stage-3 { background: #1baf7a; } .stage-4 { background: #898781; }
+.stage-1 { background: #2a78d6; } .stage-2 { background: #eb6834; } .stage-3 { background: #898781; } .stage-4 { background: #8a5cd6; }
+.stage-5 { background: #c79a08; } .stage-6 { background: #1baf7a; } .stage-7 { background: #d6457f; } .stage-8 { background: #3aa9c9; }
+table.data tr.total td { border-top: 1px solid var(--line-strong); }
 
 /* ── topology ──────────────────────────────────────────────────────────────────────── */
 .graph-wrap { overflow: auto; background: var(--sunken); border-radius: 0 0 var(--r) var(--r); max-height: 72vh; }
@@ -432,7 +434,7 @@ details.more[open] > summary { margin-bottom: 6px; }
 
 /* ── dialog and toasts ─────────────────────────────────────────────────────────────── */
 dialog.modal { border: 1px solid var(--line-strong); border-radius: 10px; padding: 0; background: var(--surface); color: var(--ink); box-shadow: var(--shadow); width: min(560px, calc(100vw - 24px)); max-height: calc(100vh - 32px); }
-dialog.modal.wide { width: min(820px, calc(100vw - 24px)); }
+dialog.modal.wide { width: min(880px, calc(100vw - 24px)); }
 dialog.modal::backdrop { background: rgba(0, 0, 0, .45); }
 dialog.modal form { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; max-height: calc(100vh - 34px); }
 dialog.modal header { padding: 16px 20px 0; }
@@ -460,3 +462,75 @@ dialog.modal footer { padding: 12px 20px; border-top: 1px solid var(--line); dis
 fieldset.field { border: 0; padding: 0; margin: 0; min-width: 0; }
 fieldset.field > legend { padding: 0; margin-bottom: 6px; }
 fieldset.field > ul { margin-bottom: 8px; }
+
+/* ── forms built from what the node describes ──────────────────────────────────────── */
+.field .input { width: 100%; }
+.field > label { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+.field.inline { display: flex; gap: 8px; align-items: center; flex: 1 1 260px; min-width: 0; }
+.field.inline .input { flex: 1; min-width: 0; }
+.help { font-size: 12px; color: var(--ink-3); line-height: 1.4; }
+.help.err, .err { color: var(--crit-ink); }
+.req { font-size: 11px; font-weight: 600; color: var(--serious-ink); }
+.fields { display: grid; gap: 12px 14px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr)); align-items: start; }
+fieldset.section { border: 0; border-top: 1px solid var(--line); padding: 12px 0 0; margin: 0; min-width: 0; display: grid; gap: 12px; }
+fieldset.section > legend { padding: 0 8px 0 0; font-size: 13px; font-weight: 650; color: var(--ink); float: left; width: 100%; margin-bottom: 0; }
+fieldset.section > legend + * { clear: both; }
+fieldset.section.choice { border: 1px solid color-mix(in srgb, var(--warn) 60%, transparent); border-radius: 8px; padding: 12px; background: color-mix(in srgb, var(--warn-wash) 45%, transparent); }
+.slot { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; display: grid; gap: 10px; background: var(--raised); min-width: 0; }
+.slot-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.dialog-bar { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; font-size: 12.5px; }
+.replace-note .replace-what { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 6px 0; color: var(--ink); }
+.evidence { list-style: disc; margin: 0 0 0 18px; font-size: 12.5px; color: var(--ink-2); display: grid; gap: 3px; overflow-wrap: anywhere; }
+.input[readonly], .input:disabled { background: var(--sunken); color: var(--ink-2); }
+.input[aria-invalid="true"] { border-color: var(--crit); }
+.input.mono { font-family: var(--mono); font-size: 12.5px; }
+.check input { margin-top: 3px; flex: none; }
+.seg button:disabled { opacity: .45; cursor: not-allowed; }
+.toolbar.bare { padding: 0; border: 0; }
+
+/* ── who is acting ─────────────────────────────────────────────────────────────────── */
+.who-button {
+  display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 10px; cursor: pointer; max-width: 200px;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--raised); color: var(--ink-2); font-size: 12.5px;
+}
+.who-button:hover:not(:disabled) { color: var(--ink); border-color: var(--line-strong); }
+.who-button:disabled { cursor: default; }
+.who-button .who-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.who-button svg { flex: none; }
+@media (max-width: 520px) { .who-button .who-name { display: none; } .who-button { padding: 0 8px; } }
+
+/* ── last-known states, clamped text ───────────────────────────────────────────────── */
+.badge.last-known { background: transparent; color: var(--ink-2); box-shadow: inset 0 0 0 1px var(--line-strong); border-radius: 4px; }
+.badge.last-known .lk { font-weight: 500; font-size: 11px; color: var(--ink-3); padding-left: 5px; margin-left: 2px; border-left: 1px solid var(--line-strong); }
+details.clamp > summary { list-style: none; cursor: pointer; }
+details.clamp > summary::-webkit-details-marker { display: none; }
+details.clamp .toggle::after { content: "show all"; color: var(--accent); font-size: 12px; white-space: nowrap; }
+details.clamp[open] .short { display: none; }
+details.clamp[open] .toggle::after { content: "show less"; }
+details.clamp .full { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 2px; }
+details.clamp > summary:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 4px; }
+
+/* ── topology: looked-up tables, the note ──────────────────────────────────────────── */
+.g-edge.probe { stroke-dasharray: 5 4; stroke: #1baf7a; }
+.g-edge.probe.hl { stroke: var(--accent); }
+.edge-key { width: 22px; height: 0; border-top: 2px solid var(--line-strong); display: inline-block; }
+.edge-key.probe { border-top: 2px dashed #1baf7a; }
+.graph-note { display: flex; gap: 8px; align-items: flex-start; padding: 10px 16px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--ink-2); }
+.graph-note svg { flex: none; margin-top: 2px; }
+.kind-help { display: block; color: var(--ink-2); font-size: 12.5px; margin-top: 2px; max-width: 86ch; }
+
+/* ── plugin versions, the dead-letter sink, sizes ──────────────────────────────────── */
+.record .head .spacer { flex: 1; }
+table.difftable td { vertical-align: top; }
+table.difftable tr.group td { background: var(--sunken); }
+table.difftable td.member { padding-left: 24px; white-space: nowrap; }
+.sinkstate { display: grid; gap: 10px; }
+.sinkstate .head { display: flex; gap: 8px 10px; align-items: center; flex-wrap: wrap; }
+.tiles.plain .tile { background: var(--raised); }
+table.data td .sub.err { color: var(--crit-ink); }
+.shape { font-family: var(--mono); font-size: 12px; display: grid; gap: 3px; overflow-wrap: anywhere; }
+.shape .same { color: var(--ink-3); }
+mark { background: var(--warn-wash); color: var(--warn-ink); border-radius: 3px; padding: 0 2px; }
+.g-edge.cross { stroke-linejoin: round; }
+.outcome { display: grid; gap: 14px; }
+.outcome:empty { display: none; }

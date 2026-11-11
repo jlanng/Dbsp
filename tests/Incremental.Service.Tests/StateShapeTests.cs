@@ -1,3 +1,4 @@
+using Incremental.Kafka;
 namespace Incremental.Service.Tests;
 
 /// <summary>The evidence for a keep-or-reset choice: only what state depends on is
@@ -69,6 +70,40 @@ public class StateShapeTests
         Assert.Equal("ValueTuple<Int32, String>", shape.Stores["n4.join.left"].Key);
         Assert.DoesNotContain(shape.Types.Keys, t => t.StartsWith("ValueTuple") || t.StartsWith("List") || t == "String");
         Assert.Equal(("Int32", "String"), shape.Tables["instruments"]);
+    }
+
+    [Fact]
+    public void A_record_type_is_spelled_out_with_the_types_it_is_made_of()
+    {
+        // The type itself first, then what it reaches; members in a stable order.
+        Assert.Equal(
+            [
+                "Incremental.Service.Tests.StateShapeTests.V1.Booked { Counterparty: String; Id: Int64; Rating: Incremental.Service.Tests.StateShapeTests.V1.Rating }",
+                "Incremental.Service.Tests.StateShapeTests.V1.Rating { A = 0; B = 1 }",
+            ],
+            StateShapes.Members(typeof(V1.Booked)));
+        // A member added in the next version is there to be seen.
+        Assert.Contains("Size: String", StateShapes.Members(typeof(V2.SinkRow)).Single());
+        Assert.DoesNotContain("Size", StateShapes.Members(typeof(V1.SinkRow)).Single());
+        // The runtime's own types have nothing to spell out.
+        Assert.Empty(StateShapes.Members(typeof(string)));
+        Assert.Empty(StateShapes.Members(typeof((int, string))));
+    }
+
+    [Fact]
+    public void A_peer_says_what_its_process_holds_in_its_probe_answer()
+    {
+        var memory = new ProcessMemory(405_900_000, 168_800_000, 281_500_000, 0.13, 4);
+        var self = new PeerInfo("b", NodeRole.Standby, 3, false, "state behind; 12 records", "http://127.0.0.1:5181/admin/", memory);
+        var detail = PeerDetail.Write(self);
+        Assert.DoesNotContain(' ', detail); // one token of the probe line
+        Assert.Equal(self, PeerDetail.Read("b", NodeRole.Standby, 3, detail));
+        // A node that predates the figures, or sends something else, is still read.
+        Assert.Null(PeerDetail.Read("b", NodeRole.Leader, 3, "ready;admin=http%3A%2F%2Fx").Memory);
+        Assert.Null(PeerDetail.Read("b", NodeRole.Leader, 3, "ready;mem=1,2,three").Memory);
+        Assert.Null(PeerDetail.Read("b", NodeRole.Leader, 3, "ready;mem=1,2,3").Memory);
+        Assert.True(PeerDetail.Read("b", NodeRole.Leader, 3, "ready;mem=1,2,3,4.5,6;later=x").Ready);
+        Assert.True(ProcessMemory.Read().WorkingSetBytes > 0);
     }
 
     [Fact]

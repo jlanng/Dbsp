@@ -78,6 +78,18 @@ internal static class StateShapes
         return $"{name}<{string.Join(", ", type.GetGenericArguments().Select(Name))}>";
     }
 
+    /// <summary>A record type spelled out for a reader: one line per described type it
+    /// is made of, the type itself first — <c>Name { member: Type; … }</c>. Empty for a
+    /// type that is the runtime's own all the way down.</summary>
+    internal static IReadOnlyList<string> Members(Type type)
+    {
+        var types = new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
+        Walk(type, types, new HashSet<string>(StringComparer.Ordinal));
+        var first = Name(type);
+        return [.. types.OrderBy(t => t.Key == first ? 0 : 1).ThenBy(t => t.Key, StringComparer.Ordinal)
+            .Select(t => $"{t.Key} {{ {string.Join("; ", t.Value)} }}")];
+    }
+
     private static bool IsRuntimeType(Type type) =>
         type.Namespace is "System" || (type.Namespace?.StartsWith("System.", StringComparison.Ordinal) ?? false);
 

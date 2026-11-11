@@ -115,6 +115,9 @@ public sealed class ExampleNode : IAsyncDisposable
                 service.AddPipeline(spec);
         }
 
+        if (options.UiDirectory is { } uiDirectory)
+            builder.Services.Configure<ServiceAdminOptions>(o => o.UiDirectory = Path.GetFullPath(uiDirectory));
+
         // <snippet:admin>
         builder.Services.AddIncrementalAdmin(o =>
         {
