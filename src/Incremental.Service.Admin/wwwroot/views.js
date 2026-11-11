@@ -738,7 +738,7 @@
               sink && ['Delivered', `${plural(sink.batches, 'batch', 'batches')}: ${fmtInt(sink.upserts)} upserts, ${fmtInt(sink.deletes)} deletes, ${fmtInt(sink.appends)} appends${sink.writeInFlightSince ? ' · a write is in flight' : ''}`],
               (selected.role === 'table' || selected.role === 'table-out') && ['Table', [tableLink(selected.label),
                 tableUse && tableUse.committedVersion != null && ` · this pipeline has committed version ${fmtInt(tableUse.committedVersion)} of ${fmtInt(tableUse.currentVersion)}`]],
-              selected.stateName && selected.role === 'operator' && ['State stores', h('span', null, h('span', { class: 'mono' }, selected.stateName), selected.name ? ' — named, so it survives changes to the circuit around it' : ' — positional: an upstream change renumbers it')],
+              selected.stateName && selected.role === 'operator' && ['Known as', h('span', null, h('span', { class: 'mono' }, selected.stateName), ' in its state stores, if it keeps any, and in dead letters', selected.name ? ' — named, so it survives changes to the circuit around it' : ' — positional: an upstream change renumbers it')],
               selected.errorPolicy && ['On a record error', selected.errorPolicy === 'DeadLetter' ? 'drop the record to the dead letters' : 'fault the pipeline'],
               selected.stateName && dead[selected.stateName] && ['Dead letters', h('a', { href: `#/pipelines/${pid}/dead-letters` }, `${dead[selected.stateName]} of those kept came from here`)],
               ['Reads', selected.inputs.length ? selected.inputs.map(nameOf).join(', ') : selected.role === 'table' ? 'the shared table, outside this circuit' : 'nothing: it is a source'],
