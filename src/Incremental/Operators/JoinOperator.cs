@@ -25,7 +25,7 @@ internal sealed class JoinOperator<TKey, TLeft, TRight, TOut> : IStepOperator
         _left = context.Storage.CreateIndexedWeightStore<TKey, TLeft>(context.StateName("left"));
         _right = context.Storage.CreateIndexedWeightStore<TKey, TRight>(context.StateName("right"));
         _resultSelector = resultSelector;
-        _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
+        _eviction = eviction is null ? null : new EvictionTracker<TKey>(context, eviction);
         _errors = context.Errors;
     }
 

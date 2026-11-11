@@ -35,7 +35,7 @@ internal sealed class TopKOperator<TKey, TValue, TOrder> : IStepOperator
         _orderBy = orderBy;
         _count = count;
         _direction = descending ? -1 : 1;
-        _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
+        _eviction = eviction is null ? null : new EvictionTracker<TKey>(context, eviction);
         var comparer = Comparer<TOrder>.Default;
         var direction = _direction;
         _rankComparison = (a, b) => direction * comparer.Compare(a.Order, b.Order);

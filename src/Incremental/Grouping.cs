@@ -362,7 +362,7 @@ public class GroupedZStream<TKey, TValue>
 
     private KeyedZStream<TKey, DateTimeOffset> WindowClosesCore(KeyEviction<TKey> policy) =>
         new(Builder,
-            Builder.AddNode("windowClose", [NodeId], _ => new WindowCloseOperator<TKey, TValue>(policy)),
+            Builder.AddNode("windowClose", [NodeId], ctx => new WindowCloseOperator<TKey, TValue>(ctx, policy)),
             policy,
             RoutingHash);
 

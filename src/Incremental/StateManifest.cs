@@ -20,13 +20,13 @@ public sealed class CircuitStateMismatchException : InvalidOperationException
     public IReadOnlyList<string> Problems { get; }
 }
 
-public enum CircuitStateStoreKind { Weight, IndexedWeight, Value }
+public enum CircuitStateStoreKind { Weight, IndexedWeight, Value, Deadline }
 
 /// <summary>One state store a circuit's operators would create, as
 /// <see cref="CircuitBuilder.DescribeState"/> reports it: its name (which carries the
 /// node's state identity, the store's purpose and the worker), the node that owns it and
 /// the types it holds. <c>KeyType</c> is null for a weight store, whose entries are the
-/// values themselves.</summary>
+/// values themselves; a deadline store's value is its deadline, a <c>long</c> of UTC ticks.</summary>
 public sealed record CircuitStateStore(string Name, int NodeId, CircuitStateStoreKind Kind, Type? KeyType, Type ValueType);
 
 /// <summary>The state manifest: what is committed with every checkpoint and compared at
@@ -34,13 +34,29 @@ public sealed record CircuitStateStore(string Name, int NodeId, CircuitStateStor
 /// and for a builder that is asked beforehand (<see cref="CircuitBuilder.CheckState"/>).</summary>
 internal static class StateManifest
 {
-    public static string Build(int workers, int processes, IEnumerable<(string Table, string Epoch)> tables, IEnumerable<string> sortedStoreNames)
+    /// <summary>The format this version writes.</summary>
+    private const string Format = "7";
+
+    /// <summary>The format before event-time state was checkpointed; see <see cref="Problems"/>.</summary>
+    private const string FormatWithoutEventTime = "6";
+
+    public static string Build(
+        int workers, int processes, int eventTimeSources,
+        IEnumerable<(string Table, string Epoch)> tables, IEnumerable<string> sortedStoreNames)
     {
         var manifest = new System.Text.StringBuilder();
-        // format 6: every checkpoint commits the step sequence under `$step` and a restart
+        // format 7: event-time state is checkpointed. The watermark and each source's max
+        // event time commit in the offsets marker (`$watermark`, `$watermark#s{n}`), and
+        // every eviction, window-close and session deadline lives in a deadline store
+        // (`{node}.deadlines.w{n}`). A circuit with event time adds an `eventtime={sources}`
+        // line. A format-6 checkpoint of such a circuit has neither: resumed, its watermark
+        // would start again from nothing and the keys it holds would have no deadline, so
+        // it must not resume. A format-6 checkpoint of a circuit with no event time holds
+        // exactly what format 7 would and resumes as it is (see Problems).
+        // (format 6: every checkpoint commits the step sequence under `$step` and a restart
         // resumes it, which is what keeps an acknowledged output's batch sequences stable
         // across a crash. A format-5 checkpoint has none: resuming it would restart the
-        // sequence at 1, below what the sinks have already seen.
+        // sequence at 1, below what the sinks have already seen.)
         // (format 5: attached shared tables add a `table={name}@{epoch}` line each, and their
         // consumed versions commit in the offsets marker under `{name}#t`. A new line kind,
         // which format-4 validation would have filed under facts and ignored.)
@@ -52,9 +68,13 @@ internal static class StateManifest
         // nodes on table-shaped outputs), so store names moved wholesale. No deployed
         // format-2 checkpoints existed; the bump is hygiene.)
         // (format 2: the committed-offsets marker became per-partition — see OffsetKeys.)
-        manifest.Append("format=6\n");
+        manifest.Append($"format={Format}\n");
         manifest.Append($"workers={workers}\n");
         manifest.Append($"processes={processes}\n");
+        // The clock's sources are numbered in declaration order, and the committed max
+        // event times are theirs by number.
+        if (eventTimeSources > 0)
+            manifest.Append($"eventtime={eventTimeSources}\n");
         // A table the circuit writes has a line like one it reads: either way the checkpoint
         // holds a version number that means something only in that table's history. (A
         // circuit cannot do both to one table, so the names do not collide.)
@@ -95,10 +115,43 @@ internal static class StateManifest
         var (committedFacts, committedStores, committedTables) = Parse(committed);
         var (currentFacts, currentStores, currentTables) = Parse(current);
 
-        foreach (var fact in new[] { "format", "workers", "processes" })
+        var committedFormat = committedFacts.GetValueOrDefault("format");
+        var currentFormat = currentFacts.GetValueOrDefault("format");
+        var eventTime = currentFacts.ContainsKey("eventtime");
+        if (committedFormat != currentFormat)
+        {
+            // The one migration: format 6 → 7 changed nothing for a circuit without event
+            // time, whose checkpoint therefore resumes as it is and is rewritten as format
+            // 7 by the next commit.
+            if (committedFormat == FormatWithoutEventTime && currentFormat == Format)
+            {
+                if (eventTime)
+                    problems.Add(
+                        "the checkpoint was committed before event-time state was checkpointed (format=6, this version writes " +
+                        $"format={Format}) and this circuit uses event time: the checkpoint holds neither the watermark nor the " +
+                        "deadlines of the windows and keys that were open, so resumed from it late records would reopen closed " +
+                        "windows and the open keys would never be evicted. Start it from an empty state store and replay its inputs");
+            }
+            else
+                problems.Add($"format changed: the checkpoint was committed with format={committedFormat}, " +
+                             $"this circuit has format={currentFormat}");
+        }
+
+        foreach (var fact in new[] { "workers", "processes" })
             if (committedFacts.GetValueOrDefault(fact) != currentFacts.GetValueOrDefault(fact))
                 problems.Add($"{fact} changed: the checkpoint was committed with {fact}={committedFacts.GetValueOrDefault(fact)}, " +
                              $"this circuit has {fact}={currentFacts.GetValueOrDefault(fact)}");
+
+        // A circuit that gains its first event-time source starts a clock; one that loses
+        // its last has none to restore. Between two counts the committed max event times
+        // would be handed to the wrong sources.
+        if (committedFormat == currentFormat
+            && committedFacts.TryGetValue("eventtime", out var committedSources)
+            && currentFacts.TryGetValue("eventtime", out var currentSources)
+            && committedSources != currentSources)
+            problems.Add($"the number of event-time sources changed: the checkpoint was committed with {committedSources} " +
+                         $"WithEventTime source(s), this circuit has {currentSources}, and the committed watermark state is kept per " +
+                         "source in declaration order");
 
         // A table attached since the checkpoint starts at its current version, and one no
         // longer attached is ignored like a removed input. The same name with another epoch
@@ -160,6 +213,12 @@ internal static class StateManifest
         {
             Stores.Add(new CircuitStateStore(name, NodeId, CircuitStateStoreKind.Value, typeof(TKey), typeof(TValue)));
             return _stores.CreateValueStore<TKey, TValue>(name);
+        }
+    
+        public IDeadlineStore<TKey> CreateDeadlineStore<TKey>(string name) where TKey : notnull
+        {
+            Stores.Add(new CircuitStateStore(name, NodeId, CircuitStateStoreKind.Deadline, typeof(TKey), typeof(long)));
+            return _stores.CreateDeadlineStore<TKey>(name);
         }
     }
 }

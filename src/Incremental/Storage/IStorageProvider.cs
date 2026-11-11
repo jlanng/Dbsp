@@ -20,6 +20,27 @@ public interface IStorageProvider
 
     /// <summary>A plain key → value map. Used to remember previously emitted results for retraction.</summary>
     IValueStore<TKey, TValue> CreateValueStore<TKey, TValue>(string name) where TKey : notnull;
+
+    /// <summary>
+    /// A key → deadline map that hands back the keys whose deadline has passed. It is what
+    /// event-time operators keep their eviction and window-close deadlines in, so that a
+    /// circuit restored from a checkpoint closes exactly the keys an uninterrupted run
+    /// would have: a deadline is state like any other, staged with the step that set it
+    /// and committed with the checkpoint that covers that step.
+    /// <para>
+    /// The default serves a provider that does not checkpoint: a heap store, gone with the
+    /// operator. A checkpointing provider must implement this method — the default refuses
+    /// for one, because deadlines that do not survive a restart leave every key that was
+    /// open at the restart, and is never touched again, in state for good.
+    /// </para>
+    /// </summary>
+    IDeadlineStore<TKey> CreateDeadlineStore<TKey>(string name) where TKey : notnull =>
+        this is ICheckpointStorageProvider
+            ? throw new NotSupportedException(
+                $"{GetType().Name} checkpoints but does not implement {nameof(IStorageProvider)}.{nameof(CreateDeadlineStore)} " +
+                $"(asked for '{name}'): the deadlines of event-time operators (window closes, EvictWhen, session gaps) are " +
+                "checkpointed state, and must be staged and committed like the provider's other stores.")
+            : new InMemoryStorageProvider.DeadlineStore<TKey>();
 }
 
 /// <summary>
@@ -222,4 +243,32 @@ public interface IValueStore<TKey, TValue> where TKey : notnull
         foreach (var key in keys)
             Remove(key);
     }
+}
+
+/// <summary>
+/// A key → deadline map, ordered by deadline: see
+/// <see cref="IStorageProvider.CreateDeadlineStore{TKey}"/>. Deadlines are UTC ticks. Like
+/// every store it belongs to one operator on one worker and is only touched by that
+/// worker's thread; writes are staged until the provider commits.
+/// </summary>
+public interface IDeadlineStore<TKey> where TKey : notnull
+{
+    /// <summary>Holds each of <paramref name="keys"/> that is not held yet, with the
+    /// deadline <paramref name="deadlineOf"/> gives for it. A key already held keeps its
+    /// deadline, and <paramref name="deadlineOf"/> is not called for it. The list may name
+    /// a key more than once. One call per step is the shape: a provider with per-call
+    /// latency answers it in one round trip.</summary>
+    void AddAll(IReadOnlyList<TKey> keys, Func<TKey, long> deadlineOf);
+
+    /// <summary>Holds <paramref name="key"/> with <paramref name="deadline"/>, replacing
+    /// the deadline it had.</summary>
+    void Set(TKey key, long deadline);
+
+    /// <summary>Forgets <paramref name="key"/>. No-op if it is not held.</summary>
+    void Remove(TKey key);
+
+    /// <summary>Removes every key whose deadline is at or below <paramref name="upTo"/> and
+    /// appends it to <paramref name="into"/>, in no particular order. Called once per step
+    /// by every operator that holds one, so finding nothing due must cost next to nothing.</summary>
+    void TakeDue(long upTo, List<TKey> into);
 }

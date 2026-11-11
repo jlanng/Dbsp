@@ -63,7 +63,7 @@ internal sealed class TableLookupOperator<TKey, TFact, TRow, TOut> : IStepOperat
         // tracked and closes with its key.
         if (eviction is not null)
             _eviction = new EvictionTracker<KeyedValue<TKey, TFact>>(
-                new KeyEviction<KeyedValue<TKey, TFact>>(eviction.Clock, fact => eviction.ClosesAt(fact.Key)));
+                context, new KeyEviction<KeyedValue<TKey, TFact>>(eviction.Clock, fact => eviction.ClosesAt(fact.Key)));
     }
 
     private readonly RecordErrors? _errors; // null under the default policy

@@ -204,6 +204,29 @@ var finals = views
     .ToOutput();
 ```
 
+### Event-time state across a restart
+
+The watermark and everything waiting on it are checkpointed. Each commit carries the
+watermark and every source's highest event time beside the input offsets, and each key
+or window that is waiting to close — a window's state, an `EvictWhen` key, a session, a
+row `OnClose` has yet to emit — is an entry in a deadline store of the operator that
+holds it, committed and restored with the rest of its state. A circuit restored from a
+checkpoint therefore goes on as one that never stopped: a record that was late before
+the restart is late after it, a closed window stays closed, and what was open still
+closes when the watermark passes it, whether or not another record ever touches it.
+That holds on every checkpointing provider and for a standby that followed the state
+changelog.
+
+Two consequences for whoever changes a definition. A checkpoint taken before this was
+so (state manifest format 6) does not resume a circuit that uses event time — start
+that one from an empty state store — while one without event time resumes untouched.
+And the number of `WithEventTime` sources is part of the manifest: adding or removing
+one, other than the first or the last, needs a fresh state store too.
+
+A storage provider of your own that checkpoints must implement
+`IStorageProvider.CreateDeadlineStore` (a key → deadline map that hands back what is
+due); `Build()` refuses an event-time circuit on one that does not.
+
 ## Grouping, aggregation, and correctness under change
 
 `GroupBy` does two jobs: it defines aggregation/join keys, and it **shards state** — records

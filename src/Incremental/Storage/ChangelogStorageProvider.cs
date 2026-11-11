@@ -23,6 +23,7 @@ namespace Incremental.Storage;
 ///     weight store          entry = value             → weight
 ///     indexed weight store  entry = key NUL value     → weight
 ///     value store           entry = key               → value
+///     deadline store        entry = key               → deadline (UTC ticks)
 /// pipeline NUL incarnation NUL $commit                → sequence, term, offsets, manifests
 /// </code>
 /// <para>
@@ -312,6 +313,19 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         }
     }
 
+    /// <summary>
+    /// How many entries the pipeline's state holds right now, uncommitted writes included:
+    /// one per record the changelog would hold for it, whether a circuit's stores hold
+    /// them or they wait as bytes. It walks the state, so it is for a test or an
+    /// operator's question — is this pipeline's state bounded? — not for a hot path. In
+    /// any role, but not while a circuit on this provider is stepping.
+    /// </summary>
+    public long CountEntries()
+    {
+        lock (_lock)
+            return _stores.Values.Sum(store => store.EntryCount) + _pending.Values.Sum(entries => (long)entries.Count);
+    }
+
     /// <summary>The pipeline's durable identity; see <see cref="ChangelogStorage.Pipeline"/>.</summary>
     public string PipelineId { get; }
 
@@ -360,6 +374,9 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
 
     public IValueStore<TKey, TValue> CreateValueStore<TKey, TValue>(string name) where TKey : notnull =>
         GetOrCreate(name, static () => new ValueStore<TKey, TValue>());
+
+    public IDeadlineStore<TKey> CreateDeadlineStore<TKey>(string name) where TKey : notnull =>
+        GetOrCreate(name, static () => new DeadlineStore<TKey>());
 
     private TStore GetOrCreate<TStore>(string name, Func<TStore> factory) where TStore : ChangelogStore
     {
@@ -422,6 +439,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         {
             "WeightStore" => "a weight store of",
             "IndexedWeightStore" => "an indexed weight store of",
+            "DeadlineStore" => "a deadline store of",
             _ => "a value store of",
         };
         return $"{kind} {string.Join(" → ", store.GetGenericArguments().Select(t => t.Name))}";
@@ -1120,6 +1138,9 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
 
         public bool HasChanges => TouchedCount > 0;
 
+        /// <summary>Entries held: the records <see cref="WriteEntries"/> would write.</summary>
+        public abstract long EntryCount { get; }
+
         /// <summary>Writes a record for every touched entry whose value differs from the
         /// one it had at the last commit.</summary>
         public abstract void WriteChanges(RecordEncoder encoder);
@@ -1210,6 +1231,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         public override int TouchedCount => _touched.Count;
         public override int TouchedCapacity => _touched.EnsureCapacity(0);
         public override int HeldCount => _held.Count;
+        public override long EntryCount => _live.Entries.Count;
 
         public override void WriteChanges(RecordEncoder encoder)
         {
@@ -1337,6 +1359,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         public override int TouchedCount => _touched.Count;
         public override int TouchedCapacity => _touched.EnsureCapacity(0);
         public override int HeldCount => _held.Count;
+        public override long EntryCount => _live.Entries().LongCount();
 
         public override void WriteChanges(RecordEncoder encoder)
         {
@@ -1443,6 +1466,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         public override int TouchedCount => _touched.Count;
         public override int TouchedCapacity => _touched.EnsureCapacity(0);
         public override int HeldCount => _held.Count;
+        public override long EntryCount => _live.Entries.Count;
 
         public override void WriteChanges(RecordEncoder encoder)
         {
@@ -1511,6 +1535,139 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             _live.Entries.Clear();
             _held.Clear();
             _touched = new Dictionary<TKey, (bool, TValue?)>();
+        }
+    }
+
+    /// <summary>Deadlines live in the heap store's map and queue, so a follower that holds
+    /// this store typed keeps the order as it applies records: a takeover starts with the
+    /// queue already built, whatever the number of open keys.</summary>
+    private sealed class DeadlineStore<TKey> : ChangelogStore, IDeadlineStore<TKey> where TKey : notnull
+    {
+        private readonly InMemoryStorageProvider.DeadlineStore<TKey> _live = new();
+
+        // Key → whether it was held at the last commit and with what deadline, for every
+        // key touched since. The key is the instance the entry's record is written under
+        // (see HeldInstances).
+        private Dictionary<TKey, (bool Held, long Deadline)> _touched = new();
+        private readonly HeldInstances<TKey> _held = new();
+        private readonly List<long> _dueDeadlines = [];
+
+        public void AddAll(IReadOnlyList<TKey> keys, Func<TKey, long> deadlineOf)
+        {
+            for (var i = 0; i < keys.Count; i++)
+                if (!_live.TryGet(keys[i], out _))
+                    Set(keys[i], deadlineOf(keys[i]));
+        }
+
+        public void Set(TKey key, long deadline)
+        {
+            var held = _live.TryGet(key, out var before);
+            if (held && before == deadline)
+                return;
+            _live.Set(Touch(key, held, before), deadline);
+        }
+
+        public void Remove(TKey key)
+        {
+            if (!_live.TryGet(key, out var before))
+                return;
+            Touch(key, true, before);
+            _live.Remove(key);
+        }
+
+        public void TakeDue(long upTo, List<TKey> into)
+        {
+            var first = into.Count;
+            _dueDeadlines.Clear();
+            _live.TakeDue(upTo, into, _dueDeadlines);
+            for (var i = first; i < into.Count; i++)
+                Touch(into[i], true, _dueDeadlines[i - first]);
+        }
+
+        /// <summary>Remembers what <paramref name="key"/> held before its first change
+        /// since the commit, and returns the instance its record is written under.</summary>
+        private TKey Touch(TKey key, bool held, long before)
+        {
+            if (_held.Active && !_touched.ContainsKey(key))
+                key = _held.Hold(key);
+            _touched.TryAdd(key, (held, before));
+            return key;
+        }
+
+        public override int TouchedCount => _touched.Count;
+        public override int TouchedCapacity => _touched.EnsureCapacity(0);
+        public override int HeldCount => _held.Count;
+        public override long EntryCount => _live.Entries.Count;
+
+        public override void WriteChanges(RecordEncoder encoder)
+        {
+            foreach (var (key, before) in _touched)
+            {
+                if (_live.TryGet(key, out var now))
+                {
+                    if (!before.Held || before.Deadline != now)
+                        encoder.Entry().Part(key).Value(now);
+                }
+                else if (before.Held)
+                    encoder.Entry().Part(key).Tombstone();
+            }
+        }
+
+        public override void Promote()
+        {
+            if (_held.Active)
+                foreach (var key in _touched.Keys)
+                    if (!_live.TryGet(key, out _))
+                        _held.Release(key);
+            Reset(ref _touched);
+        }
+
+        public override void Rollback()
+        {
+            foreach (var (key, before) in _touched)
+            {
+                if (before.Held)
+                    _live.Set(key, before.Deadline);
+                else
+                {
+                    _live.Remove(key);
+                    _held.Release(key);
+                }
+            }
+            Reset(ref _touched);
+        }
+
+        public override void Apply(Utf8StateSerializer serializer, ReadOnlySpan<byte> entry, ReadOnlySpan<byte> value, bool tombstone)
+        {
+            var key = serializer.Read<TKey>(entry);
+            if (tombstone)
+            {
+                _live.Remove(key);
+                _held.Release(key);
+            }
+            else
+            {
+                _live.Set(_held.Hold(key), serializer.Read<long>(Payload(value)));
+            }
+        }
+
+        public override void WriteTombstones(RecordEncoder encoder)
+        {
+            foreach (var key in _live.Entries.Keys)
+                encoder.Entry().Part(_held.Of(key)).Tombstone();
+        }
+
+        public override void WriteEntries(RecordEncoder encoder)
+        {
+            foreach (var (key, deadline) in _live.Entries)
+                encoder.Entry().Part(_held.Of(key)).Value(deadline);
+        }
+
+        public override void Clear()
+        {
+            _live.Clear();
+            _held.Clear();
+            _touched = new Dictionary<TKey, (bool, long)>();
         }
     }
 }

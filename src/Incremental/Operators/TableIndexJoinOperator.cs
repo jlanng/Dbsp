@@ -43,7 +43,7 @@ internal sealed class TableIndexJoinOperator<TIndexKey, TKey, TFact, TRow, TOut>
         _index = index;
         _matched = matched;
         _unmatched = unmatched;
-        _eviction = eviction is null ? null : new EvictionTracker<TIndexKey>(eviction);
+        _eviction = eviction is null ? null : new EvictionTracker<TIndexKey>(context, eviction);
         _errors = context.Errors;
     }
 

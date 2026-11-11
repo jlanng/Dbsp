@@ -1,3 +1,6 @@
+using Incremental.Runtime;
+using Incremental.Storage;
+
 namespace Incremental.Operators;
 
 /// <summary>
@@ -7,6 +10,14 @@ namespace Incremental.Operators;
 /// min over trackers of (max event time seen − allowed lateness), monotonically
 /// non-decreasing. Freezing between steps means every worker sees the same watermark for
 /// the whole of a step, so shard-local eviction decisions are consistent.
+/// <para>
+/// The clock is checkpointed: every commit carries the frozen watermark and each source's
+/// max event time in the offsets marker (<see cref="AppendCheckpoint"/>), and a circuit
+/// that resumes puts them back before its first step (<see cref="Restore"/>). So the
+/// watermark never regresses across a restart or a takeover — a record that was late
+/// before it is late after it — and the first step after resumes from exactly where the
+/// committed step left off.
+/// </para>
 /// </summary>
 internal sealed class WatermarkClock(int workers)
 {
@@ -28,7 +39,47 @@ internal sealed class WatermarkClock(int workers)
         var slots = new long[workers];
         Array.Fill(slots, long.MinValue);
         _trackers.Add(new Tracker(latenessTicks, slots));
+        _sourceKeys.Add(OffsetKeys.WatermarkSource(_trackers.Count - 1));
         return _trackers.Count - 1;
+    }
+
+    /// <summary>How many <c>WithEventTime</c> sources feed the clock.</summary>
+    public int Sources => _trackers.Count;
+
+    private readonly List<string> _sourceKeys = [];
+
+    /// <summary>Adds the clock's state to a checkpoint's offsets marker: the frozen
+    /// watermark, and each source's max event time seen (the maximum across workers — which
+    /// worker saw it does not matter to <see cref="Freeze"/>). A value still unset is left
+    /// out. Called by the coordinator between steps, after <see cref="Freeze"/>.</summary>
+    public void AppendCheckpoint(Dictionary<string, long> offsets)
+    {
+        if (_frozenTicks != long.MinValue)
+            offsets[OffsetKeys.Watermark] = _frozenTicks;
+        for (var t = 0; t < _trackers.Count; t++)
+        {
+            var maxSeen = long.MinValue;
+            var slots = _trackers[t].MaxSeenTicks;
+            for (var w = 0; w < slots.Length; w++)
+                maxSeen = Math.Max(maxSeen, Volatile.Read(ref slots[w]));
+            if (maxSeen != long.MinValue)
+                offsets[_sourceKeys[t]] = maxSeen;
+        }
+    }
+
+    /// <summary>Puts the clock back to what <see cref="AppendCheckpoint"/> wrote, and to
+    /// nothing where it wrote nothing. Called before the first step of a circuit that
+    /// starts on a checkpointing provider, so whatever an earlier, failed start of the same
+    /// definition observed is gone too.</summary>
+    public void Restore(IReadOnlyDictionary<string, long> offsets)
+    {
+        Volatile.Write(ref _frozenTicks, offsets.GetValueOrDefault(OffsetKeys.Watermark, long.MinValue));
+        for (var t = 0; t < _trackers.Count; t++)
+        {
+            var slots = _trackers[t].MaxSeenTicks;
+            Array.Fill(slots, long.MinValue);
+            Volatile.Write(ref slots[0], offsets.GetValueOrDefault(_sourceKeys[t], long.MinValue));
+        }
     }
 
     public void Observe(int tracker, int worker, long eventTicks)
@@ -161,35 +212,49 @@ internal sealed class KeyEviction<TKey>(WatermarkClock clock, Func<TKey, DateTim
     public Func<TKey, DateTimeOffset> ClosesAt { get; } = closesAt;
 }
 
-/// <summary>Per-operator, per-worker deadline queue driving state eviction.</summary>
-internal sealed class EvictionTracker<TKey>(KeyEviction<TKey> policy) where TKey : notnull
+/// <summary>
+/// Per-operator, per-worker deadlines driving state eviction. The deadlines are a store of
+/// the operator's (<c>{node}.deadlines.w{n}</c>), so they are checkpointed with the state
+/// they bound: a circuit restored from a checkpoint evicts exactly the keys an
+/// uninterrupted run would have, including the ones nothing touches again.
+/// </summary>
+internal sealed class EvictionTracker<TKey> where TKey : notnull
 {
-    private readonly PriorityQueue<TKey, long> _deadlines = new();
-    private readonly HashSet<TKey> _tracked = [];
+    private readonly WatermarkClock _clock;
+    private readonly IDeadlineStore<TKey> _deadlines;
+    private readonly Func<TKey, long> _deadlineOf;
 
-    public void Track(TKey key)
+    // The keys this step's delta rows carried, repeats and all, handed to the store in one
+    // call when the step drains: the store finds the new ones with the probe a set of
+    // tracked keys would have cost here, and a provider with per-call latency pays one
+    // round trip a step instead of one a row.
+    private readonly List<TKey> _touched = [];
+    private readonly List<TKey> _closed = [];
+
+    public EvictionTracker(OperatorContext context, KeyEviction<TKey> policy)
     {
-        if (_tracked.Add(key))
-            _deadlines.Enqueue(key, policy.ClosesAt(key).UtcTicks);
+        _clock = policy.Clock;
+        _deadlines = context.Storage.CreateDeadlineStore<TKey>(context.StateName("deadlines"));
+        var closesAt = policy.ClosesAt;
+        _deadlineOf = key => closesAt(key).UtcTicks;
     }
 
-    /// <summary>Removes and returns every tracked key whose deadline the watermark has passed,
-    /// as one list so callers can evict their state in a single batched store call.</summary>
+    public void Track(TKey key) => _touched.Add(key);
+
+    /// <summary>Removes and returns every tracked key whose deadline the watermark has
+    /// passed, as one list so callers can evict their state in a single batched store call.
+    /// Every operator calls this once per step, on every way out of the step, after its
+    /// last <see cref="Track"/>. The list is this tracker's own, valid until the next
+    /// call; callers read it and never mutate it.</summary>
     public List<TKey> DrainClosed()
     {
-        // Nothing has closed on the overwhelming majority of steps, and this runs once per
-        // evicting operator per worker per step — so the list is allocated only once a key
-        // actually passes its deadline. Callers read the result and never mutate it.
-        var watermark = policy.Clock.FrozenTicks;
-        List<TKey>? closed = null;
-        while (_deadlines.TryPeek(out var key, out var deadline) && deadline <= watermark)
+        if (_touched.Count > 0)
         {
-            _deadlines.Dequeue();
-            _tracked.Remove(key);
-            (closed ??= []).Add(key);
+            _deadlines.AddAll(_touched, _deadlineOf);
+            _touched.Clear();
         }
-        return closed ?? Empty;
+        _closed.Clear();
+        _deadlines.TakeDue(_clock.FrozenTicks, _closed);
+        return _closed;
     }
-
-    private static readonly List<TKey> Empty = [];
 }

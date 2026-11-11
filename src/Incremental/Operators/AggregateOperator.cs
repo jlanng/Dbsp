@@ -27,7 +27,7 @@ internal sealed class AggregateOperator<TKey, TValue, TResult> : IStepOperator
         _groups = context.Storage.CreateIndexedWeightStore<TKey, TValue>(context.StateName("groups"));
         _lastEmitted = context.Storage.CreateValueStore<TKey, TResult>(context.StateName("results"));
         _aggregate = aggregate;
-        _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
+        _eviction = eviction is null ? null : new EvictionTracker<TKey>(context, eviction);
         _errors = context.Errors;
     }
 

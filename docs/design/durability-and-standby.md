@@ -178,10 +178,12 @@ key:    pipeline NUL incarnation NUL store NUL entry
 value:  weight store          entry = value          → weight
         indexed weight store  entry = key NUL value  → weight
         value store           entry = key            → value
+        deadline store        entry = key            → deadline, UTC ticks (see *Event-time state*)
         null = removed (RemoveGroup writes one tombstone per member)
 
 key:    pipeline NUL incarnation NUL $commit         (written last)
-value:  commit sequence, leader term, input offsets (including {table}#t), manifests
+value:  commit sequence, leader term, input offsets (including {table}#t, and the
+        clock's $watermark entries), manifests
 ```
 
 Values are absolute, as the staged overlays already are, so replay is idempotent and
@@ -2175,3 +2177,126 @@ invisible on one plaintext broker:
   fails, the message says what the transaction was being aborted for.
   `KafkaLogOptions.Logger` is settable, and the service gives the log its own logger
   when the host gave none — before, a host heard none of this.
+
+## As built: event-time state (2026-11-11)
+
+Until this step the watermark and every eviction deadline lived in operator fields. A
+circuit restored from a checkpoint started with no watermark and no deadlines, so a late
+record could reopen a closed window and overwrite a delivered row, and a key that was
+open at the restart and never touched again stayed in the stores, the changelog and the
+standby for good. Both are state now.
+
+**The clock.** `WatermarkClock.AppendCheckpoint` adds to every commit's offsets marker
+the frozen watermark under `$watermark` and each `WithEventTime` source's max event time
+seen under `$watermark#s{n}` (UTC ticks; sources numbered in declaration order; a value
+not yet set is left out). The circuit calls it in `CommitCheckpointAsync`, which runs
+between steps and after `Freeze()`, so the entries are the clock exactly as the
+committed step left it. `Start()` hands the recovered marker to `WatermarkClock.Restore`
+before the first step. The per-worker maxima are not kept apart: `Freeze()` takes their
+maximum, so the maximum is all that is restored (into worker 0's slot). In a clustered
+circuit each process commits the entries under its own `p{n}:` prefix like its other
+offsets; they are equal across processes that committed the same step, because the
+step-end frames had already merged the observations. `$watermark` is a reserved input
+name, as `$step` is. Cost: one dictionary entry per source per commit, nothing per step.
+
+**The deadlines.** A fourth store kind, `IDeadlineStore<TKey>`
+(`IStorageProvider.CreateDeadlineStore`): key → deadline in ticks, with `AddAll` (add the
+keys not held, asking for a deadline only for those), `Set`, `Remove` and
+`TakeDue(upTo, into)`. `EvictionTracker` — every `EvictWhen` and window eviction in
+`Join`, `AntiJoin`, the aggregates, `TopK`, `Min`/`Max`, keyed `Distinct`, the table
+`Join`s and the remembered `Lookup` — keeps its keys in one, named
+`{node}.deadlines.w{n}`; so does `WindowCloseOperator` (the windows still to announce:
+`OnClose`, `WindowCloses`) through the same tracker, and `SessionWindowOperator` (a
+session's deadline moves, so it uses `Set` and `Remove`). The stores are created through
+`OperatorContext.StateName`, so they are in the state manifest like any other.
+
+A deadline is staged with the step that set it and committed with the checkpoint that
+covers that step, like every other store's writes. What each provider does:
+
+| provider | deadlines held as | at a restore |
+|---|---|---|
+| `InMemoryStorageProvider` | a dictionary and a priority queue; a queue entry whose key has since moved or gone is skipped when it reaches the front | nothing survives (the provider does not checkpoint) |
+| `InMemoryCheckpointStorageProvider` | the same, written through, with the deadline each touched key had at the last commit kept beside it for `Recover()` | rolled back to the commit |
+| `ChangelogStorageProvider` | the same structure inside a `ChangelogStore`: one record per key (`entry = key → deadline`), a tombstone when the key closes; `HeldInstances` as for the other stores | built from the store's bytes when the circuit creates the store, as every store is; a **follower that holds the store typed applies each record into the map and the queue**, so a warm standby's takeover starts with the order already built |
+| `RedisStorageProvider` | a hash `{prefix}:{store}` (key → exact deadline) and a sorted set `{prefix}:{store}:due` scored by deadline / 1,024 ticks | nothing is read. `TakeDue` asks Redis only once the watermark reaches a remembered lower bound of the committed scores |
+
+The Redis score is coarser than the deadline because a sorted set's score is a double
+and a tick count of this century is beyond a double's exact integers; a range read is
+therefore a superset, and the hash's exact value decides. The lower bound never passes
+an entry whose removal is only staged, since a rollback makes it due again.
+
+**No rebuild at start, and why not.** The alternative to a store was to rebuild each
+operator's queue from the keys of its state at `Start()`. That walks every evicting
+store at every start — the cost the layout work (above) had just taken out of a
+takeover — and the stores have no enumeration to walk with. With the deadlines in a
+store, a restore costs what restoring any store costs, and a warm standby pays nothing
+at the takeover.
+
+**What a per-record path pays.** `EvictionTracker.Track(key)` appends the key to a
+per-step list; `DrainClosed()`, which every evicting operator already called once per
+step on every way out, hands the list to the store in one `AddAll` and then takes what
+is due into a list the tracker owns. On the heap that is one dictionary probe per delta
+row where there was one hash-set probe, and no allocation per step where the old
+tracker allocated a list on every step in which something closed. On the changelog a
+key costs one more record when it opens and one tombstone when it closes, per operator
+that bounds it. On Redis a step costs one `HMGET` for the keys not seen since the last
+commit.
+
+**The manifest: format 7.** A circuit with event time adds `eventtime={sources}`. What
+happens to an existing checkpoint:
+
+- **A format-6 checkpoint of a circuit that uses event time is refused**
+  (`CircuitStateMismatchException`): it holds neither the watermark nor a deadline for
+  anything that was open, so resuming it is exactly the fault this step removes. Start
+  it from an empty state store and replay its inputs (in the service: `state=reset`).
+  The deadlines could be rebuilt from the state's keys, but not the watermark, and a
+  rebuilt circuit that admits one late record has already reopened a window.
+- **A format-6 checkpoint of a circuit with no event time resumes as it is**, and its
+  next commit writes format 7: for such a circuit the two formats hold the same things.
+- **A changed number of `WithEventTime` sources is refused**: the committed maxima are
+  per source by position. Adding the first source to a circuit that had none, or
+  removing the last, is not: there is nothing to misassign.
+- Adding `EvictWhen` to an operator that already has state is accepted, as any new
+  store is, and starts with no deadline for the keys already there: those close only if
+  a record touches them again. That is unchanged, and now the only way to get it.
+
+A checkpointing provider that does not implement `CreateDeadlineStore` is refused at
+`Build()` by the interface's default (`NotSupportedException`); a provider that does not
+checkpoint gets the heap store from it.
+
+**Tests** (`tests/Incremental.Tests`).
+
+- `EventTimeRestartTests`: one seeded workload run twice, uninterrupted and killed at
+  random steps, over six definitions — tumbling, hopping and session windows with
+  linear, non-linear and `Min`/`Max` aggregates and `OnClose`; windowed `TopK` and a
+  window-sticky regroup; stream joins under `EvictWhen` with two event-time sources
+  (`Join`, `LeftJoin`, `AntiJoin`, `Distinct`, `TopK`, `WindowCloses`, `Sum`); a table
+  `Lookup` and `Join` under `EvictWhen` — at 1 and 4 workers and both commit cadences,
+  on four backings: the in-memory checkpoint provider, the changelog read cold, a
+  changelog follower that built its circuit before the records came and is promoted,
+  and Redis from a provider that has read nothing. Every batch carries a record 5–20 s
+  behind the watermark, so the first step after each restore has one. Asserted: every
+  step's output changes equal the uninterrupted run's (and a step run again says what it
+  said the first time); the final state is equal entry for entry (by count on the
+  in-memory provider, which cannot list itself); the committed offsets, clock included,
+  are equal; a cold read of the log equals the state. Then 50 restores in 150 steps on
+  ten definition/backing pairs, with the state measured every 25 steps; a late record
+  as the first thing after a restore; keys open at a restore and never touched again;
+  the two format rules; a provider without deadline stores.
+- `DeadlineStoreTests`: the four providers against a dictionary through random adds,
+  sets, removes, takes, commits, rollbacks and reopens (cold and by promoting a follower
+  that held the store typed); one record per key on the changelog however the key is
+  written; no Redis command while nothing can be due.
+- Mutations: 23 in the core and the Redis store, all killed by these two classes
+  (enrichment-service.md, *As built*, S7, lists them).
+
+**Not done.**
+
+- The deadline of a key is not re-derived when the definition's `closesAt` changes
+  under a kept state: a key keeps the deadline it was given when it opened.
+- A dead-lettering policy does not cover `closesAt`: one that throws faults the step,
+  as before, though now at the end of the operator's step and not at the row.
+- The cluster path (several processes) restores the clock per process from its own
+  marker; that is reasoned from the code and covered by no test of a clustered restart
+  with event time.
+

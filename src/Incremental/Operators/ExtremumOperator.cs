@@ -50,7 +50,7 @@ internal sealed class ExtremumOperator<TKey, TValue, TProjected> : IStepOperator
         _tree = context.Storage.CreateIndexedWeightStore<ExtremumSlot<TKey>, TProjected>(context.StateName("tree"));
         _selector = selector;
         _sign = sign;
-        _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
+        _eviction = eviction is null ? null : new EvictionTracker<TKey>(context, eviction);
         _errors = context.Errors;
         try
         {

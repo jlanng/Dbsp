@@ -91,6 +91,12 @@ views.WithEventTime(v => v.At, lateness: TimeSpan.FromSeconds(2))
 For keyed state whose lifecycle isn't window-derived, the escape hatch is
 `.EvictWhen(key => closesAt)` on any grouping.
 
+The watermark and the deadlines of everything still open are checkpointed with the state
+they bound, so they hold across a restart and a failover: a restored circuit has the
+watermark of its last checkpoint — a record that was late stays late, a closed window
+stays closed — and what was open at the restart still closes, touched again or not
+([docs/intro.md](docs/intro.md#event-time-state-across-a-restart)).
+
 **Session windows.** `.GroupBy(c => c.UserId).SessionWindow(gap)` groups each key's
 events into sessions separated by at least `gap` of event-time inactivity; a session spans
 [first event, last event + gap), and an event exactly at a session's end starts a new one.
@@ -383,7 +389,8 @@ wrapping); floating-point sums drift permanently under retraction (adding x then
 not restore the accumulator), so prefer `decimal` or `long`.
 
 **Storage.** Stateful operators keep their state behind `IStorageProvider`
-(`IWeightStore`, `IIndexedWeightStore`, `IValueStore`), created per operator *per worker*
+(`IWeightStore`, `IIndexedWeightStore`, `IValueStore`, and `IDeadlineStore` for the
+deadlines of open windows and keys), created per operator *per worker*
 so implementations never see cross-thread access to one store.
 
 - `InMemoryStorageProvider` (default) — heap dictionaries.
@@ -649,7 +656,10 @@ operators orphans downstream state (detected, loudly); `.Named("revenue")` on th
 stateful operator returns pins its identity by name instead, so the circuit can evolve
 around it and a rebuild still finds its state. Pure additions — new operators, whose state
 starts empty — are always allowed. A name pins identity, not meaning: state is resumed
-as-is, so rename the operator when its computation changes.
+as-is, so rename the operator when its computation changes. The manifest is format 7:
+a checkpoint from before event-time state was checkpointed (format 6) resumes a circuit
+that has no event time and is refused by one that has; so is a changed number of
+`WithEventTime` sources.
 
 Output batches are transient and not checkpointed — consumers re-derive views by
 integrating. Batches published between the last commit and a crash are never replayed, so
@@ -917,6 +927,10 @@ disclosed trade-offs (below), not missing semantics:
       aggregate to publish finalized results)
 - [x] Watermark-driven eviction for join/anti-join/distinct state (keyed `Distinct`
       keeps its state grouped by key so the policy applies)
+- [x] Event-time state in the checkpoint: the watermark and every eviction, window-close
+      and session deadline (`IDeadlineStore`, state manifest format 7), so a restored
+      circuit — and a standby that followed the state changelog — reopens no closed
+      window and still evicts what was open
 - [x] Session windows (per-key inactivity gap; a bridging or late event merges sessions and
       a retraction splits them, all via ordinary deltas; key state evicted once the
       watermark passes last event + gap)

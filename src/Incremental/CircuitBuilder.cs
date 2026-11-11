@@ -511,7 +511,7 @@ public sealed class CircuitBuilder
     /// <summary>The state manifest a circuit built from this builder would commit.</summary>
     internal string DescribeStateManifest() =>
         StateManifest.Build(
-            Options.Workers, Options.Cluster?.ProcessCount ?? 1,
+            Options.Workers, Options.Cluster?.ProcessCount ?? 1, WatermarkClock?.Sources ?? 0,
             _readTables.Select(t => (t.Name, t.Epoch)).Concat(_derivedTables.Select(d => (d.Table.Name, d.Table.Epoch))),
             new SortedSet<string>(DescribeState().Select(s => s.Name), StringComparer.Ordinal));
 

@@ -46,7 +46,7 @@ internal sealed class TableJoinOperator<TKey, TFact, TRow, TOut> : IStepOperator
         _table = table;
         _matched = matched;
         _unmatched = unmatched;
-        _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
+        _eviction = eviction is null ? null : new EvictionTracker<TKey>(context, eviction);
         _errors = context.Errors;
     }
 

@@ -345,6 +345,10 @@ public sealed class Circuit : IAsyncDisposable
                     continue;
                 }
 
+                // The clock's entries: put back below, all together.
+                if (key.StartsWith(OffsetKeys.Watermark, StringComparison.Ordinal))
+                    continue;
+
                 // Plain keys are unstamped running counts; "{name}#p{partition}" keys are a
                 // stamped input's per-partition positions (see OffsetKeys). Entries for
                 // inputs this circuit no longer declares are ignored, as ever.
@@ -359,6 +363,11 @@ public sealed class Circuit : IAsyncDisposable
                     input.SeedUnstamped(offset);
             }
             Volatile.Write(ref _committedOffsets, offsets);
+
+            // The event-time clock resumes where the committed step left it: the watermark
+            // does not regress across a restart, so a record that was late stays late, and
+            // the deadlines the stores hold are measured against the clock that set them.
+            _watermarkClock?.Restore(offsets);
         }
 
         // After seeding: a table is attached at its committed version, or — a new circuit —
@@ -973,6 +982,9 @@ public sealed class Circuit : IAsyncDisposable
         foreach (var table in _derivedTables)
             table.AppendWrittenVersion(offsets);
 
+        // Between steps and after the freeze: the clock as the committed step left it.
+        _watermarkClock?.AppendCheckpoint(offsets);
+
         if (_cluster is { } cluster)
         {
             // Each process commits only its own shards and its own inputs' offsets, under
@@ -1019,7 +1031,7 @@ public sealed class Circuit : IAsyncDisposable
     /// worker — so any change that would misdirect a restore changes the manifest.</summary>
     private string BuildStateManifest(IEnumerable<string> storeNames) =>
         StateManifest.Build(
-            _options.Workers, _cluster?.ProcessCount ?? 1,
+            _options.Workers, _cluster?.ProcessCount ?? 1, _watermarkClock?.Sources ?? 0,
             _tables.Select(t => (t.TableName, t.Epoch)).Concat(_derivedTables.Select(t => (t.TableName, t.Epoch))),
             storeNames);
 

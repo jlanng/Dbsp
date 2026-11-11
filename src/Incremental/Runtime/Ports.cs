@@ -42,6 +42,14 @@ internal static class OffsetKeys
     /// <summary>The key the committed step sequence travels under, beside the offsets.</summary>
     public const string StepMarker = "$step";
 
+    /// <summary>The key the frozen event-time watermark (UTC ticks) travels under, and the
+    /// prefix of every key the clock commits.</summary>
+    public const string Watermark = "$watermark";
+
+    /// <summary>The key one <c>WithEventTime</c> source's max event time seen travels
+    /// under; sources are numbered in the order the definition declares them.</summary>
+    public static string WatermarkSource(int source) => $"{Watermark}#s{source}";
+
     public static string Encode(string inputName, int partition) => $"{inputName}{Separator}{partition}";
 
     public static string Table(string tableName) => $"{tableName}#t";
@@ -401,7 +409,11 @@ internal static class InputPorts
                 ? throw new ArgumentException(
                     $"Input name '{name}' is reserved: the checkpoint commits the circuit's step sequence under it.",
                     nameof(name))
-                : name;
+                : name == OffsetKeys.Watermark
+                    ? throw new ArgumentException(
+                        $"Input name '{name}' is reserved: the checkpoint commits the circuit's event-time watermark under it.",
+                        nameof(name))
+                    : name;
 
     public static Channel<TEntry> CreateChannel<TEntry>(CircuitOptions options) =>
         Channel.CreateBounded<TEntry>(new BoundedChannelOptions(options.InputChannelCapacity)

@@ -10,36 +10,33 @@ namespace Incremental.Operators;
 /// with several workers. Retractions track a key like insertions do: a window whose contents
 /// were fully retracted still closes (it closes by time, not by contents).
 /// </summary>
-internal sealed class WindowCloseOperator<TKey, TValue>(KeyEviction<TKey> policy) : IStepOperator
+internal sealed class WindowCloseOperator<TKey, TValue> : IStepOperator
     where TKey : notnull
     where TValue : notnull
 {
-    // Own deadline queue rather than an EvictionTracker: the notification carries the
-    // deadline, so ClosesAt runs once per key and its result is reused at close.
-    private readonly PriorityQueue<(TKey Key, DateTimeOffset ClosesAt), long> _deadlines = new();
-    private readonly HashSet<TKey> _tracked = [];
+    // The keys still to announce are state: a window open at a restart must still be
+    // announced when it closes, though nothing touches it again. So they are held in a
+    // deadline store, through the same tracker that drives eviction.
+    private readonly KeyEviction<TKey> _policy;
+    private readonly EvictionTracker<TKey> _open;
     private readonly OutputBuffer<KeyedValue<TKey, DateTimeOffset>> _output = new();
+
+    public WindowCloseOperator(OperatorContext context, KeyEviction<TKey> policy)
+    {
+        _policy = policy;
+        _open = new EvictionTracker<TKey>(context, policy);
+    }
 
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<KeyedValue<TKey, TValue>>)inputs[0]!;
         foreach (var ((key, _), _) in delta)
-        {
-            if (_tracked.Add(key))
-            {
-                var closesAt = policy.ClosesAt(key);
-                _deadlines.Enqueue((key, closesAt), closesAt.UtcTicks);
-            }
-        }
+            _open.Track(key);
 
-        var watermark = policy.Clock.FrozenTicks;
-        var output = _output.Next(0);
-        while (_deadlines.TryPeek(out var entry, out var deadline) && deadline <= watermark)
-        {
-            _deadlines.Dequeue();
-            _tracked.Remove(entry.Key);
-            output.Add(new KeyedValue<TKey, DateTimeOffset>(entry.Key, entry.ClosesAt), 1);
-        }
+        var closed = _open.DrainClosed();
+        var output = _output.Next(closed.Count);
+        foreach (var key in closed)
+            output.Add(new KeyedValue<TKey, DateTimeOffset>(key, _policy.ClosesAt(key)), 1);
         return output;
     }
 }

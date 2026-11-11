@@ -23,7 +23,7 @@ internal sealed class LinearAggregateOperator<TKey, TValue, TResult> : IStepOper
     {
         _state = context.Storage.CreateValueStore<TKey, (long, TResult)>(context.StateName("state"));
         _aggregate = aggregate;
-        _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
+        _eviction = eviction is null ? null : new EvictionTracker<TKey>(context, eviction);
         _errors = context.Errors;
     }
 

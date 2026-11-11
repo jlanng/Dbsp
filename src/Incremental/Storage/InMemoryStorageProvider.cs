@@ -20,7 +20,10 @@ public sealed class InMemoryStorageProvider : IStorageProvider
     public IValueStore<TKey, TValue> CreateValueStore<TKey, TValue>(string name) where TKey : notnull =>
         new ValueStore<TKey, TValue>();
 
-    // The three stores are internal, not private, because ChangelogStorageProvider keeps its
+    public IDeadlineStore<TKey> CreateDeadlineStore<TKey>(string name) where TKey : notnull =>
+        new DeadlineStore<TKey>();
+
+    // The stores are internal, not private, because ChangelogStorageProvider keeps its
     // state in them: the same structures and the same read path, with change capture
     // wrapped around the writes. The members below each store's interface are for that.
 
@@ -282,5 +285,72 @@ public sealed class InMemoryStorageProvider : IStorageProvider
         public bool TryGet(TKey key, [MaybeNullWhen(false)] out TValue value) => _values.TryGetValue(key, out value);
         public void Put(TKey key, TValue value) => _values[key] = value;
         public void Remove(TKey key) => _values.Remove(key);
+    }
+
+    /// <summary>The deadlines as a map, for the lookups, and as a queue, for the order.
+    /// The queue is never searched: an entry whose key has since moved or gone is skipped
+    /// when it reaches the front, which it does once the watermark passes the deadline it
+    /// was queued under — so the queue holds at most one entry per deadline ever set and
+    /// not yet passed.</summary>
+    internal sealed class DeadlineStore<TKey> : IDeadlineStore<TKey> where TKey : notnull
+    {
+        private readonly Dictionary<TKey, long> _deadlines = new();
+        private readonly PriorityQueue<TKey, long> _queue = new();
+
+        /// <summary>Every key with its deadline.</summary>
+        internal Dictionary<TKey, long> Entries => _deadlines;
+
+        internal bool TryGet(TKey key, out long deadline) => _deadlines.TryGetValue(key, out deadline);
+
+        internal void Clear()
+        {
+            _deadlines.Clear();
+            _queue.Clear();
+        }
+
+        public void AddAll(IReadOnlyList<TKey> keys, Func<TKey, long> deadlineOf)
+        {
+            for (var i = 0; i < keys.Count; i++)
+            {
+                var key = keys[i];
+                if (_deadlines.ContainsKey(key))
+                    continue;
+                var deadline = deadlineOf(key);
+                _deadlines.Add(key, deadline);
+                _queue.Enqueue(key, deadline);
+            }
+        }
+
+        public void Set(TKey key, long deadline)
+        {
+            ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(_deadlines, key, out var held);
+            if (held && slot == deadline)
+                return;
+            slot = deadline;
+            _queue.Enqueue(key, deadline);
+        }
+
+        public void Remove(TKey key) => _deadlines.Remove(key);
+
+        public void TakeDue(long upTo, List<TKey> into) => TakeDue(upTo, into, null);
+
+        /// <summary><see cref="TakeDue(long, List{TKey})"/>, also appending each key's
+        /// deadline to <paramref name="deadlines"/>: what a store that can undo needs.</summary>
+        internal void TakeDue(long upTo, List<TKey> into, List<long>? deadlines)
+        {
+            while (_queue.TryPeek(out var key, out var deadline) && deadline <= upTo)
+            {
+                _queue.Dequeue();
+                // Stale unless it is still the key's deadline: the key moved, or went, after
+                // this entry was queued. (Queued twice under one deadline, the first entry
+                // takes the key and the second finds it gone.)
+                if (_deadlines.TryGetValue(key, out var current) && current == deadline)
+                {
+                    _deadlines.Remove(key);
+                    into.Add(key);
+                    deadlines?.Add(deadline);
+                }
+            }
+        }
     }
 }

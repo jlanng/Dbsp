@@ -218,10 +218,10 @@ As built (`Operators/TableLookupOperator.cs`):
 - **Bounding the memory.** The grouping form honours `EvictWhen`: once a key closes,
   everything remembered for its facts is dropped and what was emitted stays final. Each
   remembered fact is tracked for this individually, since the state is per fact, so
-  eviction costs a deadline-queue entry per live fact where a join's costs one per key.
-  As with every evicting operator, the queue is rebuilt from arriving records and not
-  checkpointed, so facts remembered before a restart are only evicted if they are touched
-  again. There is no bound other than the watermark: no count or age limit, and nothing
+  eviction costs a deadline entry per live fact where a join's costs one per key. As
+  with every evicting operator the deadlines are a store of the operator's, checkpointed
+  with the facts they bound (durability-and-standby.md, *Event-time state*), so a fact
+  remembered before a restart is still evicted when its key closes. There is no bound other than the watermark: no count or age limit, and nothing
   on the plain `stream.Lookup` form, which has no grouping to hang a policy on.
 - **Per-fact overhead.** The state is an indexed weight store keyed by fact (for its
   batched, allocation-free reads and writes), in which every fact is a group of its own,

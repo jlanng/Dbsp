@@ -288,7 +288,7 @@ public sealed class WindowedZStream<TKey, TValue> : ZStream<WindowedValue<TKey, 
         var closes = Builder.AddNode(
             "windowClose",
             [_keyedNodeId],
-            _ => new WindowCloseOperator<WindowKey<TKey>, TValue>(eviction));
+            ctx => new WindowCloseOperator<WindowKey<TKey>, TValue>(ctx, eviction));
         var final = Builder.AddNode(
             "onClose",
             [closes, _keyedNodeId],

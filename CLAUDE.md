@@ -211,6 +211,17 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
 - `CircuitBuilder.Describe` reports a `Lookup`'s table as `Probes`, not among `Inputs`:
   the lookup probes the table and does not consume its changes, so the edge belongs to
   the picture and must never become an execution input.
+- Event-time state is checkpointed state (docs/design/durability-and-standby.md, *Event-time
+  state*). The clock commits in the offsets marker (`$watermark`, `$watermark#s{n}`) and is
+  restored at `Start()`; every deadline an operator waits on lives in an `IDeadlineStore`
+  (`{node}.deadlines.w{n}`), never in a field: an operator that evicts or announces on the
+  watermark goes through `EvictionTracker` (or sets deadlines in a store itself, as the
+  session operator does), calls `DrainClosed()` once per step on every way out, and keeps
+  no queue of its own. A checkpointing `IStorageProvider` must implement
+  `CreateDeadlineStore`; a changelog follower that holds the store typed keeps its order
+  as it applies records, so a takeover rebuilds nothing. `EventTimeRestartTests` is the
+  check: killed and restored at any step, a circuit's outputs and final state equal the
+  uninterrupted run's.
 - Checkpointed state identity is covered by the state manifest (committed with every
   checkpoint, validated at `Start()`); store names are positional unless pinned with
   `.Named()` — changing store naming or the manifest format needs a format-version bump.
