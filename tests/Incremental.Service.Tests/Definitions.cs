@@ -155,3 +155,31 @@ public sealed class LatestTrades : IPipelineDefinition
     public void Build(PipelineBuilder p) =>
         p.UpsertSink("out", p.KeyedInput<long, Trade>("trades", t => t.Id), t => t.Id);
 }
+
+public sealed record Fill(long Sequence, long TradeId, decimal Price);
+
+public sealed record FilledTrade(long Sequence, long TradeId, decimal Notional);
+
+/// <summary>Two inputs joined to each other, and a count over one of them that a record
+/// read twice would show in.</summary>
+[Pipeline("trade-fills")]
+public sealed class TradeFills : IPipelineDefinition
+{
+    public void Build(PipelineBuilder p)
+    {
+        var trades = p.Input<Trade>("trades");
+        var fills = p.Input<Fill>("fills");
+        p.UpsertSink("filled",
+            trades.GroupBy(t => t.Id).Join(fills.GroupBy(f => f.TradeId), (_, t, f) => new FilledTrade(f.Sequence, t.Id, t.Quantity * f.Price)).Named("filled"),
+            f => f.Sequence);
+        p.UpsertSink("fill-counts", fills.GroupBy(f => f.TradeId).Count().Named("fill-count"));
+    }
+
+    public static Dictionary<long, FilledTrade> Filled(IEnumerable<Trade> trades, IEnumerable<Fill> fills)
+    {
+        var byId = trades.ToDictionary(t => t.Id);
+        return fills.Where(f => byId.ContainsKey(f.TradeId)).ToDictionary(f => f.Sequence, f => new FilledTrade(f.Sequence, f.TradeId, byId[f.TradeId].Quantity * f.Price));
+    }
+
+    public static Dictionary<long, long> Counts(IEnumerable<Fill> fills) => fills.GroupBy(f => f.TradeId).ToDictionary(g => g.Key, g => g.LongCount());
+}
