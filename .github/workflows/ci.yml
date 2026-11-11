@@ -34,6 +34,15 @@ jobs:
       # plugin author would write them.
       - name: Test example pipelines
         run: dotnet test --project examples/Incremental.EnrichmentService/Pipelines.Tests -c Release --no-build
+      # The smoke tests that need no broker. Each drives the example through its admin API
+      # (or prints its narrative), checks every claim against a model and exits 1 on one
+      # that does not hold. A few seconds each.
+      - name: Smoke, enrichment service on one in-memory node
+        run: dotnet run -c Release --no-build --project examples/Incremental.EnrichmentService -- --headless
+      - name: Smoke, enrichment service on two in-memory nodes with a takeover
+        run: dotnet run -c Release --no-build --project examples/Incremental.EnrichmentService -- --headless --nodes 2
+      - name: Smoke, trade enrichment on shared tables
+        run: dotnet run -c Release --no-build --project examples/Incremental.TradeEnrichment
       # Validates the NuGet packaging (metadata, XML docs, SourceLink, symbols) on every build.
       - name: Pack
         run: |
@@ -48,6 +57,50 @@ jobs:
         with:
           name: packages
           path: artifacts/packages/*.nupkg
+
+  # Everything that needs Kafka, Postgres and Kafka Connect: the Kafka library's
+  # integration tests, the service's Kafka-backed classes (KafkaService*Tests, which the
+  # job above skips) and the example's Kafka smoke, which kills a node and takes over.
+  # The stack is the repository's own compose file rather than `services:` containers,
+  # for two reasons: Postgres has to be started with `-c wal_level=logical`, which a
+  # service container cannot be given, and this way CI runs what a developer runs.
+  # These tests skip when the stack is unreachable, so each step also fails if anything
+  # was skipped: a green run here means they ran.
+  connector-stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Start Kafka, Postgres and Kafka Connect
+        run: docker compose --profile connectors up -d --wait --wait-timeout 240
+      - name: Build
+        run: dotnet build -c Release
+      - name: Test Kafka against the broker
+        run: |
+          set -o pipefail
+          dotnet test --project tests/Incremental.Kafka.Tests -c Release --no-build | tee kafka-tests.log
+          grep -Eq '^\s*skipped: 0\s*$' kafka-tests.log
+      - name: Test Service against the broker
+        run: |
+          set -o pipefail
+          dotnet test --project tests/Incremental.Service.Tests -c Release --no-build | tee service-tests.log
+          grep -Eq '^\s*skipped: 0\s*$' service-tests.log
+      - name: Smoke, enrichment service on Kafka with a killed leader
+        run: dotnet run -c Release --no-build --project examples/Incremental.EnrichmentService -- --headless --kafka --prefix "ci-${{ github.run_id }}-${{ github.run_attempt }}"
+      - name: Measured failover times
+        if: always()
+        run: |
+          cat tests/Incremental.Kafka.Tests/bin/Release/net10.0/measurements.log || true
+          cat tests/Incremental.Service.Tests/bin/Release/net10.0/measurements.log || true
+      - name: Container logs
+        if: failure()
+        run: docker compose --profile connectors logs --no-color --tail 200
+      - name: Stop the stack
+        if: always()
+        run: docker compose --profile connectors down -v
 
   # Scaling assertions, not absolute timings: shared runners are too noisy to gate on
   # wall-clock numbers, so this job asserts that a fixed-size delta costs about the same
