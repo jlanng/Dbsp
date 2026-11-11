@@ -497,10 +497,14 @@ so implementations never see cross-thread access to one store.
   building them: about a second after the three seconds of silence that decide it,
   whether the pipelines hold a quarter of a million orders or four million. That is
   for a leader whose process is gone; one that is alive and cannot commit still
-  answers its peer's probe and is taken over after `TakeoverCeiling`, 30 s. The numbers,
+  answers its peer's probe and is taken over after `TakeoverCeiling`, 30 s. The loss of
+  one broker of three is neither: the sink is silent for 8 to 15 s — the brokers' own
+  time to give a broker up — and the same node leads afterwards. A node that does lose
+  the leadership ends its process and must be started again (`NodeSupervisor`, or the
+  platform's restart policy); it comes back as the standby. The numbers,
   and what a node needs in memory per million rows, are in the guide (*How large, how
   fast*). `docker compose --profile kafka3` is three brokers at replication factor 3 for
-  the failover and broker-restart tests; `--profile kafka-sasl` is a broker that refuses
+  the failover and broker-failure tests; `--profile kafka-sasl` is a broker that refuses
   clients it does not know.
 
 - **Start here for the service:** [docs/enrichment-service.md](docs/enrichment-service.md)

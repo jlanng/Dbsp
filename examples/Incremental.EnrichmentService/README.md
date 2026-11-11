@@ -170,6 +170,7 @@ var service = builder.Services.AddIncrementalService(o =>
 | `--ui-dir DIR` | serve the admin UI's files from DIR (`src/Incremental.Service.Admin/wwwroot`) instead of the embedded copies |
 | `--otlp` | export the meters `Incremental.Service` and `Incremental` over OTLP; the endpoint is `OTEL_EXPORTER_OTLP_ENDPOINT` (the guide's *Operating it: monitoring*) |
 | `--no-generate`, `--no-pipelines` | start with no generator; seed no pipelines |
+| `--no-supervise` | with `--kafka`: run the node alone; without it the process supervises the node (`NodeSupervisor`) and starts it again when it ends fenced, resigned or killed |
 | `--bootstrap`, `--postgres`, `--connect`, `--postgres-host-for-connect` | where the stack is, if not the compose file's |
 | `--data dir` | where the reference files, the quote, alert and dead-letter files and the plugin caches go (a temporary directory by default) |
 | `--verbose` | information-level logs |

@@ -1752,13 +1752,14 @@ Each has a default this design is built on.
     the cost is that compaction can remove the marker from under a follower that is
     behind, which then applies another version's records to its typed stores — the
     per-record tag exists because that cannot be ruled out.
-32. **The takeover ceiling stays at 30 s.** A broker that is killed (not shut down)
-    leaves the service's leader unable to commit until the controller gives up on it
-    and the coordinator has moved; in one of several runs on three local brokers that
-    silence reached the ceiling and the standby took over, with nothing lost.
-    *Alternative:* a higher `TakeoverCeiling`, which lengthens the outage when the
-    leader really is alive and stuck; or a lower `broker.session.timeout.ms` on the
-    brokers, which is the cluster's to set.
+32. **The takeover ceiling stays at 30 s** (S6; S7 found why it was reached). The loss
+    of one broker silences a leader for 8 to 15 s with the client settings of S7 —
+    11 to 16 s if the broker stops answering instead of dying, and once 26 s — so the
+    ceiling has room; before S7 the client's own delays took a leader past it.
+    *Alternative:* a lower ceiling — 20 s would have cleared every run of S7 but that
+    one — which shortens the outage when a leader really is alive and stuck and leaves
+    less room for a slow cluster; or a lower `broker.session.timeout.ms` on the
+    brokers, which is the cluster's to set and is the floor under every figure here.
 33. **A refused group lookup is passed over, and no permission on a group is asked
     for** (S6). The broker's authorizer logs each refusal, about one a second per
     consumer. *Alternative:* require `Describe` on the three group names
@@ -1768,14 +1769,18 @@ Each has a default this design is built on.
 34. **The broker-stopping tests and the SASL run are not in CI.** They need three
     brokers whose containers the test may kill, take about ten minutes, and have run
     only here. *Alternative:* a nightly job on the `kafka3` and `kafka-sasl` profiles.
-35. **A takeover that is itself fenced ends the node, like any fencing** (S6, second
-    review). In one rolling broker restart of 21 that left both nodes fenced and nothing
-    running until a supervisor would have restarted one. *Alternative:* a node whose
-    takeover is fenced within a few seconds of its own `InitTransactions`, and that
-    reads no leader record of a higher term, goes back to standing by instead of
-    exiting. It would have saved that run; it puts an exception into "Fenced is final",
-    which is what keeps two writers from ever alternating, and it wants a reproduction
-    before it is trusted. Until then: a supervisor, and an alert on no leader.
+    What S7 moved into every run instead: the lost takeover, the stale request that
+    caused it, the supervisor contract and the earlier broker fixes are tested on one
+    broker or on none.
+35. **A takeover that is fenced before the node is the writer leaves it a standby**
+    (S7; S6 had it end the node, and one rolling broker restart of 21 left both nodes
+    fenced). The reproduction S6 asked for exists (`StaleEpochRequestTests`): the
+    fence came from the replaced leader's own client, through a request the broker
+    should have refused. The exception to "Fenced is final" is drawn where nothing has
+    been promoted and no term committed, so two writers still cannot alternate.
+    *Alternative:* keep it final and rely on the supervisor alone, which S7 also built:
+    both nodes then restart and one leads from a cold start (S6's *How large* has
+    what that costs with the table size) where the standby that stayed leads warm.
 36. **Event-time state is checkpointed, and an older checkpoint of an event-time
     pipeline is refused** (S7). The watermark and every deadline are in the checkpoint
     from state-manifest format 7 on. A pipeline that uses `WithEventTime` and whose
@@ -1839,6 +1844,39 @@ Each has a default this design is built on.
     status the UI polls. *Alternative:* keep a running count per store and show it per
     pipeline; it is what would let an operator see a definition whose state grows for
     ever (the second review's `execution-quality`).
+47. **Every Kafka client starts from the service's settings, not the client
+    library's** (S7, `KafkaClientDefaults`): a reconnect delay of at most 1 s, a socket
+    timeout of 6 s, a metadata refresh every 2 s. They are what keeps the loss of a
+    broker under the takeover ceiling. *Alternative:* leave the library's defaults and
+    document the settings for the host to make; a host that forgets has a leadership
+    move at every broker that stops answering. The cost of ours: a request that takes
+    longer than six seconds for a good reason is made again (the producers are
+    idempotent), and each client asks for metadata every two seconds — a node with
+    thirty clients sends fifteen small requests a second.
+48. **At the ceiling a standby believes the controller about whether anybody can
+    commit** (S7). *Alternative:* prove it by writing — a record of its own to the
+    leader topic through a plain producer before it takes over. That also sees a
+    cluster whose controllers are gone and whose metadata is therefore stale, which the
+    built check does not; it is a second kind of write outside the fenced producer and
+    it moves the leader topic's end, which is the sign of life of a leader inside a long
+    transaction, so the standby would have to tell its own record from the leader's.
+49. **A Kafka sink keeps a producer of its own unless its spec says `"producer":
+    "log"`** (unchanged). S7 measured what that costs when a broker stops answering:
+    the sink's producer finds the broker out separately, after the writer has. With the
+    2 s metadata refresh it usually knows the new leader before it sends.
+    *Alternative:* make `log` the default for sinks on the log's own cluster — one
+    client fewer to recover, and a sink write that commits with its checkpoint; a sink
+    on another cluster cannot use it, and a large step's sink records then ride in the
+    writer's transaction.
+50. **`NodeSupervisor` is in `Incremental.Service` and the example uses it by default
+    on Kafka** (S7). *Alternative:* document the contract only and leave restarting to
+    the platform, as before; then the example, the rig and the tests each need
+    something that restarts a node, which is how round two came to run without one.
+51. **The `kafka3` profile's brokers are also its controllers** (unchanged). It makes
+    the loss of the active controller part of every broker test, which a cluster with
+    separate controllers (MSK) does not have. *Alternative:* a controller container
+    of its own and three plain brokers: the broker-loss figure is then the 9 s case
+    only, and the controller failover goes untested.
 
 ## Not verified
 
@@ -4162,3 +4200,352 @@ applies each deadline as it reads it) and is not a number.
   example's `--headless --kafka` smoke, which checks the sinks against the model with a
   straggler behind the kill; it does not measure state size.
 
+
+#### Broker failures: the stall, the leadership, the supervisor (H1, H4, the Kafka half of H13)
+
+The critic's H1: a broker failure could still take the service down, and nobody knew
+why the leader stalled for 30 to 50 s. Both are answered. The causes, the evidence for
+each and the mechanisms are in `durability-and-standby.md`, *As built: broker
+failures*; this is what it comes to for the service, and the runs.
+
+**What was wrong, in one paragraph.** The stall was three things in a row. The brokers
+give a dead broker nine seconds before its partitions move, and that is Kafka's. The
+Kafka client then waited out delays of its own — ten seconds before reconnecting,
+sixty for a broker that had stopped answering — which was ours to configure and was
+not. And the test cluster added more: containers that came back at new addresses and
+looked each other up by name left the controllers leaderless for twelve seconds, and
+the tests killed the next broker while the last was still recovering, because one
+broker's word for "the cluster is whole" was believed. The leadership moved when those
+sums passed the thirty-second ceiling. Both nodes ended fenced, once, because a
+replaced leader's client asked the transaction coordinator for a new epoch while its
+successor's first transaction was open, and the broker (Kafka 3.9) answered that by
+fencing the successor; the successor then ended like any fenced node.
+
+**What was built.**
+
+- **`KafkaClientDefaults`** (`src/Incremental.Kafka`): the settings every Kafka client
+  of the library and the service starts from — the log's producer, consumers and admin
+  client, `KafkaSource`, the Kafka sinks, the blob store — applied before the caller's
+  `ClientConfig`. Reconnect delay at most 1 s (was 10), socket timeout 6 s (was 60;
+  not for an admin client, whose calls carry their own timeouts), the producer's
+  acknowledgement timeout 5 s (was 30), connection set-up 5 s (was 30), a metadata
+  refresh every 2 s (was 300). `KafkaLog.EnsureTopicAsync` asks again while the brokers
+  cannot answer: a node its supervisor restarts in the middle of a broker fault must
+  not end because of it.
+- **A takeover that is lost before the node is the writer leaves it a standby.**
+  `KafkaLog.AcquireWriterAsync` fenced or cancelled part-way replaces its producer and
+  throws `KafkaLogNotAcquiredException`; `KafkaLeadership` goes from `Promoting` back to
+  `Standby` (`TakeoversAbandoned`), waits between one and two takeover timeouts, and
+  decides again. A takeover is called off this way when the leader's heartbeat is heard
+  while the acquisition is still running. In the service nothing had to change: nothing
+  is promoted before the acquisition returns, the standby's tables go on following and
+  its circuits stay built. A manual takeover that is lost answers 409 `takeover-lost`.
+- **At the ceiling a standby asks the brokers first** (`KafkaLog.ProbeWritePathAsync`)
+  and does not take over from a leader that answers its probe while a partition of the
+  log has no leader or too few replicas in sync (`TakeoversHeld`), nor for two takeover
+  timeouts after the brokers last said so, which is the leader's time to be heard.
+- **`NodeSupervisor`** (`src/Incremental.Service`): the restart contract a node needs,
+  as a call at the top of `Main` — the program runs itself as a child and starts it
+  again after every exit but 0 and 2. The example's Kafka mode uses it (off with
+  `--no-supervise`), the scale rig's nodes run under it (`node --supervise`), and so do
+  the broker tests' (`FailoverApp --supervise 1`). The guide states the contract for a
+  platform's supervisor.
+- **The three-broker profile** has fixed broker addresses on a network of its own, and
+  the brokers name each other by address.
+- **The broker tests** (`KafkaServiceProcessTests`, six of them now): supervised nodes;
+  a reader of the sink that times its longest silence and the longest a trade took from
+  the input's acknowledgement to its row; the cluster asked broker by broker before the
+  next fault; a killed broker left dead for fifteen seconds; one test that loses one
+  broker (killed, frozen or stopped — `INCREMENTAL_KAFKA_FAULT`) and asserts that the
+  leadership did not move; one that keeps a broker away for minutes and kills the
+  leader half way. Each run writes a record to `broker-runs.jsonl`. On a cluster
+  started a moment ago they first run a throwaway transaction, so that
+  `__transaction_state` exists to be waited for (H4).
+
+**Public API added.** `Incremental.Kafka`: `KafkaClientDefaults` (`Settings`,
+`Apply`); `KafkaLogNotAcquiredException`; `KafkaLog.WriterResets`;
+`KafkaLeadership.TakeoversAbandoned` and `TakeoversHeld`. `Incremental.Service`:
+`NodeSupervisor` (`RunAsync`, `IsSupervised`, `EnvironmentVariable`) and
+`NodeSupervisorOptions`; backend counters `writerResets`, `takeoversAbandoned`,
+`takeoversHeld` in `GET node`; error code `takeover-lost`. Internal seams for tests:
+`KafkaLog.WhileAcquiring`, `FailTransaction`, `WritePathOverride`. Behaviour that
+changed: `AcquireWriterAsync` fenced before it completes throws
+`KafkaLogNotAcquiredException` and leaves the log usable, where it threw
+`KafkaLogFencedException` and left it finished; a node may go `Promoting → Standby`.
+
+**The runs.** Three brokers on one machine (a 13th-gen i7-13700H; `kafka3` profile:
+each broker also a controller, replication factor 3, `min.insync.replicas` 2, Kafka
+3.9.0 with its defaults), two supervised node processes (`TakeoverAfter` 3 s,
+`TakeoverCeiling` 30 s, the peer probe on), one plugin pipeline from a two-partition
+topic through a Kafka-loaded table to a compacted topic, 200 trades a second for the
+whole run. Scripted (`h1/runs.sh` and `h1/series.sh` in the scratchpad directory
+beside the gaps file; each run is one execution of the named test on a deployment of
+its own, and the records are the `h1/*.jsonl` files there). For every run the test
+asserted that the sink equals the model and that exactly one node leads with the
+pipeline running while the other stands by, warm; it recorded the sink's longest
+silence as a reader of committed records sees it, the longest any trade took from the
+input's acknowledgement to its row, who led, and every exit a supervisor saw.
+
+| scenario | runs | sink = model, one leader, one warm standby | leadership moved | node processes ended | sink silent: min / median / max |
+|---|---|---|---|---|---|
+| one broker killed, 20 s away — it was **not** the active controller | 10 | 10 | 0 | 0 | 7.7 / 9.9 / 10.8 s |
+| one broker killed, 20 s away — it **was** the active controller | 20 | 20 | 0 | 0 | 12.6 / 13.6 / 15.1 s, and once 26.0 s |
+| the active controller killed, 45 s away, the node's client log at debug | 20 | 20 | 0 | 0 | 12.4 / 13.6 / 15.0 s |
+| rolling restart: each of the three brokers shut down, 5 s, started | 30 | 30 | 0 | 0 | 0.6 / 1.1 / 1.8 s |
+| one broker frozen (`docker pause`) for 20 s | 6 | 6 | 0 | 0 | 10.6 / 14.7 / 15.7 s |
+| one broker frozen for 60 s | 3 | 3 | 0 | 0 | 12.6 / 13.4 / 14.4 s |
+| the same, the Kafka client's default settings (two sets of three) | 6 | 6 | **3**, at the ceiling | 3 (exit 3, started again) | 8.3 / 35.3 / 60.6 s |
+| every broker killed in turn, 15 s each, the next when every broker calls the cluster whole | 2 | 2 | 0 | 0 | 13.1 and 13.9 s |
+| two of three brokers stopped for 40 s and started: no quorum, nothing can commit for 57 to 58 s | 3 | 3 | 0 (the standby held 15 to 39 times at the ceiling) | 0 | 56.8 / 57.9 / 58.2 s |
+| two of three stopped for 70 s and started: nothing can commit for 90 to 117 s, past the 60 s transaction timeout | 4 | 4 | 4: the leader's writer ended at 60 s, the standby led when the brokers were back | 4 (exit 3, started again; one of them once more with exit 9) | 89.6 to 117.5 s |
+| one broker killed and away for 10 min 10 s, the leader's process killed after 5 min | 1 | 1 | 1, which is the test: the standby led 3.5 s after the kill, on two brokers | 1 (the killed leader; started again, a warm standby on two brokers) | 10.8 s, at the broker's loss |
+
+The exit 9 in the 70-second row was a node started by its supervisor while the
+brokers were still down: it could not create its topics within the admin client's
+six-second socket timeout and ended; its supervisor started it again. That timeout is
+no longer applied to admin clients and topic creation is retried, and the two runs
+made after that change have exit 3 alone. Two of the four 70-second runs were made
+before the standby was given its pause after the brokers' return and two after; at 70 s
+the leader is past its transaction timeout either way. The 40-second runs were all made
+after.
+
+Against the targets: no run ended with both nodes fenced, or with any node fenced at
+all outside the rows that say so; the leadership moved in none of the thirty rolling
+restarts and in none of the thirty kills; the stall is one second for a restart and,
+for a kill, what the brokers take to give a broker up — under about ten seconds when
+the broker was only a broker, twelve to fifteen when it was also the active
+controller (the new controller gives the dead broker nine seconds from its own
+election). That second figure is over the ten-second target and is not the service's
+to shorten.
+
+**The one run in thirty that took 26 s** (kill 27: broker 3, the active controller,
+leader of one state partition and one input partition). The leader's writer waited the
+whole twenty seconds the broker was away for a transaction to be taken, logged no
+error and no retry, and went on when the broker returned. The node's client log was
+not at debug level in the series, so this is read from the brokers' logs: broker 1 was
+elected controller three seconds after the kill and took over the dead broker's
+partitions at nine more, as in every other run; but its own transaction coordinator
+and its alter-partition channel were each waiting out connection set-up timeouts to
+the dead broker's address (8 to 12 s apiece — a killed container's address does not
+refuse, it does not answer), and the alter-partition channel did not find the new
+controller until 20 s after it was elected, at which moment dozens of partitions
+changed at once. What the client was waiting for in that time is not established: twenty more
+kills of the active controller with the client's debug log on, 45 s away each, did not
+show it again (12.4 to 15.0 s every time, nobody took over). If it is what the brokers'
+logs suggest — the leader's next transaction could not be registered while the
+coordinator still had the last one's markers to write to a partition whose leader had
+been the dead broker — then its length is the brokers' own patience with a peer that
+does not answer, and in that run it was bounded by the broker's return, not by
+anything that timed out first. That is the residue: about one kill of a controller in
+forty, 26 s where 14 is usual, the leadership not moved. The one-broker test bounds the
+silence at the takeover ceiling for that reason, and asserts as before that the
+leadership stays.
+
+**Every kill** (the roles are the broker's at the moment it was killed: the active
+controller, the transaction coordinator of the deployment's writer, leader of the
+leader topic's partition, of a state partition, of an input partition, of the sink's):
+
+| run | broker killed (what it was) | sink silent, s | slowest trade, s | leads afterwards | leadership moved |
+|---|---|---|---|---|---|
+| 1 | 1 (coordinator, state, sink) | 9.6 | 9.6 | a, term 1 | no |
+| 2 | 2 (controller, coordinator, state, input) | 13.1 | 1.3 | a, term 1 | no |
+| 3 | 3 (controller, coordinator, state) | 13.6 | 0.7 | a, term 1 | no |
+| 4 | 1 (coordinator, leader-topic, state, input, sink) | 10.0 | 1.7 | a, term 1 | no |
+| 5 | 2 (controller, coordinator, state, input) | 13.3 | 13.3 | a, term 1 | no |
+| 6 | 3 (controller, coordinator, state, input) | 14.0 | 1.8 | a, term 1 | no |
+| 7 | 1 (state) | 10.0 | 1.4 | a, term 1 | no |
+| 8 | 2 (controller, state, sink) | 14.5 | 2.2 | a, term 1 | no |
+| 9 | 3 (leader-topic, state) | 10.8 | 2.1 | a, term 1 | no |
+| 10 | 1 (controller, coordinator, state, input) | 13.8 | 1.3 | a, term 1 | no |
+| 11 | 2 (controller, coordinator, leader-topic, state, input) | 13.2 | 1.3 | a, term 1 | no |
+| 12 | 3 (coordinator, state) | 8.8 | 0.6 | a, term 1 | no |
+| 13 | 1 (controller, coordinator, state, input, sink) | 13.6 | 1.8 | a, term 1 | no |
+| 14 | 2 (state, input) | 10.4 | 10.4 | a, term 1 | no |
+| 15 | 3 (controller, state, input) | 13.5 | 13.5 | a, term 1 | no |
+| 16 | 1 (state, input) | 8.4 | 1.6 | a, term 1 | no |
+| 17 | 2 (controller, coordinator, state, sink) | 12.6 | 0.6 | a, term 1 | no |
+| 18 | 3 (controller, coordinator, leader-topic, state, input) | 14.1 | 1.4 | a, term 1 | no |
+| 19 | 1 (state, input) | 7.7 | 0.6 | a, term 1 | no |
+| 20 | 2 (controller, coordinator, leader-topic, state, input) | 13.2 | 1.1 | a, term 1 | no |
+| 21 | 3 (controller, coordinator, leader-topic, state, input) | 13.7 | 13.7 | a, term 1 | no |
+| 22 | 1 (controller, coordinator, leader-topic, state, input, sink) | 14.0 | 14.0 | a, term 1 | no |
+| 23 | 2 (coordinator, state, input) | 10.6 | 1.6 | a, term 1 | no |
+| 24 | 3 (controller, state, sink) | 14.1 | 1.9 | a, term 1 | no |
+| 25 | 1 (controller, coordinator, state, input) | 12.7 | 0.5 | a, term 1 | no |
+| 26 | 2 (state, input) | 9.7 | 1.1 | a, term 1 | no |
+| 27 | 3 (controller, state, input) | 26.0 | 14.0 | a, term 1 | no |
+| 28 | 1 (controller, coordinator, state, input) | 13.0 | 0.5 | a, term 1 | no |
+| 29 | 2 (controller, coordinator, leader-topic, state, input) | 15.1 | 2.4 | a, term 1 | no |
+| 30 | 3 (controller, leader-topic, state, input) | 14.2 | 1.7 | a, term 1 | no |
+
+**Every rolling restart** (all thirty: the sink equal to the model, node a leading at
+term 1 afterwards, node b standing by, no node process ended):
+
+| run: silent s / slowest trade s | | | | | |
+|---|---|---|---|---|---|
+| 1: 1.2 / 0.9 | 2: 1.4 / 1.3 | 3: 1.2 / 1.1 | 4: 1.2 / 1.2 | 5: 1.6 / 0.7 | 6: 0.7 / 0.7 |
+| 7: 1.4 / 1.1 | 8: 1.3 / 1.3 | 9: 1.0 / 1.0 | 10: 1.1 / 1.5 | 11: 0.6 / 0.6 | 12: 1.0 / 1.5 |
+| 13: 1.2 / 1.1 | 14: 0.7 / 0.7 | 15: 1.1 / 1.4 | 16: 1.0 / 1.5 | 17: 0.8 / 0.7 | 18: 1.1 / 1.1 |
+| 19: 1.1 / 1.1 | 20: 1.1 / 1.2 | 21: 1.7 / 1.3 | 22: 1.4 / 1.4 | 23: 1.3 / 1.4 | 24: 0.7 / 0.7 |
+| 25: 1.8 / 1.8 | 26: 1.1 / 0.7 | 27: 1.3 / 1.3 | 28: 1.2 / 1.1 | 29: 1.2 / 1.2 | 30: 0.9 / 0.9 |
+
+**Before and after.** The same two tests as they stood at the start of this step —
+stock client settings, containers at changing addresses, the next broker killed 2 s
+after one survivor called the cluster whole — for comparison: three kill-in-turn runs
+had 9.0, 35.4 and 22.0 s of silence and the leadership moved in one; three rolling
+restarts 6.1, 0.7 and 0.7 s. With fixed addresses and the reconnect delay alone
+shortened, four kill-in-turn runs: 10.6, 32.8, 38.2 and 35.0 s, moved in two — which is
+what showed that the cadence itself (a second broker killed while the first was still
+recovering) was the larger part. Twenty-two more runs of that old cadence with the
+client's debug log on, to catch a both-fenced ending: the leadership moved in seven,
+silence up to 41 s, and no run ended with both nodes fenced. That ending was reproduced
+by sending its cause instead (`StaleEpochRequestTests`). A socket timeout of 12 s,
+tried before 6: one broker frozen for 60 s silenced the sink for 26.1, 25.8 and 13.6 s
+in three runs — the writer meets the frozen broker twice, as a partition's leader and
+as the coordinator.
+
+**The suites on three brokers, from a cluster started seconds before** (H4). The
+profile was removed and started, and the commands are CLAUDE.md's, with its three
+environment variables:
+
+| command | result |
+|---|---|
+| `dotnet test --project tests/Incremental.Service.Tests -- --filter-method "*broker*"`, first thing on the new cluster | 7 of 7 passed, none skipped, 7 min 15 s (the six broker tests and one whose name has the word) |
+| `dotnet test --project tests/Incremental.Kafka.Tests` | 126 total: 121 passed, 4 skipped (three need Kafka Connect, one needs the log cleaner to have run), **1 failed** — `A_row_too_large_for_one_record…` read a table's head in the instant after its commit returned and found the version before it. That is the flake round two saw once: a transaction's markers trail its commit, by longer on three brokers. The test now waits for the version to be readable. Two more full runs after that: 122 passed and 4 skipped; 123 passed and 3 skipped |
+| `dotnet test --project tests/Incremental.Service.Tests` | 194 total: 193 passed, 1 skipped (CDC), 0 failed, 10 min 33 s — the six broker tests among them, and `Dead_letters_go_to_a_topic…` under its new rule |
+
+Before this step the first of these failed after three minutes at its own precondition
+(it waited for the replicas of `__transaction_state`, which a new cluster does not have
+until something has run a transaction), and the dead-letter test failed with 47 dead
+letters for 32 dropped records against a bound of 40.
+
+**The scale rig and the broker that refuses unknown clients** (rerun after the changes;
+the critic had not). Both runs were made while a broker-kill loop ran on the three-broker
+cluster beside them, so they show that the scenario still passes with supervised nodes
+and the new client settings, and are not figures to set against S6's.
+
+| | default broker, 200,000 rows and 200,000 orders of state | `kafka-sasl`: OAUTHBEARER only, deny-by-default ACLs, 20 s tokens, 100,000 rows |
+|---|---|---|
+| exit code | 0 | 0 |
+| `kill -9` of the leader's node → the standby leads | 4.0 s | 4.4 s |
+| → the killed node's process started again by its supervisor | 0.6 s after the kill | 0.3 s |
+| → that node a warm standby again, from cold | 5.7 s after its start | 6.3 s |
+| manual takeover → leader | 1.7 s | 1.9 s |
+| → the fenced node (exit 3) a warm standby again | 5.6 s after the request | 4.3 s |
+| tokens handed to the leader's and the standby's clients | — | 245 and 88 |
+
+The ACL set is `grant-acls.sh`'s, unchanged: the node was granted nothing new for the
+write-path probe (it may describe its own topics already; `__transaction_state` it may
+not, and the probe then judges by the leader topic alone). The authorizer's log was not
+read for what it refused.
+
+**Tests that run on one broker, by default** (H13).
+
+- `StaleEpochRequestTests`: the request that fenced both nodes, sent by the test over a
+  socket (`FindCoordinator` and `InitProducerId` by hand) at the moment a log's first
+  transaction is open. The broker answers it "concurrent transactions", the log's
+  acquisition is fenced, the log is a reader with a new client, the stale request's
+  retry is refused, and the same log acquires at term 1 on its second attempt.
+- `NodeSupervisorTests`, four, with no broker: the supervisor over a program that ends
+  as a file of exit codes says — started again at once after 3 and 4; after 400, 800,
+  1,600 and 3,200 ms for one that keeps failing early; not after 0 or 2; SIGTERM passed
+  on and the node's exit code returned.
+- `KafkaLeadershipTests`, eight new (the eighth: a leader that commits again once the
+  brokers are back keeps leading past the ceiling): a standby fenced in the middle of its takeover
+  stands by again and then leads; a log fenced at either point of its acquisition is a
+  reader again and can acquire later, with none of its terms in the topic; a takeover
+  is given up when the leader is heard, and the leader is never touched afterwards; at
+  the ceiling a standby holds while the brokers can commit nothing and takes over when
+  they can; the write-path probe against the real broker and Java's hash; a step-down
+  whose resignation cannot commit closes the writer and the standby takes over on
+  silence (round one's fix, untested until now); a takeover does not announce a term
+  below one it has read (the term floor).
+- `BrokerFaultSeamTests`, five, without a broker: an offsets answer with no offset is a
+  passing failure and never an empty partition (`OffsetOf`); admin attempts are 0.5 s
+  doubling with a metadata refresh between them; a refused lookup of the unjoined group
+  is passed over and nothing else is (`ConsumeAssigned`); serving a consumer's callbacks
+  polls it once (`ServeCallbacks`); the client defaults, with a caller's own winning.
+- `KafkaServiceTests.A_standby_fenced_before_its_takeover_commits_is_still_a_warm_standby_and_leads_when_asked_again`:
+  the same loss under a whole service node — 409 `takeover-lost`, the pipeline still
+  `Built`, a second request leads, the sink equals the model and the input was resumed,
+  not read again.
+- `KafkaServiceProcessTests.A_supervised_node_that_is_fenced_resigns_or_is_killed_comes_back_as_the_standby_by_itself`:
+  two supervised processes through a takeover (exit 3), a step-down (exit 4) and a
+  `kill -9`, each time ending as leader and warm standby with nobody restarting anything.
+- `WarmStandbyTests.A_pipeline_removed_on_the_leader_is_let_go…` now asserts that the
+  plugin version is unloaded on the standby (`LoadState` `stored`). It asserted
+  `Users == 0`, which is what the catalog says and was true with the lease still held:
+  that is why round two's mutation survived. It is killed now.
+- `KafkaServiceTests.Dead_letters_go_to_a_topic…` no longer allows "eight duplicates".
+  It asserts the rule: no dropped record is there more than twice, and every one that
+  is twice was dropped by one step — the old leader's last, published and not committed
+  (H4: on three brokers that step held all fifteen records of the second half).
+- `KafkaFailoverProcessTests.A_leader_paused_past_the_timeout…` failed once in this
+  work with one `progress` event too many after `SIGCONT`. The signal can land between
+  a commit and the line that reports it; the test now asserts that nothing the woken
+  process reports was committed past where its successor resumed.
+
+**Mutations: 28, all killed in the end.** Nineteen in the Kafka library (a fenced acquisition final
+again; the reset keeping the old client; a fence met while acquiring completing
+`WhenFenced`; a heard leader not stopping a takeover; the ceiling ignoring the brokers,
+and holding whatever they say; a lost takeover ending the node; a failed resignation
+leaving the writer open; an unset offset read as an offset; no term floor; a refused
+group lookup ending the reader; callbacks not served; an admin attempt given the whole
+timeout; nothing refreshed between attempts; a client default dropped; the coordinator
+placed by another hash; no pause for the leader once the brokers are back; that pause
+never ending; an admin client given the six-second socket timeout), seven in the
+supervisor (a fenced node not restarted; a killed node not restarted; a process that
+refused its arguments restarted; no growing delay for a process that keeps failing; a
+growing delay for a node that only lost the leadership; a stop request not passed on;
+a node that was asked to stop started again), one in the service (a lost manual
+takeover not answered as a conflict) and round two's survivor in `SyncFromCatalog`.
+One survived its first run: with the pause after the brokers' return made endless the
+ceiling test still passed, a minute late, because the stall it uses to silence the
+leader gives up after sixty seconds; the test now bounds the wait from above. Not
+covered by any test: a takeover whose wait is called off in the instant it completes
+(`KafkaLeadership.PromoteAsync` carries on with it; the race could not be provoked).
+Script and results: `h1/mut.py` and `h1/mutations.txt` beside the gaps file.
+
+**Deviations.**
+
+- **A node can go `Promoting → Standby`.** CLAUDE.md said that fenced is final and that
+  there is no demotion in place; both still hold for a node that has been the writer.
+  The new path ends before that.
+- **`AcquireWriterAsync` changed what it throws** when it is fenced part-way (above).
+- **`ReconnectBackoff`, `SocketTimeout`, `RequestTimeout` and the metadata interval are
+  no longer the client's defaults.** A host that set none of them gets ours; one that
+  set any keeps its own.
+- **The kill-in-turn test leaves a killed broker dead for 15 s and waits for every
+  broker's own word before the next kill.** Before, it restarted the broker after 8 s —
+  inside the nine the controller gives it — and went on while it was still recovering.
+  That cadence is what produced most of round two's "leadership moved" runs; it is a
+  two-broker outage, which the 70-second test covers on purpose.
+- **The brokers of the `kafka3` profile are still combined broker-controllers.** MSK's
+  controllers are separate nodes; losing the broker that is also the active controller
+  is the profile's worst case (12 to 15 s) and not MSK's.
+- **CI's connector-stack job expects `skipped: 6`** for the service tests, not 4.
+- **The scale rig's phase H no longer starts the killed node**; its supervisor does, and
+  the rig measures from the supervisor's start line. The rig's two nodes are both
+  killed with their supervisors before the cold-start phase. The node that takes over
+  by hand in phase I was started by its supervisor with its first arguments, so it has
+  the plugin directory, which the node S6 started by hand did not: that takeover's
+  `plugin directory` stage is 0.7 s where it was 2 ms, and the takeover 1.7 s where S6
+  measured 1.0. It is what a node configured with a plugin directory pays at every
+  takeover; it was not looked into.
+
+**Left undone.**
+
+- Nothing ran on MSK, on a cluster with separate controllers, or in CI.
+- The write-path probe reads the controller's view. With no controller quorum that
+  view does not change, and a standby can still take over at the ceiling into a
+  cluster that cannot commit; it then waits inside the acquisition and is called off by
+  the leader's first heartbeat or completes (Open for James 48).
+- A broker that stops answering is found out by each client separately. A pipeline
+  whose sink has a producer of its own waits once more after the writer has recovered
+  (the metadata refresh makes that unlikely, not impossible); `"producer": "log"` on
+  the sink removes the extra client (Open for James 49).
+- `NodeSupervisor` does not tie the child's life to its own: `kill -9` of the
+  supervisor leaves the node running with nobody to restart it. On Windows it cannot
+  pass a stop request on and kills the child.
+- No state-size, memory or latency figure was taken under a broker fault; the reader's
+  two timings are what was measured.

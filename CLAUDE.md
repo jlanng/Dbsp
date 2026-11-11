@@ -64,16 +64,29 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   logical decoding (`localhost:5432`, user/password/db `incremental`) and Debezium's Kafka
   Connect (`localhost:8083`). Plain `docker compose up -d` stays Redis-only.
 - Three brokers: `docker compose --profile kafka3 up -d` (replication factor 3,
-  `min.insync.replicas` 2, on `localhost:9192,localhost:9292,localhost:9392`; no volume).
+  `min.insync.replicas` 2, on `localhost:9192,localhost:9292,localhost:9392`; no volume;
+  fixed addresses on a network of their own, 10.89.93.0/24 — a container cluster whose
+  brokers change address or look each other up by name stalls for reasons that are not
+  Kafka's, see durability-and-standby.md, *As built: broker failures*).
   Run the Kafka and service tests against it with `INCREMENTAL_KAFKA_BOOTSTRAP` set to
   those three and `INCREMENTAL_KAFKA_REPLICATION=3`; the CDC tests skip there (Kafka
   Connect writes to the single broker). With
   `INCREMENTAL_KAFKA_BROKERS=incremental-kafka3-1-1,incremental-kafka3-2-1,incremental-kafka3-3-1`
-  as well, four tests in `KafkaServiceProcessTests` stop and start those containers
-  (every broker shut down in turn, and killed in turn; a takeover with one down; 70 s
-  without a quorum): `-- --filter-method "*broker*"`, about eight minutes; skipped
-  everywhere else. They assert that nothing is lost and one node leads, and record in
-  `measurements.log` whether the leadership moved — a broker restart can move it.
+  as well, six tests in `KafkaServiceProcessTests` stop, kill and freeze those containers
+  under a running pipeline (every broker shut down in turn, and killed in turn; one
+  broker lost; a takeover with one down; 70 s without a quorum; one broker gone for
+  minutes with the leader killed half way): `-- --filter-method "*broker*"`, about seven
+  minutes, on a cluster started a moment ago or an hour ago; skipped everywhere else.
+  They run their nodes under `NodeSupervisor`, assert that the sink equals the model,
+  that one node leads and the other stands by, and — for one broker lost — that the
+  leadership did not move; each run's line goes to `measurements.log` and its record to
+  `broker-runs.jsonl` beside the test assembly (the sink's longest silence, the longest a
+  trade took, who led). `INCREMENTAL_KAFKA_BROKER` (0–2), `INCREMENTAL_KAFKA_FAULT`
+  (`kill`, `pause`, `stop`), `INCREMENTAL_KAFKA_AWAY_SECONDS` and
+  `INCREMENTAL_KAFKA_ZONE_MINUTES` choose what the one-broker and the minutes-long tests
+  do; `INCREMENTAL_NODE_LOGS=<dir>`, `INCREMENTAL_LOG_LEVEL=Debug` and
+  `INCREMENTAL_KAFKA_CLIENT="debug=eos,broker,protocol"` keep each node's Kafka client
+  log in a file, which is how a stall is read.
   `docker compose rm -sf kafka3-1 kafka3-2 kafka3-3` when done — not `down`, which
   takes Redis and the rest of the stack with it.
 - A broker that refuses unknown clients: `docker compose --profile kafka-sasl up -d`
@@ -180,6 +193,10 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   topic it has not seen waits a second for the client to look the leader up, and that
   consumer keeps `fetch.wait.max.ms` at 5 so one read does not wait out the last one's
   long poll. Both cost a takeover or a start-up a second or half a second per table.
+  Every Kafka client starts from `KafkaClientDefaults` (reconnect delay at most 1 s,
+  socket timeout 6 s, a metadata refresh every 2 s), applied before the caller's own
+  settings: librdkafka's defaults leave a healthy leader silent for 10 to 60 s after a
+  broker goes, which is a takeover. A new client that skips them brings that back.
 - Kafka clients, wherever one is made (found on three brokers and on a broker with ACLs;
   docs/design/durability-and-standby.md, last section). Consume through
   `AssignedConsumer.ConsumeAssigned`, never `consumer.Consume`: the client reports a
@@ -208,6 +225,15 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   is fencing, never the election or the probe. Every node starts as a standby; `Fenced`
   and `Resigned` are final (the process exits) — no demotion in place. Takeover order:
   writer, tables, storage, circuits. A node that cannot lead must stop heartbeating.
+  The one way back to `Standby` is a takeover that ends before the node is the log's
+  writer (the leader was heard after all; the acquisition was fenced, which a replaced
+  leader's stale request to the coordinator can do — `StaleEpochRequestTests`): nothing
+  is promoted before `AcquireWriterAsync` returns, and that must stay so. Such an
+  acquisition replaces the producer (`KafkaLogNotAcquiredException`); never keep a
+  client whose `InitTransactions` was cancelled — it finishes by itself and fences the
+  leader. The process must run under something that starts it again after exit codes
+  3, 4 and 5 (`NodeSupervisor`, or the platform's restart policy): without it a
+  deployment is one node after its first takeover.
 - `CircuitBuilder.Describe` reports a `Lookup`'s table as `Probes`, not among `Inputs`:
   the lookup probes the table and does not consume its changes, so the edge belongs to
   the picture and must never become an execution input.

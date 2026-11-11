@@ -793,6 +793,11 @@ circuit.Start();
   `TableLogFencedException`, and `log.WhenFenced` completes. A broker that times a
   transaction out (`TransactionTimeout`, 60 s) looks the same to the client, so an outage
   longer than that also ends the active.
+- Every client the package creates starts from `KafkaClientDefaults` — a reconnect delay
+  of at most a second, a socket timeout of six, a metadata refresh every two — and
+  `ClientConfig` is applied after them. The client's own defaults (ten seconds, sixty,
+  five minutes) leave a healthy writer silent for long after a broker has gone, which a
+  standby reads as a dead leader.
 - A table's key type must serialize equal values to the same text — integers, strings,
   `Guid`s, enums, and tuples or records of them. `decimal`, `double` and `DateTimeOffset`
   keys are refused when the log is opened: Kafka compacts by key bytes.
@@ -838,10 +843,18 @@ await leadership.StartAsync();
 ```
 
 - **Roles.** `Standby → Promoting → Leader`, ending in `Fenced` (replaced, or the takeover
-  failed) or `Resigned` (stepped down). Both ends are final for the process.
+  failed) or `Resigned` (stepped down). Both ends are final for the process. A takeover
+  that is lost before the node is the log's writer is not an end: the leader was heard
+  again while the standby was on its way to fencing it, or something else took the
+  `transactional.id` first (`AcquireWriterAsync` then throws
+  `KafkaLogNotAcquiredException` and the log reads on with a new client). Nothing has
+  been promoted yet, so the node goes back to `Standby` and decides again
+  (`TakeoversAbandoned`).
 - **When a standby takes over.** The leader topic has been silent for `TakeoverAfter` and
   the probe, if there is one, does not answer as a leader; or silent for `TakeoverCeiling`
-  (30 s) whatever the probe says; or the leader resigned; or `TakeOverAsync()` was called.
+  (30 s) whatever the probe says — unless the brokers say that nobody can commit, in
+  which case it waits for them (`TakeoversHeld`); or the leader resigned; or
+  `TakeOverAsync()` was called.
   The probe only prevents needless failovers when Kafka itself stalls. It never decides
   who may write: that is the `transactional.id`. Two standbys that decide together both
   try; one is fenced. A leader in the middle of one long commit is not silent: it keeps
@@ -1316,7 +1329,9 @@ What to know:
   compacted, for an upsert sink.
 - **Fenced and resigned are final.** A node that has been taken over, or has stepped
   down, stops its host with exit code 3 or 4 and comes back, when its supervisor restarts
-  it, as the standby. `node.StepDownAsync` is refused unless the peer's probe answers as a
+  it, as the standby. Something must restart it: the platform's restart policy, or
+  `NodeSupervisor.RunAsync(args)` at the top of `Main`, which runs the program as its
+  own child and starts it again after every exit but 0 and 2. `node.StepDownAsync` is refused unless the peer's probe answers as a
   ready standby; `node.TakeOverAsync` unless this node is warm; both take `Force`.
 - **Failing pipelines do not move leadership.** Only a node that can no longer write its
   catalog gives leadership up by itself: it steps down to a ready standby, or exits with 5.

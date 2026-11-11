@@ -1356,6 +1356,7 @@ directory the program prints as `files:`.
 | `-- --kafka --node a` / `--node b` | one process per node on the local connector stack (below) |
 | `-- --headless` | the smoke test, in memory; add `--nodes 2` for a takeover, `--kafka` for two processes and a kill |
 | `-- --kafka --clean` | removes what the Kafka mode made under its prefix |
+| `--no-supervise` | with `--kafka`: run the node alone. Without it the process is the node's supervisor and starts the node again whenever it ends |
 | `--otlp` | export the meters over OTLP ([monitoring](#operating-it-monitoring)) |
 | `--poison N` | one generated trade in N has no quantity, which `watchlist-alerts` refuses: the dead letters. Default 200; 0 for none |
 | `--ui-dir src/Incremental.Service.Admin/wwwroot` | serve the admin UI's files from the checkout: an edit is a browser reload away |
@@ -1446,12 +1447,32 @@ Then:
 
 1. Open both UIs. `b` shows **Standby** and a banner pointing at the leader; its
    *Cluster* page shows the catalog, state and table lag, and "a takeover now would be warm".
-2. Kill `a` hard: `kill -9` its process (Ctrl+C is a graceful step-down, which is step 4).
+2. Kill `a` hard. Each terminal runs a supervisor and, under it, the node; the supervisor
+   printed the node's process id (`node supervisor: started process 12345`). `kill -9`
+   that one. (Ctrl+C is a graceful stop, which is step 4.)
 3. Watch `b`: about three seconds of silence, then **Leader**, term 2, pipelines Running.
-   *Cluster → Last takeover* shows where the time went. `b` is `Degraded` with the reason
-   `no-ready-standby` until a standby answers.
-4. Start `a` again. It comes back as the standby. Now press Ctrl+C in `b`'s terminal: it
-   steps down because a ready standby answers, and `a` leads within a second.
+   *Cluster → Last takeover* shows where the time went. In terminal 1 the supervisor
+   says the process ended and starts it again; `a` comes back as the standby, and `b`,
+   `Degraded` with the reason `no-ready-standby` meanwhile, is `Healthy` again.
+4. Press Ctrl+C in `b`'s terminal: it steps down because a ready standby answers, and
+   `a` leads within a second.
+
+Nobody restarted `a` in step 3, and that is the point of the supervisor. A node that has
+led and no longer does ends its process, by design; what it comes back as is the
+standby, and something has to bring it back:
+
+<!-- snippet: examples/Incremental.EnrichmentService/Program.cs#supervisor -->
+```csharp
+// A node that has led and no longer does ends its process (exit code 3 fenced, 4 resigned,
+// 5 cannot lead), and something must start it again: then it is the standby. Under
+// systemd, Kubernetes or ECS that is the platform's restart policy. From a terminal there
+// is nobody, so the program supervises itself: this process only starts the node, as a
+// child, and starts it again each time it ends.
+if (options.Kafka && options.Supervise && !args.Contains("--clean") && !NodeSupervisor.IsSupervised)
+    return await NodeSupervisor.RunAsync(args);
+```
+
+`-- --no-supervise` runs the node alone, for when something else restarts it.
 
 State persists under the prefix (`enrich` unless `--prefix` says otherwise) in Kafka and
 Postgres; `-- --kafka --clean` removes it.
@@ -1494,7 +1515,9 @@ and — with two nodes — a takeover, after which the first execution the new l
 is many minutes of event time behind the watermark: the windowed sinks must equal a
 model that leaves it out. The alert files and the dead letters are read back
 with `FileSinkFormat` and compared too: every alert once, every dropped record there.
-A claim that does not hold exits 1 (48 claims in memory, 62 with two nodes, 61 on
+On Kafka the first node runs under its supervisor, the kill is of the node alone, and
+the last claim is that it came back as a warm standby without anybody starting it.
+A claim that does not hold exits 1 (48 claims in memory, 62 with two nodes, 62 on
 Kafka). CI runs the two in-memory ones on every build, and the Kafka one in a job of its
 own that starts the connector stack from `docker-compose.yml` and also runs the Kafka
 and Kafka-backed service tests, failing if any of them was skipped
@@ -1632,20 +1655,44 @@ measurement in this guide is a `kill -9`.
 A leader that is alive and cannot commit is the other case: hung in a sink or a
 connector call, cut off from the brokers but still reachable by its peer, or waiting
 for the brokers themselves. It answers the probe, so the standby waits for
-`TakeoverCeiling` (30 s) of silence and takes over then, whatever the probe says.
-Output stops for those 30 s and the takeover: in the broker-restart runs below the
-sinks stood still for 30 to 50 s when that happened. Size a failover budget on both
-figures. A lower ceiling shortens the second and makes a slow broker failover more
-likely to move the leadership (*Through a broker failure*).
+`TakeoverCeiling` (30 s) of silence and takes over then — unless the brokers say
+outright that nobody can commit (a partition of the log has no leader, or too few
+replicas in sync), in which case the leader's place is no better than its own and it
+waits for them. Output stops for those 30 s and the takeover. The loss of one broker
+does not get there: the sink is silent for 8 to 15 s and the leader carries on
+(*Through a broker failure*). Size a failover budget on both figures.
 
 Delivery is at least once: whatever the old leader had delivered but not committed is
 delivered again. An upsert sink converges; an append sink sees duplicates.
 
-**A node that stops leading exits.** Exit code 3: fenced by a takeover. 4: resigned
-(stepped down). 5: its catalog writer faulted and no ready standby answered. Run nodes
-under a supervisor that restarts them; a restarted node is the standby. Start the first
-node of a new deployment before the second: two nodes that start together on an empty
-log both take over, and one is fenced at once.
+**A node that stops leading exits, and must be started again.** Exit code 3: fenced by
+a takeover. 4: resigned (stepped down). 5: its catalog writer faulted and no ready
+standby answered. A restarted node is the standby. This is half of the design and the
+other half is yours: whatever runs the process must start it again, or the deployment
+has one node after its first takeover and none after its second. The contract:
+
+- start it again after every exit except 0 (it was asked to stop) and 2 (it refused its
+  arguments) — after a crash or a kill as well;
+- at once after 3 and 4, which is how a healthy node ends; with a delay that doubles, up
+  to half a minute, while it keeps ending within a minute of starting;
+- never give up after some number of restarts;
+- pass a stop request on (SIGTERM) and wait for the node, which steps down if a ready
+  standby answers and takes up to `StopTimeout` to drain if not.
+
+In systemd that is `Restart=always` with `RestartSec` small and `StartLimitIntervalSec=0`;
+in Kubernetes a pod's default `restartPolicy: Always` (its back-off is capped at five
+minutes, which is long: a `Deployment` of one replica per node id, or a `StatefulSet`,
+and an alert on `node.role`); in ECS a service. Where there is no platform — a terminal,
+a container whose entry point is the node — `NodeSupervisor.RunAsync(args)` is the same
+contract in the process itself, as the example uses it (*On Kafka, with a standby*).
+
+One takeover does not end the node: one that is lost before the node has become the
+log's writer — the leader was heard again while the standby was on its way, or another
+node took the log first. Nothing has been promoted at that point, so the node stands by
+again (`takeoversAbandoned` in `GET node`'s backend counters; a manual takeover that is
+lost answers 409 `takeover-lost`). Start the first node of a new deployment before the
+second: two nodes that start together on an empty log both take over, and one is fenced
+at once.
 
 **Takeover and step-down by hand.** `POST node/takeover` on the standby is refused
 unless it is warm; `POST node/stepdown` on the leader is refused unless the peer answers
@@ -2028,43 +2075,83 @@ million rows are 134 MB (141 bytes a row, zstd), and the state of the four pipel
 machine had 20–25 GB free, and two nodes at three million rows used 21 of them. Nothing in a takeover reads the rows, so the failover numbers
 should hold; the loading, the cold start and the memory scale as above.
 
-**Through a broker failure** (three brokers, replication factor 3,
-`min.insync.replicas` 2 — `docker compose --profile kafka3`):
+**Through a broker failure** (three brokers, each also a controller, replication factor
+3, `min.insync.replicas` 2 — `docker compose --profile kafka3`; two supervised node
+processes, one pipeline from a topic to a topic at 200 trades a second; a reader of the
+sink timing what arrives):
 
-| | what happened |
-|---|---|
-| a rolling restart — each broker shut down, five seconds, started | 21 runs. In 16 the leader kept leading, the pipeline did not restart and the sink was complete. In 4 the standby took over at the ceiling and the old leader exited with 3; the test of that day stopped there, so the sink was not compared in those runs. In 1 **both nodes ended fenced and exited**, and the sink stood at 7,930 rows of 10,660 until someone would have restarted a node |
-| each broker killed in turn, eight seconds, started | nothing lost; the standby took over in about half the runs, and the old leader exited with 3 |
-| a broker killed, then the leader `kill -9`ed, the broker started under the new leader | the standby led 3.5–5.3 s after the kill; nothing lost |
-| two of three brokers down for 70 s (no quorum: nothing can be written) | the standby led within four seconds of the brokers being back; the old leader was fenced and exited with 3; nothing lost |
+| what happened to the brokers | runs | leadership moved | the sink was silent for |
+|---|---|---|---|
+| one of three killed, away for 20 s — a broker that was not the active controller | 10 | 0 | 8 to 11 s |
+| the same — the broker that was the active controller (twenty of them away for 45 s) | 40 | 0 | 12 to 15 s, and once 26 s |
+| a rolling restart: each broker shut down, five seconds, started | 30 | 0 | 0.6 to 1.8 s |
+| one of three frozen for 20 s or 60 s: it answers nothing and its connections stay open | 9 | 0 | 11 to 16 s |
+| the same with the Kafka client's own default settings | 6 | 3 | 8 to 61 s |
+| every broker killed in turn, 15 s each | 2 | 0 | 13 to 14 s |
+| two of three stopped for 40 s: no quorum, nothing commits for just under a minute | 3 | 0 | 57 to 58 s |
+| two of three stopped for 70 s: nothing commits for a minute and a half or more | 4 | 4 | 90 to 117 s |
+| one of three gone for ten minutes, the leader's process killed after five | 1 | yes, as intended: the standby led 3.5 s after the kill, on two brokers, and the killed node came back as its standby | 11 s (the broker's loss) |
 
-A broker that goes takes with it, for a while, whatever it led — partitions, and the
-transaction coordinator if it was that. The service's leader can commit nothing until
-those have moved, and to its standby a leader that commits nothing is silent. The
-standby waits out a silence while the leader still answers its probe, but only up to
-`TakeoverCeiling` (30 s): past it, it takes over, the old leader is fenced and exits,
-and the pipelines carry on from their last checkpoint on the other node. That is what
-happened in the runs above where leadership moved, and it is the designed outcome. It
-means **a broker restart can move the leadership**, with output stopped for the 30 to
-50 s that takes — about one rolling restart in four on three local brokers.
+In every run the sink equalled the model, one node led and the other stood by, warm.
 
-It can also go wrong. In one rolling restart of the 21 the standby's takeover was itself
-fenced a moment after it began — the old leader's Kafka client, still alive, had
-initialised the transactional id again — and the old leader was then fenced by the
-standby's: both processes exited with 3 and nothing ran. Nothing committed is lost by
-that (the checkpoint and the logs are where they were), but the service is down until a
-node is started, and a start from nothing is a cold one: 12.5 s at a million rows,
-24–34 s at three to five million (*How large, how fast*). This was seen once, was not
-reproduced and is not fixed. So **run the nodes under a supervisor that restarts them**
-— it is what turns this from an outage into half a minute — and do not plan a rolling
-upgrade of the brokers on "nothing happens": plan on a takeover per upgrade, and watch
-`node.role`. The kill-each-broker runs, which compare the sink after the leadership has
-moved, lost nothing. If the brokers' own failover is slower than thirty seconds where
-you run, raise `KafkaServiceBackendOptions.TakeoverCeiling` above it.
+**What a broker loss costs is the brokers' own time to give the broker up.** A broker
+that is killed stays the leader of its partitions, and a member of every replica set it
+was in, until the controller has missed its heartbeats for
+`broker.session.timeout.ms` — nine seconds. Until then nothing that needs its
+acknowledgement commits, the service's leader included. If the broker lost was also the
+active controller, the others first elect a new one, which then gives the dead broker a
+full nine seconds of its own: twelve to fifteen. Those are the first two rows of the
+table, and no setting of the service shortens them; a lower session timeout on the
+brokers does, and so does a cluster whose controllers are not its brokers, which has
+only the first row. A rolling restart is another thing altogether: a broker that is
+asked to stop hands its partitions over first, and the sink pauses for about a second
+per broker.
 
-An outage of the whole cluster longer than the ceiling always ends that way: the
-standby's takeover waits for the brokers and completes when they return. One shorter
-than the ceiling ends with the same leader.
+**The service's part is not to add to it**, and until this was measured it added a
+great deal: the Kafka client's own defaults wait ten seconds before reconnecting to a
+broker that went away and sixty for one that stops answering, which is how a leader
+came to be silent for thirty to fifty seconds and lose the leadership to its standby
+over one broker. Every client the service creates now starts from settings of its own
+(`KafkaClientDefaults`: reconnect within a second, give a silent broker six seconds,
+ask for the topics' leaders every two); what you put in a connection's `ClientConfig`
+is applied on top. Leave them unless you have measured otherwise — in particular a
+`socket.timeout.ms` near the takeover ceiling brings the leadership moves back.
+
+**A broker that stops answering is the harder case** — frozen, or its host or zone cut
+off, so that connections stay open and nothing comes back. Each client finds that out
+by a request of its own timing out, one connection after another. The frozen-broker
+rows are that: with the service's settings the sink is silent for eleven to sixteen
+seconds and the same node leads; with the client's defaults the standby took over at
+the ceiling in half the runs and the sink was silent for up to a minute.
+
+**The leadership does not move for one broker.** If the brokers lose their quorum for
+longer than `TakeoverCeiling`, the standby asks them whether anybody could commit
+before it takes over from a leader that still answers; while a partition of the log has
+no leader, or fewer replicas in sync than `min.insync.replicas`, it waits, and for a
+few seconds after they are back, so that the leader can be heard first. What a leader
+does not survive is `KafkaLogOptions.TransactionTimeout` (60 s) without a commit: its
+open transaction fails for good, the node ends with exit code 3, and the standby — or
+the node itself, started again — leads when the brokers return. Raise that timeout if
+your brokers may be without a quorum for longer and you would rather keep the leader.
+
+A standby that does start a takeover stops if the leader is heard again before the
+fence. And a takeover that is itself fenced before it has committed anything — which a replaced
+leader's Kafka client can do to its successor through the transaction coordinator, and
+once did, leaving two fenced nodes — no longer ends the node: it stands by again and
+takes over a few seconds later. The node that *was* the writer and is fenced still
+ends, and its supervisor starts it again (*Operating it*).
+
+**What is left.** One kill of a controller in forty silenced the sink for 26 s instead of fourteen: the
+two brokers that remained spent the twenty seconds the third was away waiting on
+connections to it before the leader's next transaction could begin, and went on when it
+returned. The leadership did not move. It did not happen again in the kills made to
+catch it, so its cause inside the brokers is read from their logs and not shown
+(`docs/design/enrichment-service.md`, S7). Nothing here was run on MSK: a cluster with
+other session timeouts, with controllers of its own, or with brokers a network away
+will have other figures, and the two that matter to set against them are
+`TakeoverCeiling` (30 s: longer than your brokers take to give a broker up, with room)
+and `KafkaLogOptions.TransactionTimeout` (60 s: how long a leader survives brokers that
+cannot commit).
 
 ## On Amazon MSK
 
@@ -2153,9 +2240,10 @@ it, on local brokers:
   that ended a follower. It is passed over now (`ConsumeAssigned`); nothing the service
   creates joins a group or commits an offset.
 - **Three brokers, replication factor 3, `min.insync.replicas` 2** (*How large, how
-  fast*, above): the Kafka and service test suites, every broker restarted in turn
-  under a running pipeline, a takeover with a broker down, and seventy seconds without
-  a quorum.
+  fast*, above): the Kafka and service test suites; thirty rolling restarts and thirty
+  single-broker kills under a running pipeline; a broker frozen for a minute; a takeover
+  with a broker down; seventy seconds without a quorum; and one broker gone for ten
+  minutes with the leader killed half way.
 
 **The permissions a node needs.** Worked out against the deny-by-default broker — the
 node's principal held exactly this and nothing else
@@ -2170,6 +2258,7 @@ equivalences in the MSK documentation. The translation has not been run.
 | transactional id `{prefix}.writer` | `Describe`, `Write` | `DescribeTransactionalId`, `AlterTransactionalId` | the one writer every node shares; initialising it is the fence |
 | topics a pipeline or a table loader reads | `Describe`, `Read` | `DescribeTopic`, `ReadData` | |
 | topics a sink writes | `Describe`, `Write` | `DescribeTopic`, `WriteData` | the service does not create them |
+| topic `__transaction_state` (optional) | `Describe`, `DescribeConfigs` | `DescribeTopic`, `DescribeTopicDynamicConfiguration` | lets a standby at the takeover ceiling see that the transaction coordinator's own partition cannot be written; without it that check looks at the leader topic alone |
 | consumer groups | none | none | nothing joins a group. The client still asks for the coordinator of `{prefix}.reader`, `{prefix}.svc.blobs.{node}` and `incremental.source` about once a second per consumer, and the broker logs each refusal; `Describe` on those three (`DescribeGroup`) quiets its log and changes nothing else |
 
 The IAM actions are all `kafka-cluster:…`. `{prefix}.writer` is
@@ -2187,7 +2276,11 @@ resources are ARNs (`…:topic/<cluster>/<uuid>/{prefix}.*`,
 - Token refresh over hours. Twenty-second tokens over a few minutes are many refreshes,
   not a long time.
 - A rolling broker upgrade as MSK does it, an availability-zone loss, and broker
-  storage running out. The local cluster had three brokers on one machine.
+  storage running out. The local cluster had three brokers on one machine, each of
+  them also a controller, and the nearest thing to a zone loss was one container
+  frozen or killed for ten minutes.
+- What `broker.session.timeout.ms` is on MSK and whether it can be lowered: it is the
+  floor under every broker-loss figure above.
 - MSK Serverless, whose restrictions on topic configuration and transactions have not
   been compared with what the service asks for.
 - Debezium on MSK Connect: the example registers its connector through Kafka Connect's

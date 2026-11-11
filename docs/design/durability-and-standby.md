@@ -2300,3 +2300,193 @@ checkpoint gets the heap store from it.
   marker; that is reasoned from the code and covered by no test of a clustered restart
   with event time.
 
+
+## As built: broker failures (2026-11-11)
+
+The review after round two asked why a leader stalled for 30 to 50 s when a broker went
+away, why a rolling restart of the brokers moved the leadership in about one run in
+five, and what had once left both nodes fenced. Each has a cause that was read from a
+log or reproduced. The runs are on the `kafka3` compose profile (three brokers, each
+also a controller, replication factor 3, `min.insync.replicas` 2); the tables of
+results are in enrichment-service.md, *As built*, S7.
+
+### What the stall was made of
+
+Read from the Kafka client's debug log of a leader (`debug=eos,broker,protocol`, through
+`INCREMENTAL_KAFKA_CLIENT` and `INCREMENTAL_LOG_LEVEL=Debug` on the test's node
+process) and from the brokers' own logs. One 36 s stall was three things one after
+another, and only the first is Kafka's.
+
+1. **The brokers give a dead broker nine seconds.** A broker that is killed stays the
+   leader of its partitions, a member of every replica set it was in, and the
+   transaction coordinator of the ids it held, until the controller has missed its
+   heartbeats for `broker.session.timeout.ms` (9 s). Until then a write with
+   `acks=all` to any partition it replicates waits. This is the floor: 7.7 to 10.8 s of
+   silence in the sink in the ten kills where the broker lost was not the active
+   controller.
+2. **If the broker was the active controller, the nine seconds start late.** The other
+   controllers elect one of themselves (about three seconds: a two-second fetch timeout
+   and an election), and the new controller gives every broker a fresh session — the
+   dead one included. 12.6 to 15.1 s in the sink in nineteen of twenty such kills. A cluster whose controllers are not its
+   brokers (MSK's are separate) does not have this case for a broker loss.
+3. **The client then sat out its own delays.** Three of them, all defaults of
+   librdkafka that suit a batch job:
+   - `reconnect.backoff.max.ms` is ten seconds. A broker that restarts refuses
+     connections for long enough to double the delay up to that; the log shows
+     `TxnCoordinator/2: Delaying next reconnect by 9999ms` and then no
+     `FindCoordinator` for nine seconds, with the coordinator long since moved.
+   - `socket.timeout.ms` is sixty seconds. A broker that stops answering without
+     closing its connections — a frozen process, a host or a zone that drops off the
+     network — is found out only by a request timing out, one connection at a time:
+     the writer waits once for a partition's old leader and once more for the
+     coordinator. With one broker paused for a minute (`docker pause`) and the
+     defaults, the standby took over at the ceiling in three runs of six and the sink
+     was silent for up to 61 s.
+   - `topic.metadata.refresh.interval.ms` is five minutes. A client that is idle while
+     a broker stops answering learns nothing: a sink's own producer, idle while the
+     writer waited, sent its next batch to the old leader and waited in its turn.
+
+`KafkaClientDefaults` is what every client of this package and of the service now
+starts from (the log's producer, consumers and admin client, sources, sinks, the blob
+store): `reconnect.backoff.ms` 50, `reconnect.backoff.max.ms` 1000, `socket.timeout.ms`
+6000, `request.timeout.ms` 5000 (producers; it stays under the socket timeout so that a
+broker waiting for a dead replica answers "timed out" and the request is made again on
+the same connection), `socket.connection.setup.timeout.ms` 5000,
+`topic.metadata.refresh.interval.ms` 2000. A caller's `ClientConfig` is applied after
+them and wins. An admin client is not given the socket timeout: its calls carry their
+own (a topic's creation the operation timeout, a leader lookup half a second and then
+longer), and six seconds cut all of them — a node restarted while the brokers were
+between controllers could not create its topics and ended. `EnsureTopicAsync` now also
+asks again while the brokers cannot answer.
+
+With these settings, one broker paused for a minute or for twenty seconds: 10.6 to
+15.7 s of silence in the sink in nine runs, and nobody took over. (A socket timeout of
+twelve seconds, tried first, gave 26 s in two runs of three: twice twelve.)
+
+### What the test environment added
+
+Three things lengthened the stalls of the earlier runs and were the environment's, not
+the service's. They are fixed in `docker-compose.yml` and in the tests, and they are
+worth knowing before believing a number from a container cluster.
+
+- **A container that is killed and started again came back at a new address.** The
+  other brokers' controller clients went on connecting to the old one until
+  `socket.connection.setup.timeout.ms` (ten seconds). With the next broker gone the two
+  that were left could not reach each other, and the controller quorum had no leader
+  for twelve seconds. The brokers now have fixed addresses on a network of their own.
+- **A stopped container's name takes five seconds not to resolve**, on the one thread
+  a controller talks to its peers on, and the controller listener advertised the
+  container's host name. Two surviving controllers took eight seconds to agree. The
+  brokers now name each other by address.
+- **"The cluster is whole" was believed from one broker.** A killed broker is still
+  listed, and still in every replica set, for the nine seconds above; asked through a
+  survivor the cluster looked whole the moment the container was started, and the next
+  broker was killed while the last was still recovering — two of three down, which is
+  not the loss of a broker. Most of the "leadership moved when a broker was killed"
+  runs were this. `ClusterWholeAsync` now asks each broker, one at a time.
+
+### The leadership rules
+
+- **A takeover is given up when the leader is heard.** Between the decision and the
+  moment `InitTransactions` returns, the node's watch of the leader topic is still
+  reading. A heartbeat from another node cancels the acquisition
+  (`KafkaLeadership.Heard`): the leader was slow, its brokers were, and it is committing
+  again. Not on a manual takeover, which is the operator's word against the leader's.
+- **A cancelled or fenced acquisition puts the client away.** `KafkaLog.AcquireAsync`
+  replaces the producer and fails with `KafkaLogNotAcquiredException`; the log is a
+  reader again. The client must go because a fenced one is finished, and because a
+  cancelled `InitTransactions` is not cancelled inside the client: it goes on asking
+  and would fence whoever leads when the coordinator answers. The term is committed by
+  the acquiring call itself, and the writer thread starts only once the log is the
+  writer, so a lost acquisition has nothing to stop.
+- **A takeover lost before the node is the writer ends as Standby, not Fenced**
+  (`Promotion.Lost`, `BackToStandby`). Nothing has been promoted at that point — the
+  acquisition is the first thing a takeover does. The node waits the takeover timeout
+  and a random part of it more before it may try again, so that two nodes that fenced
+  each other do not do it in step. "Fenced is final" still holds for every node that
+  has been the writer.
+- **At the ceiling, a standby asks the brokers before it takes over from a leader that
+  answers.** `KafkaLog.ProbeWritePathAsync` describes the leader topic's partition and
+  the partition of `__transaction_state` that holds the log's transactional id (Java's
+  `String.hashCode`, as the brokers place it): no leader, or fewer replicas in sync
+  than `min.insync.replicas`, and nobody can commit — the standby waits
+  (`TakeoversHeld`), and for two takeover timeouts after the brokers last said so: a
+  leader they held up has to find them again before it can be heard, and without that
+  pause the standby took over in the instant they returned. It is the controller's view. With no controller quorum nothing
+  updates it, and a cluster that lost two brokers at once can read as writable; then the
+  standby takes over as before, waits inside `InitTransactions` for the brokers, and
+  either completes when they return or is called off by the leader's first heartbeat.
+
+### A leader does not outlive its transaction timeout
+
+With no quorum of brokers a leader's open transaction cannot be taken or committed. The
+client gives its records `transaction.timeout.ms` (`KafkaLogOptions.TransactionTimeout`,
+60 s): then they fail, the transaction has to be aborted, and the abort of a
+transaction the coordinator never managed to register is refused
+(`INVALID_TXN_STATE`), which the client counts as fatal. The writer is finished and the
+node ends with exit code 3, sixty seconds into the outage and with nobody having taken
+anything over. That is what the 70-second test shows: the standby holds at the ceiling
+while the leader answers, the leader ends at sixty seconds, and the standby — or the
+restarted node, whichever is first when the brokers return — leads. An outage shorter
+than the timeout ends with the same leader. A deployment that must ride out longer
+ones raises `TransactionTimeout` (the brokers allow up to `transaction.max.timeout.ms`,
+fifteen minutes by default); what it pays is that a writer that died with a transaction
+open blocks readers of its partitions for that long if nobody takes over, which a
+standby does in seconds.
+
+### How both nodes ended fenced
+
+Once in 21 rolling restarts of round two. The log of that run has it, and
+`StaleEpochRequestTests` reproduces it on one broker by sending the request itself.
+
+The old leader's transaction had lost a batch to a change of partition leader
+(`OUT_OF_ORDER_SEQUENCE_NUMBER`, "requires epoch bump"). The client recovers from that
+by asking the coordinator for a new epoch: `InitProducerId` carrying the producer id and
+epoch it has (KIP-360). Meanwhile the standby reached the ceiling, took the
+transactional id — which makes that request stale — and opened its first transaction,
+the one that commits its term. The coordinator of Kafka 3.9 refuses a stale request
+only when no transaction is open on the id. When one is, it compares the producer id,
+not the epoch, treats the request as a newcomer's, aborts the open transaction and
+raises the epoch. The standby's `EndTxn` failed and its abort was refused as fenced; the
+old leader's request was answered "concurrent transactions", and its retry was refused
+as fenced too. Two fenced nodes, an epoch nobody held, and no leader until a process was
+started by hand.
+
+The broker's behaviour is not ours to change. What changed is that the standby was
+never the writer when this happened to it, so it is not finished: it stands by again,
+and when the silence has lasted it takes the id with a new client, which nothing stale
+can touch. In the test the same log acquires at term 1 on its second attempt.
+
+### The supervisor
+
+A node that has been the writer and is fenced, or has resigned, still ends its process
+(exit code 3 or 4; 5 when it could not lead). Something has to start it again, or one
+takeover later the deployment has one node. That was said in the guide and done by
+nothing: the tests restarted nodes by hand. `NodeSupervisor` (in `Incremental.Service`)
+is the contract in code — start the process again after every exit but 0 and 2, at once
+after 3 and 4, with a doubling delay while it keeps ending within a minute, pass
+SIGTERM on and wait — and the example's Kafka mode, the scale rig and the broker tests
+run their nodes under it. A platform's own supervisor (systemd `Restart=always`, a
+Kubernetes pod, an ECS service) is the same contract and is what production should use.
+
+### Not done, not known
+
+- One kill of the active controller in forty silenced the sink for 26 s, the whole
+  time the broker was away, with the leadership not moved. The brokers' logs show their
+  own clients waiting out connection set-up timeouts to the dead broker; what the
+  service's client was waiting for is not established, and twenty kills made to catch
+  it with the client's log on did not show it (enrichment-service.md, S7).
+
+- Nothing was run on MSK. The nine seconds are `broker.session.timeout.ms`, which is
+  the cluster's; whether MSK lets it be lowered was not checked.
+- A broker that stops answering is still found out one connection at a time. The
+  worst case measured is in S7's table; a sink that writes through the log's producer
+  (`"producer": "log"`) has one client fewer to find out.
+- The write-path probe is as stale as the controller. A standby could instead prove the
+  path by writing — a record of its own to the leader topic through a plain producer —
+  which was not built: it would be a write outside the fenced producer, and the leader
+  topic's end moving is what tells a standby that a leader inside a long transaction is
+  alive.
+- `InitTransactions` is called in one-second slices so that a takeover can be called
+  off. The client documents the call as resumable; a broker that answers slower than a
+  second was not tried.
