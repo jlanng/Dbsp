@@ -84,6 +84,22 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
 
         public string Id { get; }
 
+        public bool HasExited => _process.HasExited;
+
+        /// <summary>The longest the node's log writer said it had been waiting for the
+        /// brokers to take a transaction's records, in seconds; 0 if it never said so.</summary>
+        public int LongestWaitForBrokers()
+        {
+            lock (_stderr)
+            {
+                var longest = 0;
+                foreach (System.Text.RegularExpressions.Match match in System.Text.RegularExpressions.Regex.Matches(
+                             _stderr.ToString(), @"has been waiting (\d+) s for the brokers"))
+                    longest = Math.Max(longest, int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture));
+                return longest;
+            }
+        }
+
         public List<JsonElement> Events(string kind)
         {
             lock (_events)
@@ -162,8 +178,15 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
 
         public void Send(string command)
         {
-            _process.StandardInput.WriteLine(command);
-            _process.StandardInput.Flush();
+            try
+            {
+                _process.StandardInput.WriteLine(command);
+                _process.StandardInput.Flush();
+            }
+            catch (IOException ex)
+            {
+                Assert.Fail($"Node '{Id}' could not be sent '{command}' ({ex.Message}); it has {(_process.HasExited ? "exited with code " + _process.ExitCode : "not exited")}.{Environment.NewLine}{Dump()}");
+            }
         }
 
         /// <summary>Sends a command and waits for the event that answers it.</summary>
@@ -295,7 +318,7 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         var startedB = Now;
         using var b = new AppNode(env, "b", ports[1], ports[0], tables: extraTables);
         var standing = await b.StatusWhenAsync(
-            s => s.GetProperty("warm").GetBoolean() && State(s, "main") == "Unbuilt" && s.GetProperty("leader").GetString() == "a",
+            s => s.GetProperty("warm").GetBoolean() && State(s, "main") == "Built" && s.GetProperty("leader").GetString() == "a",
             "the standby to be warm");
         Measured($"service standby warm (catalog, {extraTables + 1} tables, state, plugin files): {T(standing) - startedB} ms from process start");
         Assert.True(T(standing) - startedB < 25_000,
@@ -379,9 +402,368 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         // The dead node comes back the only way it can: as the standby.
         using var again = new AppNode(env, "a", ports[0], ports[1], tables: extraTables);
         var back = await again.StatusWhenAsync(
-            s => s.GetProperty("warm").GetBoolean() && s.GetProperty("leader").GetString() == "b", "the restarted node to stand by");
+            s => s.GetProperty("warm").GetBoolean() && s.GetProperty("leader").GetString() == "b" && State(s, "late") == "Built",
+            "the restarted node to stand by");
         Assert.Equal("Standby", back.GetProperty("role").GetString());
-        Assert.Equal("Unbuilt", State(back, "late"));
+        Assert.Equal("Built", State(back, "main"));
+    }
+
+    // ── a cluster of brokers, one of them stopped ──────────────────────────────────────
+    //
+    // These run only against a broker cluster whose containers the test may stop and
+    // start: the kafka3 compose profile, with
+    //   INCREMENTAL_KAFKA_BOOTSTRAP=localhost:9192,localhost:9292,localhost:9392
+    //   INCREMENTAL_KAFKA_REPLICATION=3
+    //   INCREMENTAL_KAFKA_BROKERS=incremental-kafka3-1-1,incremental-kafka3-2-1,incremental-kafka3-3-1
+    // Everywhere else they are skipped.
+
+    private static string[] Brokers =>
+        (Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_BROKERS") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    /// <summary>Skips unless the broker cluster is there to be stopped, and starts every
+    /// broker first: a test that failed between a stop and a start must not leave the
+    /// next one a cluster of two.</summary>
+    private static async Task RequireBrokerClusterAsync()
+    {
+        Assert.SkipUnless(
+            Brokers.Length >= 3 && KafkaTestEnv.Replication >= 3,
+            "Needs a three-broker cluster whose containers can be stopped: the kafka3 compose profile, with INCREMENTAL_KAFKA_BROKERS naming them and INCREMENTAL_KAFKA_REPLICATION=3.");
+        foreach (var broker in Brokers)
+            await DockerAsync("start", broker);
+        await ClusterWholeAsync("__transaction_state");
+    }
+
+    private static async Task DockerAsync(params string[] arguments)
+    {
+        var info = new ProcessStartInfo("docker") { RedirectStandardOutput = true, RedirectStandardError = true };
+        foreach (var argument in arguments)
+            info.ArgumentList.Add(argument);
+        using var process = Process.Start(info) ?? throw new InvalidOperationException("docker did not start.");
+        var error = process.StandardError.ReadToEndAsync();
+        await process.StandardOutput.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        Assert.True(process.ExitCode == 0, $"docker {string.Join(' ', arguments)} exited {process.ExitCode}: {await error}");
+    }
+
+    /// <summary>Waits until every broker is back and every partition of the deployment's
+    /// own topics has all its replicas in sync again.</summary>
+    private static async Task ClusterWholeAsync(string prefix)
+    {
+        var clock = Stopwatch.StartNew();
+        using var admin = new Confluent.Kafka.AdminClientBuilder(new Confluent.Kafka.AdminClientConfig { BootstrapServers = KafkaTestEnv.Bootstrap }).Build();
+        while (true)
+        {
+            try
+            {
+                var metadata = admin.GetMetadata(TimeSpan.FromSeconds(5));
+                var partitions = metadata.Topics.Where(t => t.Topic.StartsWith(prefix + ".", StringComparison.Ordinal) || t.Topic == "__transaction_state")
+                    .SelectMany(t => t.Partitions).ToList();
+                if (metadata.Brokers.Count >= Brokers.Length && partitions.Count > 0
+                    && partitions.All(p => p.Leader >= 0 && p.InSyncReplicas.Length == p.Replicas.Length))
+                    return;
+            }
+            catch (Confluent.Kafka.KafkaException)
+            {
+            }
+            Assert.True(clock.Elapsed < TimeSpan.FromMinutes(3), "the broker cluster did not become whole again within three minutes");
+            await Task.Delay(500);
+        }
+    }
+
+    private sealed record Deployment(AppNode A, AppNode B, string TradesTopic, string InstrumentsTopic, string EnrichedTopic, List<Instrument> Instruments, int[] Ports);
+
+    /// <summary>A leads with a Kafka-loaded table and one plugin pipeline between two
+    /// topics; B stands by, warm.</summary>
+    private static async Task<Deployment> DeployAsync(KafkaTestEnv env)
+    {
+        var tradesTopic = await env.CreateTopicAsync("trades", partitions: 2);
+        var instrumentsTopic = await env.CreateTopicAsync("instruments", compacted: true);
+        var enrichedTopic = await env.CreateTopicAsync("enriched", compacted: true);
+        var ports = KafkaTestEnv.FreePorts(2);
+        var instruments = Instruments(10);
+        foreach (var instrument in instruments)
+            env.ProduceJson(instrumentsTopic, instrument.Id, instrument);
+        await env.FlushAsync();
+
+        var a = new AppNode(env, "a", ports[0], ports[1], plugins: true);
+        await a.WaitForRoleAsync("Leader");
+        await a.RunAsync("declare " + JsonSerializer.Serialize(new TableSpec
+        {
+            Name = "instruments",
+            Definition = typeof(InstrumentsTable).FullName!,
+            Loader = new TableLoaderSpec("kafka", "log", TestService.Json($$"""{ "topic": "{{instrumentsTopic}}" }""")),
+        }, Json), "declared");
+        await a.RunAsync("deploy " + JsonSerializer.Serialize(new PipelineSpec
+        {
+            Id = "main",
+            Plugin = "acme.pipelines",
+            Definition = "trade-enrichment",
+            Inputs = new Dictionary<string, JsonElement> { ["trades"] = Binding(tradesTopic) },
+            Sinks = new Dictionary<string, JsonElement> { ["enriched"] = Binding(enrichedTopic) },
+        }, Json), "deployed");
+        await a.StatusWhenAsync(s => State(s, "main") == "Running", "the pipeline to run on the leader");
+        var b = new AppNode(env, "b", ports[1], ports[0]);
+        await b.StatusWhenAsync(
+            s => s.GetProperty("warm").GetBoolean() && State(s, "main") == "Built" && s.GetProperty("leader").GetString() == "a", "the standby to be warm");
+        await a.StatusWhenAsync(
+            s => s.GetProperty("peer") is { ValueKind: JsonValueKind.Object } peer && peer.GetProperty("ready").GetBoolean(), "the leader to see a ready standby");
+        return new Deployment(a, b, tradesTopic, instrumentsTopic, enrichedTopic, instruments, ports);
+    }
+
+    /// <summary>Trades at a steady rate until cancelled; returns what was produced.</summary>
+    private static Task<List<Trade>> ProduceUntilAsync(KafkaTestEnv env, string topic, CancellationToken stop) => Task.Run(async () =>
+    {
+        var produced = new List<Trade>();
+        while (!stop.IsCancellationRequested)
+        {
+            var chunk = Trades(produced.Count, 20);
+            foreach (var trade in chunk)
+                env.ProduceJson(topic, trade.Id, trade);
+            produced.AddRange(chunk);
+            await Task.Delay(100);
+        }
+        await env.FlushAsync();
+        return produced;
+    });
+
+    /// <summary>A rolling restart, as an upgrade does it: each broker is asked to stop,
+    /// hands its partitions over, and comes back.</summary>
+    [Fact]
+    public Task Restarting_every_broker_in_turn_under_a_running_pipeline_loses_nothing_and_leaves_one_leader() =>
+        EveryBrokerInTurnAsync(kill: false);
+
+    /// <summary>A broker that dies hands nothing over: its partitions, and the transaction
+    /// coordinator if it was that, are leaderless until the controller gives up on it
+    /// (<c>broker.session.timeout.ms</c>, nine seconds).</summary>
+    [Fact]
+    public Task Killing_every_broker_in_turn_under_a_running_pipeline_loses_nothing_and_leaves_one_leader() =>
+        EveryBrokerInTurnAsync(kill: true);
+
+    /// <summary>
+    /// Whichever broker is the controller, the transaction coordinator or the leader of
+    /// the state partition is among them, and each goes in the middle of the service
+    /// leader's commits. Required: nothing lost, and one node leading with the pipeline
+    /// running. While a broker's partitions and its coordinator move, the service's leader
+    /// can commit nothing, and if that silence reaches the takeover ceiling (30 s) the
+    /// standby takes over, as it should: whether it did is recorded, not asserted — on
+    /// three brokers on one machine it happens in about one run in five.
+    /// </summary>
+    private async Task EveryBrokerInTurnAsync(bool kill)
+    {
+        await RequireBrokerClusterAsync();
+        await using var env = KafkaTestEnv.Create();
+        var d = await DeployAsync(env);
+        using var a = d.A;
+        using var b = d.B;
+        using var stop = new CancellationTokenSource();
+        var producing = ProduceUntilAsync(env, d.TradesTopic, stop.Token);
+        var how = kill ? "killed" : "shut down";
+        foreach (var broker in Brokers)
+        {
+            await Task.Delay(2000);
+            var stopped = Stopwatch.StartNew();
+            if (kill)
+                await DockerAsync("kill", broker);
+            else
+                await DockerAsync("stop", "-t", "30", broker);
+            await Task.Delay(kill ? 8000 : 5000);
+            await DockerAsync("start", broker);
+            await ClusterWholeAsync(env.Prefix);
+            Measured($"kafka3: broker {broker} {how} and back, cluster whole again after {stopped.ElapsedMilliseconds} ms");
+        }
+        await Task.Delay(2000);
+        stop.Cancel();
+        var trades = await producing;
+
+        // The sink first: it is complete only once a leader that can commit has caught up,
+        // which is after a takeover if one is still to come (a leader stalled on its
+        // brokers still answers as the leader until the standby's ceiling is reached).
+        await SinkEqualsAsync(d, trades, a, b, $"the enriched sink after every broker was {how} in turn", TimeSpan.FromMinutes(3));
+
+        var leading = new List<(AppNode Node, JsonElement Status)>();
+        var clock = Stopwatch.StartNew();
+        while (leading.Count != 1 || State(leading[0].Status, "main") != "Running")
+        {
+            Assert.True(clock.Elapsed < Patience, $"no single leader ran the pipeline after the brokers were back.{Environment.NewLine}{a.Dump()}{Environment.NewLine}{b.Dump()}");
+            await Task.Delay(500);
+            leading.Clear();
+            foreach (var node in new[] { a, b })
+            {
+                if (node.HasExited)
+                    continue;
+                try
+                {
+                    var status = await node.StatusAsync();
+                    if (status.GetProperty("role").GetString() == "Leader")
+                        leading.Add((node, status));
+                }
+                catch (Exception) when (node.HasExited)
+                {
+                }
+            }
+        }
+        var (leader, final) = leading[0];
+        var other = ReferenceEquals(leader, a) ? b : a;
+        var moved = final.GetProperty("term").GetInt64() != 1;
+        Measured(
+            $"kafka3: {trades.Count} trades through three brokers {how} in turn; node {leader.Id} leads at term {final.GetProperty("term").GetInt64()}" +
+            (moved
+                ? $" (takeover reason: {final.GetProperty("takeover").GetProperty("reason").GetString()}), the other node " +
+                  (other.HasExited ? $"exited with code {await other.ExitCodeAsync()}" : "is " + (await other.StatusAsync()).GetProperty("role").GetString())
+                : ", nobody took over") +
+            $"; the pipeline restarted {final.GetProperty("pipelines").EnumerateArray().Single().GetProperty("restarts").GetInt32()} time(s) on the leader; " +
+            $"the first leader's longest wait for the brokers to take a transaction was {a.LongestWaitForBrokers()} s");
+        if (!moved)
+            await b.StatusWhenAsync(
+                s => s.GetProperty("warm").GetBoolean() || s.GetProperty("role").GetString() != "Standby", "the standby to be warm again");
+    }
+
+    private static async Task SinkEqualsAsync(Deployment d, List<Trade> trades, AppNode a, AppNode b, string what, TimeSpan? patience = null)
+    {
+        var clock = Stopwatch.StartNew();
+        while (true)
+        {
+            try
+            {
+                await KafkaTestEnv.TopicEqualsAsync(d.EnrichedTopic, Enrich.Model(trades, d.Instruments), what);
+                return;
+            }
+            catch (Exception ex) when (patience is null || clock.Elapsed > patience)
+            {
+                Assert.Fail($"{ex.Message}{Environment.NewLine}{a.Dump()}{Environment.NewLine}{b.Dump()}");
+            }
+            catch (Exception)
+            {
+                // Not yet: a takeover may still be on its way.
+            }
+        }
+    }
+
+    [Fact]
+    public async Task A_takeover_with_one_broker_down_completes_and_the_broker_comes_back_under_the_new_leader()
+    {
+        await RequireBrokerClusterAsync();
+        await using var env = KafkaTestEnv.Create();
+        var d = await DeployAsync(env);
+        using var a = d.A;
+        using var b = d.B;
+        using var stop = new CancellationTokenSource();
+        var producing = ProduceUntilAsync(env, d.TradesTopic, stop.Token);
+        await Task.Delay(2000);
+
+        // A broker goes, and before the cluster has settled the leader is killed.
+        await DockerAsync("stop", "-t", "1", Brokers[1]);
+        await Task.Delay(1500);
+        a.Kill();
+        var killedAt = Now;
+        var leading = await b.WaitForRoleAsync("Leader");
+        Measured($"kafka3: kill -9 with one of three brokers down: kill to Leader {T(leading) - killedAt} ms");
+        await b.StatusWhenAsync(s => State(s, "main") == "Running", "the pipeline to run on the new leader");
+
+        // The broker returns while the new leader commits.
+        await DockerAsync("start", Brokers[1]);
+        await ClusterWholeAsync(env.Prefix);
+        await Task.Delay(2000);
+        stop.Cancel();
+        var trades = await producing;
+        await KafkaTestEnv.TopicEqualsAsync(d.EnrichedTopic, Enrich.Model(trades, d.Instruments), "the enriched sink after a takeover with a broker down");
+        var status = await b.StatusAsync();
+        Assert.Equal("Leader", status.GetProperty("role").GetString());
+        Assert.Equal(2, status.GetProperty("term").GetInt64());
+
+        // And the killed node comes back as its standby.
+        using var again = new AppNode(env, "a", d.Ports[0], d.Ports[1]);
+        await again.StatusWhenAsync(
+            s => s.GetProperty("warm").GetBoolean() && s.GetProperty("leader").GetString() == "b" && State(s, "main") == "Built", "the restarted node to stand by");
+    }
+
+    [Fact]
+    public async Task Seventy_seconds_without_a_quorum_of_brokers_ends_with_one_leader_and_nothing_lost()
+    {
+        await RequireBrokerClusterAsync();
+        await using var env = KafkaTestEnv.Create();
+        var d = await DeployAsync(env);
+        using var a = d.A;
+        using var b = d.B;
+        using var stop = new CancellationTokenSource();
+        var producing = ProduceUntilAsync(env, d.TradesTopic, stop.Token);
+        await Task.Delay(2000);
+
+        // Two of three brokers: no controller quorum, no partition with two replicas in
+        // sync. Nothing can be written or elected — for longer than the transaction
+        // timeout (60 s), the heartbeat interval and the takeover ceiling put together.
+        var outage = Stopwatch.StartNew();
+        await DockerAsync("stop", "-t", "1", Brokers[0]);
+        await DockerAsync("stop", "-t", "1", Brokers[1]);
+        await Task.Delay(TimeSpan.FromSeconds(70));
+        await DockerAsync("start", Brokers[0]);
+        await DockerAsync("start", Brokers[1]);
+        Measured($"kafka3: two of three brokers down for {outage.ElapsedMilliseconds} ms");
+        await ClusterWholeAsync(env.Prefix);
+        var back = Stopwatch.StartNew();
+
+        // What is required: in the end one node leads and runs the pipeline, and nothing
+        // is lost. A node that exits is started again, as the process supervisor it runs
+        // under would: which nodes had to end, and how, is what the measurement records.
+        // A leader that cannot commit still answers as the leader until its standby's
+        // takeover fences it, so "one leader" is only believed together with a complete
+        // sink, which needs a leader that commits.
+        await Task.Delay(2000);
+        stop.Cancel();
+        var trades = await producing;
+        var expected = Enrich.Model(trades, d.Instruments);
+        var nodes = new Dictionary<string, AppNode> { ["a"] = a, ["b"] = b };
+        var started = new List<AppNode>();
+        var exits = new List<string>();
+        try
+        {
+            AppNode? leader = null;
+            while (leader is null)
+            {
+                Assert.True(back.Elapsed < TimeSpan.FromMinutes(5),
+                    $"no node led with the pipeline running and the sink complete within five minutes of the brokers' return ({string.Join("; ", exits)}).{Environment.NewLine}{nodes["a"].Dump()}{Environment.NewLine}{nodes["b"].Dump()}");
+                await Task.Delay(1000);
+                var leading = new List<AppNode>();
+                foreach (var id in new[] { "a", "b" })
+                {
+                    var node = nodes[id];
+                    if (node.HasExited)
+                    {
+                        exits.Add($"{id} exited with code {await node.ExitCodeAsync()} {back.ElapsedMilliseconds} ms after the cluster was whole");
+                        var again = new AppNode(env, id, id == "a" ? d.Ports[0] : d.Ports[1], id == "a" ? d.Ports[1] : d.Ports[0]);
+                        started.Add(again);
+                        nodes[id] = again;
+                        continue;
+                    }
+                    try
+                    {
+                        var status = await node.StatusAsync();
+                        if (status.GetProperty("role").GetString() == "Leader" && State(status, "main") == "Running")
+                            leading.Add(node);
+                    }
+                    catch (Exception) when (node.HasExited)
+                    {
+                        // It ended while it was being asked; the next round restarts it.
+                    }
+                }
+                if (leading.Count != 1)
+                    continue;
+                var actual = await Task.Run(() => KafkaTestEnv.ReadTable<long, EnrichedTrade>(d.EnrichedTopic));
+                if (actual.Count == expected.Count && expected.All(e => actual.TryGetValue(e.Key, out var row) && Equals(row, e.Value)))
+                    leader = leading[0];
+            }
+            var final = await leader.StatusAsync();
+            Measured(
+                $"kafka3: after the outage node {leader.Id} leads at term {final.GetProperty("term").GetInt64()} with the pipeline running and the sink complete " +
+                $"({trades.Count} trades), {back.ElapsedMilliseconds} ms after the cluster was whole; " +
+                (exits.Count == 0 ? "no node ended" : string.Join("; ", exits)) +
+                $"; the pipeline restarted {final.GetProperty("pipelines").EnumerateArray().Single().GetProperty("restarts").GetInt32()} time(s) on the leader");
+        }
+        finally
+        {
+            foreach (var node in started)
+                node.Dispose();
+        }
     }
 
     [Fact]

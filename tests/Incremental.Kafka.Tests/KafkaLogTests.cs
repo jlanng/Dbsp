@@ -83,7 +83,7 @@ public class KafkaLogTests(ITestOutputHelper output)
     {
         await using var env = KafkaEnv.Create();
         using (var admin = new AdminClientBuilder(new AdminClientConfig { BootstrapServers = KafkaEnv.Bootstrap }).Build())
-            await admin.CreateTopicsAsync([new TopicSpecification { Name = env.Prefix + ".state", NumPartitions = 3, ReplicationFactor = 1 }]);
+            await admin.CreateTopicsAsync([new TopicSpecification { Name = env.Prefix + ".state", NumPartitions = 3, ReplicationFactor = KafkaEnv.Replication }]);
 
         var failure = await Assert.ThrowsAsync<KafkaLogException>(() => KafkaLog.ConnectAsync(env.Options(statePartitions: 3)));
         Assert.Contains("cleanup.policy=delete", failure.Message);

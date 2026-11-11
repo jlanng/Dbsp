@@ -120,13 +120,15 @@ public enum HealthLevel { Healthy, Degraded, Unhealthy }
 /// is healthy.</summary>
 public sealed record NodeHealth(bool Live, bool Ready, HealthLevel Level, IReadOnlyList<string> Reasons);
 
-/// <summary>How ready a standby is to lead, in terms an operator can act on. On this
-/// build a standby holds pipeline state as bytes and builds circuits at takeover.</summary>
+/// <summary>How ready a standby is to lead, in terms an operator can act on.</summary>
 /// <remarks><c>PluginsPending</c> counts plugin versions a deployed pipeline names whose files
-/// this node has not yet fetched from the blob store.</remarks>
+/// this node has not yet fetched from the blob store. <c>PipelinesToBuild</c> counts
+/// pipelines whose circuit this standby is still building on the state it follows
+/// (<see cref="ServiceOptions.WarmStandbyPipelines"/>); one it could not build is not
+/// counted — it shows as <c>Unbuilt</c> with the reason and is built at takeover.</remarks>
 public sealed record StandbyReadiness(
     long CatalogVersionApplied, long CatalogVersionLatest, long StateLagRecords, int TablesBehind, int TablesFaulted,
-    int PluginsPending, bool TakeoverWouldBeWarm, IReadOnlyList<string> NotWarmBecause);
+    int PluginsPending, bool TakeoverWouldBeWarm, IReadOnlyList<string> NotWarmBecause, int PipelinesToBuild = 0);
 
 /// <summary>Where the service's part of this node's takeover went. The leadership's own
 /// record (<see cref="KafkaLeadershipDetail.LastTakeover"/>) has the stages around it:
@@ -213,6 +215,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
 
     private readonly StateLagWindow _stateLagWindow = new();
     private int _pluginsPending;
+    private Task? _warming;
     private volatile PeerInfo? _peer;
     private volatile bool _peerSampled;
     private volatile ServiceTakeoverTimings? _lastTakeover;
@@ -554,8 +557,9 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
                                 await _context.Tables.ReconcileAsync(entries, asWriter: false, stop).ConfigureAwait(false);
                                 _context.Supervisor.SyncFromCatalog(entries);
 
-                                // No plugin code runs on a standby, but its files are fetched
-                                // now, so that a takeover loads them from this node's disk.
+                                // The plugins' files are fetched as soon as the catalog names
+                                // them: this node builds its circuits from them, and a
+                                // takeover loads what it did not build from this node's disk.
                                 Volatile.Write(ref _pluginsPending, await _context.Plugins.PrefetchAsync(entries, stop).ConfigureAwait(false));
                                 await _context.Plugins.PruneCacheAsync(entries, stop).ConfigureAwait(false);
                                 if (version != _catalogApplied)
@@ -568,6 +572,15 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
                     {
                         _roleGate.Release();
                     }
+                }
+
+                // Outside the role gate: building a circuit on a large state takes seconds,
+                // and a takeover that begins meanwhile waits only for the pipelines being
+                // built, each on its own queue.
+                if (role == NodeRole.Standby && catalog.IsOpen && _catalogApplied == catalog.Version && (_warming is null || _warming.IsCompleted))
+                {
+                    _warming = _context.Supervisor.WarmAsync(stop);
+                    _warming.Forget();
                 }
 
                 var now = DateTimeOffset.UtcNow;
@@ -750,8 +763,12 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         var pending = Volatile.Read(ref _pluginsPending);
         if (pending > 0)
             reasons.Add("plugin-pending");
+        var toBuild = _context.Supervisor.WarmPending();
+        if (toBuild > 0)
+            reasons.Add("pipeline-building");
         return new StandbyReadiness(
-            Math.Max(0, _catalogApplied), catalog.Version, Interlocked.Read(ref _stateLag), opening, faulted, pending, reasons.Count == 0, reasons);
+            Math.Max(0, _catalogApplied), catalog.Version, Interlocked.Read(ref _stateLag), opening, faulted, pending, reasons.Count == 0, reasons,
+            toBuild);
     }
 
     public NodeStatus Status

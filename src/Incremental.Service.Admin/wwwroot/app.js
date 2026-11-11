@@ -227,8 +227,8 @@
     Failed: ['crit', 'x', 'Faulted too often; needs a person'],
     NeedsReset: ['crit', 'alert', 'Its state cannot be read; reset it'],
     Wedged: ['crit', 'alert', 'A teardown did not finish on this node'],
-    Unbuilt: ['idle', 'circle', 'Not built on this node; a standby builds at takeover'],
-    Built: ['info', 'circle', 'Built, not started'],
+    Unbuilt: ['idle', 'circle', 'Not built on this node; built when it takes over'],
+    Built: ['info', 'circle', 'Built on this standby; a takeover starts it'],
   };
   const STATE_ORDER = ['Failed', 'Wedged', 'NeedsReset', 'Blocked', 'Backoff', 'Starting', 'Stopping', 'Running', 'Built', 'Unbuilt', 'Stopped'];
   const TABLE_STATES = {

@@ -80,7 +80,7 @@ public class KafkaServiceTests(ITestOutputHelper output)
         await WarmStandbyAsync(b);
         Assert.False(b.Node.IsLeader);
         Assert.Equal(["counts", "enrich"], b.Pipelines.Pipelines.Select(p => p.Id));
-        Assert.All(b.Pipelines.Pipelines, p => Assert.Equal(PipelineState.Unbuilt, p.State));
+        await Eventually(() => b.Pipelines.Pipelines.All(p => p.State == PipelineState.Built), "the standby to build both circuits");
         var followed = b.Tables.Stats("instruments");
         Assert.True(followed.Following);
         Assert.Equal(instruments.Count, followed.Rows);
@@ -318,7 +318,8 @@ public class KafkaServiceTests(ITestOutputHelper output)
                 await WarmStandbyAsync(b);
                 Assert.Equal(0, b.Node.Status.Standby!.PluginsPending);
 
-                // Fetched, hash-checked, and not loaded: a standby runs no plugin code.
+                // Fetched and hash-checked; and loaded, because the standby builds the
+                // pipeline's circuit on the state it follows.
                 var cache = b.Services.GetRequiredService<Microsoft.Extensions.Options.IOptions<ServiceOptions>>().Value.CacheDirectory!;
                 var fetched = Path.Combine(cache, "plugins", "acme.pipelines", version);
                 foreach (var file in manifest.Files)
@@ -327,7 +328,8 @@ public class KafkaServiceTests(ITestOutputHelper output)
                     Assert.True(File.Exists(path), $"{file.Path} was not fetched to the standby's cache");
                     Assert.Equal(file.Sha256, Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))).ToLowerInvariant());
                 }
-                Assert.Equal("stored", b.Plugins.Plugins.Single(p => p.Name == "acme.pipelines").LoadState);
+                await Eventually(() => b.Pipelines.Get("plugged").State == PipelineState.Built, "the standby to build the circuit");
+                Assert.Equal("loaded", b.Plugins.Plugins.Single(p => p.Name == "acme.pipelines").LoadState);
 
                 await b.Node.TakeOverAsync(new NodeActionOptions(), default).WaitAsync(Timeout);
                 await b.Running("plugged");

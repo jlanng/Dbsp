@@ -124,10 +124,13 @@ public class NodeTests
         log.AppendRange(trades);
         await SinksEqualModelAsync(memory, trades, instruments, "under the first leader");
 
-        // The standby follows the catalog and the tables; it builds nothing.
-        await Eventually(() => b.Node.Status.Standby is { TakeoverWouldBeWarm: true }, "the standby being warm");
+        // The standby follows the catalog and the tables, and builds every circuit on the
+        // state it follows — but for the one that writes a table, which is built at takeover.
         await Eventually(() => b.Pipelines.Pipelines.Count == 4 && b.Tables.Tables.Count == 2, "the standby seeing the catalog");
-        Assert.All(b.Pipelines.Pipelines, p => Assert.Equal(PipelineState.Unbuilt, p.State));
+        await Eventually(
+            () => b.Node.Status.Standby is { TakeoverWouldBeWarm: true } && b.Pipelines.Pipelines.Count(p => p.State == PipelineState.Built) == 3,
+            "the standby being warm");
+        Assert.All(b.Pipelines.Pipelines, p => Assert.Equal(b.Pipelines.Spec(p.Id).Writes.Count > 0 ? PipelineState.Unbuilt : PipelineState.Built, p.State));
         Assert.True(b.Tables.Stats("instruments").Following);
         await Eventually(() => b.Tables.Stats("positions").Rows == a.Tables.Stats("positions").Rows, "the standby's copy of the derived table");
         Assert.Equal(HealthLevel.Healthy, b.Node.Health.Level);

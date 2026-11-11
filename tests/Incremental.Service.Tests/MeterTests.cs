@@ -186,6 +186,7 @@ public class MeterTests
         await Eventually(() => b.Node.Status.Standby is { TakeoverWouldBeWarm: true } && b.Pipelines.Pipelines.Count == 1
             && b.Tables.Tables.Any(t => t.State == TableState.Open), "the standby being warm");
         await Eventually(() => a.Node.Status.Peer is { Ready: true }, "the leader seeing its standby");
+        await Eventually(() => b.Pipelines.Get("p").State == PipelineState.Built, "the standby building the circuit");
 
         var onB = await SnapshotAsync(b, collected);
         (string, string) nb = ("node", idB);
@@ -194,7 +195,7 @@ public class MeterTests
         Assert.Equal(0, Value(onB, "incremental.service.node.state_lag", nb));
         Assert.Equal(0, Value(onB, "incremental.service.table.lag", nb, ("table", "instruments")));
         Assert.Equal(5, Value(onB, "incremental.service.table.rows", nb, ("table", "instruments")));
-        Assert.Equal(1, Value(onB, "incremental.service.pipelines", nb, ("state", "Unbuilt")));
+        Assert.Equal(1, Value(onB, "incremental.service.pipelines", nb, ("state", "Built")));
         // A standby runs nothing: it says nothing of whether a pipeline is up.
         Assert.Null(Value(onB, "incremental.service.pipeline.up", nb, ("pipeline", "p")));
         Assert.Null(Value(onB, "incremental.service.pipeline.checkpoint_age", nb, ("pipeline", "p")));

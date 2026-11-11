@@ -20,8 +20,8 @@ namespace Incremental.Service;
 /// The gauges are read from a snapshot each node refreshes once a second (tables every
 /// five), so a collection costs a walk over arrays and never touches a circuit, a table
 /// or the backend. A node reports what it knows: a standby runs no pipelines, so it
-/// reports their states as the catalog lists them (<c>Unbuilt</c>) and no lag or
-/// checkpoint age for them.
+/// reports them as <c>Built</c> (the circuit is ready for a takeover) or <c>Unbuilt</c>,
+/// and no lag or checkpoint age for them.
 /// </para>
 /// </summary>
 public static class ServiceMeter

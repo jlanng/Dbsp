@@ -488,7 +488,23 @@ public sealed record PipelineStatus(
     IReadOnlyList<PipelineTransition>? History = null,
     PipelineRollback? RolledBack = null,
     bool ReplaceUnconfirmed = false,
-    DeadLetterSinkStatus? DeadLetterSink = null);
+    DeadLetterSinkStatus? DeadLetterSink = null,
+    PipelineStartTimings? LastStart = null);
+
+/// <summary>
+/// Where the last start of a pipeline on this node spent its time. <c>Plugin</c>: getting
+/// the plugin version (nothing when the pipeline already holds it). <c>Build</c>: running
+/// the definition and building the circuit on the pipeline's state — on a node that has
+/// just taken over this is where state the standby followed becomes the circuit's stores.
+/// <c>Start</c>: the circuit's own start (the manifest check, recovery, the workers).
+/// <c>Edges</c>: creating the sinks and starting the sources at their committed positions.
+/// <c>Run</c> is the count <see cref="PipelineFault.Run"/> uses. <c>Warm</c>: the circuit
+/// was the one this node built while it stood by, so <c>Build</c> is next to nothing.
+/// On a standby this is its build of the pipeline (<c>Run</c> 0, nothing started): there
+/// <c>Build</c> is what reading the followed state into the circuit's stores cost.
+/// </summary>
+public sealed record PipelineStartTimings(
+    DateTimeOffset At, long Run, TimeSpan Plugin, TimeSpan Build, TimeSpan Start, TimeSpan Edges, TimeSpan Total, bool Warm = false);
 
 public interface IPipelineSupervisor
 {
@@ -516,7 +532,7 @@ public interface IPipelineSupervisor
     Task<PipelineValidation> DescribeAsync(PipelineSpec spec, CancellationToken cancellationToken);
 
     /// <summary>The graph of the pipeline's circuit as this node last built or dry-ran it;
-    /// null where it never has — a standby runs no plugin code.</summary>
+    /// null where it never has.</summary>
     PipelineGraph? Graph(string id);
 
     /// <summary>The spec with every config property a connector declares secret replaced

@@ -38,6 +38,8 @@ public class DebeziumCdcTests(ITestOutputHelper output)
 
         public static async Task<Cdc> CreateAsync()
         {
+            // Kafka Connect writes to the connector stack's broker and to no other.
+            Assert.SkipUnless(KafkaEnv.IsLocalStack, $"Kafka Connect on {Connect} writes to localhost:9092, not to {KafkaEnv.Bootstrap}.");
             var kafka = KafkaEnv.Create();
             var client = new KafkaConnectClient(Connect);
             NpgsqlDataSource? database = null;

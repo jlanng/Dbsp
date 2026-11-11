@@ -24,6 +24,8 @@ public class KafkaServiceCdcTests
     [Fact]
     public async Task A_postgres_table_reaches_a_pipelines_lookup_through_debezium_and_the_registry_on_both_sides_of_a_takeover()
     {
+        // Kafka Connect writes to the connector stack's broker and to no other.
+        Assert.SkipUnless(KafkaTestEnv.IsLocalStack, $"Kafka Connect on {Connect} writes to localhost:9092, not to {KafkaTestEnv.Bootstrap}.");
         await using var env = KafkaTestEnv.Create();
         using var connect = new KafkaConnectClient(Connect);
         NpgsqlDataSource? database = null;

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
@@ -11,7 +12,7 @@ namespace Incremental.Service;
 /// <summary>One circuit and what hangs off it: its sources, deliveries and dead-letter reader.</summary>
 internal sealed class Generation
 {
-    public required long Number { get; init; }
+    public required long Number { get; set; }
     public required Circuit Circuit { get; init; }
     public required PipelineBuilder Builder { get; init; }
     public List<(string Slot, IRunningSource Source)> Sources { get; } = [];
@@ -122,7 +123,32 @@ internal sealed class PipelineRuntime(PipelineSpec spec, ServiceOptions options)
     /// <summary>What the state of <see cref="Spec"/> is made of, as the last build or dry
     /// run of that spec on this node described it; null where it never was.</summary>
     public volatile StateShape? StateShape;
+
+    /// <summary>Where the last start of a generation on this node spent its time.</summary>
+    public volatile PipelineStartTimings? LastStart;
+
+    /// <summary>A standby's circuit for this pipeline: built on the state it follows, not
+    /// started. A takeover starts it instead of building one.</summary>
+    public volatile WarmGeneration? Warm;
+
+    /// <summary>Why this standby could not build the pipeline, the last time it tried.</summary>
+    public volatile string? WarmFault;
+
+    /// <summary>When a failed standby build may be tried again, and the spec generation it
+    /// failed for: a new spec is tried at once.</summary>
+    public DateTimeOffset WarmRetryAt;
+    public long WarmFaultGeneration = -1;
+
+    /// <summary>A table the pipeline reads was opened again since <see cref="Warm"/> was built.</summary>
+    public volatile bool WarmStale;
+
+    /// <summary>The provider's store epoch when the pipeline's typed stores were bound: a
+    /// later one says they have been given up since.</summary>
+    public long BoundEpoch = -1;
 }
+
+/// <summary>A circuit a standby built ahead of a takeover, and what it was built on.</summary>
+internal sealed record WarmGeneration(Generation Generation, string Layout, long StoreEpoch, long SpecGeneration);
 
 /// <summary>
 /// Runs one circuit per pipeline and changes them one at a time while the others run:
@@ -207,7 +233,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             runtime.Id, runtime.State, spec.Desired, spec.Generation, spec.Plugin, spec.Version, spec.Definition,
             blockedOn, runtime.Since, runtime.Operation, runtime.Restarts, runtime.DeadLetters.Total,
             generation?.Circuit.CommittedStep, committed, faults, runtime.Shape, sources, sinks, runtime.History.After(),
-            runtime.RolledBack, spec.Previous is not null, DeadLetterSink(runtime, spec, generation));
+            runtime.RolledBack, spec.Previous is not null, DeadLetterSink(runtime, spec, generation), runtime.LastStart);
     }
 
     private DeadLetterSinkStatus? DeadLetterSink(PipelineRuntime runtime, PipelineSpec spec, Generation? generation)
@@ -1159,8 +1185,33 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         var provider = context.Storage.Pipeline(runtime.Id);
         provider.ReleaseStores();
         provider.UseSerializer(new JsonStateSerializer(lease.StateJson));
+        provider.UseLayout(LayoutOf(runtime.Spec));
+        runtime.BoundEpoch = provider.StoreEpoch;
         runtime.Lease = lease;
     }
+
+    /// <summary>
+    /// The identity of everything that decides what a pipeline's typed stores are: the
+    /// plugin version, the definition, its settings, the worker count, the error policy
+    /// and the tables its slots are bound to. Every record the pipeline writes carries it
+    /// (<see cref="ChangelogStorageProvider.UseLayout"/>), which is what lets a standby
+    /// hold the state in typed stores: it gives them up at the first record of another
+    /// layout. Two specs with the same layout build the same stores.
+    /// </summary>
+    internal static string LayoutOf(PipelineSpec spec)
+    {
+        var text = string.Join('\n',
+            spec.Plugin, spec.Version, spec.Definition, spec.Settings is { } settings ? Canonical(settings) : "",
+            spec.Circuit.Workers.ToString(System.Globalization.CultureInfo.InvariantCulture), spec.Circuit.ErrorPolicy.ToString(),
+            string.Join(',', spec.Tables.OrderBy(t => t.Key, StringComparer.Ordinal).Select(t => t.Key + "=" + t.Value)));
+        return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(text)), 0, 6).ToLowerInvariant();
+    }
+
+    /// <summary>Whether the pipeline's typed stores are still the ones bound for
+    /// <paramref name="spec"/>: same plugin version, same layout, not given up since.</summary>
+    private bool BoundFor(PipelineRuntime runtime, PipelineSpec spec, ChangelogStorageProvider provider) =>
+        runtime.Lease is { } bound && bound.Name == spec.Plugin && bound.Version == spec.Version
+        && provider.Layout == LayoutOf(spec) && provider.StoreEpoch == runtime.BoundEpoch;
 
     /// <summary>Turns the pipeline's typed stores back into bytes and lets go of the
     /// plugin version they belonged to, which is what allows that version to unload.</summary>
@@ -1168,11 +1219,181 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
     {
         if (runtime.Wedged)
             return; // The stores still belong to a circuit that will not stop.
+        DiscardWarm(runtime);
         var provider = context.Storage.Pipeline(runtime.Id);
         provider.ReleaseStores();
         provider.UseSerializer(JsonStateSerializer.Instance);
+        provider.UseLayout(null);
+        runtime.BoundEpoch = -1;
         runtime.Lease?.Dispose();
         runtime.Lease = null;
+    }
+
+    /// <summary>Drops a standby's circuit. It was never started, so there is nothing to
+    /// drain: disposing it completes its outputs and frees what it claimed.</summary>
+    private void DiscardWarm(PipelineRuntime runtime)
+    {
+        if (Interlocked.Exchange(ref runtime.Warm, null) is not { } warm)
+            return;
+        try
+        {
+            warm.Generation.Circuit.DisposeAsync().AsTask().Forget();
+            warm.Generation.Stop.Cancel();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Pipeline {Pipeline}: dropping the standby's circuit failed", runtime.Id);
+        }
+        runtime.WarmStale = false;
+    }
+
+    /// <summary>The standby's circuit, if it is still good for <paramref name="spec"/>:
+    /// built for this very spec, on stores that have not been given up, over tables that
+    /// have not been opened again. Otherwise it is dropped and null is returned.</summary>
+    private Generation? TakeWarm(PipelineRuntime runtime, PipelineSpec spec, ChangelogStorageProvider provider)
+    {
+        if (runtime.Warm is not { } warm)
+            return null;
+        if (!runtime.WarmStale && warm.SpecGeneration == spec.Generation && warm.Layout == LayoutOf(spec)
+            && warm.StoreEpoch == provider.StoreEpoch && BoundFor(runtime, spec, provider)
+            && ReferenceEquals(Interlocked.CompareExchange(ref runtime.Warm, null, warm), warm))
+            return warm.Generation;
+        DiscardWarm(runtime);
+        return null;
+    }
+
+    /// <summary>
+    /// A standby's work between takeovers: for every pipeline that should run and whose
+    /// state is under its spec's layout, get the plugin, build the circuit on the followed
+    /// state and keep it, unstarted. From then on the follower applies the leader's
+    /// commits to the circuit's own stores, and a takeover starts the circuit — its cost
+    /// no longer grows with the state. A pipeline that cannot be built here stays as bytes
+    /// and is built at takeover as before; nothing a pipeline does here can fail the node.
+    /// Returns how many pipelines are still to be built.
+    /// </summary>
+    internal async Task<int> WarmAsync(CancellationToken cancellationToken)
+    {
+        if (!context.Options.WarmStandbyPipelines)
+            return 0;
+        var results = await Task.WhenAll(_pipelines.Values.Select(runtime => Task.Run(async () =>
+        {
+            if (!runtime.Exists || _accepting || context.Leading)
+                return 0;
+            if (!await runtime.Queue.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+                return 1;
+            try
+            {
+                runtime.Operation = "build (standby)";
+                if (!Attached(runtime) || !runtime.Exists || _accepting || context.Leading)
+                    return 0;
+                var spec = runtime.Spec;
+                var layout = LayoutOf(spec);
+                var provider = context.Storage.Pipeline(runtime.Id);
+
+                // A pipeline that writes a table is built at takeover: its circuit would
+                // claim the table's writer while the table still follows.
+                var wanted = spec.Desired == DesiredState.Running && spec.Pending is null && spec.Writes.Count == 0;
+                if (runtime.Warm is { } warm
+                    && (!wanted || runtime.WarmStale || warm.SpecGeneration != spec.Generation || warm.Layout != layout
+                        || warm.StoreEpoch != provider.StoreEpoch || !BoundFor(runtime, spec, provider)))
+                {
+                    DiscardWarm(runtime);
+                    Set(runtime, PipelineState.Unbuilt);
+                }
+                if (!wanted || runtime.Warm is not null)
+                    return 0;
+
+                // Until the leader has put the state under this layout there is nothing
+                // to build on: the state is another version's, or the pipeline's first
+                // generation has not started.
+                if (provider.CommittedLayout != layout)
+                    return 0;
+                if (runtime.WarmFault is not null && runtime.WarmFaultGeneration == spec.Generation && DateTimeOffset.UtcNow < runtime.WarmRetryAt)
+                    return 0;
+                try
+                {
+                    var clock = Stopwatch.StartNew();
+                    if (!BoundFor(runtime, spec, provider))
+                    {
+                        ReleaseBinding(runtime);
+                        Bind(runtime, await context.Plugins.AcquireAsync(spec.Plugin, spec.Version, cancellationToken).ConfigureAwait(false));
+                    }
+                    var plugin = clock.Elapsed;
+                    var epoch = provider.StoreEpoch;
+                    var generation = Build(runtime, 0);
+                    if (provider.StoreEpoch != epoch)
+                    {
+                        // The state moved to another layout while this was built.
+                        generation.Circuit.DisposeAsync().AsTask().Forget();
+                        return 1;
+                    }
+                    if (!Attached(runtime) || !runtime.Exists)
+                    {
+                        // Removed from the catalog while this was built.
+                        generation.Circuit.DisposeAsync().AsTask().Forget();
+                        ReleaseBinding(runtime);
+                        return 0;
+                    }
+                    runtime.WarmStale = false;
+                    runtime.WarmFault = null;
+                    runtime.Warm = new WarmGeneration(generation, layout, epoch, spec.Generation);
+                    runtime.LastStart = new PipelineStartTimings(
+                        DateTimeOffset.UtcNow, 0, plugin, clock.Elapsed - plugin, TimeSpan.Zero, TimeSpan.Zero, clock.Elapsed);
+                    Set(runtime, PipelineState.Built);
+                    return 0;
+                }
+                catch (TableNotOpenException)
+                {
+                    return 1; // the table is still opening on this node
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+                {
+                    var cause = DefinitionBinding.Cause(ex);
+                    var message = $"{cause.GetType().Name}: {cause.Message}";
+                    var news = runtime.WarmFault != message || runtime.State != PipelineState.Unbuilt;
+                    if (news)
+                        _logger.LogWarning(cause, "Pipeline {Pipeline} could not be built on this standby; a takeover builds it from the followed state", runtime.Id);
+                    runtime.WarmFault = message;
+                    runtime.WarmFaultGeneration = spec.Generation;
+                    runtime.WarmRetryAt = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(30);
+                    try
+                    {
+                        ReleaseBinding(runtime);
+                    }
+                    catch (Exception release)
+                    {
+                        _logger.LogWarning(release, "Pipeline {Pipeline}: giving the standby's stores back failed", runtime.Id);
+                    }
+                    if (news)
+                        Set(runtime, PipelineState.Unbuilt, "not built on this standby: " + message);
+                    return 0;
+                }
+            }
+            finally
+            {
+                runtime.Operation = null;
+                runtime.Queue.Release();
+            }
+        }, cancellationToken))).ConfigureAwait(false);
+        return results.Sum();
+    }
+
+    /// <summary>Pipelines this standby should have built and has not, failures aside.</summary>
+    internal int WarmPending()
+    {
+        if (!context.Options.WarmStandbyPipelines)
+            return 0;
+        var pending = 0;
+        foreach (var runtime in _pipelines.Values)
+        {
+            var spec = runtime.Spec;
+            if (!runtime.Exists || runtime.Warm is not null || runtime.WarmFault is not null
+                || spec.Desired != DesiredState.Running || spec.Pending is not null || spec.Writes.Count != 0)
+                continue;
+            if (context.Storage.Pipeline(runtime.Id).CommittedLayout == LayoutOf(spec))
+                pending++;
+        }
+        return pending;
     }
 
     // ── a generation ───────────────────────────────────────────────────────────────────
@@ -1197,15 +1418,34 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         try
         {
             var spec = runtime.Spec;
-            if (runtime.Lease is not { } bound || bound.Name != spec.Plugin || bound.Version != spec.Version)
+            var clock = Stopwatch.StartNew();
+            var provider = context.Storage.Pipeline(runtime.Id);
+
+            // What this node built while it stood by, if it is still good; else the
+            // pipeline's stores under this spec's layout, and a circuit built on them.
+            generation = TakeWarm(runtime, spec, provider);
+            var warm = generation is not null;
+            if (!warm && !BoundFor(runtime, spec, provider))
             {
                 ReleaseBinding(runtime);
                 Bind(runtime, await context.Plugins.AcquireAsync(spec.Plugin, spec.Version, CancellationToken.None).ConfigureAwait(false));
             }
-            generation = Build(runtime, number);
+            var plugin = clock.Elapsed;
+            if (generation is null)
+                generation = Build(runtime, number);
+            else
+                generation.Number = number;
+            var built = clock.Elapsed;
             runtime.Starting = generation;
+
+            // Before anything is written under it: a standby that reads this gives up
+            // typed stores of any other layout, and may build this one's.
+            await provider.CommitLayoutAsync().ConfigureAwait(false);
             generation.Circuit.Start();
+            var started = clock.Elapsed;
             await StartEdgesAsync(runtime, generation).ConfigureAwait(false);
+            runtime.LastStart = new PipelineStartTimings(
+                DateTimeOffset.UtcNow, number, plugin, built - plugin, started - built, clock.Elapsed - started, clock.Elapsed, warm);
 
             // The start can take as long as a connector does, and the node may have been
             // fenced or stopped meanwhile. Whoever ended it could not see this generation
@@ -1918,8 +2158,8 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
 
     // ── the node's calls ───────────────────────────────────────────────────────────────
 
-    /// <summary>A standby's view: what the catalog deploys, none of it built. Its state is
-    /// followed as bytes and its circuits are built at takeover.</summary>
+    /// <summary>A standby's view: what the catalog deploys. <see cref="WarmAsync"/> builds
+    /// what can be built ahead of a takeover; the rest is followed as bytes.</summary>
     internal void SyncFromCatalog(IReadOnlyDictionary<string, string> catalog)
     {
         var specs = catalog.Where(e => e.Key.StartsWith("pipeline/", StringComparison.Ordinal))
@@ -1931,6 +2171,24 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 continue;
             runtime.Exists = false;
             _pipelines.TryRemove(new KeyValuePair<string, PipelineRuntime>(id, runtime));
+
+            // What this standby built for it goes too, and with it the plugin version it
+            // held. A build that is running finds the pipeline gone and does the same.
+            if (runtime.Queue.Wait(0))
+            {
+                try
+                {
+                    ReleaseBinding(runtime);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Pipeline {Pipeline}: releasing a removed pipeline's stores failed", id);
+                }
+                finally
+                {
+                    runtime.Queue.Release();
+                }
+            }
         }
         foreach (var spec in specs.Values)
         {
@@ -1948,7 +2206,9 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
     {
         SyncFromCatalog(catalog);
         _accepting = true;
-        await Task.WhenAll(_pipelines.Values.Select(async runtime =>
+        // Each on a thread of its own: building a circuit on followed bytes is synchronous
+        // work, and one pipeline's must not wait for another's.
+        await Task.WhenAll(_pipelines.Values.Select(runtime => Task.Run(async () =>
         {
             using var exit = await EnterAsync(runtime, "takeover", cancellationToken).ConfigureAwait(false);
             if (!Attached(runtime) || !runtime.Exists)
@@ -1962,7 +2222,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 _logger.LogError(ex, "Pipeline {Pipeline} could not be taken over", runtime.Id);
                 HandleFault(runtime, ex, runtime.Generations);
             }
-        })).ConfigureAwait(false);
+        }, cancellationToken))).ConfigureAwait(false);
     }
 
     /// <summary>Stops every pipeline in stop order and in parallel, within the budget.
@@ -2057,6 +2317,9 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
     /// instance hold it, so they are rebuilt.</summary>
     internal void OnTableReopened(string table)
     {
+        // A circuit a standby built holds the old instance too; it is built again.
+        foreach (var runtime in _pipelines.Values.Where(p => p.Warm is not null && (p.Spec.Reads.Contains(table) || p.Spec.Writes.Contains(table))))
+            runtime.WarmStale = true;
         if (!Leads)
             return;
         foreach (var runtime in _pipelines.Values.Where(p => p.Spec.Reads.Contains(table) || p.Spec.Writes.Contains(table)))
@@ -2080,6 +2343,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         foreach (var runtime in _pipelines.Values)
         {
             CancelRetry(runtime);
+            DiscardWarm(runtime);
             if (runtime.Current is null && !runtime.Wedged)
             {
                 try

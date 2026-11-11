@@ -27,6 +27,14 @@ internal sealed class KafkaTestEnv : IAsyncDisposable
         Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_BOOTSTRAP") is { Length: > 0 } configured ? configured : "localhost:9092";
     public static readonly TimeSpan Timeout = TimeSpan.FromSeconds(60);
 
+    /// <summary>1 on the local single broker; <c>INCREMENTAL_KAFKA_REPLICATION</c> on a
+    /// cluster (3 on the <c>kafka3</c> profile).</summary>
+    public static readonly short Replication =
+        short.TryParse(Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_REPLICATION"), out var replication) ? replication : (short)1;
+
+    /// <summary>Whether the broker under test is the one Kafka Connect writes to.</summary>
+    public static bool IsLocalStack => Bootstrap == "localhost:9092";
+
     private IProducer<byte[], byte[]>? _producer;
 
     private KafkaTestEnv()
@@ -60,7 +68,7 @@ internal sealed class KafkaTestEnv : IAsyncDisposable
         TopicPrefix = Prefix,
         NodeId = nodeId,
         HeartbeatInterval = TimeSpan.FromMilliseconds(250),
-        ReplicationFactor = 1,
+        ReplicationFactor = Replication,
         StatePartitions = 3,
         TableRowPartitions = 2,
     };
@@ -120,7 +128,7 @@ internal sealed class KafkaTestEnv : IAsyncDisposable
             {
                 Name = topic,
                 NumPartitions = partitions,
-                ReplicationFactor = 1,
+                ReplicationFactor = Replication,
                 Configs = compacted ? new Dictionary<string, string> { ["cleanup.policy"] = "compact" } : [],
             },
         ]);
@@ -135,7 +143,10 @@ internal sealed class KafkaTestEnv : IAsyncDisposable
 
     /// <summary>A plain producer, as some other system writing a source topic would be.</summary>
     public IProducer<byte[], byte[]> Producer =>
-        _producer ??= new ProducerBuilder<byte[], byte[]>(new ProducerConfig { BootstrapServers = Bootstrap, LingerMs = 2 }).Build();
+        // Idempotent: a retry after a broker died before it answered must not put a record
+        // into the topic twice, or the test would compare the sinks with a model the
+        // input no longer matches.
+        _producer ??= new ProducerBuilder<byte[], byte[]>(new ProducerConfig { BootstrapServers = Bootstrap, LingerMs = 2, EnableIdempotence = true }).Build();
 
     public static byte[] Json<T>(T value) => JsonSerializer.SerializeToUtf8Bytes(value, JsonSerializerOptions.Web);
 
@@ -221,6 +232,16 @@ internal sealed class KafkaTestEnv : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        // Flushed first: disposing a producer that still holds records for a broker that
+        // is down has crashed the test process in the client's native code (a glibc
+        // assertion in pthread), which hides whatever the test was failing for.
+        try
+        {
+            _producer?.Flush(TimeSpan.FromSeconds(20));
+        }
+        catch (KafkaException)
+        {
+        }
         _producer?.Dispose();
 
         // Best effort: the prefix is unique, so a topic left behind harms nothing.

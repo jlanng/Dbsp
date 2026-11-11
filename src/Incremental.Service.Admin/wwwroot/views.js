@@ -316,7 +316,7 @@
     const fault = detail.faults[0];
 
     return h('div', { class: 'stack' },
-      !running && p.state !== 'Stopped' && p.state !== 'Unbuilt' && notice(p.state === 'Failed' || p.state === 'Wedged' || p.state === 'NeedsReset' ? 'error' : 'warn',
+      !running && p.state !== 'Stopped' && p.state !== 'Unbuilt' && p.state !== 'Built' && notice(p.state === 'Failed' || p.state === 'Wedged' || p.state === 'NeedsReset' ? 'error' : 'warn',
         h('strong', null, PIPELINE_STATES[p.state] ? PIPELINE_STATES[p.state][2] + '. ' : ''),
         fault ? `${fault.exceptionType}${fault.message ? ': ' + fault.message : ''} ` : '',
         fault && h('a', { href: `#/pipelines/${enc(id)}/faults` }, 'See the faults')),
@@ -325,7 +325,8 @@
         timeEl(p.rolledBack.time), '.',
         p.rolledBack.problems && p.rolledBack.problems.length > 0 && h('ul', null, p.rolledBack.problems.map(x => h('li', null, x)))),
       p.replaceUnconfirmed && notice('info', 'A replace that kept state has not finished its first start yet: if it cannot read the state, the previous spec is put back.'),
-      p.state === 'Unbuilt' && notice('info', 'This node is a standby: it holds this pipeline’s state as bytes and builds the circuit only when it takes over. Rates and topology are on the leader.'),
+      p.state === 'Built' && notice('info', 'This node is a standby: it has built this pipeline’s circuit on the state it follows and starts it when it takes over. Rates are on the leader.'),
+      p.state === 'Unbuilt' && notice('info', 'This node has not built this pipeline’s circuit: it follows its state as bytes and builds the circuit if it takes over. ' + ((detail.history || []).filter(t => t.state === 'Unbuilt' && t.why).map(t => t.why).pop() || 'A standby builds a pipeline once the leader has run it; one that writes a table is built at takeover.')),
 
       h('div', { class: 'tiles' },
         tile([h('span', { class: 'swatch in' }), 'Records in'], rate(r.in), '/s', `${fmtInt(r.steps || 0)} steps in the last second`, spark(seriesOf(id, 'in'), { label: 'Records in per second', unit: '/s' })),
@@ -723,7 +724,7 @@
     const sink = selected && selected.role === 'sink' ? detail.sinks.find(x => x.slot === selected.label) : null;
     const tableUse = selected && (selected.role === 'table' || selected.role === 'table-out') ? detail.tables.find(x => x.name === selected.label) : null;
     return h('div', { class: 'stack' },
-      graph.source === 'declared' && notice('info', 'This node has not built this pipeline’s circuit (a standby builds at takeover), so this is the declared edges only: its input slots, tables and sinks around one box. The leader shows the operators.'),
+      graph.source === 'declared' && notice('info', 'This node has not built this pipeline’s circuit, so this is the declared edges only: its input slots, tables and sinks around one box. The leader shows the operators.'),
       card('Topology', `${graph.nodes.length} nodes · ${graph.source === 'circuit' ? 'the circuit as its definition declares it' : 'declared edges'}`,
         h('div', null,
           h('div', { class: 'graph-wrap', tabindex: 0, 'aria-label': 'Topology drawing; scroll to pan' }, svg),

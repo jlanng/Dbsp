@@ -1170,13 +1170,13 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         Assert.Equal(0, rows["lagVersions"].GetInt64());
         var tables = await admin.SendAsync(HttpMethod.Get, "tables", baseUrl: standby);
         Assert.All(tables["items"].EnumerateArray(), t => Assert.True(t.GetProperty("following").GetBoolean()));
-        // It has run no definition, so the graph is the declared edges.
+        // It has built the circuit on the state it follows, so it has the circuit's graph.
+        await TestService.Eventually(() => admin.Host.Nodes[1].Node.Pipelines.Get("enrich-orders").State == PipelineState.Built, "the standby builds the circuit");
         var pipeline = await admin.SendAsync(HttpMethod.Get, "pipelines/enrich-orders", baseUrl: standby);
-        Assert.Equal("Unbuilt", pipeline["pipeline"].GetProperty("state").GetString());
-        Assert.False(pipeline["hasGraph"].GetBoolean());
+        Assert.Equal("Built", pipeline["pipeline"].GetProperty("state").GetString());
+        Assert.True(pipeline["hasGraph"].GetBoolean());
         var graph = await admin.SendAsync(HttpMethod.Get, "pipelines/enrich-orders/graph", baseUrl: standby);
-        Assert.Equal("declared", graph["source"].GetString());
-        Assert.Equal(["circuit", "input", "sink", "table", "table"], graph["nodes"].EnumerateArray().Select(n => n.GetProperty("role").GetString()).Order());
+        Assert.Equal("circuit", graph["source"].GetString());
 
         // What there is to deploy with is the host's, so a standby lists it; describing a
         // definition runs plugin code, which only the leader does.

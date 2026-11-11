@@ -17,6 +17,16 @@ internal sealed class KafkaEnv : IAsyncDisposable
         Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_BOOTSTRAP") is { Length: > 0 } configured ? configured : "localhost:9092";
     public static readonly TimeSpan Timeout = TimeSpan.FromSeconds(60);
 
+    /// <summary>The replication factor of every topic the tests create: 1 on the local
+    /// single broker, <c>INCREMENTAL_KAFKA_REPLICATION</c> on a cluster (3 on the
+    /// <c>kafka3</c> profile, whose brokers want two replicas in sync).</summary>
+    public static readonly short Replication =
+        short.TryParse(Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_REPLICATION"), out var replication) ? replication : (short)1;
+
+    /// <summary>Whether the broker under test is the local connector stack's, which is
+    /// the one Kafka Connect writes to.</summary>
+    public static bool IsLocalStack => Bootstrap == "localhost:9092";
+
     private readonly List<KafkaLog> _logs = [];
 
     private KafkaEnv()
@@ -68,7 +78,7 @@ internal sealed class KafkaEnv : IAsyncDisposable
             HeartbeatInterval = heartbeat ?? TimeSpan.FromSeconds(1),
             BootstrapServers = Bootstrap,
             TopicPrefix = Prefix,
-            ReplicationFactor = 1,
+            ReplicationFactor = Replication,
             StatePartitions = statePartitions,
             TableRowPartitions = rowPartitions,
             MaxRecordBytes = maxRecordBytes,
@@ -148,7 +158,7 @@ internal sealed class KafkaEnv : IAsyncDisposable
             settings["cleanup.policy"] = "compact";
         using var admin = new AdminClientBuilder(new AdminClientConfig { BootstrapServers = Bootstrap }).Build();
         await admin.CreateTopicsAsync(
-            [new Confluent.Kafka.Admin.TopicSpecification { Name = topic, NumPartitions = partitions, ReplicationFactor = 1, Configs = settings }]);
+            [new Confluent.Kafka.Admin.TopicSpecification { Name = topic, NumPartitions = partitions, ReplicationFactor = Replication, Configs = settings }]);
         return topic;
     }
 

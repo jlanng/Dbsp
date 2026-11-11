@@ -64,9 +64,14 @@ try
                 TopicPrefix = Argument("--prefix"),
                 NodeId = nodeId,
                 HeartbeatInterval = TimeSpan.FromMilliseconds(Number("--heartbeat-ms", 1000)),
-                ReplicationFactor = 1,
+                // 1 on the local broker; the test passes its own through the environment.
+                ReplicationFactor = short.TryParse(Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_REPLICATION"), out var replication) ? replication : (short)1,
                 StatePartitions = 3,
                 TableRowPartitions = 2,
+                // Client settings a test wants to try: "name=value;name=value".
+                ClientConfig = (Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_CLIENT") ?? "")
+                    .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .Select(pair => pair.Split('=', 2)).ToDictionary(pair => pair[0], pair => pair[1]),
             },
             TakeoverAfter = TimeSpan.FromMilliseconds(Number("--takeover-after-ms", 3000)),
             ProbeListen = probePort > 0 ? new IPEndPoint(IPAddress.Loopback, probePort) : null,

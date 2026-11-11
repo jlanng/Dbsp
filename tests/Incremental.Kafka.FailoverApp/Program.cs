@@ -32,6 +32,9 @@ var probePort = Number("--probe-port", 0);
 var peerPort = Number("--peer-port", 0);
 var sinkTopic = prefix + ".sink";
 
+// 1 on the local broker; the test passes its own through the environment.
+var replication = short.TryParse(Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_REPLICATION"), out var configured) ? configured : (short)1;
+
 var emitLock = new object();
 void Emit(string kind, object? data = null)
 {
@@ -53,7 +56,7 @@ try
         TopicPrefix = prefix,
         NodeId = nodeId,
         HeartbeatInterval = heartbeat,
-        ReplicationFactor = 1,
+        ReplicationFactor = replication,
         StatePartitions = 3,
         TableRowPartitions = 2,
     });
@@ -66,7 +69,7 @@ try
         {
             await admin.CreateTopicsAsync([new TopicSpecification
             {
-                Name = sinkTopic, NumPartitions = 1, ReplicationFactor = 1,
+                Name = sinkTopic, NumPartitions = 1, ReplicationFactor = replication,
                 Configs = new Dictionary<string, string> { ["cleanup.policy"] = "compact" },
             }]);
         }

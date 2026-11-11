@@ -93,6 +93,16 @@ public sealed class ServiceOptions
     /// host application. A process supervisor then restarts it as a standby.</summary>
     public bool ExitOnLeadershipLoss { get; set; } = true;
 
+    /// <summary>
+    /// Whether a standby builds each pipeline's circuit on the state it follows, so that a
+    /// takeover starts circuits instead of building them — which is what keeps a takeover's
+    /// length from growing with the state. It means the plugin's code is loaded and its
+    /// definitions run on the standby (the build, never a step). False: a standby holds
+    /// pipeline state as bytes, loads no plugin code, and a takeover decodes the state of
+    /// every pipeline — about a second per million entries of the largest one.
+    /// </summary>
+    public bool WarmStandbyPipelines { get; set; } = true;
+
     /// <summary>A test hook: awaited, with the pipeline's id, after a generation has been
     /// found not to fit the kept state and before the catalog commit that puts the previous
     /// spec back.</summary>

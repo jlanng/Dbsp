@@ -230,7 +230,7 @@ public class SeamTests
     }
 
     [Fact]
-    public async Task A_standby_has_no_graph_and_counts_nothing_for_circuits_the_leader_runs()
+    public async Task A_standby_builds_the_circuit_and_counts_nothing_for_what_the_leader_runs()
     {
         var cluster = new InMemoryServiceCluster();
         var memory = new MemoryConnector();
@@ -239,7 +239,9 @@ public class SeamTests
         await leader.DeployAsync(Spec("s-enrich", "enrich", "s-in", "s-out"));
         await using var standby = await StartAsync(cluster, "b", memory);
         await Eventually(() => standby.Pipelines.Pipelines.Any(p => p.Id == "s-enrich"), "the standby sees the pipeline");
-        Assert.Null(standby.Pipelines.Graph("s-enrich"));
+        // Built on the state it follows, so it has the graph; it runs no step of it.
+        await Eventually(() => standby.Pipelines.Get("s-enrich").State == PipelineState.Built, "the standby builds the circuit");
+        Assert.NotNull(standby.Pipelines.Graph("s-enrich"));
 
         var log = memory.Log<Trade>("s-in");
         for (var i = 1; i <= 50; i++)
