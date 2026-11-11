@@ -755,7 +755,7 @@ public class TableCircuitTests
         var recreated = NewTable();
         await Commit(recreated, new Instrument(1, "something else"));
         await using var circuit = Build(recreated, storage).Builder.Build();
-        var refused = Assert.Throws<InvalidOperationException>(circuit.Start);
+        var refused = Assert.Throws<CircuitStateMismatchException>(circuit.Start);
         Assert.Contains("shared table 'instruments'", refused.Message);
         Assert.Contains(original.Epoch, refused.Message);
         Assert.Contains(recreated.Epoch, refused.Message);

@@ -65,6 +65,13 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
     // and only the circuit knows the stores' types.
     private readonly Dictionary<string, Dictionary<byte[], byte[]>> _pending = new(StringComparer.Ordinal);
 
+    // The bytes a store was created from, kept until the provider next commits or a
+    // record is applied to a store: until then nothing has been written through the
+    // store's types, and ReleaseStores gives these back rather than what those types
+    // made of them. A circuit that was built and then refused to start — or whose later
+    // stores could not be read — therefore leaves the committed state byte for byte.
+    private readonly Dictionary<string, Dictionary<byte[], byte[]>> _origins = new(StringComparer.Ordinal);
+
     private readonly Dictionary<string, string> _committedManifests = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _stagedManifests = new(StringComparer.Ordinal);
     private Dictionary<string, long> _committedOffsets = new();
@@ -109,6 +116,13 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
     /// and what lets the first version's types be unloaded. Writes since the last commit
     /// are undone first. No circuit may be running on this provider, and the circuits built
     /// on it before the call must not be started afterwards. Valid in either role.
+    /// <para>
+    /// A store that was created from held bytes and has seen no commit since is given back
+    /// as those very bytes, not as its types would write them: types that have committed
+    /// nothing have no say in what the state is. So a version of the code that was built on
+    /// the state and never ran (its circuit refused to start, or one of its stores could
+    /// not be read) drops no member it does not model.
+    /// </para>
     /// </summary>
     public void ReleaseStores()
     {
@@ -120,6 +134,11 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             _encoder.Begin(collect, _partition, 0);
             foreach (var (name, store) in _stores)
             {
+                if (_origins.Remove(name, out var origin))
+                {
+                    _pending[name] = origin;
+                    continue;
+                }
                 store.Rollback();
                 // Bytes that never reached the store (a failed Apply leaves them) stay.
                 if (!_pending.TryGetValue(name, out var entries))
@@ -129,6 +148,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
                 store.WriteEntries(_encoder);
             }
             _stores.Clear();
+            _origins.Clear();
             _lastStore = null;
             _lastPending = null;
             _lastStoreName = [];
@@ -221,9 +241,23 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             // once all of it has applied: a failure leaves the bytes for another attempt.
             if (_pending.TryGetValue(name, out var pending))
             {
-                foreach (var (entry, value) in pending)
-                    store.Apply(_serializer, entry, value, tombstone: false);
+                try
+                {
+                    foreach (var (entry, value) in pending)
+                        store.Apply(_serializer, entry, value, tombstone: false);
+                }
+                // A value the declared types cannot take. A record this version cannot
+                // read at all (an unknown format byte) is not a mismatch of types.
+                catch (Exception ex) when (ex is not CircuitStateMismatchException and not InvalidDataException)
+                {
+                    var problem = $"store '{name}' holds committed state that cannot be read as {Describe(typeof(TStore))}: {ex.GetType().Name}: {ex.Message}";
+                    throw new CircuitStateMismatchException(
+                        [problem],
+                        $"Pipeline '{PipelineId}': {problem}. Nothing was changed: the committed state is as it was, and a circuit " +
+                        "whose stores have the types that wrote it can still be built on it.", ex);
+                }
                 _pending.Remove(name);
+                _origins[name] = pending;
             }
 
             _stores[name] = store;
@@ -232,6 +266,17 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             _lastStoreName = [];
             return store;
         }
+    }
+
+    private static string Describe(Type store)
+    {
+        var kind = store.Name[..store.Name.IndexOf('`')] switch
+        {
+            "WeightStore" => "a weight store of",
+            "IndexedWeightStore" => "an indexed weight store of",
+            _ => "a value store of",
+        };
+        return $"{kind} {string.Join(" → ", store.GetGenericArguments().Select(t => t.Name))}";
     }
 
     /// <summary>Undoes whatever was written to the stores since the last commit and returns
@@ -304,6 +349,8 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
 
         lock (_lock)
         {
+            // From here the stores' types have written: what they hold is the state.
+            _origins.Clear();
             foreach (var store in _stores.Values)
                 store.Promote();
             foreach (var (scope, manifest) in _stagedManifests)
@@ -400,6 +447,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         foreach (var store in _stores.Values)
             store.Clear();
         _pending.Clear();
+        _origins.Clear();
         _committedManifests.Clear();
         _stagedManifests.Clear();
         _committedOffsets = new Dictionary<string, long>();
@@ -448,7 +496,12 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             }
 
             if (_lastStore is { } store)
+            {
+                // A typed store that is followed has moved on from the bytes it was made of.
+                if (_origins.Count != 0)
+                    _origins.Clear();
                 store.Apply(_serializer, entry, record.Value.Span, record.IsTombstone);
+            }
             else if (record.IsTombstone)
                 _lastPending!.Remove(entry.ToArray());
             else

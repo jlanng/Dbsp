@@ -1,5 +1,6 @@
 using Incremental.Operators;
 using Incremental.Runtime;
+using Incremental.Storage;
 using Incremental.Tables;
 
 namespace Incremental;
@@ -446,6 +447,65 @@ public sealed class CircuitBuilder
                     null);
         }
         return new CircuitGraph(nodes, outputs, _loopRegions.ConvertAll(l => new CircuitGraphLoop(l.Start, l.End, l.ResultNode)));
+    }
+
+    /// <summary>
+    /// Every state store the circuit's operators would create, for every worker, with the
+    /// types each holds. Like <see cref="Describe"/> it touches nothing outside the
+    /// builder: the operators are constructed against throwaway stores and dropped, no
+    /// table is claimed and <see cref="CircuitOptions.Storage"/> is not used — so it can be
+    /// asked of a builder that is never built. The names are exactly those a circuit built
+    /// from this builder commits in its state manifest.
+    /// </summary>
+    public IReadOnlyList<CircuitStateStore> DescribeState()
+    {
+        var recorder = new StateManifest.Recorder();
+        var workers = Options.Workers;
+        var first = Options.Cluster is { } cluster ? cluster.ProcessIndex * workers : 0;
+        List<DeadLetter>? dropped = null;
+        for (var w = 0; w < workers; w++)
+        {
+            foreach (var node in _nodes)
+            {
+                recorder.NodeId = node.Id;
+                node.Factory(new OperatorContext
+                {
+                    WorkerId = w,
+                    WorkerCount = workers,
+                    GlobalWorkerId = first + w,
+                    Storage = recorder,
+                    NodeName = node.Name,
+                    // An operator may keep more state under the dead-letter policy than
+                    // without it, so it is told which it runs under.
+                    Errors = (node.ErrorPolicy ?? Options.ErrorPolicy) == RecordErrorPolicy.DeadLetter
+                        ? new RecordErrors(node.Name, dropped ??= [])
+                        : null,
+                });
+            }
+        }
+        return recorder.Stores;
+    }
+
+    /// <summary>The state manifest a circuit built from this builder would commit.</summary>
+    internal string DescribeStateManifest() =>
+        StateManifest.Build(
+            Options.Workers, Options.Cluster?.ProcessCount ?? 1,
+            _readTables.Select(t => (t.Name, t.Epoch)).Concat(_derivedTables.Select(d => (d.Table.Name, d.Table.Epoch))),
+            new SortedSet<string>(DescribeState().Select(s => s.Name), StringComparer.Ordinal));
+
+    /// <summary>
+    /// Whether a circuit built from this builder could resume the checkpoint
+    /// <paramref name="committed"/> holds: the comparison <see cref="Circuit.Start"/> makes
+    /// and refuses on, made beforehand and without building anything. Empty when nothing
+    /// stands in the way — also when nothing has been committed. It covers the layout
+    /// (format, worker count, table identities, store names); whether the committed bytes
+    /// read as the types the stores now declare is known only when they are read.
+    /// </summary>
+    public IReadOnlyList<string> CheckState(ICheckpointStorageProvider committed)
+    {
+        ArgumentNullException.ThrowIfNull(committed);
+        var scope = Options.Cluster is { } cluster ? $"p{cluster.ProcessIndex}" : "local";
+        return committed.CommittedManifest(scope) is { } manifest ? StateManifest.Problems(manifest, DescribeStateManifest()) : [];
     }
 
     public Circuit Build()

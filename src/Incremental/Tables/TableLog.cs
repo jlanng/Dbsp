@@ -123,9 +123,13 @@ public sealed class InMemoryTableLog<TKey, TRow> : ITableLog<TKey, TRow>
     private static readonly IReadOnlyDictionary<int, long> NoOffsets = new Dictionary<int, long>();
 
     /// <summary>The log itself, shared by every connection to it.</summary>
-    private sealed class Shared(int maxRetainedVersions)
+    private sealed class Shared(int maxRetainedVersions, long maxRetainedChanges)
     {
         public readonly int MaxRetainedVersions = maxRetainedVersions;
+        public readonly long MaxRetainedChanges = maxRetainedChanges;
+
+        // Row changes across History.
+        public long RetainedChanges;
         public readonly string Epoch = Guid.NewGuid().ToString("N");
         public readonly Dictionary<TKey, TRow> Rows = [];
 
@@ -146,10 +150,26 @@ public sealed class InMemoryTableLog<TKey, TRow> : ITableLog<TKey, TRow>
     /// <param name="maxRetainedVersions">Versions of history kept for
     /// <see cref="ReadAsync"/>; the oldest is dropped as each new one arrives. Zero keeps
     /// rows and head only.</param>
-    public InMemoryTableLog(int maxRetainedVersions = 1024)
+    /// <param name="maxRetainedChanges">Row changes kept across those versions: a count of
+    /// versions bounds nothing when one version can change a million rows. Past it the
+    /// oldest versions go, down to the newest one, which is always kept (a follower that
+    /// is up to date must be able to read the version just appended). The default keeps
+    /// whatever the version cap keeps.</param>
+    public InMemoryTableLog(int maxRetainedVersions = 1024, long maxRetainedChanges = long.MaxValue)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(maxRetainedVersions);
-        _log = new Shared(maxRetainedVersions) { Writer = this };
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxRetainedChanges, 1);
+        _log = new Shared(maxRetainedVersions, maxRetainedChanges) { Writer = this };
+    }
+
+    /// <summary>Row changes held across the retained versions of history.</summary>
+    public long RetainedChanges
+    {
+        get
+        {
+            lock (_log)
+                return _log.RetainedChanges;
+        }
     }
 
     private InMemoryTableLog(Shared log) => _log = log;
@@ -206,8 +226,10 @@ public sealed class InMemoryTableLog<TKey, TRow> : ITableLog<TKey, TRow>
             _log.Last = version.Version;
             _log.Offsets = version.Offsets;
             _log.History.Enqueue(version);
-            while (_log.History.Count > _log.MaxRetainedVersions)
-                _log.History.Dequeue();
+            _log.RetainedChanges += version.Changes.Count;
+            while (_log.History.Count > _log.MaxRetainedVersions
+                   || (_log.RetainedChanges > _log.MaxRetainedChanges && _log.History.Count > 1))
+                _log.RetainedChanges -= _log.History.Dequeue().Changes.Count;
 
             appended = _log.Appended;
             _log.Appended = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -280,7 +302,7 @@ public sealed class InMemoryTableLog<TKey, TRow> : ITableLog<TKey, TRow>
         lock (_log)
         {
             while (_log.History.TryPeek(out var oldest) && oldest.Version < version)
-                _log.History.Dequeue();
+                _log.RetainedChanges -= _log.History.Dequeue().Changes.Count;
         }
         return default;
     }

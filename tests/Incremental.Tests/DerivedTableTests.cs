@@ -1077,7 +1077,7 @@ public class DerivedTableTests
         // checkpoint survived. Resuming would leave group 0 out of the table for good.
         var recreated = NewCounts();
         var stale = BuildCounts(recreated, storage).Builder.Build();
-        var error = Assert.Throws<InvalidOperationException>(() => stale.Start());
+        var error = Assert.Throws<CircuitStateMismatchException>(() => stale.Start());
         Assert.Contains("recreated", error.Message);
         Assert.Contains("OpenAsync", error.Message);
 

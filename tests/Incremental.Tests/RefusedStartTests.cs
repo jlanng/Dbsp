@@ -52,7 +52,7 @@ public class RefusedStartTests
         var refused = changedBuilder.Build();
         await refused.Handle(changedOrders).InsertAsync(new Order(12, "emea"), 12);
         await refused.Handle(changedOrders).InsertAsync(new Order(13, "emea"), 13);
-        var error = Assert.Throws<InvalidOperationException>(refused.Start);
+        var error = Assert.Throws<CircuitStateMismatchException>(refused.Start);
         Assert.Contains("does not match the checkpoint", error.Message);
 
         // It cannot be stepped or started again, and it disposes without running anything.

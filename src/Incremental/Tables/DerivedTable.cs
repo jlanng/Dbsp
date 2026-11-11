@@ -73,6 +73,9 @@ namespace Incremental.Tables
     {
         string Name { get; }
 
+        /// <summary>The table's identity in a checkpoint's state manifest.</summary>
+        string Epoch { get; }
+
         /// <summary>Read and written only under <see cref="TableLineage"/>'s lock, except by
         /// the table's writer, which reads it to refuse other callers.</summary>
         TableWriterClaim? WriterClaim { get; set; }

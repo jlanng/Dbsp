@@ -10,6 +10,18 @@ namespace Incremental.Storage;
 /// with no record behind it, as a Kafka commit marker does), <see cref="Compact"/> drops
 /// superseded records as the log cleaner would, and acquiring the writer fences the
 /// previous one. It keeps every live record for good, so it is not a store to run on.
+/// <para>
+/// With a <c>compactAbove</c> it also compacts by itself, so that what it holds stays
+/// proportional to the keys that are live rather than to everything ever committed: a
+/// partition is compacted inside the commit that takes it past its threshold, and the
+/// threshold then moves to twice what survived (never below <c>compactAbove</c>), so the
+/// work is amortised over the records appended. A tombstone is dropped only once every
+/// reader that is enumerating the partition has passed it — a reader that had seen the
+/// record a tombstone removes and not the tombstone would keep the record. That protects
+/// a reader for as long as it enumerates; a reader that stops and later resumes from the
+/// offset it had reached is not protected, and must read from 0 again
+/// (<see cref="ChangelogStorage"/> always does).
+/// </para>
 /// </summary>
 public sealed class InMemoryStateChangelog : IStateChangelog
 {
@@ -31,16 +43,37 @@ public sealed class InMemoryStateChangelog : IStateChangelog
         public List<ChangelogRecord> Records = [];
         public long NextOffset;
         public bool Touched; // by the transaction being applied
+
+        // Self-compaction: the record count that triggers the next one, and where each
+        // reader now enumerating this partition stands.
+        public long CompactAt;
+        public readonly List<ReaderPosition> Readers = [];
     }
 
+    private sealed class ReaderPosition
+    {
+        public long Next;
+    }
+
+    private readonly int _compactAbove;
+    private long _compactions;
+
     /// <param name="partitions">The fixed partition count (the design's <c>P</c>).</param>
-    public InMemoryStateChangelog(int partitions = 12)
+    /// <param name="compactAbove">Records a partition may hold before it compacts itself;
+    /// 0 (the default) leaves compaction to <see cref="Compact"/>.</param>
+    public InMemoryStateChangelog(int partitions = 12, int compactAbove = 0)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(partitions, 1);
+        ArgumentOutOfRangeException.ThrowIfNegative(compactAbove);
+        _compactAbove = compactAbove;
         _partitions = new Partition[partitions];
         for (var p = 0; p < partitions; p++)
-            _partitions[p] = new Partition();
+            _partitions[p] = new Partition { CompactAt = compactAbove };
     }
+
+    /// <summary>Times a partition has compacted itself (see the constructor's
+    /// <c>compactAbove</c>).</summary>
+    public long Compactions => Interlocked.Read(ref _compactions);
 
     public int PartitionCount => _partitions.Length;
 
@@ -105,30 +138,45 @@ public sealed class InMemoryStateChangelog : IStateChangelog
         ArgumentOutOfRangeException.ThrowIfNegative(fromOffset);
         var source = _partitions[partition];
         var position = fromOffset;
-        while (true)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            ChangelogBatch? batch = null;
-            Task committed;
-            lock (_lock)
-            {
-                committed = _committed.Task;
-                if (position < source.NextOffset)
-                {
-                    var records = source.Records;
-                    var index = FirstAtOrAfter(records, position);
-                    var count = Math.Min(MaxBatchRecords, records.Count - index);
-                    var copy = new ChangelogRecord[count];
-                    records.CopyTo(index, copy, 0, count);
-                    position = index + count == records.Count ? source.NextOffset : copy[^1].Offset + 1;
-                    batch = new ChangelogBatch(copy, position);
-                }
-            }
 
-            if (batch is not null)
-                yield return batch;
-            else
-                await committed.WaitAsync(cancellationToken).ConfigureAwait(false);
+        // Registered for as long as the enumeration lasts: no tombstone at or after
+        // where this reader stands is dropped by a self-compaction.
+        var reader = new ReaderPosition { Next = fromOffset };
+        lock (_lock)
+            source.Readers.Add(reader);
+        try
+        {
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                ChangelogBatch? batch = null;
+                Task committed;
+                lock (_lock)
+                {
+                    committed = _committed.Task;
+                    if (position < source.NextOffset)
+                    {
+                        var records = source.Records;
+                        var index = FirstAtOrAfter(records, position);
+                        var count = Math.Min(MaxBatchRecords, records.Count - index);
+                        var copy = new ChangelogRecord[count];
+                        records.CopyTo(index, copy, 0, count);
+                        position = index + count == records.Count ? source.NextOffset : copy[^1].Offset + 1;
+                        reader.Next = position;
+                        batch = new ChangelogBatch(copy, position);
+                    }
+                }
+
+                if (batch is not null)
+                    yield return batch;
+                else
+                    await committed.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            lock (_lock)
+                source.Readers.Remove(reader);
         }
     }
 
@@ -159,21 +207,45 @@ public sealed class InMemoryStateChangelog : IStateChangelog
         lock (_lock)
         {
             foreach (var partition in _partitions)
-            {
-                var last = new Dictionary<ReadOnlyMemory<byte>, int>(ByteKeyComparer.Instance);
-                for (var i = 0; i < partition.Records.Count; i++)
-                    last[partition.Records[i].Key] = i;
-
-                var kept = new List<ChangelogRecord>(last.Count);
-                for (var i = 0; i < partition.Records.Count; i++)
-                {
-                    var record = partition.Records[i];
-                    if (last[record.Key] == i && !(dropTombstones && record.IsTombstone))
-                        kept.Add(record);
-                }
-                partition.Records = kept;
-            }
+                CompactPartition(partition, dropTombstones ? long.MaxValue : 0);
         }
+    }
+
+    /// <summary>Keeps the last record of every key, and of those drops the tombstones
+    /// below <paramref name="dropTombstonesBelow"/>. Caller holds the lock.</summary>
+    private static void CompactPartition(Partition partition, long dropTombstonesBelow)
+    {
+        var records = partition.Records;
+        var last = new Dictionary<ReadOnlyMemory<byte>, int>(ByteKeyComparer.Instance);
+        for (var i = 0; i < records.Count; i++)
+            last[records[i].Key] = i;
+
+        var kept = new List<ChangelogRecord>(last.Count);
+        for (var i = 0; i < records.Count; i++)
+        {
+            var record = records[i];
+            if (last[record.Key] == i && !(record.IsTombstone && record.Offset < dropTombstonesBelow))
+                kept.Add(record);
+        }
+        partition.Records = kept;
+    }
+
+    /// <summary>A partition compacting itself, inside the commit that took it past its
+    /// threshold. Caller holds the lock.</summary>
+    private void CompactIfDue(Partition partition)
+    {
+        if (_compactAbove == 0 || partition.Records.Count < partition.CompactAt)
+            return;
+
+        // Every reader enumerating the partition has been handed the records below where
+        // it stands; with none, a later reader starts from 0 and never sees what a
+        // dropped tombstone removed.
+        var horizon = long.MaxValue;
+        foreach (var reader in partition.Readers)
+            horizon = Math.Min(horizon, reader.Next);
+        CompactPartition(partition, horizon);
+        partition.CompactAt = Math.Max(_compactAbove, 2L * partition.Records.Count);
+        _compactions++;
     }
 
     private sealed class ByteKeyComparer : IEqualityComparer<ReadOnlyMemory<byte>>
@@ -222,6 +294,7 @@ public sealed class InMemoryStateChangelog : IStateChangelog
                     continue;
                 partition.Touched = false;
                 partition.NextOffset++;
+                CompactIfDue(partition);
             }
 
             _recordsAppended += transaction.Entries.Count;

@@ -71,6 +71,83 @@ public class ChangelogReleaseTests
         Assert.Equal(2, cold.Pipeline("p").CommittedOffsets["in"]);
     }
 
+    // Fewer members than V2: read into this, a V2's Extra is skipped.
+    private sealed record Narrow(int Id);
+
+    // A member of another type under the same name: V1's Name cannot be read into it.
+    private sealed record Clash(int Id, int Name);
+
+    [Fact]
+    public async Task Stores_released_before_they_commit_give_back_the_bytes_they_were_made_of()
+    {
+        var log = new InMemoryStateChangelog(partitions: 1);
+        await using var storage = await ChangelogStorage.OpenAsync(log);
+        var provider = storage.Pipeline("p");
+        var values = provider.CreateValueStore<int, V2>("v");
+        provider.Recover();
+        values.Put(5, new V2(5, "e", "kept"));
+        await provider.CommitAsync(Offsets(1));
+        var committed = provider.DescribeState();
+        provider.ReleaseStores();
+
+        // A version that does not model Name or Extra is built on the state, writes
+        // without committing, and is released: it never ran, so it dropped nothing.
+        var narrow = provider.CreateValueStore<int, Narrow>("v");
+        provider.Recover();
+        Assert.True(narrow.TryGet(5, out var seen));
+        Assert.Equal(new Narrow(5), seen);
+        narrow.Put(6, new Narrow(6));
+        provider.ReleaseStores();
+        Assert.Equal(committed, provider.DescribeState());
+        var back = provider.CreateValueStore<int, V2>("v");
+        Assert.True(back.TryGet(5, out var row));
+        Assert.Equal(new V2(5, "e", "kept"), row);
+        Assert.False(back.TryGet(6, out _));
+        provider.ReleaseStores();
+
+        // Once it has committed, what it holds is the state: the members are gone.
+        narrow = provider.CreateValueStore<int, Narrow>("v");
+        provider.Recover();
+        narrow.Put(6, new Narrow(6));
+        await provider.CommitAsync(Offsets(2));
+        provider.ReleaseStores();
+        back = provider.CreateValueStore<int, V2>("v");
+        Assert.True(back.TryGet(5, out row));
+        Assert.Equal(new V2(5, null!, null), row);
+        Assert.True(back.TryGet(6, out _));
+    }
+
+    [Fact]
+    public async Task State_that_cannot_be_read_as_the_declared_types_is_a_typed_mismatch_and_stays_as_it_was()
+    {
+        var log = new InMemoryStateChangelog(partitions: 1);
+        await using var storage = await ChangelogStorage.OpenAsync(log);
+        var provider = storage.Pipeline("p");
+        var other = provider.CreateWeightStore<int>("other");
+        var values = provider.CreateValueStore<int, V1>("v");
+        provider.Recover();
+        other.Update(3, 1);
+        values.Put(5, new V1(5, "e"));
+        await provider.CommitAsync(Offsets(1));
+        var committed = provider.DescribeState();
+        provider.ReleaseStores();
+
+        // One store reads, the next does not: the failure is typed and names the store.
+        provider.CreateWeightStore<int>("other");
+        var mismatch = Assert.Throws<CircuitStateMismatchException>(() => provider.CreateValueStore<int, Clash>("v"));
+        Assert.Contains("store 'v'", mismatch.Message);
+        Assert.Contains("Clash", mismatch.Message);
+        Assert.Single(mismatch.Problems);
+        Assert.IsType<JsonException>(mismatch.InnerException);
+
+        // Nothing was changed, so the types that wrote the state still read it.
+        provider.ReleaseStores();
+        Assert.Equal(committed, provider.DescribeState());
+        var again = provider.CreateValueStore<int, V1>("v");
+        Assert.True(again.TryGet(5, out var row));
+        Assert.Equal(new V1(5, "e"), row);
+    }
+
     [Fact]
     public async Task Release_on_a_follower_keeps_following_into_bytes()
     {

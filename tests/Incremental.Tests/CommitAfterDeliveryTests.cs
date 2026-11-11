@@ -1110,7 +1110,7 @@ public class CommitAfterDeliveryTests
         var pipeline = CountByRegion(storage);
         var circuit = pipeline.Builder.Build();
         await using var cleanup = new BoundedDisposal(circuit);
-        var refusal = Assert.Throws<InvalidOperationException>(circuit.Start);
+        var refusal = Assert.Throws<CircuitStateMismatchException>(circuit.Start);
         Assert.Contains("format", refusal.Message);
     }
 }

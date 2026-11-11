@@ -984,105 +984,17 @@ public sealed class Circuit : IAsyncDisposable
     /// version, worker/process shape, then every store name, sorted. Store names encode the
     /// operator's identity (positional, or explicit via <c>.Named</c>), kind, purpose, and
     /// worker — so any change that would misdirect a restore changes the manifest.</summary>
-    private string BuildStateManifest(IEnumerable<string> storeNames)
-    {
-        var manifest = new System.Text.StringBuilder();
-        // format 6: every checkpoint commits the step sequence under `$step` and a restart
-        // resumes it, which is what keeps an acknowledged output's batch sequences stable
-        // across a crash. A format-5 checkpoint has none: resuming it would restart the
-        // sequence at 1, below what the sinks have already seen.
-        // (format 5: attached shared tables add a `table={name}@{epoch}` line each, and their
-        // consumed versions commit in the offsets marker under `{name}#t`. A new line kind,
-        // which format-4 validation would have filed under facts and ignored.)
-        // (format 4: keyed inputs keep their current rows as circuit state (an input-named
-        // upsert store) instead of in the producer's handle; a format-3 checkpoint of a
-        // circuit with keyed inputs has no rows to retract against, so it must not resume.)
-        // (format 3: the 0.2 API surface rewrite — operator kinds and node layouts changed
-        // (groupBy/select naming, windowed groupings' composite WindowKey state, snapshot
-        // nodes on table-shaped outputs), so store names moved wholesale. No deployed
-        // format-2 checkpoints existed; the bump is hygiene.)
-        // (format 2: the committed-offsets marker became per-partition — see OffsetKeys.)
-        manifest.Append("format=6\n");
-        manifest.Append($"workers={_options.Workers}\n");
-        manifest.Append($"processes={_cluster?.ProcessCount ?? 1}\n");
-        // A table the circuit writes has a line like one it reads: either way the checkpoint
-        // holds a version number that means something only in that table's history. (A
-        // circuit cannot do both to one table, so the names do not collide.)
-        foreach (var (table, epoch) in _tables.Select(t => (t.TableName, t.Epoch))
-                     .Concat(_derivedTables.Select(t => (t.TableName, t.Epoch)))
-                     .OrderBy(t => t.TableName, StringComparer.Ordinal))
-            manifest.Append($"table={table}@{epoch}\n");
-        foreach (var store in storeNames)
-            manifest.Append($"store={store}\n");
-        return manifest.ToString();
-    }
+    private string BuildStateManifest(IEnumerable<string> storeNames) =>
+        StateManifest.Build(
+            _options.Workers, _cluster?.ProcessCount ?? 1,
+            _tables.Select(t => (t.TableName, t.Epoch)).Concat(_derivedTables.Select(t => (t.TableName, t.Epoch))),
+            storeNames);
 
     private static void ValidateStateManifest(string committed, string current)
     {
-        if (committed == current)
-            return;
-
-        static (Dictionary<string, string> Facts, List<string> Stores, Dictionary<string, string> Tables) Parse(string manifest)
-        {
-            var facts = new Dictionary<string, string>();
-            var stores = new List<string>();
-            var tables = new Dictionary<string, string>(); // name → epoch
-            foreach (var line in manifest.Split('\n', StringSplitOptions.RemoveEmptyEntries))
-            {
-                var separator = line.IndexOf('=');
-                var (key, value) = (line[..separator], line[(separator + 1)..]);
-                if (key == "store")
-                    stores.Add(value);
-                else if (key == "table")
-                    tables[value[..value.LastIndexOf('@')]] = value[(value.LastIndexOf('@') + 1)..];
-                else
-                    facts[key] = value;
-            }
-            return (facts, stores, tables);
-        }
-
-        var (committedFacts, committedStores, committedTables) = Parse(committed);
-        var (currentFacts, currentStores, currentTables) = Parse(current);
-
-        var problems = new List<string>();
-        foreach (var fact in new[] { "format", "workers", "processes" })
-            if (committedFacts.GetValueOrDefault(fact) != currentFacts.GetValueOrDefault(fact))
-                problems.Add($"{fact} changed: the checkpoint was committed with {fact}={committedFacts.GetValueOrDefault(fact)}, " +
-                             $"this circuit has {fact}={currentFacts.GetValueOrDefault(fact)}");
-
-        // A table attached since the checkpoint starts at its current version, and one no
-        // longer attached is ignored like a removed input. The same name with another epoch
-        // is a table that was dropped and recreated: the committed version counts positions
-        // in a history that no longer exists.
-        foreach (var (table, epoch) in committedTables)
-            if (currentTables.TryGetValue(table, out var currentEpoch) && currentEpoch != epoch)
-                problems.Add($"shared table '{table}' is not the table the checkpoint read: it was recreated since (epoch {epoch} " +
-                             $"then, {currentEpoch} now), so the version this circuit committed does not refer to its history " +
-                             "(a table this circuit writes needs a log to outlive the process: open it with SharedTable.OpenAsync)");
-
-        // New stores are fine — they start empty. Committed stores this circuit no longer
-        // mints are not: their state would be orphaned, and whatever operator inherited
-        // their position would be reading someone else's.
-        var currentSet = new HashSet<string>(currentStores, StringComparer.Ordinal);
-        var missing = committedStores.Where(s => !currentSet.Contains(s)).ToList();
-        if (missing.Count > 0)
-        {
-            const int shown = 12;
-            problems.Add($"committed state with no home in this circuit:\n      " +
-                         string.Join("\n      ", missing.Take(shown)) +
-                         (missing.Count > shown ? $"\n      … and {missing.Count - shown} more" : ""));
-        }
-
-        if (problems.Count == 0)
-            return;
-
-        throw new InvalidOperationException(
-            "This circuit does not match the checkpoint it is resuming from — refusing to start, because a mismatched " +
-            "restore silently reads the wrong operators' state:\n  - " + string.Join("\n  - ", problems) + "\n" +
-            "Operator state is keyed by circuit position unless named, so inserting, removing, or reordering operators " +
-            "renumbers everything downstream. Options: revert the topology or worker-count change; give stateful " +
-            "operators stable identities with .Named(\"…\") (before their first checkpoint) so unrelated changes leave " +
-            "them alone; or start fresh against an empty state store (for Redis, a new KeyPrefix).");
+        var problems = StateManifest.Problems(committed, current);
+        if (problems.Count > 0)
+            throw StateManifest.Mismatch(problems);
     }
 
     /// <summary>The step sequence the last committed checkpoint reflects, or null before any
