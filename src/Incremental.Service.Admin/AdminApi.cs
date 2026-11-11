@@ -315,6 +315,7 @@ internal static class AdminApi
                     lag = s.Stats.Lag,
                     pausedSince = s.Stats.PausedSince,
                     positions = s.Stats.Positions,
+                    at = s.Stats.At,
                     committed = status.CommittedOffsets.Where(o => o.Key == s.Slot || o.Key.StartsWith(s.Slot + "#", StringComparison.Ordinal))
                         .ToDictionary(o => o.Key, o => o.Value),
                 }),

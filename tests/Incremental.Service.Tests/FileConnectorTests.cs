@@ -321,6 +321,26 @@ public class FileConnectorTests : IDisposable
     }
 
     [Fact]
+    public async Task A_minimum_interval_between_objects_makes_fewer_larger_objects_of_the_same_records()
+    {
+        await using var service = await StartAsync();
+        var trades = Trades(0, 400);
+        var log = service.Memory.Log<Trade>("in");
+        await service.DeployAsync(Spec("big", "big-trades", "in") with
+        {
+            Sinks = new Dictionary<string, JsonElement> { ["out"] = Files("out/spaced-", "\"minInterval\": \"00:00:00.25\"") },
+        });
+        // Forty appends, 25 ms apart: unspaced, that is about forty steps and forty objects.
+        for (var i = 0; i < 40; i++)
+        {
+            log.AppendRange(trades.Skip(i * 10).Take(10));
+            await Task.Delay(25);
+        }
+        await EventuallyAsync(async () => (await AppendsAsync<Trade>("out/spaced-")).Order(ById).SequenceEqual(BigTrades.Model(trades)), "every record, in fewer objects");
+        Assert.InRange((await FileSinkFormat.StepObjectsAsync(_store, "out/spaced-")).Count, 2, 12);
+    }
+
+    [Fact]
     public async Task Where_two_terms_wrote_the_same_step_the_reader_takes_the_higher_term()
     {
         await PutAsync(FileSinkFormat.ObjectName("out/", 1, 1), ["{\"key\":1,\"row\":\"first\"}"]);
@@ -403,6 +423,7 @@ public class FileConnectorTests : IDisposable
             await Refused(Json("""{ "connector": "files", "store": "nowhere", "prefix": "in/" }""")));
         Assert.Contains("pollInterval is a positive duration", await Refused(Files("in/", "\"pollInterval\": \"soon\"")));
         Assert.Contains("are a source's settings", await Refused(Files("in/"), Files("out/", "\"pollInterval\": \"00:00:01\"")));
+        Assert.Contains("is a sink's setting", await Refused(Files("in/", "\"minInterval\": \"00:00:01\"")));
 
         var connector = Assert.Single(service.Node.Discovery.Connectors, c => c.Name == "files");
         Assert.Equal([SlotKind.AppendInput, SlotKind.KeyedInput, SlotKind.UpsertSink, SlotKind.AppendSink], connector.Kinds);

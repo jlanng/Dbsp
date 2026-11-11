@@ -62,10 +62,15 @@ internal sealed record FilesSlotConfig
     /// <summary>Sources only: how often the prefix is listed for new objects (hh:mm:ss).</summary>
     public string? PollInterval { get; init; }
 
+    /// <summary>Sinks only: the least time between two objects (hh:mm:ss).</summary>
+    public string? MinInterval { get; init; }
+
     private static readonly JsonSerializerOptions Strict = new(JsonSerializerDefaults.Web)
     {
         UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
     };
+
+    public TimeSpan Spacing => MinInterval is null ? TimeSpan.Zero : TimeSpan.Parse(MinInterval, CultureInfo.InvariantCulture);
 
     public TimeSpan Poll => PollInterval is null ? TimeSpan.FromSeconds(5) : TimeSpan.Parse(PollInterval, CultureInfo.InvariantCulture);
 
@@ -81,7 +86,7 @@ internal sealed record FilesSlotConfig
         catch (JsonException ex)
         {
             throw new InvalidOperationException(
-                $"the files config accepts connector, store, prefix, suffix and pollInterval — where the store is belongs to the host ({ex.Message})");
+                $"the files config accepts connector, store, prefix, suffix, pollInterval and minInterval — where the store is belongs to the host ({ex.Message})");
         }
         if (string.IsNullOrEmpty(parsed.Prefix))
             throw new InvalidOperationException("the files config needs a \"prefix\": the objects of this slot are the ones whose name starts with it");
@@ -90,6 +95,9 @@ internal sealed record FilesSlotConfig
         if (parsed.PollInterval is not null
             && (!TimeSpan.TryParse(parsed.PollInterval, CultureInfo.InvariantCulture, out var poll) || poll <= TimeSpan.Zero))
             throw new InvalidOperationException($"pollInterval is a positive duration (hh:mm:ss), not '{parsed.PollInterval}'");
+        if (parsed.MinInterval is not null
+            && (!TimeSpan.TryParse(parsed.MinInterval, CultureInfo.InvariantCulture, out var spacing) || spacing < TimeSpan.Zero))
+            throw new InvalidOperationException($"minInterval is a duration (hh:mm:ss), not '{parsed.MinInterval}'");
         return parsed;
     }
 }
@@ -124,6 +132,13 @@ internal sealed record FilesSlotConfig
 /// term is the step and the other is to be ignored. A prefix belongs to one slot of one
 /// pipeline. Nothing compacts an upsert sink's objects.
 /// </para>
+/// <para>
+/// One object per step is many small objects when steps are small. <c>minInterval</c>
+/// spaces them: a step's write waits until that long after the last one. The circuit's
+/// checkpoint waits for the write, so the circuit pauses with it, its input queues up
+/// behind the bounded channel, and the next step — and its object — is larger. It trades
+/// latency of every sink of the pipeline for fewer objects.
+/// </para>
 /// </summary>
 public sealed class FileConnector(ObjectStores stores)
     : IAppendSourceConnector, IKeyedSourceConnector, IAppendSinkConnector, IUpsertSinkConnector, IResettableSinkConnector, IConfigDescribed
@@ -134,6 +149,7 @@ public sealed class FileConnector(ObjectStores stores)
         new("prefix", "string", Required: true, Description: "The objects of this slot are those whose name starts with it. One slot of one pipeline per prefix."),
         new("suffix", "string", Description: "Sources: read only objects whose name ends with this."),
         new("pollInterval", "string", Description: "Sources: how often the prefix is listed for new objects, as a duration (hh:mm:ss).", Default: "00:00:05"),
+        new("minInterval", "string", Description: "Sinks: the least time between two objects, as a duration (hh:mm:ss). The pipeline pauses to keep it, so steps and objects grow.", Default: "00:00:00"),
     ], "JSON-lines objects under a prefix: read in name order as an append or keyed input, written one object per step as an append or upsert sink.");
 
     private (FilesSlotConfig Config, IObjectStore Store) Resolve(JsonElement json)
@@ -153,6 +169,8 @@ public sealed class FileConnector(ObjectStores stores)
         var config = FilesSlotConfig.Parse(json);
         if (kind is SlotKind.AppendSink or SlotKind.UpsertSink && (config.Suffix is not null || config.PollInterval is not null))
             throw new InvalidOperationException("\"suffix\" and \"pollInterval\" are a source's settings");
+        if (kind is SlotKind.AppendInput or SlotKind.KeyedInput && config.MinInterval is not null)
+            throw new InvalidOperationException("\"minInterval\" is a sink's setting");
     }
 
     Task<IRunningSource> IAppendSourceConnector.StartAsync<T>(SourceContext<T> context, CancellationToken cancellationToken)
@@ -182,13 +200,13 @@ public sealed class FileConnector(ObjectStores stores)
     IAppendSink<T> IAppendSinkConnector.Create<T>(SinkContext context)
     {
         var (config, store) = Resolve(context.Config);
-        return new AppendSink<T>(store, config.Prefix!, context);
+        return new AppendSink<T>(store, config.Prefix!, config.Spacing, context);
     }
 
     IUpsertSink<TKey, TRow> IUpsertSinkConnector.Create<TKey, TRow>(SinkContext context)
     {
         var (config, store) = Resolve(context.Config);
-        return new UpsertSink<TKey, TRow>(store, config.Prefix!, context);
+        return new UpsertSink<TKey, TRow>(store, config.Prefix!, config.Spacing, context);
     }
 
     async Task IResettableSinkConnector.ResetAsync(SinkContext context, CancellationToken cancellationToken)
@@ -199,10 +217,11 @@ public sealed class FileConnector(ObjectStores stores)
 
     /// <summary>What both sinks share: the clean-up a generation owes before its first
     /// write, and one object per step.</summary>
-    private abstract class StepObjectSink(IObjectStore store, string prefix, SinkContext context)
+    private abstract class StepObjectSink(IObjectStore store, string prefix, TimeSpan spacing, SinkContext context)
     {
         private static readonly byte[] NewLine = "\n"u8.ToArray();
         private bool _cleaned;
+        private long _lastWrite;
 
         protected JsonSerializerOptions Json => context.Json;
 
@@ -217,16 +236,19 @@ public sealed class FileConnector(ObjectStores stores)
                 await FileSinkFormat.DeleteAboveAsync(store, prefix, context.CommittedStep ?? 0, cancellationToken).ConfigureAwait(false);
                 _cleaned = true;
             }
+            if (spacing > TimeSpan.Zero && _lastWrite != 0 && spacing - System.Diagnostics.Stopwatch.GetElapsedTime(_lastWrite) is var wait && wait > TimeSpan.Zero)
+                await Task.Delay(wait, cancellationToken).ConfigureAwait(false);
             var stream = await store.OpenWriteAsync(FileSinkFormat.ObjectName(prefix, sequence, context.Term), cancellationToken).ConfigureAwait(false);
             await using (stream.ConfigureAwait(false))
                 await write(state, stream, cancellationToken).ConfigureAwait(false);
+            _lastWrite = System.Diagnostics.Stopwatch.GetTimestamp();
         }
 
         protected static ValueTask EndLineAsync(Stream stream, CancellationToken cancellationToken) => stream.WriteAsync(NewLine, cancellationToken);
     }
 
-    private sealed class AppendSink<T>(IObjectStore store, string prefix, SinkContext context)
-        : StepObjectSink(store, prefix, context), IAppendSink<T>
+    private sealed class AppendSink<T>(IObjectStore store, string prefix, TimeSpan spacing, SinkContext context)
+        : StepObjectSink(store, prefix, spacing, context), IAppendSink<T>
     {
         public ValueTask WriteAsync(AppendBatch<T> batch, CancellationToken cancellationToken) =>
             batch.Records.Count == 0
@@ -241,8 +263,8 @@ public sealed class FileConnector(ObjectStores stores)
                 }, cancellationToken);
     }
 
-    private sealed class UpsertSink<TKey, TRow>(IObjectStore store, string prefix, SinkContext context)
-        : StepObjectSink(store, prefix, context), IUpsertSink<TKey, TRow>
+    private sealed class UpsertSink<TKey, TRow>(IObjectStore store, string prefix, TimeSpan spacing, SinkContext context)
+        : StepObjectSink(store, prefix, spacing, context), IUpsertSink<TKey, TRow>
         where TKey : notnull
     {
         public ValueTask WriteAsync(UpsertBatch<TKey, TRow> batch, CancellationToken cancellationToken) =>
