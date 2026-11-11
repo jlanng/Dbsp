@@ -38,6 +38,18 @@
   // ── inputs for one property of a schema ─────────────────────────────────────────────
 
   /**
+   * Text typed into an array or object field that is not that kind of JSON, by the field's
+   * id. Such a field has no value to give, and silently keeping its last one would send a
+   * spec the form does not show: a form with a draft on screen is not checked or sent.
+   */
+  const drafts = new Map();
+  const draftProblem = () => {
+    for (const [id, draft] of drafts)
+      if (document.getElementById(id)) return `“${draft.name}” is not valid JSON (${draft.problem}). Correct it, or clear the field.`;
+    return null;
+  };
+
+  /**
    * `p`: { name, jsonType, required, description, values, default (as text), minimum,
    * maximum, secret, tag }. `set(undefined)` removes the property from what is edited.
    */
@@ -68,10 +80,28 @@
         on: { input: e => set(e.target.value === '' || Number.isNaN(Number(e.target.value)) ? undefined : Number(e.target.value)) },
       });
     } else if (p.jsonType === 'array' || p.jsonType === 'object') {
+      const draft = drafts.get(id);
+      const edit = text => {
+        if (text.trim() === '') { drafts.delete(id); set(undefined); return; }
+        let parsed, problem = null;
+        try {
+          parsed = JSON.parse(text);
+          const isArray = Array.isArray(parsed), isObject = parsed !== null && typeof parsed === 'object' && !isArray;
+          if (p.jsonType === 'array' ? !isArray : !isObject) problem = `it is not ${p.jsonType === 'array' ? 'an array: [ … ]' : 'an object: { … }'}`;
+        } catch (e) { problem = e.message; }
+        if (problem == null) { drafts.delete(id); set(parsed); return; }
+        // Not a value yet. What is edited keeps the last one, so the text is held here
+        // and the form is not sent while it stands: see draftProblem.
+        drafts.set(id, { name: p.name, text, problem });
+        set(value);
+      };
       control = h('input', {
-        class: 'input mono', id, spellcheck: 'false', autocomplete: 'off', value: unset ? '' : JSON.stringify(value), placeholder: p.jsonType === 'array' ? '[ ]  as JSON' : '{ }  as JSON',
-        on: { input: e => { if (e.target.value.trim() === '') set(undefined); else { try { set(JSON.parse(e.target.value)); } catch { /* not JSON yet: what is edited keeps its last value */ } } } },
+        class: 'input mono', id, spellcheck: 'false', autocomplete: 'off', value: draft ? draft.text : unset ? '' : JSON.stringify(value), placeholder: p.jsonType === 'array' ? '[ ]  as JSON' : '{ }  as JSON',
+        'aria-invalid': draft ? 'true' : null, 'aria-describedby': draft ? `${id}-problem` : null,
+        on: { input: e => edit(e.target.value) },
       });
+      if (draft)
+        return field(id, p.name, control, [h('span', { class: 'err', id: `${id}-problem` }, `Not valid JSON, so not used: ${draft.problem}. `), help], tags);
     } else {
       const kept = p.secret && value === '***';
       control = h('input', {
@@ -138,6 +168,7 @@
    * that the server refuses if a pipeline of that id has appeared meanwhile.
    */
   async function deployDialog({ existing, spec, after }) {
+    drafts.clear();
     const dlg = modal(existing ? `Replace pipeline ${existing.id}` : 'Deploy a pipeline', { wide: true });
     const st = {
       loading: true, loadError: null, view: 'form', text: '', textError: null,
@@ -221,7 +252,7 @@
     };
     const chooseDefinition = name => { s().definition = name; describe('fresh'); };
 
-    const toJson = () => { st.text = JSON.stringify(s(), null, 2); st.textError = null; st.view = 'json'; draw(); };
+    const toJson = () => { drafts.clear(); st.text = JSON.stringify(s(), null, 2); st.textError = null; st.view = 'json'; draw(); };
     const toForm = () => {
       if (st.textError != null) return;
       st.view = 'form';
@@ -240,6 +271,7 @@
 
     const body = () => {
       if (st.textError != null) throw local('The spec is not valid JSON: ' + st.textError);
+      if (st.view === 'form' && draftProblem()) throw local(draftProblem());
       const value = clone(s());
       if (!value.id) throw local('Give the pipeline an id.');
       if (!NAME.test(value.id)) throw local(`"${value.id}" cannot be a pipeline id: lower-case letters, digits, dots, dashes and underscores, starting with a letter or digit, at most 63.`);
@@ -462,6 +494,7 @@
   // ── declare a table ─────────────────────────────────────────────────────────────────
 
   async function declareTableDialog({ after }) {
+    drafts.clear();
     const dlg = modal('Declare a table', { wide: true });
     const st = {
       loading: true, loadError: null, view: 'form', text: '', textError: null,
@@ -474,6 +507,7 @@
     const changed = () => { st.checked = null; st.plan = null; st.error = null; draw(); };
 
     const body = () => {
+      if (st.view === 'form' && draftProblem()) throw local(draftProblem());
       if (st.textError != null) throw local('The spec is not valid JSON: ' + st.textError);
       const value = clone(s());
       if (!value.name) throw local('Give the table a name.');
@@ -499,7 +533,7 @@
         if (after) after(result);
       } catch (e) { st.error = e; st.busy = false; st.checked = null; draw(); showOutcome(); }
     };
-    const toJson = () => { st.text = JSON.stringify(s(), null, 2); st.textError = null; st.view = 'json'; draw(); };
+    const toJson = () => { drafts.clear(); st.text = JSON.stringify(s(), null, 2); st.textError = null; st.view = 'json'; draw(); };
     const toForm = () => { if (st.textError == null) { st.view = 'form'; draw(); } };
     const editText = text => {
       st.text = text;

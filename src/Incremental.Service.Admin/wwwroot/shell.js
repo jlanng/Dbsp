@@ -267,6 +267,9 @@
     store.view = same ? store.view : { key, data: null, error: null, loading: true, refreshError: null, ui: {} };
     const def = views[store.route.name];
     document.title = `${def && def.title ? def.title(store.route.args) : 'Not found'} · Incremental admin`;
+    // A dialog belongs to the page it was opened on. Left open across Back or Forward it
+    // would act on that page's pipeline or table over another's.
+    if (!same) document.querySelectorAll('dialog.modal[open]').forEach(d => d.close());
     drawNav();
     render();
     if (!same) window.scrollTo(0, 0);
