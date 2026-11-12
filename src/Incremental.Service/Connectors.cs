@@ -16,6 +16,15 @@ public sealed record ConnectorDescription(string Summary, IReadOnlyList<string>?
     /// slot — its own or another pipeline's — already owns is refused. Null: nothing is
     /// claimed.</summary>
     public string? Owns { get; init; }
+
+    /// <summary>What an input bound this way reads, as a name that starts a sink's
+    /// <see cref="Owns"/> exactly when the input would read what that sink writes (the
+    /// <c>files</c> source's is its store and prefix). A spec whose input reads what a
+    /// sink slot owns — its own or another pipeline's — is refused, and so is a sink onto
+    /// what an input already reads: a sink rewrites and deletes what it owns, which a
+    /// source that only reads on cannot follow. Null: the input reads nothing a sink of
+    /// this connector could own.</summary>
+    public string? Reads { get; init; }
 }
 
 /// <summary>

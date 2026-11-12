@@ -139,6 +139,40 @@ public class DeadLetterSinkTests
     }
 
     [Fact]
+    public async Task An_input_named_as_the_clocks_entries_begin_is_an_input_and_a_dead_letter_names_its_position()
+    {
+        // "$watermark" and "$watermark#s0" are the clock's. "$watermark-feed" is a slot a
+        // tenant named, and where a dropped record came from is a position in it.
+        await using var service = await StartAsync();
+        await service.DeployAsync(Spec("odd", "windowed-oddly-named") with
+        {
+            Circuit = Lenient,
+            DeadLetters = MemoryBinding("odd-dlq"),
+            Inputs = new Dictionary<string, JsonElement> { [OddlyNamedInput.Input] = MemoryBinding("odd-in") },
+            Sinks = new Dictionary<string, JsonElement> { ["live"] = MemoryBinding("odd-live") },
+        });
+        service.Memory.Log<Tick>("odd-in").AppendRange([new Tick(1, "t", 1_000, 1), new Tick(2, "t", 2_000, 1)]);
+        await Eventually(() => service.Pipelines.Get("odd").CommittedOffsets.ContainsKey("$watermark"), "a checkpoint with the watermark in it");
+
+        service.Memory.Log<Tick>("odd-in").AppendRange([new Tick(3, "t", 3_000, -1)]);
+        var sink = service.Memory.AppendSink<DeadLetterEnvelope>("odd-dlq");
+        await Eventually(() => sink.Records.Count == 1, "the dropped tick in the dead-letter sink");
+        var after = sink.Records[0].After;
+        Assert.NotNull(after);
+        Assert.Equal([OddlyNamedInput.Input + "#p0"], after.Keys);
+
+        // And the pipeline goes on from its position after a restart: nothing it had
+        // read is read again.
+        var live = service.Memory.UpsertSink<string, WindowTotal>("odd-live");
+        await Eventually(() => live.Rows.Values.Sum(r => r.Quantity) == 2, "the two good ticks");
+        await service.Pipelines.StopAsync("odd", new ActionOptions(), default);
+        await service.Pipelines.StartAsync("odd", new ActionOptions(), default);
+        await service.Running("odd");
+        service.Memory.Log<Tick>("odd-in").AppendRange([new Tick(4, "t", 4_000, 5)]);
+        await Eventually(() => live.Rows.Values.Sum(r => r.Quantity) == 7, "one more tick, and the first two once");
+    }
+
+    [Fact]
     public async Task The_checkpoint_waits_for_the_sink_so_a_takeover_delivers_what_the_old_leader_had_not_stored()
     {
         var cluster = new InMemoryServiceCluster();

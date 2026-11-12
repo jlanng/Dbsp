@@ -1013,17 +1013,40 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         var producing = ProduceUntilAsync(env, d.TradesTopic, stop.Token);
         await Task.Delay(2000);
 
-        // A broker goes, and before the cluster has settled the leader is killed.
-        await DockerAsync("stop", "-t", "1", Brokers[1]);
-        await Task.Delay(1500);
+        // A broker goes, and before the cluster has settled the leader is killed. How the
+        // broker goes is INCREMENTAL_KAFKA_FAULT's to say, and the two are different
+        // things. "stop" (the default): the broker is shut down a second and a half
+        // before the kill — it hands its partitions over and tells the controller, so the
+        // cluster the standby takes over on already knows. "kill": the broker and the
+        // leader die in the same moment, as a zone does — the standby takes over on a
+        // cluster that will go on believing in the dead broker for its session timeout,
+        // and its takeover waits that out.
+        var fault = Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_FAULT") is "kill" ? "kill" : "stop";
+        var index = int.TryParse(Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_BROKER"), out var chosen) ? chosen % Brokers.Length : 1;
+        var roles = await RolesAsync(index, env.Prefix, d);
+        if (fault == "kill")
+            await DockerAsync("kill", Brokers[index]);
+        else
+        {
+            await DockerAsync("stop", "-t", "1", Brokers[index]);
+            await Task.Delay(1500);
+        }
         a.Kill();
         var killedAt = Now;
         var leading = await b.WaitForRoleAsync("Leader");
-        Measured($"kafka3: kill -9 with one of three brokers down: kill to Leader {T(leading) - killedAt} ms");
-        await b.StatusWhenAsync(s => State(s, "main") == "Running", "the pipeline to run on the new leader");
+        var running = await b.StatusWhenAsync(s => State(s, "main") == "Running", "the pipeline to run on the new leader");
+        var takeover = running.GetProperty("takeover");
+        Measured(
+            $"kafka3: kill -9 with broker {index + 1} of three ({(roles.Count == 0 ? "no role" : string.Join(", ", roles))}) {(fault == "kill" ? "killed in the same moment" : "shut down 1.5 s before")}: kill to Leader {T(leading) - killedAt} ms " +
+            $"(silence {takeover.GetProperty("silenceMs").GetDouble():F0} ms, fence {takeover.GetProperty("fenceMs").GetDouble():F0} ms, takeover {takeover.GetProperty("totalMs").GetDouble():F0} ms)");
+        Result(new Dictionary<string, object?>
+        {
+            ["scenario"] = "takeover-broker-down", ["prefix"] = env.Prefix, ["fault"] = fault, ["broker"] = index + 1, ["roles"] = roles, ["killToLeaderMs"] = T(leading) - killedAt,
+            ["takeover"] = takeover.Clone(),
+        });
 
         // The broker returns while the new leader commits.
-        await DockerAsync("start", Brokers[1]);
+        await DockerAsync("start", Brokers[index]);
         await ClusterWholeAsync(env.Prefix);
         await Task.Delay(2000);
         stop.Cancel();
@@ -1055,15 +1078,31 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         // timeout (60 s), the heartbeat interval and the takeover ceiling put together.
         // INCREMENTAL_KAFKA_OUTAGE_SECONDS makes it shorter: under the transaction timeout
         // the leader's open transaction survives the outage, and so should the leader.
+        // INCREMENTAL_KAFKA_FAULT=kill takes the two away in one command and without a
+        // word to the controller; otherwise they are stopped one after the other, a
+        // second each to shut down in (which the second of them may not manage).
         var seconds = int.TryParse(Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_OUTAGE_SECONDS"), out var asked) ? asked : 70;
+        var fault = Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_FAULT") is "kill" ? "kill" : "stop";
         var outage = Stopwatch.StartNew();
-        await DockerAsync("stop", "-t", "1", Brokers[0]);
-        await DockerAsync("stop", "-t", "1", Brokers[1]);
+        if (fault == "kill")
+            await DockerAsync("kill", Brokers[0], Brokers[1]);
+        else
+        {
+            await DockerAsync("stop", "-t", "1", Brokers[0]);
+            await DockerAsync("stop", "-t", "1", Brokers[1]);
+        }
         await Task.Delay(TimeSpan.FromSeconds(seconds));
+
+        // The brokers first, in one command, and the time taken from before and after
+        // it: the outage is as long as it was asked to be, whatever the counter costs
+        // to read. (Asked first, the standby's status once took thirty seconds to come.)
+        var downFor = outage.ElapsedMilliseconds;
+        await DockerAsync("start", Brokers[0], Brokers[1]);
+        var startedAfter = outage.ElapsedMilliseconds;
         var held = (await b.StatusAsync()).GetProperty("counters").GetProperty("takeoversHeld").GetInt64();
-        await DockerAsync("start", Brokers[0]);
-        await DockerAsync("start", Brokers[1]);
-        Measured($"kafka3: two of three brokers down for {outage.ElapsedMilliseconds} ms; the standby held its takeover back {held} time(s) at the ceiling");
+        Measured(
+            $"kafka3: two of three brokers {(fault == "kill" ? "killed" : "stopped")} and down for {downFor} ms (started again by {startedAfter} ms); " +
+            $"the standby held its takeover back {held} time(s) at the ceiling");
         await ClusterWholeAsync(env.Prefix);
         var back = Stopwatch.StartNew();
 
@@ -1074,7 +1113,7 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         var (trades, stall) = await load.StopAsync();
         await ConcludeAsync(
             "no-quorum", env, d, trades, stall, $"two of three brokers were down for {seconds} s",
-            new() { ["takeoversHeld"] = held, ["wholeToSettledMs"] = null, ["outageMs"] = outage.ElapsedMilliseconds });
+            new() { ["takeoversHeld"] = held, ["wholeToSettledMs"] = null, ["outageMs"] = outage.ElapsedMilliseconds, ["outageSeconds"] = seconds, ["fault"] = fault });
         Measured($"kafka3 no-quorum: one leader, a warm standby and a complete sink {back.ElapsedMilliseconds} ms after the cluster was whole");
     }
 

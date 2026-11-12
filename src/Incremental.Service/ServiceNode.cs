@@ -1020,14 +1020,26 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
 
     // ── the end ────────────────────────────────────────────────────────────────────────
 
+    /// <summary>What the process of a node whose leadership has finished exits with:
+    /// 4 when it stepped down, 3 when another node replaced it — the two ways a healthy
+    /// node ends, which a supervisor answers by starting it again at once — and 5 when
+    /// it is fenced by its own doing, a takeover that failed after it had taken the log
+    /// (<see cref="NodeLeadershipStatus.TakeoverFailed"/>): it could not lead, and one
+    /// that keeps failing so must not be started again at once for ever.</summary>
+    internal static int ExitCodeFor(NodeLeadershipStatus status) =>
+        status.Role == NodeRole.Resigned ? 4 : status.TakeoverFailed ? 5 : 3;
+
     /// <summary>Fenced and Resigned are final: abandon every circuit without draining
     /// (their commits can only fail) and, in a host, stop the application so that a
     /// process supervisor restarts it as a standby.</summary>
     private async Task OnFinishedAsync()
     {
-        var role = _context.Backend.Leadership.Status.Role;
+        var finished = _context.Backend.Leadership.Status;
+        var role = finished.Role;
         _context.Leading = false;
-        _logger.LogWarning("Service node {Node} is {Role}; it will not lead again in this process", NodeId, role);
+        _logger.LogWarning(
+            "Service node {Node} is {Role}{Why}; it will not lead again in this process",
+            NodeId, role, finished.TakeoverFailed ? " (its takeover failed: it could not lead)" : "");
         try
         {
             await _context.Tables.StopLoadersAsync().ConfigureAwait(false);
@@ -1039,7 +1051,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         }
         if (_lifetime is not null && _context.Options.ExitOnLeadershipLoss && Volatile.Read(ref _disposed) == 0 && !_stopping.IsCancellationRequested)
         {
-            Environment.ExitCode = role == NodeRole.Fenced ? 3 : 4;
+            Environment.ExitCode = ExitCodeFor(finished);
             _lifetime.StopApplication();
         }
     }

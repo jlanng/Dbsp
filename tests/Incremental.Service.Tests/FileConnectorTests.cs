@@ -725,10 +725,60 @@ public class FileConnectorTests : IDisposable
         Assert.Equal(objects, await FileSinkFormat.StepObjectsAsync(_store, "out/a/"));
         Assert.DoesNotContain(service.Pipelines.Pipelines, p => p.Id == "b");
 
-        // Its own prefix is its own across a replace; a source may read what a sink writes; a neighbouring prefix is free.
+        // Its own prefix is its own across a replace; a neighbouring prefix is free.
         await service.DeployAsync(Big("a", "out/a/") with { Circuit = new PipelineCircuitOptions { CheckpointInterval = 2 } });
-        await service.DeployAsync(Big("b", "out/a-2/") with { Inputs = new Dictionary<string, JsonElement> { ["trades"] = Files("out/a/", "\"pollInterval\": \"00:00:00.05\", \"settle\": \"00:00:00\"") } });
+        await service.DeployAsync(Big("b", "out/a-2/"));
         await service.Running("b");
+    }
+
+    [Fact]
+    public async Task An_input_onto_what_a_files_sink_writes_is_refused_and_so_is_a_sink_onto_what_an_input_reads()
+    {
+        // A sink's objects are not a log of names: a step run again is written under the
+        // name it had, compactAfter folds objects away and leaves deleted keys out of the
+        // snapshot, retain prunes. A source reads on by name and would see none of it.
+        await using var service = await StartAsync();
+        const string fast = "\"pollInterval\": \"00:00:00.05\", \"settle\": \"00:00:00\"";
+        PipelineSpec Big(string id, string sink, JsonElement? input = null) => Spec(id, "big-trades", "in") with
+        {
+            Inputs = new Dictionary<string, JsonElement> { ["trades"] = input ?? MemoryBinding("in") },
+            Sinks = new Dictionary<string, JsonElement> { ["out"] = Files(sink) },
+        };
+        await service.DeployAsync(Big("a", "lake/a/"));
+
+        // The sink's own prefix, and a prefix its objects lie under.
+        foreach (var prefix in new[] { "lake/a/", "lake/", "lake/a" })
+        foreach (var dryRun in new[] { true, false })
+        {
+            var refused = await Assert.ThrowsAsync<ServiceException>(
+                () => service.Pipelines.DeployAsync(Big("b", "lake/b/", Files(prefix, fast)), new DeployOptions(DryRun: dryRun), default));
+            Assert.Contains(refused.Details, d => d.StartsWith("input slot 'trades'") && d.Contains("pipeline 'a' writes from its sink slot 'out'")
+                && d.Contains("files:landing:lake/a/") && d.Contains("Kafka topic or a table"));
+        }
+        Assert.DoesNotContain(service.Pipelines.Pipelines, p => p.Id == "b");
+
+        // One spec reading what it writes itself.
+        var own = await Assert.ThrowsAsync<ServiceException>(() => service.Pipelines.ValidateAsync(Big("c", "loop/", Files("loop/", fast)), default));
+        Assert.Contains(own.Details, d => d.StartsWith("sink slot 'out'") && d.Contains("this spec's input slot 'trades' reads it"));
+
+        // The other order: the reader is there first, and a sink onto what it reads is refused.
+        await service.DeployAsync(Big("reader", "lake/reader-out/", Files("landing/", fast)));
+        foreach (var dryRun in new[] { true, false })
+        {
+            var refused = await Assert.ThrowsAsync<ServiceException>(
+                () => service.Pipelines.DeployAsync(Big("d", "landing/d/"), new DeployOptions(DryRun: dryRun), default));
+            Assert.Contains(refused.Details, d => d.StartsWith("sink slot 'out'") && d.Contains("pipeline 'reader' reads it as its input slot 'trades'") && d.Contains("files:landing:landing/"));
+        }
+        var letters = await Assert.ThrowsAsync<ServiceException>(() => service.Pipelines.ValidateAsync(Big("d", "lake/d/") with { DeadLetters = Files("landing/dead/") }, default));
+        Assert.Contains(letters.Details, d => d.StartsWith("dead-letter slot") && d.Contains("pipeline 'reader' reads it"));
+
+        // What is not a sink's: a neighbouring prefix, a prefix below the sink's (its
+        // objects are not under it), and a source whose suffix no sink object can end in.
+        await service.Pipelines.ValidateAsync(Big("e", "lake/e/", Files("lake/a-in/", fast)), default);
+        await service.Pipelines.ValidateAsync(Big("e", "lake/e/", Files("lake/a/in/", fast)), default);
+        await service.Pipelines.ValidateAsync(Big("e", "lake/e/", Files("lake/a/", fast + ", \"suffix\": \".csv\"")), default);
+        foreach (var suffix in new[] { ".jsonl", "l", "0.jsonl", ".snapshot.jsonl" })
+            await Assert.ThrowsAsync<ServiceException>(() => service.Pipelines.ValidateAsync(Big("e", "lake/e/", Files("lake/a/", fast + $", \"suffix\": \"{suffix}\"")), default));
     }
 
     [Fact]
@@ -939,6 +989,77 @@ public class FileConnectorTests : IDisposable
         Assert.Equal(Numbered("0001", 1).Concat(Numbered("0003", 1)), input.Lines);
     }
 
+    /// <summary>A store whose clock is not the node's: every modification time it
+    /// reports is shifted, as a file server's or a bucket's would be.</summary>
+    private sealed class SkewedStore(LocalObjectStore inner, TimeSpan skew) : IObjectStore
+    {
+        private ObjectInfo Shift(ObjectInfo info) => info with { Modified = info.Modified + skew };
+
+        public async ValueTask<ObjectInfo?> StatAsync(string path, CancellationToken cancellationToken) =>
+            await inner.StatAsync(path, cancellationToken) is { } info ? Shift(info) : null;
+
+        public ValueTask<Stream> OpenReadAsync(string path, CancellationToken cancellationToken) => inner.OpenReadAsync(path, cancellationToken);
+        public ValueTask WriteAsync(string path, Func<Stream, CancellationToken, ValueTask> write, CancellationToken cancellationToken) => inner.WriteAsync(path, write, cancellationToken);
+        public ValueTask DeleteAsync(string path, CancellationToken cancellationToken) => inner.DeleteAsync(path, cancellationToken);
+
+        public async IAsyncEnumerable<ObjectInfo> ListAsync(string prefix, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            await foreach (var info in inner.ListAsync(prefix, cancellationToken))
+                yield return Shift(info);
+        }
+
+        public async ValueTask<ObjectPage> ListPageAsync(string prefix, string? after, int limit, CancellationToken cancellationToken)
+        {
+            var page = await inner.ListPageAsync(prefix, after, limit, cancellationToken);
+            return new ObjectPage([.. page.Objects.Select(Shift)], page.More);
+        }
+    }
+
+    [Theory]
+    [InlineData(-6)]    // the store's clock six seconds behind the node's: every new object "is six seconds old"
+    [InlineData(-3600)]
+    [InlineData(90)]    // and ahead of it: every new object "was written in the future"
+    public async Task The_settle_time_does_not_depend_on_the_nodes_clock_agreeing_with_the_stores(int skewSeconds)
+    {
+        var store = new SkewedStore(_store, TimeSpan.FromSeconds(skewSeconds));
+        var input = new FakeInput();
+        await using var reader = Read(store, input, "in/", ", \"settle\": \"00:00:01.5\"");
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        await PutAsync("in/0002.jsonl", Numbered("0002", 2));
+        await Task.Delay(400);
+        // Behind the node's clock, the object must not pass for settled; it is 0.4 s old.
+        Assert.Equal(0, input.Count);
+        await PutAsync("in/0001.jsonl", Numbered("0001", 2));                   // behind it in name order, 0.4 s late
+        await Eventually(() => input.Count == 4, "both objects read");
+        Assert.Equal(Numbered("0001", 2).Concat(Numbered("0002", 2)), input.Lines);
+        // Ahead of it, the objects must not wait out the difference as well.
+        Assert.InRange(clock.Elapsed.TotalSeconds, 1.5, 6);
+
+        // And a backlog is not made to wait object by object: these are old by the
+        // store's own stamps the moment one newer than them is listed.
+        for (var i = 3; i <= 40; i++)
+            await PutAsync($"in/{i:D4}.jsonl", Numbered($"{i:D4}", 1));
+        await Task.Delay(1600);
+        clock.Restart();
+        await PutAsync("in/0041.jsonl", Numbered("0041", 1));
+        await Eventually(() => input.Count == 4 + 38, "the backlog read");
+        Assert.InRange(clock.Elapsed.TotalSeconds, 0, 1.2);
+        await Eventually(() => input.Count == 4 + 39, "and the newest once it has settled");
+    }
+
+    [Fact]
+    public async Task An_object_that_changes_while_it_settles_waits_from_the_change()
+    {
+        var input = new FakeInput();
+        await using var reader = Read(_store, input, "in/", ", \"settle\": \"00:00:01\"");
+        await PutAsync("in/0001.jsonl", Numbered("0001", 1));
+        await Task.Delay(700);
+        await PutAsync("in/0001.jsonl", Numbered("0001", 3));                   // written again: another object under the name
+        await Task.Delay(600);
+        Assert.Equal(0, input.Count);                                           // 1.3 s after the first write, 0.6 s after the second
+        await Eventually(() => input.Count == 3, "the object as it was last written");
+    }
+
     [Fact]
     public async Task With_no_settle_time_an_object_that_arrives_behind_the_position_is_not_read()
     {
@@ -968,7 +1089,7 @@ public class FileConnectorTests : IDisposable
     // ── a keyed input's deletes ────────────────────────────────────────────────────────
 
     [Fact]
-    public async Task A_keyed_input_in_the_changes_format_upserts_and_deletes_and_reads_what_an_upsert_sink_wrote()
+    public async Task A_keyed_input_in_the_changes_format_upserts_and_deletes_and_reads_the_lines_an_upsert_sink_writes()
     {
         await using var service = await StartAsync();
         var keyed = "\"pollInterval\": \"00:00:00.05\", \"settle\": \"00:00:00\", \"format\": \"changes\"";
@@ -980,15 +1101,25 @@ public class FileConnectorTests : IDisposable
             Inputs = new Dictionary<string, JsonElement> { ["trades"] = Files("in/", keyed) },
             Sinks = new Dictionary<string, JsonElement> { ["out"] = Files("mid/") },
         });
-        // Second pipeline: reads the first one's sink objects as its keyed input.
+        // Second pipeline: a keyed input in the same format, fed with the first one's
+        // objects handed on under names of their own. (Its input is not the sink's
+        // prefix itself: that is refused, see the test above.)
         var rows = service.Memory.UpsertSink<long, Trade>("latest");
         await service.DeployAsync(Spec("second", "latest-trades", null, "latest") with
         {
-            Inputs = new Dictionary<string, JsonElement> { ["trades"] = Files("mid/", keyed) },
+            Inputs = new Dictionary<string, JsonElement> { ["trades"] = Files("handed/", keyed) },
         });
+        var handed = 0;
+        async Task HandOnAsync()
+        {
+            foreach (var name in (await FileSinkFormat.StepObjectsAsync(_store, "mid/")).Skip(handed))
+                await PutAsync($"handed/{++handed:D6}.jsonl", await File.ReadAllLinesAsync(Path.Combine(_root, name)));
+        }
 
         var trades = Trades(0, 6);
         await PutAsync("in/0001.jsonl", trades.Select(Row));
+        await EventuallyAsync(async () => Same(await FileSinkFormat.ReadUpsertsAsync<long, Trade>(_store, "mid/"), trades.ToDictionary(t => t.Id)), "six rows in the first pipeline's sink");
+        await HandOnAsync();
         await Eventually(() => Same(rows.Rows, trades.ToDictionary(t => t.Id)), "six rows through both pipelines");
 
         var changed = trades[1] with { Quantity = 777 };
@@ -997,8 +1128,9 @@ public class FileConnectorTests : IDisposable
         expected[changed.Id] = changed;
         expected.Remove(trades[3].Id);
         expected.Remove(trades[4].Id);
+        await EventuallyAsync(async () => Same(await FileSinkFormat.ReadUpsertsAsync<long, Trade>(_store, "mid/"), expected), "an upsert and two deletes in the first pipeline's sink");
+        await HandOnAsync();
         await Eventually(() => Same(rows.Rows, expected), "an upsert and two deletes through both pipelines");
-        Assert.True(Same(await FileSinkFormat.ReadUpsertsAsync<long, Trade>(_store, "mid/"), expected));
 
         // A line that is neither is rejected in its place, like any line that is not a record.
         await PutAsync("in/0003.jsonl", ["{\"row\":{\"id\":1}}", "{\"key\":99}", Row(trades[3])]);

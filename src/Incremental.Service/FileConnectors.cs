@@ -208,7 +208,7 @@ public sealed class FileConnector(ObjectStores stores)
         new("prefix", "string", Required: true, Description: "The objects of this slot are those whose name starts with it. One slot of one pipeline per prefix."),
         new("suffix", "string", Description: "Read only objects whose name ends with this.", AppliesTo: ConfigProperty.Sources),
         new("pollInterval", "string", Description: "How often the prefix is asked for objects after the last one read, as a duration (hh:mm:ss).", Default: "00:00:05", AppliesTo: ConfigProperty.Sources),
-        new("settle", "string", Description: "An object is read once it has been left unchanged this long (hh:mm:ss), and nothing after it in name order is read before it. So an object may arrive up to this long after one with a greater name and still be read. 00:00:00 when names only ever increase and objects appear whole.", Default: "00:00:05", AppliesTo: ConfigProperty.Sources),
+        new("settle", "string", Description: "An object is read once it has been left unchanged this long (hh:mm:ss), and nothing after it in name order is read before it. So an object may arrive up to this long after one with a greater name and still be read. Measured by the store's own modification times against each other, or by how long this source has seen the object unchanged: never by this node's clock against the store's. 00:00:00 when names only ever increase and objects appear whole.", Default: "00:00:05", AppliesTo: ConfigProperty.Sources),
         new("maxLineLength", "number", Description: "The longest line, in characters, read as a record. A longer one is rejected like a line that is not a record, without being held.", Default: "1048576", AppliesTo: ConfigProperty.Sources),
         new("format", "string", Description: "rows: every line is a row, and nothing deletes. changes: a line is {\"key\":…,\"row\":…} or {\"key\":…,\"deleted\":true}, which is also what an upsert sink of this connector writes.", Values: ["rows", "changes"], Default: "rows", AppliesTo: [SlotKind.KeyedInput]),
         new("minInterval", "string", Description: "The least time between two objects, as a duration (hh:mm:ss). The pipeline pauses to keep it, so steps and objects grow.", Default: "00:00:00", AppliesTo: ConfigProperty.Sinks),
@@ -226,9 +226,38 @@ public sealed class FileConnector(ObjectStores stores)
     {
         var (parsed, _) = Resolve(config);
         // A sink deletes step objects under its prefix (above the checkpoint at a start,
-        // all of them at a reset): the prefix is one sink slot's alone.
-        return new ConnectorDescription($"objects under {parsed.Prefix} in store {parsed.Store}") { Owns = $"files:{parsed.Store}:{parsed.Prefix}" };
+        // all of them at a reset): the prefix is one sink slot's alone. And not a
+        // source's either: see ReadsSinkObjects.
+        var name = $"files:{parsed.Store}:{parsed.Prefix}";
+        return new ConnectorDescription($"objects under {parsed.Prefix} in store {parsed.Store}")
+        {
+            Owns = name,
+            Reads = ReadsSinkObjects(parsed.Suffix) ? name : null,
+        };
     }
+
+    /// <summary>
+    /// Whether a source with this suffix would read a sink's objects, were its prefix one
+    /// a sink's objects lie under. That is refused (<see cref="ConnectorDescription.Reads"/>),
+    /// because a source follows names and a sink's objects are not a log of names:
+    /// <list type="bullet">
+    /// <item>a step above the sink's checkpoint is run again after a restart and written
+    /// under the name it had, with whatever the new cut of the step holds — a source that
+    /// has read past the name never sees the difference;</item>
+    /// <item><c>compactAfter</c> folds step objects into a snapshot that leaves deleted
+    /// keys out and deletes the objects: a source that had not read them yet never sees
+    /// the deletes, and reads the snapshot as so many upserts;</item>
+    /// <item><c>retain</c> deletes objects a source may not have reached, and an object
+    /// a replaced leader wrote late is void by the reader's rule 3, which needs the
+    /// whole listing to apply.</item>
+    /// </list>
+    /// A sink's objects all end in <c>.jsonl</c>; a source whose suffix cannot end such a
+    /// name reads none of them.
+    /// </summary>
+    internal static bool ReadsSinkObjects(string? suffix) =>
+        string.IsNullOrEmpty(suffix)
+        || FileSinkFormat.Extension.EndsWith(suffix, StringComparison.Ordinal)
+        || suffix.EndsWith(FileSinkFormat.Extension, StringComparison.Ordinal);
 
     public string? DescribePosition(JsonElement config, IReadOnlyDictionary<int, long> committed) => FilePosition.Describe(committed);
 
@@ -467,7 +496,7 @@ public sealed class FileConnector(ObjectStores stores)
 /// </summary>
 public static class FileSinkFormat
 {
-    private const string Extension = ".jsonl";
+    internal const string Extension = ".jsonl";
     private const string SnapshotExtension = ".snapshot.jsonl";
 
     // The default for a caller that gives no options. Never used by the service itself:
@@ -869,6 +898,14 @@ internal sealed class FileSourceReader : IRunningSource
     private volatile string? _at;
     private volatile string? _waitingFor;
 
+    // settle, without comparing this node's clock with the store's: the newest
+    // modification time any listing has shown (the store's clock against itself), and for
+    // the objects not yet old by that measure, what each looked like and when this reader
+    // first saw it so (this node's clock against itself). Only the objects of the last
+    // listing that were not read are held: a page or two of names.
+    private DateTimeOffset _newestModified = DateTimeOffset.MinValue;
+    private Dictionary<string, (string Identity, long FirstSeen)> _sightings = new(StringComparer.Ordinal);
+
     public FileSourceReader(
         IObjectStore store, FilesSlotConfig config, IReadOnlyDictionary<int, long> committed,
         Func<string, long, CancellationToken, ValueTask> send,
@@ -953,6 +990,15 @@ internal sealed class FileSourceReader : IRunningSource
     /// <paramref name="current"/> and stops at the first object that has not been left
     /// alone for <c>settle</c>: nothing after it is read before it, which is what lets an
     /// object arrive a little behind a greater name and still be read in its place.
+    /// <para>
+    /// "Left alone for <c>settle</c>" is never this node's clock against the store's: a
+    /// node whose clock runs ahead of the store's would call every object old the moment
+    /// it appears, and <c>settle</c> would be off with nothing to say so. An object has
+    /// settled when the store's own stamps say so — a listing has shown an object
+    /// modified at least <c>settle</c> after it — or when this reader has seen it,
+    /// unchanged, for <c>settle</c> of its own time. The first serves a backlog, which is
+    /// read as fast as it lists; the second is what the newest objects wait out.
+    /// </para>
     /// </summary>
     private async Task<(List<string> Names, long Unread, bool Empty)> NextAsync(string? current, CancellationToken stop)
     {
@@ -961,29 +1007,54 @@ internal sealed class FileSourceReader : IRunningSource
         var after = current;
         long unread = 0;
         var empty = true;
-        while (true)
+        var now = Stopwatch.GetTimestamp();
+        var sightings = new Dictionary<string, (string Identity, long FirstSeen)>(StringComparer.Ordinal);
+        try
         {
-            var page = await _store.ListPageAsync(_config.Prefix!, after, ListAhead, stop).ConfigureAwait(false);
-            if (page.Objects.Count > 0)
-                empty = false;
-            var held = false;
-            foreach (var info in page.Objects)
+            while (true)
             {
-                after = info.Path;
-                if (_config.Suffix is { } suffix && !info.Path.EndsWith(suffix, StringComparison.Ordinal))
-                    continue;
-                unread++;
-                if (held || names.Count == ListAhead)
-                    continue;
-                if (settle > TimeSpan.Zero && DateTimeOffset.UtcNow - info.Modified < settle)
-                    held = true;            // and everything after it waits with it
-                else
-                    names.Add(info.Path);
+                var page = await _store.ListPageAsync(_config.Prefix!, after, ListAhead, stop).ConfigureAwait(false);
+                if (page.Objects.Count > 0)
+                    empty = false;
+
+                // The store's newest stamp first, over the whole page: an object is old
+                // against anything listed, wherever in name order that is.
+                foreach (var info in page.Objects)
+                {
+                    if (info.Modified > _newestModified)
+                        _newestModified = info.Modified;
+                }
+                var held = false;
+                foreach (var info in page.Objects)
+                {
+                    after = info.Path;
+                    if (_config.Suffix is { } suffix && !info.Path.EndsWith(suffix, StringComparison.Ordinal))
+                        continue;
+                    unread++;
+                    var settled = settle <= TimeSpan.Zero || _newestModified - info.Modified >= settle;
+                    if (!settled)
+                    {
+                        // Seen before and unchanged since: the wait counts from then.
+                        var first = _sightings.TryGetValue(info.Path, out var seen) && seen.Identity == info.Identity ? seen.FirstSeen : now;
+                        sightings[info.Path] = (info.Identity, first);
+                        settled = Stopwatch.GetElapsedTime(first, now) >= settle;
+                    }
+                    if (held || names.Count == ListAhead)
+                        continue;
+                    if (!settled)
+                        held = true;            // and everything after it waits with it
+                    else
+                        names.Add(info.Path);
+                }
+                // Another page only while it could still add a name: with a suffix a page can
+                // hold none that match.
+                if (held || names.Count == ListAhead || !page.More || page.Objects.Count == 0)
+                    return (names, unread, empty);
             }
-            // Another page only while it could still add a name: with a suffix a page can
-            // hold none that match.
-            if (held || names.Count == ListAhead || !page.More || page.Objects.Count == 0)
-                return (names, unread, empty);
+        }
+        finally
+        {
+            _sightings = sightings;
         }
     }
 

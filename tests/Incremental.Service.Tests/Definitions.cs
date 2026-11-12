@@ -225,3 +225,22 @@ public sealed class WindowedTotals : IPipelineDefinition
             .Select(g => new WindowTotal(g.Key.Trader, g.Key.Start, g.Sum(t => t.Quantity)))
             .ToDictionary(Key);
 }
+
+/// <summary>The windowed totals again, over an input whose name starts as the clock's own
+/// entries in the checkpoint do. It is an input like any other.</summary>
+[Pipeline("windowed-oddly-named")]
+public sealed class OddlyNamedInput : IPipelineDefinition
+{
+    public const string Input = "$watermark-feed";
+
+    public void Build(PipelineBuilder p)
+    {
+        var totals = p.Input<Tick>(Input)
+            .Where(t => t.Quantity >= 0 ? true : throw new InvalidOperationException($"negative quantity on tick {t.Id}"))
+            .WithEventTime(t => t.At(), TimeSpan.FromMilliseconds(WindowedTotals.LatenessMs))
+            .GroupBy(t => t.Trader)
+            .TumblingWindow(TimeSpan.FromMilliseconds(WindowedTotals.WindowMs))
+            .Sum(t => t.Quantity);
+        p.UpsertSink("live", totals.Rows().Select(w => new WindowTotal(w.Key, (long)(w.WindowStart - Tick.Epoch).TotalMilliseconds, w.Value)), WindowedTotals.Key);
+    }
+}

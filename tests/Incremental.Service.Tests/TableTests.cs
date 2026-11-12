@@ -487,4 +487,53 @@ public class TableTests
         await Task.Delay(150);
         Assert.True(service.Tables.Stats("instruments") is { Rows: 3, Loader.State: TableSourceState.Idle });
     }
+
+    [Fact]
+    public async Task A_loaded_table_whose_file_has_since_been_removed_is_not_waiting_after_a_takeover_or_a_restart()
+    {
+        // The upstream job delivers a file and takes it away again. The table has its
+        // rows; that the loader of a node which took over, or was restarted, has loaded
+        // nothing itself does not make the table one that is waiting for its input.
+        var directory = Directory.CreateTempSubdirectory("incremental-service-files").FullName;
+        var cluster = new InMemoryServiceCluster();
+        Action<ServiceOptions> options = o => o.MissingInputGrace = TimeSpan.FromMilliseconds(200);
+        Action<IncrementalServiceBuilder> configure = b => b.AddObjectStore("refdata", _ => new LocalObjectStore(directory));
+        var spec = new TableSpec
+        {
+            Name = "instruments", Definition = typeof(InstrumentsTable).FullName!,
+            Loader = new TableLoaderSpec("file", "refdata", Json("""{ "path": "delivered.jsonl", "pollInterval": "00:00:00.03" }""")),
+        };
+        await File.WriteAllLinesAsync(Path.Combine(directory, "delivered.jsonl"), Instruments(5).Select(i => JsonSerializer.Serialize(i, JsonSerializerOptions.Web)));
+
+        await using (var a = await StartAsync(cluster, "a", options: options, configure: configure))
+        await using (var b = await StartAsync(cluster, "b", options: options, configure: configure))
+        {
+            await a.Tables.DeclareAsync(spec, default);
+            await Eventually(() => a.Tables.Stats("instruments") is { Rows: 5, Loader.State: TableSourceState.Idle }, "the table loaded on a");
+            await Eventually(() => b.Tables.Tables.Any(t => t.Name == "instruments") && b.Tables.Stats("instruments") is { Rows: 5 }, "the table followed by b");
+            File.Delete(Path.Combine(directory, "delivered.jsonl"));
+
+            await b.Node.TakeOverAsync(new NodeActionOptions(), default).WaitAsync(TestService.Timeout);
+            await Eventually(() => b.Tables.Stats("instruments").Loader is { State: TableSourceState.Idle }, "b's loader running, with nothing to load");
+            await Task.Delay(500);      // well past the grace period
+            var taken = b.Tables.Stats("instruments");
+            Assert.Equal(5, taken.Rows);
+            Assert.Equal(TableSourceState.Idle, taken.Loader!.State);
+            Assert.Null(taken.Loader.WaitingFor);
+            Assert.DoesNotContain("loader-waiting", b.Node.Health.Reasons);
+            Assert.DoesNotContain(b.Node.RecentEvents(), e => e.Kind == "table" && e.Message.StartsWith("loader waiting for"));
+        }
+
+        // A node from nothing restores the table with its rows; the file is still gone.
+        await using var c = await StartAsync(cluster, "c", options: options, configure: configure);
+        await Eventually(() => c.Node.Status.Leadership.Role == Incremental.Kafka.NodeRole.Leader, "c leading");
+        await Eventually(() => c.Tables.Tables.Any(t => t.Name == "instruments") && c.Tables.Stats("instruments") is { Rows: 5, Loader.State: TableSourceState.Idle }, "the table restored on c, its loader idle");
+        await Task.Delay(500);
+        Assert.Null(c.Tables.Stats("instruments").Loader!.WaitingFor);
+        Assert.DoesNotContain("loader-waiting", c.Node.Health.Reasons);
+
+        // A new file is still loaded: the table is replaced by it.
+        await File.WriteAllLinesAsync(Path.Combine(directory, "delivered.jsonl"), Instruments(2).Select(i => JsonSerializer.Serialize(i, JsonSerializerOptions.Web)));
+        await Eventually(() => c.Tables.Stats("instruments") is { Rows: 2 }, "the new file loaded");
+    }
 }

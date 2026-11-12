@@ -441,6 +441,7 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         Assert.Equal(NodeRole.Fenced, a.Role);
         Assert.False(a.Leadership.HoldsLease);
         Assert.IsType<KafkaLogFencedException>(a.Leadership.Status.Fault, exactMatch: false);
+        Assert.False(a.Leadership.Status.TakeoverFailed);   // replaced, which is not a failure of its own
         await Assert.ThrowsAsync<KafkaLogFencedException>(async () => await a.Leadership.WaitForLeaseAsync());
         await Assert.ThrowsAsync<ChangelogFencedException>(() => CommitStateAsync(a.Log, "p", "x"));
         await Assert.ThrowsAsync<InvalidOperationException>(() => a.Leadership.TakeOverAsync());
@@ -605,12 +606,40 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         Assert.Contains("no circuits today", a.Leadership.Status.Fault!.Message);
         Assert.True(a.Log.IsFenced);
 
+        // Fenced by its own doing, and it says so: nobody replaced it.
+        Assert.True(a.Leadership.Status.TakeoverFailed);
+
         // It leads nothing, so it must not look alive: the next node takes over.
         var beats = a.Log.IdleHeartbeats;
         await using var b = await StartAsync(env, "b");
         await LeadsAsync(b);
         Assert.Equal(beats, a.Log.IdleHeartbeats);
         Assert.Equal(2, b.Leadership.Term);
+    }
+
+    /// <summary>The other way a takeover ends fenced: this node took the log, and before
+    /// it led another node took it from it. That is a node that was replaced, however
+    /// the takeover's own steps then failed, and it must not be told apart as a failure
+    /// of its own.</summary>
+    [Fact]
+    public async Task A_takeover_that_fails_because_another_node_took_the_log_meanwhile_is_not_the_nodes_own_failure()
+    {
+        await using var env = KafkaEnv.Create();
+        await using var a = await StartAsync(env, "a", prepare: async (node, _) =>
+        {
+            var c = await KafkaLog.ConnectAsync(env.Options(nodeId: "c", heartbeat: Beat));
+            await c.AcquireWriterAsync().WaitAsync(Timeout);
+            await c.DisposeAsync();
+
+            // The node finds out — it reads the higher term, or its next write fails —
+            // and whatever it was doing for its takeover fails with something else.
+            SpinWait.SpinUntil(() => node.Log.IsFenced, Timeout);
+            throw new InvalidOperationException("the catalog could not be opened");
+        });
+        await a.Leadership.WhenFinished.WaitAsync(Timeout);
+        Assert.Equal(NodeRole.Fenced, a.Role);
+        Assert.True(a.Log.IsFenced);
+        Assert.False(a.Leadership.Status.TakeoverFailed);
     }
 
     // ── a long commit ──────────────────────────────────────────────────────────────────
@@ -747,6 +776,10 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         await KafkaEnv.EventuallyAsync(() => Task.FromResult(b.Leadership.TakeoversAbandoned == 1), "b's first takeover to be lost");
         Assert.Equal(1, b.Log.WriterResets);
         Assert.False(b.Log.IsFenced);
+
+        // Lost to a fence: it waits before it tries again, so that two nodes that fenced
+        // each other do not do it in step.
+        Assert.True(b.Leadership.RetryNotBefore > Environment.TickCount64, "a takeover lost to a fence is not tried again at once");
         Assert.False(b.Log.WhenFenced.IsCompleted);
         Assert.False(b.Leadership.WhenFinished.IsCompleted);
 
@@ -838,6 +871,11 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         Assert.Equal(NodeRole.Standby, b.Role);
         Assert.Equal(1, b.Log.WriterResets);
 
+        // Given up for a leader that was heard: nothing holds the next attempt back but
+        // that leader's own heartbeats. (Were it fenced after all, by a request that had
+        // left this node already, its silence would be answered like any dead leader's.)
+        Assert.Equal(0, b.Leadership.RetryNotBefore);
+
         // The leader was never touched, and stays untouched: the client the standby put
         // away does not finish the takeover behind its back.
         await Task.Delay(After * 3);
@@ -847,6 +885,96 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         Assert.Equal(1, b.Leadership.Status.LeaderTerm);
         await CommitStateAsync(a.Log, "p", "still mine");
         Assert.Empty(b.Calls);
+    }
+
+    /// <summary>A decision to take over rests on a silence, and finding the reason out
+    /// takes time: the probe is asked, then the brokers, then the topic's end — seconds,
+    /// when brokers are only just back. A leader heard in those seconds is a leader. As
+    /// first built the decision stood on the silence measured before the questions, and
+    /// a standby that had held through a whole broker outage took over from a leader it
+    /// had heard twenty milliseconds earlier.</summary>
+    [Fact]
+    public async Task A_leader_heard_while_the_standby_was_asking_the_brokers_is_not_taken_over_from()
+    {
+        await using var env = KafkaEnv.Create();
+        await using var a = await StartAsync(env, "a");
+        await LeadsAsync(a);
+        var ceiling = TimeSpan.FromSeconds(2);
+        await using var b = await StartAsync(env, "b", ceiling: ceiling, probe: _ => ValueTask.FromResult(true));
+        await Task.Delay(After);
+
+        using var stall = Stall(a);
+        var asked = 0;
+        b.Log.WritePathOverride = () =>
+        {
+            // The standby is at the ceiling and asks the brokers. While it waits for the
+            // answer the leader comes back and is heard; the answer is "nothing wrong".
+            if (Interlocked.Increment(ref asked) == 1)
+            {
+                var beats = a.Log.IdleHeartbeats;
+                stall.Set();
+                SpinWait.SpinUntil(() => a.Log.IdleHeartbeats >= beats + 2, Timeout);
+                SpinWait.SpinUntil(() => b.Leadership.Status.HeartbeatAge < Beat * 2, Timeout);
+            }
+            return (KafkaLog.WritePath.Writable, null);
+        };
+
+        await KafkaEnv.EventuallyAsync(() => Task.FromResult(Volatile.Read(ref asked) >= 1), "b to reach the ceiling and ask");
+        await Task.Delay(After * 3);
+        Assert.Equal(NodeRole.Standby, b.Role);
+        Assert.Equal(NodeRole.Leader, a.Role);
+        Assert.True(a.Log.IsWriter);
+        Assert.Empty(b.Calls);
+        Assert.Equal(0, b.Leadership.TakeoversAbandoned);
+        Assert.Equal(0, b.Log.WriterResets);
+        Assert.Equal(1, b.Leadership.Status.LeaderTerm);
+        await CommitStateAsync(a.Log, "p", "still mine");
+    }
+
+    /// <summary>The other side of that line. Once the standby has taken the transactional
+    /// id the leader is fenced, whatever it committed a moment before; a heartbeat of its
+    /// that is only heard now changes nothing, and a standby that stood down for it would
+    /// leave a fenced leader and nobody else. The takeover goes through.</summary>
+    [Theory]
+    [InlineData("initialised")]
+    [InlineData("term-read")]
+    public async Task A_takeover_that_hears_the_leader_once_it_has_taken_the_log_goes_through(string point)
+    {
+        await using var env = KafkaEnv.Create();
+        await using var a = await StartAsync(env, "a");
+        await LeadsAsync(a);
+        await using var b = await StartAsync(env, "b");
+        await Task.Delay(After);
+
+        using var stall = Stall(a);
+        var met = 0;
+        b.Log.WhileAcquiring = at =>
+        {
+            if (at != point || Interlocked.Exchange(ref met, 1) != 0)
+                return;
+
+            // A heartbeat the leader committed just before it was fenced, read by the
+            // standby's watch only now.
+            b.Leadership.Heard(new KafkaLog.LeaderRecord(1, "a", DateTimeOffset.UtcNow, Sequence: int.MaxValue));
+        };
+
+        await LeadsAsync(b);
+        Assert.Equal(1, met);
+        Assert.Equal(0, b.Leadership.TakeoversAbandoned);
+        Assert.Equal(0, b.Log.WriterResets);
+        Assert.Equal(2, b.Leadership.Term);
+        Assert.Equal(["prepare", "start 2"], b.Calls);
+        List<NodeRole> roles;
+        lock (b.Changes)
+            roles = [.. b.Changes.Select(c => c.Role)];
+        Assert.DoesNotContain(NodeRole.Standby, roles.SkipWhile(r => r != NodeRole.Promoting));
+        await CommitStateAsync(b.Log, "p", "mine now");
+
+        // The old leader finds itself fenced, as after any takeover.
+        stall.Set();
+        await a.Leadership.WhenFinished.WaitAsync(Timeout);
+        Assert.Equal(NodeRole.Fenced, a.Role);
+        Assert.False(a.Leadership.Status.TakeoverFailed);
     }
 
     /// <summary>At the ceiling a standby takes over from a leader that still answers —
@@ -895,6 +1023,46 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         var (path, why) = await log.ProbeWritePathAsync(default).WaitAsync(Timeout);
         Assert.Equal(KafkaLog.WritePath.Writable, path);
         Assert.Null(why);
+
+        // The lists of who leads and who is in sync are not believed by themselves: they
+        // are the controller's, and with no controller quorum they go on naming brokers
+        // that are gone. Each broker named is asked directly, and the broker the real
+        // cluster answers for is asked for real (above: it answered). One that is not
+        // there — here, an id no broker has — is a second and a half of silence.
+        var silent = Stopwatch.StartNew();
+        Assert.False(await log.BrokerAnswersAsync(9_999, default).WaitAsync(Timeout));
+        Assert.InRange(silent.Elapsed.TotalSeconds, 1, 6);
+        var asked = new List<int>();
+        log.BrokerAnswersOverride = broker =>
+        {
+            lock (asked)
+                asked.Add(broker);
+            return false;
+        };
+        (path, why) = await log.ProbeWritePathAsync(default).WaitAsync(Timeout);
+        Assert.Equal(KafkaLog.WritePath.Unwritable, path);
+        Assert.Matches(@"\.leader \[0\] is led by broker \d+, which does not answer$", why);
+        Assert.NotEmpty(asked);
+        log.BrokerAnswersOverride = null;
+        foreach (var broker in asked.Distinct())
+            Assert.True(await log.BrokerAnswersAsync(broker, default).WaitAsync(Timeout), $"broker {broker} leads the partition and answers");
+
+        log.BrokerAnswersOverride = _ => true;
+        Assert.Equal(KafkaLog.WritePath.Writable, (await log.ProbeWritePathAsync(default).WaitAsync(Timeout)).Path);
+        log.BrokerAnswersOverride = null;
+
+        // The judgement, on what three brokers look like after two of them have gone at
+        // once: all three still listed in sync, and only one there to answer.
+        static string? Why(int leader, int[] inSync, int[] answering, int? minimum) =>
+            KafkaLog.WhyUnwritable("p.leader", 0, leader, inSync, answering.ToHashSet(), minimum);
+        Assert.Equal("p.leader [0] has no leader", Why(-1, [1, 2, 3], [1, 2, 3], 2));
+        Assert.Equal("p.leader [0] is led by broker 1, which does not answer", Why(1, [1, 2, 3], [3], 2));
+        Assert.Equal("p.leader [0] has 1 replica(s) in sync that answer (3 listed) and needs 2", Why(3, [1, 2, 3], [3], 2));
+        Assert.Null(Why(3, [1, 2, 3], [2, 3], 2));
+        Assert.Null(Why(3, [3, 2], [2, 3], 2));
+        Assert.Equal("p.leader [0] has 1 replica(s) in sync that answer (1 listed) and needs 2", Why(3, [3], [1, 2, 3], 2));
+        // A minimum that could not be asked is not guessed: the leader answers, and that is all that is known.
+        Assert.Null(Why(3, [1, 2, 3], [3], null));
 
         // Java's String.hashCode, which is what places a transactional id on a partition
         // of __transaction_state: values from a JVM.

@@ -270,6 +270,7 @@ public sealed class InMemoryServiceBackend : IServiceBackend, ICatalogMirror
         private LeadershipCallbacks? _callbacks;
         private NodeRole _role = NodeRole.Standby;
         private long _term;
+        private bool _takeoverFailed;
 
         public event Action<NodeLeadershipStatus>? Changed;
         public Task WhenFinished => _finished.Task;
@@ -283,7 +284,7 @@ public sealed class InMemoryServiceBackend : IServiceBackend, ICatalogMirror
                 {
                     var leader = _cluster.Leader;
                     return new NodeLeadershipStatus(
-                        backend.NodeId, _role, _term, leader?.NodeId, leader is null ? 0 : _cluster.Term);
+                        backend.NodeId, _role, _term, leader?.NodeId, leader is null ? 0 : _cluster.Term) { TakeoverFailed = _takeoverFailed };
                 }
             }
         }
@@ -348,6 +349,9 @@ public sealed class InMemoryServiceBackend : IServiceBackend, ICatalogMirror
             }
             catch
             {
+                // Fenced by its own doing, unless another node took over meanwhile.
+                lock (_cluster.Gate)
+                    _takeoverFailed = _role == NodeRole.Promoting;
                 Finish(NodeRole.Fenced);
                 throw;
             }

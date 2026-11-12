@@ -109,7 +109,16 @@ public interface INodeLeadership
 /// in-memory backend invents no heartbeat or lease numbers: <see cref="Kafka"/> is null there.</summary>
 public sealed record NodeLeadershipStatus(
     string NodeId, NodeRole Role, long Term, string? LeaderNodeId, long LeaderTerm,
-    KafkaLeadershipDetail? Kafka = null);
+    KafkaLeadershipDetail? Kafka = null)
+{
+    /// <summary>The node is <see cref="NodeRole.Fenced"/> because a takeover it began
+    /// failed after it had taken the log — the catalog, the storage or the start of its
+    /// pipelines failed it — and not because another node leads. Its process ends with
+    /// exit code 5 ("it could not lead"), which a supervisor answers with a growing delay
+    /// when it keeps happening; a node another node replaced ends with 3 and is started
+    /// again at once.</summary>
+    public bool TakeoverFailed { get; init; }
+}
 
 /// <summary>What only a Kafka-backed node knows of its leadership. <c>Fault</c> is why the
 /// node is <see cref="NodeRole.Fenced"/>, as text.</summary>

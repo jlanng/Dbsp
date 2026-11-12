@@ -98,8 +98,9 @@ public sealed class ServiceOptions
     /// for a pipeline whose spec names none.</summary>
     public RestartPolicy Restart { get; set; } = new();
 
-    /// <summary>Whether losing leadership (fenced: exit code 3; resigned: 4) stops the
-    /// host application. A process supervisor then restarts it as a standby.</summary>
+    /// <summary>Whether losing leadership (fenced: exit code 3; resigned: 4; a takeover
+    /// that failed after the node had taken the log: 5) stops the host application. A
+    /// process supervisor then restarts it as a standby.</summary>
     public bool ExitOnLeadershipLoss { get; set; } = true;
 
     /// <summary>

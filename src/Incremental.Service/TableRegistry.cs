@@ -1083,8 +1083,11 @@ internal sealed class FileTableSource<TKey, TRow>(IObjectStore store) : ITableSo
             }
             // Never loaded and nothing there: a file that is yet to be delivered, or a
             // path with a typing mistake in it. Either way the table is as it was, and
-            // that is said. An object that goes away after a load leaves its rows.
-            if (info is null && loaded is null)
+            // that is said. An object that goes away after a load leaves its rows — and
+            // "after a load" is the table's to say, not this run's: a node that took the
+            // table over, or was restarted, starts here with nothing loaded by itself
+            // and a table that has every version the load wrote.
+            if (info is null && loaded is null && context.Table.LatestVersion == 0)
                 context.ReportWaiting($"object {path} in store {context.Loader.Connection}");
             else
                 context.Report(TableSourceState.Idle, path);

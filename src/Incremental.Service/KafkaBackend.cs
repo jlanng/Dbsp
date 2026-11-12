@@ -182,7 +182,7 @@ public sealed class KafkaServiceBackend : IServiceBackend
             status.NodeId, status.Role, status.Term, status.LeaderNodeId, status.LeaderTerm,
             new KafkaLeadershipDetail(
                 status.HeartbeatAge, status.LeaderHeartbeatAt, status.LeaderResigned, status.HoldsLease, status.LastTakeover,
-                status.Fault is { } fault ? $"{fault.GetType().Name}: {fault.Message}" : null));
+                status.Fault is { } fault ? $"{fault.GetType().Name}: {fault.Message}" : null)) { TakeoverFailed = status.TakeoverFailed };
 
         public void Track(ChangelogStorage storage)
         {

@@ -333,7 +333,20 @@ public sealed class KafkaLog : IAsyncDisposable
     /// <see cref="KafkaLogFencedException"/>.
     /// </para>
     /// </summary>
-    public Task AcquireWriterAsync(CancellationToken cancellationToken = default)
+    public Task AcquireWriterAsync(CancellationToken cancellationToken = default) =>
+        AcquireWriterUnlessAsync(CancellationToken.None, cancellationToken);
+
+    /// <summary>
+    /// <see cref="AcquireWriterAsync"/> for a caller that may find the
+    /// acquisition is not needed after all (a standby that hears its leader):
+    /// <paramref name="whileFree"/> calls it off for as long as that costs nothing, which
+    /// is until the transactional id is this process's. From that moment the previous
+    /// writer is fenced, whatever it was doing, and an acquisition that stopped there
+    /// would leave the log with no writer at all: the token is no longer looked at, and
+    /// the call goes on to commit its term. <paramref name="cancellationToken"/> is the
+    /// caller going away, and ends the call at any point.
+    /// </summary>
+    internal Task AcquireWriterUnlessAsync(CancellationToken whileFree, CancellationToken cancellationToken)
     {
         lock (_gate)
         {
@@ -342,7 +355,7 @@ public sealed class KafkaLog : IAsyncDisposable
                 return Task.FromException(new KafkaLogFencedException(fenced.Message, fenced.InnerException));
             if (_acquire is { IsCompleted: false } or { IsCompletedSuccessfully: true })
                 return _acquire;
-            return _acquire = Task.Run(() => AcquireAsync(cancellationToken), CancellationToken.None);
+            return _acquire = Task.Run(() => AcquireAsync(cancellationToken, whileFree), CancellationToken.None);
         }
     }
 
@@ -368,7 +381,7 @@ public sealed class KafkaLog : IAsyncDisposable
     /// where a real one can be.</summary>
     internal Action<string>? WhileAcquiring { get; set; }
 
-    private async Task AcquireAsync(CancellationToken cancellationToken)
+    private async Task AcquireAsync(CancellationToken cancellationToken, CancellationToken whileFree)
     {
         ThrowIfFenced();
         var began = false;
@@ -376,7 +389,7 @@ public sealed class KafkaLog : IAsyncDisposable
             _acquiring = true;
         try
         {
-            await AcquireCoreAsync(() => began = true, cancellationToken).ConfigureAwait(false);
+            await AcquireCoreAsync(() => began = true, cancellationToken, whileFree).ConfigureAwait(false);
         }
         catch (Exception ex) when (!_isWriter && began && Volatile.Read(ref _disposed) == 0
             && (ex is KafkaLogFencedException || (ex is OperationCanceledException && !_stop.IsCancellationRequested)))
@@ -427,7 +440,7 @@ public sealed class KafkaLog : IAsyncDisposable
         });
     }
 
-    private async Task AcquireCoreAsync(Action begun, CancellationToken cancellationToken)
+    private async Task AcquireCoreAsync(Action begun, CancellationToken cancellationToken, CancellationToken whileFree)
     {
         var clock = System.Diagnostics.Stopwatch.StartNew();
         if (!_initialised)
@@ -436,6 +449,12 @@ public sealed class KafkaLog : IAsyncDisposable
             WhileAcquiring?.Invoke("begin");
             while (true)
             {
+                // The one stretch in which the acquisition can be called off for nothing
+                // (whileFree). A slice that has timed out may have a request on its way
+                // that still lands — the client is put away, and its request with it if
+                // it had not left — so "for nothing" is the rule and not a certainty; the
+                // caller's answer to the exception is to watch the writer it spared.
+                whileFree.ThrowIfCancellationRequested();
                 cancellationToken.ThrowIfCancellationRequested();
                 _stop.Token.ThrowIfCancellationRequested();
                 try
@@ -463,6 +482,10 @@ public sealed class KafkaLog : IAsyncDisposable
         begun();
         WhileAcquiring?.Invoke("initialised");
 
+        // The point of no return for whileFree: the previous writer is fenced. Nothing
+        // below looks at that token — a call that stopped here because its caller had
+        // changed its mind would leave a fenced writer and no other.
+        //
         // Every earlier writer's transactions are decided now, so the leader topic's last
         // term is final.
         var initialised = clock.Elapsed;
@@ -1255,30 +1278,44 @@ public sealed class KafkaLog : IAsyncDisposable
         Unknown,
 
         /// <summary>The leader topic's partition, and the partition that holds this
-        /// log's transactional id, have a leader and enough replicas in sync.</summary>
+        /// log's transactional id, have a leader that answers and enough replicas in
+        /// sync that answer.</summary>
         Writable,
 
-        /// <summary>One of them has no leader, or fewer replicas in sync than
-        /// <c>min.insync.replicas</c>: no process can commit through this log now.</summary>
+        /// <summary>One of them has no leader, or a leader that does not answer, or
+        /// fewer replicas in sync that answer than <c>min.insync.replicas</c>: no
+        /// process can commit through this log now.</summary>
         Unwritable,
     }
 
     /// <summary>For tests: answers <see cref="ProbeWritePathAsync"/> instead of the brokers.</summary>
     internal Func<(WritePath Path, string? Why)>? WritePathOverride { get; set; }
 
+    /// <summary>For tests: says whether a broker answers, instead of asking it.</summary>
+    internal Func<int, bool>? BrokerAnswersOverride { get; set; }
+
     private readonly Dictionary<string, int> _minInSync = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Asks the brokers whether a commit through this log could succeed right now, by any
     /// process: whether the leader topic's partition and the transaction coordinator's
-    /// partition for this log's transactional id each have a leader and at least
-    /// <c>min.insync.replicas</c> replicas in sync. A standby asks before it takes over
-    /// from a leader that is alive and silent (<see cref="KafkaLeadership"/>): if the
-    /// answer is <see cref="WritePath.Unwritable"/> the leader's silence is the brokers',
-    /// and a takeover would only wait in the same place. It is the controller's view, so
-    /// it is as stale as the controller is: a broker that died less than its session
-    /// timeout ago still counts, and with no controller quorum nothing changes at all —
-    /// those read as <see cref="WritePath.Writable"/>. Never throws.
+    /// partition for this log's transactional id each have a leader that answers and at
+    /// least <c>min.insync.replicas</c> replicas in sync that answer. A standby asks
+    /// before it takes over from a leader that is alive and silent
+    /// (<see cref="KafkaLeadership"/>): if the answer is <see cref="WritePath.Unwritable"/>
+    /// the leader's silence is the brokers', and a takeover would only wait in the same
+    /// place.
+    /// <para>
+    /// Who leads a partition and who is in sync is the cluster's metadata, which is as
+    /// stale as its controller: a broker that died less than its session timeout ago is
+    /// still listed, and with no controller quorum — two of three brokers lost at once —
+    /// nothing is ever taken off the lists, which then say that all is well for as long
+    /// as the outage lasts. So the lists are not believed by themselves: each broker
+    /// they name is asked something directly (its own configuration, which only that
+    /// broker can answer), and one that does not answer does not count. The metadata is
+    /// asked of any broker and not of the controller, which may be what is missing.
+    /// </para>
+    /// Never throws.
     /// </summary>
     internal async Task<(WritePath Path, string? Why)> ProbeWritePathAsync(CancellationToken cancellationToken)
     {
@@ -1314,31 +1351,119 @@ public sealed class KafkaLog : IAsyncDisposable
     private async Task<string?> UnwritableAsync(string topic, Func<int, int> partitionOf, CancellationToken cancellationToken)
     {
         var timeout = TimeSpan.FromSeconds(2);
-        var described = await _admin.DescribeTopicsAsync(
-            TopicCollection.OfTopicNames([topic]), new DescribeTopicsOptions { RequestTimeout = timeout })
-            .WaitAsync(timeout * 2, cancellationToken).ConfigureAwait(false);
-        var partitions = described.TopicDescriptions[0].Partitions;
-        if (partitions.Count == 0)
-            throw new InvalidOperationException($"Topic '{topic}' was described without partitions.");
-        var partition = partitions[partitionOf(partitions.Count)];
-        if (partition.Leader is null || partition.Leader.Id < 0)
-            return $"{topic} [{partition.Partition}] has no leader";
 
-        int minimum;
+        // Any broker's word (a Metadata request), not the controller's: a cluster that has
+        // lost its controller quorum never answers what is asked of the controller, and
+        // that is one of the states this is here to recognise.
+        var metadata = await Task.Run(() => _admin.GetMetadata(topic, timeout), cancellationToken)
+            .WaitAsync(timeout * 2, cancellationToken).ConfigureAwait(false);
+        var described = metadata.Topics.FirstOrDefault(t => t.Topic == topic);
+        if (described is null || described.Error.IsError || described.Partitions.Count == 0)
+            throw new InvalidOperationException($"Topic '{topic}' was described without partitions ({described?.Error.Reason ?? "it is not in the answer"}).");
+        var index = partitionOf(described.Partitions.Count);
+        var partition = described.Partitions.FirstOrDefault(p => p.PartitionId == index)
+            ?? throw new InvalidOperationException($"Topic '{topic}' was described without partition {index}.");
+        if (partition.Leader < 0)
+            return WhyUnwritable(topic, index, partition.Leader, partition.InSyncReplicas, new HashSet<int>(), null);
+
+        // The lists name brokers; whether each is there is asked of the broker itself.
+        var listed = partition.InSyncReplicas.Append(partition.Leader).Distinct().ToArray();
+        var asked = await Task.WhenAll(listed.Select(broker => BrokerAnswersAsync(broker, cancellationToken))).ConfigureAwait(false);
+        var answering = listed.Where((_, i) => asked[i]).ToHashSet();
+
+        // The minimum is the topic's configuration, which is asked of the controller: it
+        // is asked once and kept (PrimeWritePathAsync asks it while all is well).
+        var minimum = answering.Contains(partition.Leader) ? await MinInSyncAsync(topic, cancellationToken).ConfigureAwait(false) : null;
+        return WhyUnwritable(topic, index, partition.Leader, partition.InSyncReplicas, answering, minimum);
+    }
+
+    /// <summary>The judgement itself: why a partition with this leader and these replicas
+    /// in sync cannot be written, given which of those brokers answer and the topic's
+    /// <c>min.insync.replicas</c> (null: not known, and then the count is not judged);
+    /// null if it can.</summary>
+    internal static string? WhyUnwritable(
+        string topic, int partition, int leader, IReadOnlyList<int> inSync, IReadOnlySet<int> answering, int? minimum)
+    {
+        if (leader < 0)
+            return $"{topic} [{partition}] has no leader";
+        if (!answering.Contains(leader))
+            return $"{topic} [{partition}] is led by broker {leader}, which does not answer";
+        var there = inSync.Count(answering.Contains);
+        return minimum is { } needed && there < needed
+            ? $"{topic} [{partition}] has {there} replica(s) in sync that answer ({inSync.Count} listed) and needs {needed}"
+            : null;
+    }
+
+    /// <summary><c>min.insync.replicas</c> of <paramref name="topic"/>, asked once and
+    /// kept; null while it cannot be asked.</summary>
+    private async Task<int?> MinInSyncAsync(string topic, CancellationToken cancellationToken)
+    {
         lock (_minInSync)
-            minimum = _minInSync.GetValueOrDefault(topic);
-        if (minimum == 0)
+        {
+            if (_minInSync.TryGetValue(topic, out var known))
+                return known;
+        }
+        var timeout = TimeSpan.FromSeconds(2);
+        try
         {
             var configs = await _admin.DescribeConfigsAsync(
                 [new ConfigResource { Type = ResourceType.Topic, Name = topic }], new DescribeConfigsOptions { RequestTimeout = timeout })
                 .WaitAsync(timeout * 2, cancellationToken).ConfigureAwait(false);
-            minimum = configs[0].Entries.TryGetValue("min.insync.replicas", out var entry) && int.TryParse(entry.Value, out var parsed) ? parsed : 1;
+            var minimum = configs[0].Entries.TryGetValue("min.insync.replicas", out var entry) && int.TryParse(entry.Value, out var parsed) ? parsed : 1;
             lock (_minInSync)
                 _minInSync[topic] = minimum;
+            return minimum;
         }
-        return partition.ISR.Count < minimum
-            ? $"{topic} [{partition.Partition}] has {partition.ISR.Count} replica(s) in sync and needs {minimum}"
-            : null;
+        catch (Exception ex) when (ex is KafkaException or TimeoutException or InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Learns, while the brokers can say, what <see cref="ProbeWritePathAsync"/>
+    /// cannot ask in the middle of an outage: the topics' <c>min.insync.replicas</c>.
+    /// A standby calls it when it starts to watch. Never throws.</summary>
+    internal async Task PrimeWritePathAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await MinInSyncAsync(_leaderPartition.Topic, cancellationToken).ConfigureAwait(false);
+            await MinInSyncAsync("__transaction_state", cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    /// <summary>Whether broker <paramref name="broker"/> answers a request that only it
+    /// can answer: a description of its own configuration, which the client sends to
+    /// that broker and to no other. An answer that refuses (a node that may not describe
+    /// brokers) is an answer. Silence for a second and a half is not.</summary>
+    internal async Task<bool> BrokerAnswersAsync(int broker, CancellationToken cancellationToken)
+    {
+        if (BrokerAnswersOverride is { } injected)
+            return injected(broker);
+        var timeout = TimeSpan.FromSeconds(1.5);
+        try
+        {
+            await _admin.DescribeConfigsAsync(
+                [new ConfigResource { Type = ResourceType.Broker, Name = broker.ToString(System.Globalization.CultureInfo.InvariantCulture) }],
+                new DescribeConfigsOptions { RequestTimeout = timeout })
+                .WaitAsync(timeout * 2, cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (DescribeConfigsException ex)
+        {
+            return ex.Results.Any(result => result.Error.IsBrokerError);
+        }
+        catch (KafkaException ex)
+        {
+            return ex.Error.IsBrokerError;
+        }
+        catch (TimeoutException)
+        {
+            return false;
+        }
     }
 
     /// <summary><c>String.hashCode</c> as Java computes it: what the brokers place a

@@ -127,6 +127,49 @@ public class NodeSupervisorTests
     }
 
     [Fact]
+    public async Task A_node_whose_own_takeover_failed_ends_with_5_and_is_slowed_down_where_one_that_was_replaced_ends_with_3()
+    {
+        // The node's side: what it exits with. Replaced by another node, or resigned: how a
+        // healthy node ends. Fenced by its own doing — it took the log and then could not
+        // lead — is a failure, and the same failure is likely waiting for the next start.
+        static NodeLeadershipStatus Status(Incremental.Kafka.NodeRole role, bool failed = false) => new("a", role, 2, "b", 3) { TakeoverFailed = failed };
+        Assert.Equal(3, ServiceNode.ExitCodeFor(Status(Incremental.Kafka.NodeRole.Fenced)));
+        Assert.Equal(4, ServiceNode.ExitCodeFor(Status(Incremental.Kafka.NodeRole.Resigned)));
+        Assert.Equal(5, ServiceNode.ExitCodeFor(Status(Incremental.Kafka.NodeRole.Fenced, failed: true)));
+
+        // The in-memory leadership says which it was, as the Kafka one does.
+        var cluster = new InMemoryServiceCluster();
+        var failing = cluster.Node("a");
+        var callbacks = new LeadershipCallbacks(
+            _ => Task.CompletedTask, (_, _) => throw new InvalidOperationException("no pipelines today"), _ => Task.CompletedTask,
+            () => throw new NotSupportedException());
+        await Assert.ThrowsAsync<InvalidOperationException>(() => failing.Leadership.StartAsync(callbacks, default));
+        Assert.Equal(Incremental.Kafka.NodeRole.Fenced, failing.Leadership.Status.Role);
+        Assert.True(failing.Leadership.Status.TakeoverFailed);
+        Assert.Equal(5, ServiceNode.ExitCodeFor(failing.Leadership.Status));
+
+        var leading = cluster.Node("b");
+        var taking = cluster.Node("c");
+        var fine = new LeadershipCallbacks(_ => Task.CompletedTask, (_, _) => Task.CompletedTask, _ => Task.CompletedTask, () => throw new NotSupportedException());
+        await leading.Leadership.StartAsync(fine, default);
+        await taking.Leadership.StartAsync(fine, default);
+        await taking.Leadership.TakeOverAsync(default);
+        Assert.Equal(Incremental.Kafka.NodeRole.Fenced, leading.Leadership.Status.Role);
+        Assert.False(leading.Leadership.Status.TakeoverFailed);
+        Assert.Equal(3, ServiceNode.ExitCodeFor(leading.Leadership.Status));
+
+        // The supervisor's side: a node that keeps ending with 5 is started again more
+        // and more slowly, where one that keeps ending with 3 is started again at once.
+        using var failed = new Supervised("5", "5", "5");
+        Assert.Equal(0, await failed.ExitCodeAsync());
+        var delays = System.Text.RegularExpressions.Regex.Matches(failed.Said, @"starting it again in (\d+) ms").Select(m => int.Parse(m.Groups[1].Value)).ToList();
+        Assert.Equal([400, 800, 1600], delays);
+        using var replaced = new Supervised("3", "3", "3");
+        Assert.Equal(0, await replaced.ExitCodeAsync());
+        Assert.Equal(3, replaced.Count("starting it again in 200 ms"));
+    }
+
+    [Fact]
     public async Task A_process_that_refuses_its_arguments_is_not_started_again()
     {
         using var supervised = new Supervised("2", "3");

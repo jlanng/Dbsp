@@ -611,46 +611,87 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
     private static string Flat(string problem) =>
         string.Join(" ", problem.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
 
+    /// <summary>What a slot of a stored spec claims or reads; null for a config its
+    /// connector no longer accepts, which claims nothing.</summary>
+    private ConnectorDescription? Described(JsonElement config)
+    {
+        try
+        {
+            return TryConnector(config)?.Describe(config);
+        }
+        catch
+        {
+            return null;        // not a config that binds any more
+        }
+    }
+
+    private static IEnumerable<KeyValuePair<string, JsonElement>> SinkSlots(PipelineSpec spec) =>
+        spec.DeadLetters is { } letters ? spec.Sinks.Append(new(PipelineSpec.DeadLetterSlot, letters)) : spec.Sinks;
+
+    private const string WhySinksAreNotRead =
+        "a sink writes a step again under the name it had, and folds and deletes its objects, which a source that reads on by name cannot follow — " +
+        "put a Kafka topic or a table between the two pipelines, or load the objects with FileSinkFormat";
+
     /// <summary>
     /// What a sink claims for itself (<see cref="ConnectorDescription.Owns"/>) is one sink
-    /// slot's: not another slot's of this spec, and not a sink's of another pipeline. A
-    /// stored spec whose config its connector no longer accepts claims nothing.
+    /// slot's: not another slot's of this spec, not a sink's of another pipeline, and not
+    /// something an input reads (<see cref="ConnectorDescription.Reads"/>) — this spec's
+    /// or another pipeline's. A stored spec whose config its connector no longer accepts
+    /// claims nothing.
     /// </summary>
     private void RequireUnowned(PipelineSpec spec, string slot, string claim, Dictionary<string, string> owned)
     {
         if (!owned.TryAdd(claim, slot))
             throw new InvalidOperationException($"it would write what this spec's sink slot '{owned[claim]}' writes ({claim}); a sink has that to itself");
+        foreach (var (input, config) in spec.Inputs)
+        {
+            if (Described(config)?.Reads is { } read && claim.StartsWith(read, StringComparison.Ordinal))
+                throw new InvalidOperationException($"this spec's input slot '{input}' reads it ({read}): {WhySinksAreNotRead}");
+        }
         foreach (var other in Specs)
         {
             if (other.Id == spec.Id)
                 continue;
-            var sinks = other.DeadLetters is { } letters ? other.Sinks.Append(new(PipelineSpec.DeadLetterSlot, letters)) : other.Sinks;
-            foreach (var (name, config) in sinks)
+            foreach (var (name, config) in SinkSlots(other))
             {
-                string? theirs = null;
-                try
-                {
-                    theirs = TryConnector(config)?.Describe(config).Owns;
-                }
-                catch
-                {
-                    // Not a config that binds any more.
-                }
-                if (theirs == claim)
+                if (Described(config)?.Owns == claim)
                     throw new InvalidOperationException(
                         $"it would write what pipeline '{other.Id}' writes from its sink slot '{name}' ({claim}); a sink has that to itself");
+            }
+            foreach (var (name, config) in other.Inputs)
+            {
+                if (Described(config)?.Reads is { } read && claim.StartsWith(read, StringComparison.Ordinal))
+                    throw new InvalidOperationException(
+                        $"pipeline '{other.Id}' reads it as its input slot '{name}' ({read}): {WhySinksAreNotRead}");
             }
         }
     }
 
-    /// <summary>The claims of every sink of <paramref name="spec"/>, checked again where
-    /// specs are committed one at a time: two deploys that passed their dry runs side by
-    /// side cannot both take one prefix.</summary>
+    /// <summary>An input does not read what a sink owns — another pipeline's sink; this
+    /// spec's own sinks are checked from their side (<see cref="RequireUnowned"/>).</summary>
+    private void RequireNotASinks(PipelineSpec spec, string read)
+    {
+        foreach (var other in Specs)
+        {
+            if (other.Id == spec.Id)
+                continue;
+            foreach (var (name, config) in SinkSlots(other))
+            {
+                if (Described(config)?.Owns is { } claim && claim.StartsWith(read, StringComparison.Ordinal))
+                    throw new InvalidOperationException(
+                        $"it would read what pipeline '{other.Id}' writes from its sink slot '{name}' ({claim}): {WhySinksAreNotRead}");
+            }
+        }
+    }
+
+    /// <summary>The claims of every sink of <paramref name="spec"/> and what its inputs
+    /// read, checked again where specs are committed one at a time: two deploys that
+    /// passed their dry runs side by side cannot both take one prefix, nor one take what
+    /// the other reads.</summary>
     private void RequireSinksUnowned(PipelineSpec spec)
     {
         var owned = new Dictionary<string, string>(StringComparer.Ordinal);
-        var sinks = spec.DeadLetters is { } letters ? spec.Sinks.Append(new(PipelineSpec.DeadLetterSlot, letters)) : spec.Sinks;
-        foreach (var (slot, config) in sinks)
+        foreach (var (slot, config) in SinkSlots(spec))
         {
             try
             {
@@ -660,6 +701,18 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             catch (InvalidOperationException ex)
             {
                 throw ServiceException.Invalid($"Pipeline '{spec.Id}' does not bind.", [$"sink slot '{slot}': {ex.Message}"]);
+            }
+        }
+        foreach (var (slot, config) in spec.Inputs)
+        {
+            try
+            {
+                if (context.Connector(config).Describe(config).Reads is { } read)
+                    RequireNotASinks(spec, read);
+            }
+            catch (InvalidOperationException ex)
+            {
+                throw ServiceException.Invalid($"Pipeline '{spec.Id}' does not bind.", [$"input slot '{slot}': {ex.Message}"]);
             }
         }
     }
@@ -686,6 +739,8 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 (connector as ITypedConnector)?.RequireTypes(kind, clr.Record, clr.Key);
                 if (claims && kind is SlotKind.UpsertSink or SlotKind.AppendSink && described.Owns is { } claim)
                     RequireUnowned(spec, slot, claim, owned);
+                if (claims && kind is SlotKind.AppendInput or SlotKind.KeyedInput && described.Reads is { } read)
+                    RequireNotASinks(spec, read);
             }
             catch (Exception ex)
             {
@@ -2067,9 +2122,10 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             Dictionary<string, Dictionary<int, long>>? perSlot = null;
             foreach (var (key, offset) in committed)
             {
-                // The step sequence and the event-time clock ($watermark…) are the
-                // circuit's own entries, not a position in any input.
-                if (key.StartsWith('$'))
+                // The step sequence and the event-time clock are the circuit's own
+                // entries, not a position in any input: those keys exactly, since an
+                // input may itself be named with a '$' ("$watermark-feed").
+                if (key is "$step" or "$watermark" || key.StartsWith("$watermark#s", StringComparison.Ordinal))
                     continue;
                 var mark = key.LastIndexOf("#p", StringComparison.Ordinal);
                 if (mark > 0 && worded.Any(w => key.AsSpan(0, mark).SequenceEqual(w.Slot))
