@@ -1335,7 +1335,9 @@ What to know:
   compacted, for an upsert sink.
 - **Fenced and resigned are final.** A node that has been taken over, or has stepped
   down, stops its host with exit code 3 or 4 and comes back, when its supervisor restarts
-  it, as the standby. Something must restart it: the platform's restart policy, or
+  it, as the standby. (5 is a node that could not lead — its catalog writer faulted, or
+  a takeover of its own failed after it had taken the log — and a supervisor slows a
+  node down that keeps ending so.) Something must restart it: the platform's restart policy, or
   `NodeSupervisor.RunAsync(args)` at the top of `Main`, which runs the program as its
   own child and starts it again after every exit but 0 and 2. `node.StepDownAsync` is refused unless the peer's probe answers as a
   ready standby; `node.TakeOverAsync` unless this node is warm; both take `Force`.
@@ -1446,7 +1448,10 @@ bound to the built-in `files` connector: JSON-lines objects under a prefix of an
 write, a sixth to page its listing). As a source it reads objects in name order with
 the object and line in the checkpoint, asks only for names after its position, and
 waits `settle` for an object to be left alone so that one arriving a little late is
-still read in its place; a keyed input can read deletes (`"format": "changes"`). As a
+still read in its place (by the store's own times, or by how long the source has seen
+the object: not by the node's clock against the store's); a keyed input can read
+deletes (`"format": "changes"`). An input is refused on a prefix a `files` sink
+writes: a sink rewrites and folds its objects, and a source follows names. As a
 sink it writes one object per step, named by the step, its leader term and the
 checkpoint it started from, so that a step delivered again overwrites itself and a
 replaced leader's late object is void once its successor writes; `retain` and

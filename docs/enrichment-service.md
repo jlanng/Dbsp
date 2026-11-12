@@ -405,7 +405,11 @@ What a second input changes:
   late after, and a closed window stays closed. And the keys that were open still close
   when the watermark passes them, whether or not another record ever touches them. The
   cost is one more state entry per open key or window per operator that bounds it,
-  written when the key opens and removed when it closes.
+  written when the key opens and removed when it closes. A remembered `Lookup` under
+  `EvictWhen` is the one operator whose entries are not per key: it remembers per fact,
+  so it has one entry per fact it remembers — keyed by the fact, as its remembered row
+  is — written when the fact is asserted and removed when the fact is taken back or its
+  key closes. An order that is corrected a hundred times costs one entry, not a hundred.
 - **`LeftJoin` emits the unmatched row and takes it back.** An execution whose quote has
   not arrived is emitted as unpriced; when the quote arrives the unpriced row is
   retracted and the priced one asserted, and the window totals downstream follow. The
@@ -1229,7 +1233,11 @@ is created. So `Create` must open nothing.
 Two more optional interfaces are for what the service shows. A sink connector whose
 slot must be the only writer of something returns that something's name as
 `ConnectorDescription.Owns`; the service refuses a second sink slot with the same
-claim (the `files` sink claims its store and prefix). A source connector whose
+claim (the `files` sink claims its store and prefix). A source connector whose input
+would read what such a sink owns returns the name of what it reads as
+`ConnectorDescription.Reads`, chosen so that it starts the sink's claim exactly then;
+the service refuses the input, and a sink onto what an input reads (the `files`
+source's is its store and prefix). A source connector whose
 position is not a partition and an offset to a person implements `IPositionDescribing`,
 and a dead letter then carries its wording (`afterAt`).
 
@@ -1281,14 +1289,25 @@ What reading in name order asks of whoever writes the objects:
   malformed, and its completed form is never read;
 - **`settle`** (five seconds unless the slot says otherwise) is how late an object may
   arrive behind one with a greater name. An object is read only once it has been left
-  unchanged that long (its modification time), and nothing after it in name order is
-  read before it: the source stops at the first object that has not settled and waits.
-  So two writers that finish a moment apart, or a store whose listing shows a new name a
-  moment late, lose nothing as long as each object appears within `settle` of the
-  objects that sort after it. One that arrives later than that, behind the position, is
-  never read, and nothing says so. Every object is read at least `settle` after it was
-  written; `"settle": "00:00:00"` reads at once, and is right where names only ever
-  increase and each object appears whole (the example's quote files);
+  unchanged that long, and nothing after it in name order is read before it: the source
+  stops at the first object that has not settled and waits. So two writers that finish a
+  moment apart, or a store whose listing shows a new name a moment late, lose nothing as
+  long as each object appears within `settle` of the objects that sort after it. One
+  that arrives later than that, behind the position, is never read, and nothing says
+  so. Every object is read at least `settle` after it was written; `"settle":
+  "00:00:00"` reads at once, and is right where names only ever increase and each object
+  appears whole (the example's quote files).
+
+  "Left unchanged that long" is never the node's clock against the store's — a file
+  server or a bucket keeps its own time, and a node a few seconds ahead of it would
+  call every object old the moment it appeared. An object has settled when the store's
+  own modification times say so (a listing has shown an object modified at least
+  `settle` after it), or when the source has itself seen it, unchanged, for `settle`.
+  The first is what reads a backlog as fast as it lists; the second is what the newest
+  objects wait out, and what every object waits out once after a restart if nothing
+  newer is there. What it still trusts is that a modification time is when the object
+  appeared: a file written an hour ago and moved into the prefix now carries the hour,
+  and is read at once when a newer object is listed;
 - old objects can be deleted. The position does not need the object it names.
 
 A line that is not a record is rejected in its place: it faults the pipeline under the
@@ -1302,8 +1321,10 @@ checkpointed.
 
 A keyed input takes every line as an upsert unless its slot says `"format": "changes"`:
 then a line is `{"key":…,"row":…}` (an upsert) or `{"key":…,"deleted":true}` (a
-delete) — what an upsert sink of this connector writes, so one pipeline's upsert sink
-can be another's keyed input with its deletes.
+delete) — the lines an upsert sink of this connector writes, so what one pipeline wrote
+can be handed to another as files, deletes included, by whatever copies the objects on
+under names of its own. Not by pointing the input at the sink's prefix: that is
+refused (below).
 
 A source that has found nothing under its prefix says so: the pipeline's page shows the
 input *waiting for objects under quotes/ in store lake*, and after
@@ -1336,9 +1357,29 @@ are about to be run again and may be cut differently. A pipeline that is reset h
 objects deleted. So a prefix belongs to one sink slot of one pipeline, and the service
 holds to it: a spec whose sink, or dead-letter sink, names a store and prefix that
 another sink slot already writes — its own or another pipeline's — is refused at the dry
-run and at the deploy. (A source may read a prefix a sink writes; that is one pipeline
-feeding another.) An object is written whole or not at all: a write that fails or is
-cancelled part-way leaves nothing under the step's name.
+run and at the deploy. An object is written whole or not at all: a write that fails or
+is cancelled part-way leaves nothing under the step's name.
+
+**A `files` input does not read what a `files` sink writes**, and the service refuses
+it in either order: an input whose prefix a sink's objects lie under (the sink's own
+prefix, or one above it), and a sink onto a prefix an input already reads — at the dry
+run and at the deploy, naming the other pipeline and slot. A sink's objects are not a
+log of names, and a source follows names:
+
+- a step above the sink's checkpoint is run again after a restart and written under
+  the name it had, with whatever the new cut of the step holds. A source that had read
+  the name already never sees the difference;
+- `compactAfter` folds step objects into a snapshot and deletes them, and the snapshot
+  leaves deleted keys out. A source that had not yet read the folded objects never sees
+  their deletes, and reads the snapshot as so many upserts;
+- `retain` deletes objects a source may not have reached, and rule 3 below — an object
+  a replaced leader finished late is void — needs the whole listing, which a source
+  that reads on does not have.
+
+Put a Kafka topic between two pipelines, or a table one writes and the other reads
+(`ToTable`); to load a sink's objects somewhere else, read them with `FileSinkFormat`,
+which applies the rules. A source whose `suffix` no sink object can end in (`.csv`)
+is not refused: it reads none of them.
 
 **The reader's rules** — what `FileSinkFormat.ReadAppendsAsync` and `ReadUpsertsAsync`
 do over an `IObjectStore`, and what anything else that reads the objects must do:
@@ -1739,15 +1780,20 @@ Delivery is at least once: whatever the old leader had delivered but not committ
 delivered again. An upsert sink converges; an append sink sees duplicates.
 
 **A node that stops leading exits, and must be started again.** Exit code 3: fenced by
-a takeover. 4: resigned (stepped down). 5: its catalog writer faulted and no ready
-standby answered. A restarted node is the standby. This is half of the design and the
+a takeover. 4: resigned (stepped down). 5: it could not lead — its catalog writer
+faulted and no ready standby answered, or a takeover of its own failed after it had
+taken the log (its catalog, its storage or the start of its pipelines failed; nobody
+replaced it). A restarted node is the standby. This is half of the design and the
 other half is yours: whatever runs the process must start it again, or the deployment
 has one node after its first takeover and none after its second. The contract:
 
 - start it again after every exit except 0 (it was asked to stop) and 2 (it refused its
   arguments) — after a crash or a kill as well;
 - at once after 3 and 4, which is how a healthy node ends; with a delay that doubles, up
-  to half a minute, while it keeps ending within a minute of starting;
+  to half a minute, while it keeps ending within a minute of starting — which is what a
+  node that ends with 5 does when whatever failed its takeover is still there: each
+  attempt restores its tables, takes the log and commits a term, and without the delay
+  two such nodes would do that every few seconds;
 - never give up after some number of restarts;
 - pass a stop request on (SIGTERM) and wait for the node, which steps down if a ready
   standby answers and takes up to `StopTimeout` to drain if not.
@@ -1799,7 +1845,10 @@ takes over on the silence instead.
 object that does not exist is declared, empty, and its loader shows `Waiting` with what
 it waits for (`object nope.jsonl in store refdata`) instead of `Idle`; a `files` input
 whose prefix holds nothing shows *waiting for objects under …* on its pipeline. Nothing
-has failed — a file yet to be delivered looks the same — so neither is a fault. After
+has failed — a file yet to be delivered looks the same — so neither is a fault. (A table
+that has been loaded is not waiting, whatever has become of its file since: a file the
+upstream job takes away after delivery leaves the rows, on the node that loaded it and
+on the one that takes the table over or is restarted.) After
 `ServiceOptions.MissingInputGrace` (30 s) each is an event (`loader waiting for …`,
 `input 'quotes' waiting for …`) and a reason the node is `Degraded`: `loader-waiting`,
 `source-waiting`. Both end, with an event, when the first object is there. The dry run

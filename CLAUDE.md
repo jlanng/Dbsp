@@ -261,26 +261,46 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   and `Resigned` are final (the process exits) — no demotion in place. Takeover order:
   writer, tables, storage, circuits. A node that cannot lead must stop heartbeating.
   The one way back to `Standby` is a takeover that ends before the node is the log's
-  writer (the leader was heard after all; the acquisition was fenced, which a replaced
-  leader's stale request to the coordinator can do — `StaleEpochRequestTests`): nothing
-  is promoted before `AcquireWriterAsync` returns, and that must stay so. Such an
-  acquisition replaces the producer (`KafkaLogNotAcquiredException`); never keep a
-  client whose `InitTransactions` was cancelled — it finishes by itself and fences the
-  leader. The process must run under something that starts it again after exit codes
+  writer (the leader was heard before this node had taken the transactional id; the
+  acquisition was fenced, which a replaced leader's stale request to the coordinator
+  can do — `StaleEpochRequestTests`): nothing is promoted before `AcquireWriterAsync`
+  returns, and that must stay so. Such an acquisition replaces the producer
+  (`KafkaLogNotAcquiredException`); never keep a client whose `InitTransactions` was
+  cancelled — it finishes by itself and fences the leader. A takeover is called off
+  for a heard leader only until `InitTransactions` has returned
+  (`AcquireWriterUnlessAsync`): after that the leader is fenced and the takeover must go
+  through — do not add a check of the abandon token past that point, or a fenced
+  leader and a standby that stood down are what is left. A takeover given up for a
+  heard leader holds the next attempt back by nothing; one lost to a fence waits.
+  The process must run under something that starts it again after exit codes
   3, 4 and 5 (`NodeSupervisor`, or the platform's restart policy): without it a
-  deployment is one node after its first takeover.
+  deployment is one node after its first takeover. 3 and 4 are how a healthy node ends
+  (replaced, resigned) and are answered at once; 5 is a node that could not lead —
+  including a takeover of its own that failed after it had taken the log
+  (`LeadershipStatus.TakeoverFailed`) — and is answered with a growing delay. Do not
+  map a failure of the node's own to 3.
+  The ceiling's question to the brokers (`KafkaLog.ProbeWritePathAsync`) does not
+  believe the metadata's lists of leaders and replicas in sync by themselves: with no
+  controller quorum they never change. It asks any broker for the metadata and each
+  listed broker directly; keep it so.
 - `CircuitBuilder.Describe` reports a `Lookup`'s table as `Probes`, not among `Inputs`:
   the lookup probes the table and does not consume its changes, so the edge belongs to
   the picture and must never become an execution input.
 - Event-time state is checkpointed state (docs/design/durability-and-standby.md, *Event-time
   state*). The clock commits in the offsets marker (`$watermark`, `$watermark#s{n}`) and is
-  restored at `Start()`; every deadline an operator waits on lives in an `IDeadlineStore`
+  restored at `Start()`; those keys exactly — never tell the clock's entries from an
+  input's by how a key starts (`$watermark-feed` is an input). Every deadline an operator waits on lives in an `IDeadlineStore`
   (`{node}.deadlines.w{n}`), never in a field: an operator that evicts or announces on the
   watermark goes through `EvictionTracker` (or sets deadlines in a store itself, as the
   session operator does), calls `DrainClosed()` once per step on every way out, and keeps
-  no queue of its own. A checkpointing `IStorageProvider` must implement
+  no queue of its own. An operator whose tracked keys come and go under a grouping's key
+  (the remembered `Lookup` tracks facts) calls `EvictionTracker.Forget` for one it holds
+  nothing for any more, or every key ever tracked keeps a deadline record until the
+  group closes. A checkpointing `IStorageProvider` must implement
   `CreateDeadlineStore`; a changelog follower that holds the store typed keeps its order
-  as it applies records, so a takeover rebuilds nothing. `EventTimeRestartTests` is the
+  as it applies records, so a takeover rebuilds nothing — and a follower only ever
+  writes the store, so a deadline store must bound its own order at `Set` and `Remove`,
+  not only when `TakeDue` drains it (`DeadlineStoreTests`). `EventTimeRestartTests` is the
   check: killed and restored at any step, a circuit's outputs and final state equal the
   uninterrupted run's.
 - Checkpointed state identity is covered by the state manifest (committed with every
@@ -373,6 +393,16 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     partition 0 the line, 1 the name's length, 2… the name in two banks, each offset
     prefixed by the object's ordinal so that it only rises). Change either and deployed
     pipelines lose their place: a new connector name, not an edit.
+  - A `files` input never reads what a `files` sink writes: a sink rewrites a step
+    under its name, folds and prunes its objects, and a source follows names. It is
+    refused in either order through `ConnectorDescription.Reads` against `Owns`, at the
+    dry run and under the references lock. Do not relax it without giving the sink a
+    commit marker a streaming reader can follow. The source's `settle` never compares
+    the node's clock with the store's: the store's stamps against each other, or the
+    reader's own time since it first saw the object.
+  - A table loader says `Waiting` only for a table that has never had a version: what
+    a loader run has loaded itself is not evidence, since a takeover and a restart begin
+    a run with nothing.
   - Dead letters with a sink bound (`PipelineSpec.DeadLetters`) are an acknowledged
     output: nothing acknowledges a batch before the sink has it, and a sink that fails
     faults the pipeline — never drop to the ring and carry on.

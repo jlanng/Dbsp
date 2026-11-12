@@ -1868,13 +1868,18 @@ Each has a default this design is built on.
     longer than six seconds for a good reason is made again (the producers are
     idempotent), and each client asks for metadata every two seconds — a node with
     thirty clients sends fifteen small requests a second.
-48. **At the ceiling a standby believes the controller about whether anybody can
-    commit** (S7). *Alternative:* prove it by writing — a record of its own to the
-    leader topic through a plain producer before it takes over. That also sees a
-    cluster whose controllers are gone and whose metadata is therefore stale, which the
-    built check does not; it is a second kind of write outside the fenced producer and
-    it moves the leader topic's end, which is the sign of life of a leader inside a long
-    transaction, so the standby would have to tell its own record from the leader's.
+48. **At the ceiling a standby asks each broker the metadata names whether it is
+    there, and does not take the metadata's word** (S7, as changed by the third
+    review: the controller's lists never change once the controller quorum is gone, and
+    read "writable" through three of four two-broker outages). The question is a
+    `DescribeConfigs` of the broker's own configuration, which only that broker
+    answers; a refusal counts as an answer, so it needs no permission.
+    *Alternative:* prove the path by writing — a record of the standby's own to the
+    leader topic through a plain producer before it takes over. That tests exactly
+    what matters, replication included; it is a second kind of write outside the fenced
+    producer and it moves the leader topic's end, which is the sign of life of a leader
+    inside a long transaction, so the standby would have to tell its own record from
+    the leader's.
 49. **A Kafka sink keeps a producer of its own unless its spec says `"producer":
     "log"`** (unchanged). S7 measured what that costs when a broker stops answering:
     the sink's producer finds the broker out separately, after the writer has. With the
@@ -1896,7 +1901,13 @@ Each has a default this design is built on.
 52. **A files source waits `settle` (5 s) for an object to be left alone before it reads
     it, and reads nothing after one that has not settled** (S7). It closes "an object
     that arrives behind the position" for objects that arrive within `settle` of the
-    greater names, at `settle` of latency on every object. *Alternative:* `0` by default
+    greater names, at `settle` of latency on every object. "Left alone" is the store's
+    modification times against each other, or the reader's own time since it first saw
+    the object — never the node's clock against the store's (the third review); what it
+    still trusts is that a modification time is when the object appeared, which a file
+    moved into place with an old time is not. *Alternative there:* count only what the
+    reader has seen for itself — no trust in any stamp, and a backlog read at a page
+    (1,024 objects) per `settle`. *Alternative to the default:* `0` by default
     and the rule "names must increase", as before — no latency, and the hole is open for
     any writer that is not strictly ordered; or a seen-set over a look-back window,
     which reads late objects out of order without holding the others back, and needs a
@@ -1959,6 +1970,33 @@ Each has a default this design is built on.
     *Alternative:* leave the count to the runtime (a heap per core): on this machine's
     twenty cores that was not run with the rest of the settings, and the adaptive mode
     that chooses the count by itself paused three times as long.
+63. **A `files` input onto what a `files` sink writes is refused** (S7, the third
+    review; it was allowed and documented as "one pipeline feeding another"). A sink's
+    objects are rewritten under their names when a step runs again, folded away by
+    `compactAfter` with the deleted keys left out, pruned by `retain`; a source that
+    follows names loses changes and deletes without a word. *Alternative:* make it
+    work — the sink writes a commit marker (or puts the committed step in each name) so
+    that a reader reads only steps that will not be run again; a snapshot keeps the
+    tombstones of the keys deleted since the one before it; the source keeps "read
+    through step N" in its checkpoint, reads a snapshot it is at most one fold behind,
+    and faults ("position gone", like a Kafka source) when it is further behind. That
+    is a change to the persisted object names and to the source's checkpoint, and a
+    reader that must keep within one fold of its writer. Until then: a Kafka topic or a
+    table between the pipelines.
+64. **A takeover is called off for a heard leader until the transactional id is
+    taken, and goes through after** (S7, the third review). Between two one-second
+    slices of `InitTransactions` it is still called off, and a request that had left
+    the client can then land all the same: the leader ends and the standby takes over
+    on its silence, one takeover timeout later. *Alternative:* never call a takeover
+    off once the first request may have been sent — no such case, and every ceiling
+    takeover that begins during a broker outage then moves the leadership when the
+    brokers return, whoever of the two was faster; or do not call takeovers off at
+    all, as before S7.
+65. **A takeover of the node's own that fails after it took the log ends the process
+    with exit code 5, not 3** (S7, the third review): 5 already meant "it could not
+    lead" and is answered with a growing delay. *Alternative:* a code of its own (6),
+    if an operator's alerts should tell "the catalog writer faulted" from "a takeover
+    failed"; the events and the log already do.
 
 ## Not verified
 
@@ -3731,7 +3769,7 @@ produced throughout, and ends by comparing the sink topic with the model.
 |---|---|
 | a rolling restart: each broker shut down (`docker stop -t 30`), five seconds, started, until every partition has all its replicas in sync | 21 runs (twelve as built, six with `request.timeout.ms` 5 s, three back at the default). In 16 the leader kept leading under term 1, the pipeline did not restart and the sink was complete. In 5 the leader lost the leadership (three of the twelve, two of the six), at the third broker — by then the leader of most partitions and the coordinator of the service's transactions: the leader's open transaction waited 10 to 30 s for the brokers to take its records (the writer logs it: `Kafka transaction has been waiting 30 s for the brokers to take its records`) and the standby saw no heartbeat for `TakeoverCeiling` and began a takeover. In 4 of those it completed and the old leader exited with 3; the test as it then was failed there ("the leader did not stay the leader", or a broken pipe to the node that had exited), **so the sink was not compared in any rolling run in which the leadership moved**. In 1 (`k3-rt5-2`) both nodes ended `Fenced` and exited with 3, and the test timed out with the sink at 7,930 rows of 10,660. The three rolling runs made after the test was corrected had no move |
 | each broker killed in turn (`docker kill`), eight seconds, started | nothing lost in 3 runs. In one nobody took over; in two the standby took over at the ceiling after the third broker's kill (the cluster took 43–48 s to be whole again that time, 8–17 s otherwise), and the old leader exited with 3 |
-| one broker killed, the leader `kill -9`ed 1.5 s later, the broker started under the new leader | the standby led 3.5–5.3 s after the kill (3 s of that is `TakeoverAfter`); the sink complete; the killed node back as a warm standby. Three runs. |
+| one broker shut down (`docker stop`, which is a controlled shutdown and not a kill, as this row first said), the leader `kill -9`ed 1.5 s later, the broker started under the new leader | the standby led 3.5–5.3 s after the kill (3 s of that is `TakeoverAfter`); the sink complete; the killed node back as a warm standby. Three runs. A broker lost in the same moment as the leader, without a word to the controller, costs more: S7, *The third review's findings*. |
 | two of three brokers killed for 70 s — no controller quorum, nothing writable — then started | the standby had started its takeover at the ceiling and completed it 0.6–3.8 s after the cluster was whole again, at term 2 (four runs); the old leader was fenced and exited with 3; the sink complete, the pipeline not restarted. (Before fix 3 below, that takeover failed and both nodes had exited.) |
 
 **A broker restart can move the leadership.** That is the finding of the two rows
@@ -4254,8 +4292,11 @@ eviction used to allocate, and a map entry where there was a set entry and a que
 entry's key). `benchmarks -- --assert`: all 10 contracts hold, before and after. Not
 measured: the rig on a checkpointing provider — the changelog record a key now costs
 when it opens and the tombstone when it closes — and a takeover against the number of
-open keys; that a warm takeover does not depend on it is by construction (the follower
-applies each deadline as it reads it) and is not a number.
+open keys. That a warm takeover does not depend on it was claimed here "by
+construction (the follower applies each deadline as it reads it)", and was wrong as
+built: the follower applied each deadline into a queue that nothing ever took from, so
+a standby's queue grew for as long as it stood by and the takeover's first step paid
+for it. *The third review's findings*, below, has the measurement and the fix.
 
 **Deviations.**
 
@@ -4360,9 +4401,13 @@ each broker also a controller, replication factor 3, `min.insync.replicas` 2, Ka
 3.9.0 with its defaults), two supervised node processes (`TakeoverAfter` 3 s,
 `TakeoverCeiling` 30 s, the peer probe on), one plugin pipeline from a two-partition
 topic through a Kafka-loaded table to a compacted topic, 200 trades a second for the
-whole run. Scripted (`h1/runs.sh` and `h1/series.sh` in the scratchpad directory
-beside the gaps file; each run is one execution of the named test on a deployment of
-its own, and the records are the `h1/*.jsonl` files there). For every run the test
+whole run. Scripted; each run is one execution of the named test on a deployment of
+its own. (The scripts and the per-run records of this table were kept in a scratch
+directory beside the gaps file — `h1/runs.sh`, `h1/series.sh`, `h1/*.jsonl` — which
+no longer exists, so these rows cannot be checked against records any more. The two
+two-broker rows were measured again in the third review's step, below, did not
+reproduce as stated, and are replaced there; the records of those runs are in the
+repository, `docs/design/runs/`.) For every run the test
 asserted that the sink equals the model and that exactly one node leads with the
 pipeline running while the other stands by, warm; it recorded the sink's longest
 silence as a reader of committed records sees it, the longest any trade took from the
@@ -4378,18 +4423,14 @@ input's acknowledgement to its row, who led, and every exit a supervisor saw.
 | one broker frozen for 60 s | 3 | 3 | 0 | 0 | 12.6 / 13.4 / 14.4 s |
 | the same, the Kafka client's default settings (two sets of three) | 6 | 6 | **3**, at the ceiling | 3 (exit 3, started again) | 8.3 / 35.3 / 60.6 s |
 | every broker killed in turn, 15 s each, the next when every broker calls the cluster whole | 2 | 2 | 0 | 0 | 13.1 and 13.9 s |
-| two of three brokers stopped for 40 s and started: no quorum, nothing can commit for 57 to 58 s | 3 | 3 | 0 (the standby held 15 to 39 times at the ceiling) | 0 | 56.8 / 57.9 / 58.2 s |
-| two of three stopped for 70 s and started: nothing can commit for 90 to 117 s, past the 60 s transaction timeout | 4 | 4 | 4: the leader's writer ended at 60 s, the standby led when the brokers were back | 4 (exit 3, started again; one of them once more with exit 9) | 89.6 to 117.5 s |
+| two of three brokers away for 40 s or 70 s | | | | | see *The third review's findings*: the rows that stood here (0 moves in 3 runs at 40 s; 4 in 4 at 70 s) were not reproduced by the review — in three of its four 40 s outages the standby did not hold — and are measured again there |
 | one broker killed and away for 10 min 10 s, the leader's process killed after 5 min | 1 | 1 | 1, which is the test: the standby led 3.5 s after the kill, on two brokers | 1 (the killed leader; started again, a warm standby on two brokers) | 10.8 s, at the broker's loss |
 
-The exit 9 in the 70-second row was a node started by its supervisor while the
-brokers were still down: it could not create its topics within the admin client's
-six-second socket timeout and ended; its supervisor started it again. That timeout is
-no longer applied to admin clients and topic creation is retried, and the two runs
-made after that change have exit 3 alone. Two of the four 70-second runs were made
-before the standby was given its pause after the brokers' return and two after; at 70 s
-the leader is past its transaction timeout either way. The 40-second runs were all made
-after.
+One thing the 70-second runs of that step showed stands, though their row does not:
+a node started by its supervisor while the brokers were still down could not create
+its topics within the admin client's six-second socket timeout and ended with exit 9;
+its supervisor started it again. That timeout is no longer applied to admin clients
+and topic creation is retried.
 
 Against the targets: no run ended with both nodes fenced, or with any node fenced at
 all outside the rows that say so; the leadership moved in none of the thirty rolling
@@ -4585,8 +4626,10 @@ One survived its first run: with the pause after the brokers' return made endles
 ceiling test still passed, a minute late, because the stall it uses to silence the
 leader gives up after sixty seconds; the test now bounds the wait from above. Not
 covered by any test: a takeover whose wait is called off in the instant it completes
-(`KafkaLeadership.PromoteAsync` carries on with it; the race could not be provoked).
-Script and results: `h1/mut.py` and `h1/mutations.txt` beside the gaps file.
+(`KafkaLeadership.PromoteAsync` carries on with it; the race could not be provoked —
+the third review's step moved that decision into the log and tests it at both points
+after the fence). The script and its results were `h1/mut.py` and `h1/mutations.txt`
+in the same scratch directory, and are gone with it.
 
 **Deviations.**
 

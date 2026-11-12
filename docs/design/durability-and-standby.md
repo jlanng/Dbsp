@@ -2209,7 +2209,13 @@ maximum, so the maximum is all that is restored (into worker 0's slot). In a clu
 circuit each process commits the entries under its own `p{n}:` prefix like its other
 offsets; they are equal across processes that committed the same step, because the
 step-end frames had already merged the observations. `$watermark` is a reserved input
-name, as `$step` is. Cost: one dictionary entry per source per commit, nothing per step.
+name, as `$step` is — that name and no other: an input called `$watermarks` or
+`$watermark-feed` is an input, and its position is restored like any input's. (As first
+built, `Start()` skipped every marker entry that *started* with `$watermark`, so such an
+input lost its committed position at each restart and applied again whatever its source
+re-sent. Nothing is skipped by how a key starts now; the clock's keys cannot be an
+input's, because the one is refused as a name and the others contain `#`.) Cost: one
+dictionary entry per source per commit, nothing per step.
 
 **The deadlines.** A fourth store kind, `IDeadlineStore<TKey>`
 (`IStorageProvider.CreateDeadlineStore`): key → deadline in ticks, with `AddAll` (add the
@@ -2227,15 +2233,33 @@ covers that step, like every other store's writes. What each provider does:
 
 | provider | deadlines held as | at a restore |
 |---|---|---|
-| `InMemoryStorageProvider` | a dictionary and a priority queue; a queue entry whose key has since moved or gone is skipped when it reaches the front | nothing survives (the provider does not checkpoint) |
+| `InMemoryStorageProvider` | a dictionary and a priority queue; a queue entry whose key has since moved or gone is stale: dropped off the front at every removal, skipped when taken, and the queue rebuilt from the map when stale entries outnumber the live ones, so the queue holds at most twice the map's entries and 64 more | nothing survives (the provider does not checkpoint) |
 | `InMemoryCheckpointStorageProvider` | the same, written through, with the deadline each touched key had at the last commit kept beside it for `Recover()` | rolled back to the commit |
-| `ChangelogStorageProvider` | the same structure inside a `ChangelogStore`: one record per key (`entry = key → deadline`), a tombstone when the key closes; `HeldInstances` as for the other stores | built from the store's bytes when the circuit creates the store, as every store is; a **follower that holds the store typed applies each record into the map and the queue**, so a warm standby's takeover starts with the order already built |
+| `ChangelogStorageProvider` | the same structure inside a `ChangelogStore`: one record per key (`entry = key → deadline`), a tombstone when the key closes; `HeldInstances` as for the other stores | built from the store's bytes when the circuit creates the store, as every store is; a **follower that holds the store typed applies each record into the map and the queue**, so a warm standby's takeover starts with the order already built — and with a queue the size of the leader's (below) |
 | `RedisStorageProvider` | a hash `{prefix}:{store}` (key → exact deadline) and a sorted set `{prefix}:{store}:due` scored by deadline / 1,024 ticks | nothing is read. `TakeDue` asks Redis only once the watermark reaches a remembered lower bound of the committed scores |
 
 The Redis score is coarser than the deadline because a sorted set's score is a double
 and a tick count of this century is beyond a double's exact integers; a range read is
 therefore a superset, and the hash's exact value decides. The lower bound never passes
 an entry whose removal is only staged, since a rollback makes it due again.
+
+**A follower's queue, which nothing takes from.** A leader's queue loses its stale
+entries as `TakeDue` dequeues them. A follower never calls `TakeDue`: it applies the
+leader's records, a value as `Set` and a tombstone as `Remove`. As first built `Remove`
+touched only the map, so a warm standby's queue gained an entry for every deadline
+record it applied and lost none — 400,000 entries after 20,000 steps of a windowed
+pipeline whose leader held 60, 24 MB that the state's size estimate did not show (it
+counted the map's entries for the queue), and a first step after the takeover that
+dequeued all of it (36 ms where the steps after took 0.05 to 0.08; the review's
+measurement, on a copy of that build). The heap store now keeps the bound itself, at
+every write that leaves an entry stale: it drops stale entries off the front — where
+they are, when keys go in the order of their deadlines, as a leader's `TakeDue` and a
+follower's tombstones make them go — and when stale entries elsewhere outnumber the
+live ones it rebuilds the queue from the map, which costs in proportion to the writes
+that made them stale. The estimate counts the queue's own array. `DeadlineStoreTests`
+holds the bound against a follower that stands by through 3,000 steps of opening and
+closing windows (its queue equals the leader's map, not 60,000 entries) and against
+removals out of order and keys that only ever move.
 
 **No rebuild at start, and why not.** The alternative to a store was to rebuild each
 operator's queue from the keys of its state at `Start()`. That walks every evicting
@@ -2253,6 +2277,18 @@ tracker allocated a list on every step in which something closed. On the changel
 key costs one more record when it opens and one tombstone when it closes, per operator
 that bounds it. On Redis a step costs one `HMGET` for the keys not seen since the last
 commit.
+
+**The remembered `Lookup` tracks facts, not keys**, because its state is per fact: the
+grouping's policy closes a key, and every fact remembered under it goes then. A fact
+that is taken back whole has nothing left to bound, and `EvictionTracker.Forget` gives
+its deadline back at once — as first built it did not, and a key whose facts are
+corrected (the upsert's shape: retract the old fact, assert the new) kept a deadline,
+and a changelog record keyed by the whole fact, for every version the fact ever had
+until the key closed: 5,000 deadline entries beside one remembered entry after 5,000
+corrections of one order (the review's measurement). It is one entry per fact
+remembered now, written when the fact is asserted and tombstoned when it is taken back
+or its key closes; a fact held with a weight above one keeps its deadline until the
+last of it goes.
 
 **The manifest: format 7.** A circuit with event time adds `eventtime={sources}`. What
 happens to an existing checkpoint:
@@ -2399,11 +2435,31 @@ worth knowing before believing a number from a container cluster.
 
 ### The leadership rules
 
-- **A takeover is given up when the leader is heard.** Between the decision and the
-  moment `InitTransactions` returns, the node's watch of the leader topic is still
-  reading. A heartbeat from another node cancels the acquisition
-  (`KafkaLeadership.Heard`): the leader was slow, its brokers were, and it is committing
-  again. Not on a manual takeover, which is the operator's word against the leader's.
+- **A takeover is given up when the leader is heard — until the transactional id is
+  taken, and not after.** Between the decision and the moment `InitTransactions`
+  returns, the node's watch of the leader topic is still reading. A heartbeat from
+  another node calls the acquisition off (`KafkaLeadership.Heard`): the leader was slow,
+  its brokers were, and it is committing again. Not on a manual takeover, which is the
+  operator's word against the leader's. And not once `InitTransactions` has returned:
+  from that moment the leader's epoch is gone, whatever it committed a moment before,
+  and the acquisition goes through — reads the term, commits its own, leads
+  (`KafkaLog.AcquireWriterUnlessAsync`: the token that calls it off is looked at only
+  until then). As first built the token was honoured to the end, so a heartbeat read
+  after the fence stopped the takeover there: the standby stood down, the fenced leader
+  ended at its next transaction, and nobody led until the standby's wait had passed and
+  a silence after it. That is what the third review read in a node's log after a
+  two-broker outage, and `KafkaLeadershipTests` now holds the other outcome at both
+  points after the fence.
+- **A takeover given up for a heard leader holds nothing back.** The silence goes on
+  counting from the record that was heard, and the node may take over again as soon as
+  that silence is long enough — it does not wait the one to two takeover timeouts of a
+  takeover lost to a fence (next but one). The reason is the one case that is left: the
+  acquisition is called off between two one-second slices of `InitTransactions`, and a
+  request for the id that had already left the client can still land, although the
+  client is put away. Whether it did cannot be asked. If it did, the leader's next
+  transaction fails and it ends, and the standby answers its silence as it answers any
+  dead leader's — one takeover timeout and a takeover, which is the failover the
+  design budgets for, not two or three timeouts more.
 - **A cancelled or fenced acquisition puts the client away.** `KafkaLog.AcquireAsync`
   replaces the producer and fails with `KafkaLogNotAcquiredException`; the log is a
   reader again. The client must go because a fenced one is finished, and because a
@@ -2413,21 +2469,44 @@ worth knowing before believing a number from a container cluster.
   writer, so a lost acquisition has nothing to stop.
 - **A takeover lost before the node is the writer ends as Standby, not Fenced**
   (`Promotion.Lost`, `BackToStandby`). Nothing has been promoted at that point — the
-  acquisition is the first thing a takeover does. The node waits the takeover timeout
-  and a random part of it more before it may try again, so that two nodes that fenced
-  each other do not do it in step. "Fenced is final" still holds for every node that
-  has been the writer.
+  acquisition is the first thing a takeover does. A node whose acquisition was fenced
+  waits the takeover timeout and a random part of it more before it may try again, so
+  that two nodes that fenced each other do not do it in step. "Fenced is final" still
+  holds for every node that has been the writer.
 - **At the ceiling, a standby asks the brokers before it takes over from a leader that
-  answers.** `KafkaLog.ProbeWritePathAsync` describes the leader topic's partition and
+  answers.** `KafkaLog.ProbeWritePathAsync` looks at the leader topic's partition and
   the partition of `__transaction_state` that holds the log's transactional id (Java's
-  `String.hashCode`, as the brokers place it): no leader, or fewer replicas in sync
-  than `min.insync.replicas`, and nobody can commit — the standby waits
-  (`TakeoversHeld`), and for two takeover timeouts after the brokers last said so: a
-  leader they held up has to find them again before it can be heard, and without that
-  pause the standby took over in the instant they returned. It is the controller's view. With no controller quorum nothing
-  updates it, and a cluster that lost two brokers at once can read as writable; then the
-  standby takes over as before, waits inside `InitTransactions` for the brokers, and
-  either completes when they return or is called off by the leader's first heartbeat.
+  `String.hashCode`, as the brokers place it): no leader, a leader that does not
+  answer, or fewer replicas in sync *that answer* than `min.insync.replicas`, and
+  nobody can commit — the standby waits (`TakeoversHeld`), and for two takeover
+  timeouts after the brokers last said so: a leader they held up has to find them again
+  before it can be heard, and without that pause the standby took over in the instant
+  they returned.
+
+  "That answer" is what the third review's runs added. Who leads a partition and who
+  is in sync is metadata, and metadata is the controller's: with no controller quorum
+  nothing takes a dead broker off the lists. Two of three brokers killed in one
+  command, and the survivor went on reporting `leader 1, isr [1,2,3]` for the whole
+  outage (when it answered at all: a description asked of the controller timed out
+  "waiting for controller" in two polls of three) — so the probe read "writable", and
+  the standby took over at the ceiling into a cluster that could commit nothing, in
+  three of the review's four 40-second outages. The lists are no longer believed by
+  themselves. The partition is read from any broker's metadata, not the controller's,
+  and every broker it names is asked for its own configuration (`DescribeConfigs` on
+  the broker resource), which the client sends to that broker and no other: an answer,
+  a refusal included, is a broker that is there; a second and a half of silence is not.
+  The topics' `min.insync.replicas` is the one thing still asked of the controller, so
+  it is asked when the standby starts to watch and kept.
+- **A decision to take over is looked at again after the questions it took.** The
+  reason for a takeover is found on a silence, and then the peer is probed, the brokers
+  are asked and the leader topic's end is read — which takes seconds exactly when
+  brokers are only just back and a leader they held up is about to be heard. As first
+  built the decision stood on the silence measured before the questions. With the
+  broker-by-broker question above taking a second or two, the first runs of it showed
+  what that meant: a standby that had held correctly through a whole outage logged
+  `taking over (ceiling; leader silent for 00:00:00.0200000)` and fenced a leader it
+  had heard twenty milliseconds before, in two runs of six. The silence is measured
+  again once the answers are in, and a leader heard meanwhile is a leader.
 
 ### A leader does not outlive its transaction timeout
 
@@ -2480,6 +2559,17 @@ after 3 and 4, with a doubling delay while it keeps ending within a minute, pass
 SIGTERM on and wait — and the example's Kafka mode, the scale rig and the broker tests
 run their nodes under it. A platform's own supervisor (systemd `Restart=always`, a
 Kubernetes pod, an ECS service) is the same contract and is what production should use.
+
+"At once after 3" is right only if 3 means what it says: another node leads. A takeover
+that fails after the node has taken the log — its catalog, its storage or the start of
+its circuits failed — also ends the node as `Fenced` (it closes its own writer, or it
+would heartbeat for a node that leads nothing), and as first built that too was exit
+code 3. Two nodes with the same deterministic failure then took the log from each other
+every few seconds for ever: restore the tables, wait out the silence, take the log,
+commit a term, fail, exit 3, start again after 200 ms. `LeadershipStatus.TakeoverFailed`
+tells the two apart — set when the takeover failed and nobody had fenced the log — and
+the service exits with 5 for it, which the supervisor slows down like any process that
+keeps failing early.
 
 ### Not done, not known
 
