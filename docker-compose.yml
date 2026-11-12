@@ -37,6 +37,11 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # The tests make many compacted topics, and one of them waits for the cleaner to
+      # compact its topic: with one cleaner thread that looks again every 15 s, it can
+      # wait behind the others for more than a minute and a half on a slow runner.
+      KAFKA_LOG_CLEANER_THREADS: 2
+      KAFKA_LOG_CLEANER_BACKOFF_MS: 1000
     volumes:
       - kafka-data:/var/lib/kafka/data
     healthcheck:

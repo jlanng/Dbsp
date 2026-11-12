@@ -75,8 +75,11 @@ public class KafkaSourcePositionTests(ITestOutputHelper output)
         {
             await loader.WhenCaughtUpAsync().WaitAsync(Timeout);
             Assert.Equal(2, loader.Positions[0]);
-            Assert.Equal(0, table.CommittedOffsets[0]);   // the record; the marker is not yet covered
-            Assert.Equal(1, table.LatestVersion);
+            // The record; the marker is covered only once the topic has been idle for the
+            // delay — which a slow machine can reach before this line (seen on CI). Either
+            // way the version says which: a version of no changes records the marker.
+            var (committed, version) = (table.CommittedOffsets[0], table.LatestVersion);
+            Assert.True((committed, version) is (0, 1) or (1, 2), $"committed {committed} at version {version}");
 
             // Idle for the delay: the loader records where it stands, in a version of no changes.
             await KafkaEnv.EventuallyAsync(() => Task.FromResult(table.CommittedOffsets[0] == 1), "the position covers the marker");

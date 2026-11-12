@@ -4681,7 +4681,13 @@ summary line carries colour codes on a runner (`\e[m  skipped: 0`), so the ancho
 never matched; and `LeadershipProbe`'s listener could throw "Not listening" from
 `DisposeAsync` when stopped just after an answer — a real race, reproduced by a new test
 that stops a listener the moment it has answered, 300 times (it failed 3 runs of 3
-before the fix).
+before the fix). A third run failed on two things a slow runner shows and this machine
+had not: `KafkaSourcePositionTests` asserted the loader's position before its one-second
+idle commit, which the runner had already passed (the test now accepts either state,
+told apart by the table's version), and the compaction test skipped because the
+broker's one cleaner thread, looking every 15 s, had not reached its topic in 90 s
+behind the other tests' compacted topics (the compose broker now has two cleaner
+threads and a 1 s back-off; that test compacted in 2 s here afterwards).
 
 **The front door (H12).** The example, AdminHost, the scale rig and both failover apps
 print their usage for `--help` and exit 2 on an option they do not have
