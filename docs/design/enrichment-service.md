@@ -1998,6 +1998,11 @@ Each has a default this design is built on.
     if an operator's alerts should tell "the catalog writer faulted" from "a takeover
     failed"; the events and the log already do.
 
+66. **The records of the broker runs are in the repository**
+    (`docs/design/runs/`, S7): the third review found S7's tables citing a scratch
+    directory that no longer existed. *Alternative:* keep citing nothing and say so; a
+    table nobody can check is then all there is.
+
 ## Not verified
 
 - That a collectible context unloads once state, connectors and settings use
@@ -5110,3 +5115,257 @@ fill (24.1–24.9 s in six runs of this build, 24.6 s before) does not show.
 - Nothing on three brokers, behind SASL, on MSK, on Windows or on another C library
   than glibc; there the keeper's allocator half does nothing and `process.other` is
   not reported.
+
+#### The third review's findings
+
+A review of the round-three work confirmed twelve findings. Eleven are fixed in code or
+made true in the documents, one is fixed by refusing what could not be made right in
+the time (a `files` input on a `files` sink's prefix), and one more defect turned up
+while the fixes were being measured and is fixed with them (a takeover decided on a
+silence that had ended). What each was, and what was done:
+
+**Event-time state (the core).**
+
+- **A warm standby's deadline queues grew for as long as it stood by.** The heap
+  deadline store drops a stale queue entry when `TakeDue` reaches it, and a follower
+  never calls `TakeDue`. The review measured it on a copy of the build: 20,000 steps of
+  a windowed pipeline, the leader's stores at 60 deadlines, the standby's queue at
+  400,000 entries and 24 MB with the estimate still saying 8,220 bytes, and the new
+  leader's first step at 36 ms where the next took 0.05 to 0.08. The store now keeps
+  its queue within twice its map and 64 entries at every write that leaves an entry
+  stale, whoever writes it, and the estimate counts the queue's array
+  (`durability-and-standby.md`, *A follower's queue, which nothing takes from*). The
+  sentence in this section that called a warm takeover independent of the number of
+  open keys "by construction" is corrected where it stands.
+- **A remembered `Lookup` under `EvictWhen` kept a deadline for every version a fact
+  ever had**, each a changelog record keyed by the whole fact, until the key closed:
+  5,000 deadline entries beside one remembered entry after 5,000 corrections of one
+  order (the review's measurement). A fact that is taken back whole now gives its
+  deadline back (`EvictionTracker.Forget`); the guide's sentence about what the
+  deadlines cost says what this operator's are.
+- **An input named `$watermarks` or `$watermark-feed` lost its committed position at
+  every restart**: `Start()` skipped every entry of the offsets marker that began with
+  `$watermark`, and the service's dead-letter envelope left out every position whose
+  key began with `$`. Both now go by the clock's keys exactly.
+- **A table restored or followed from Kafka held a second key object per row** for a
+  key that is an object (a string): the log decodes the key and the row apart, and the
+  estimate counts a key as a reference to "one of the row's own". The table now holds
+  a row from a log under the row's own key where the selector gives an equal one, so
+  the estimate is right and the strings are not held — about 64 bytes a row for a
+  20-character key, by the review's arithmetic; it was not measured at a million rows.
+
+**The leadership.**
+
+- **A takeover that heard the leader after it had fenced it stood down.** The token
+  that calls a takeover off was honoured to the end of the acquisition. The review
+  read it in a node's log after a two-broker outage: the standby's `InitTransactions`
+  completed when the brokers returned, the leader's last heartbeat was read while the
+  standby was reading the term, the standby stood down — and the leader, fenced, ended
+  at its next transaction. Nobody led for six seconds, on top of the outage. The log
+  now looks at that token only until the transactional id is taken
+  (`KafkaLog.AcquireWriterUnlessAsync`); after it the takeover goes through. A
+  takeover given up before that point no longer waits one to two takeover timeouts
+  before it may try again, because of the one case that is left and cannot be closed
+  from the client: a request that had left before the client was put away. If it
+  lands, the leader ends and the standby takes over on its silence like on any dead
+  leader's (Open for James 64).
+- **A takeover was decided on a silence that had ended** — found here, not by the
+  review. See *The runs* below: with the brokers asked one by one the questions before
+  a ceiling takeover take a second or two, and the decision stood on the silence
+  measured before them. The silence is measured again when the answers are in.
+- **The hold at the ceiling did not engage when two brokers went at once.** The
+  write-path probe believed the cluster's metadata, and the metadata is the
+  controller's: with the controller quorum gone it never changes. Measured here with a
+  probe program against the `kafka3` profile, brokers 1 and 2 killed in one command:
+  for the thirty seconds they were away the surviving broker reported `leader 1, isr
+  [1,2,3]` whenever it answered, and timed out "waiting for controller" in between;
+  a `DescribeConfigs` of each broker's own configuration, which the client sends to
+  that broker alone, timed out for brokers 1 and 2 at its 1.5 s and was answered by
+  broker 3 in under 10 ms. The probe now reads the partition from any broker's
+  metadata and asks each broker named there directly; a leader that does not answer,
+  or fewer replicas in sync that answer than the minimum, is "nobody can commit"
+  (`durability-and-standby.md`, *The leadership rules*).
+- **A takeover that failed for the node's own reasons exited 3**, which a supervisor
+  answers at once and for ever. It exits 5 now (`LeadershipStatus.TakeoverFailed`,
+  `NodeLeadershipStatus.TakeoverFailed`, `ServiceNode.ExitCodeFor`), which the
+  supervisor slows down. A node that another node fenced in the middle of its takeover
+  is still 3.
+
+**The runs.** Same machine and profile as the runs above (three brokers, each also a
+controller, replication factor 3, `min.insync.replicas` 2; two supervised node
+processes, `TakeoverAfter` 3 s, `TakeoverCeiling` 30 s, the peer probe on; 200 trades a
+second). Each run is one execution of a test in `KafkaServiceProcessTests` on a
+deployment of its own; its record is a line of
+a `…-broker-failures-series{n}.jsonl` under `docs/design/runs/` and its summary a line
+of the `….measurements.log` beside it, with the commands that made them in the
+`README.md` there. In every run the test asserted that the sink equals the model and that one node
+leads with the pipeline running while the other stands by, warm.
+
+**Series 1** — made with every change above except the second look at the decision,
+which it is what found. Two of three brokers away, asked for 40 s (records:
+`docs/design/runs/2026-11-12-broker-failures-series1.jsonl`):
+
+| brokers | away for | the standby's `takeoversHeld` when read | leads afterwards | leadership moved | node exits | sink silent |
+|---|---|---|---|---|---|---|
+| two stopped (`docker stop -t 1`, one after the other) | 42.7 s | 103 | a, term 1 | no | none | 58.4 s |
+| two stopped | 42.6 s | 24 | b, term 2 | **yes**: the standby held through the outage, then took over 20 ms after it had heard the leader | a: 3 | 59.7 s |
+| two stopped | 42.4 s | 114 | a, term 1 | no | none | 45.7 s |
+| two killed (`docker kill`, one command) | 40.4 s | 6 | a, term 1 | no | none | 55.8 s |
+| two killed | 70.4 s (see below) | 3 | b, term 2 | **yes**: the same | a: 3 | 86.3 s |
+| two killed | 70.4 s (see below) | 3 | a, term 1 | no | none | 85.7 s |
+
+In all six the standby held at the ceiling, which is what the review's runs lacked in
+three of four: its log says why each time — `….leader [0] is led by broker 1, which
+does not answer`, or `has 1 replica(s) in sync that answer (1 listed) and needs 2`.
+The two that moved did so after the outage. Both logs read `taking over (ceiling;
+leader silent for 00:00:00.0200000)`: the brokers had just returned, the standby's
+questions took a second or two to be answered, the leader's first heartbeat arrived
+meanwhile, and the takeover went ahead on the silence it had measured before asking.
+That is the defect listed above, and the fix is in the series that follows.
+
+Two of the killed-broker outages were 70 s and not the 40 asked for: the test read
+the standby's counter before it restarted the brokers, and the standby's status took
+thirty seconds to answer (below, *Deviations*). The last of them is a leader that
+survived 70 s without a quorum, past its 60 s transaction timeout; why that
+transaction did not fail is not established.
+
+A takeover with one broker lost (the same file):
+
+| broker 2 | `kill -9` of the leader → the standby leads | of which silence until the decision | taking the log and committing the term |
+|---|---|---|---|
+| shut down 1.5 s before the kill | 3.9 s | 3.0 s | 0.7 s |
+| shut down 1.5 s before | 3.4 s | 3.0 s | 0.2 s |
+| shut down 1.5 s before | 3.9 s | 3.0 s | 0.6 s |
+| killed in the same moment as the leader | 9.8 s | 8.4 s | 0.7 s |
+| killed in the same moment | 9.4 s | 3.0 s | 6.1 s |
+| killed in the same moment | 8.8 s | 3.1 s | 5.7 s |
+
+So S6's 3.5 to 5.3 s is the figure for a broker that was shut down, which hands its
+partitions over before it goes. A broker that dies with the leader costs the brokers'
+own time to give it up on top — the nine seconds of `broker.session.timeout.ms` —
+which the standby spends either before it can confirm the silence (it cannot read the
+leader topic's end from a dead partition leader) or inside `InitTransactions`. 8.8 to
+9.8 s in these three; the review measured 13.4 to 16.3 s in three of its own, which is
+what the controller's loss adds when the broker killed was the active controller, and
+25.8 s once on a node's first lead with a plugin import pending. Which roles broker 2
+had in these three runs was not recorded; the series that follows records them.
+
+**Series 2** — after the second look at the decision, with the brokers restarted on
+time: being run as this is written; its rows are added here when it is done.
+
+**Files and tables.**
+
+- **A `files` source on a compacting upsert sink's prefix lost deletes**, read
+  snapshots as upserts, and read objects a replaced leader had written late. Looking
+  for a fix found a fourth way, which needs no compaction: a step above the sink's
+  checkpoint is run again after a restart and written under the same name with a
+  different cut, and a source that has read the name never sees the difference. None
+  of these can be put right in the source alone — a streaming reader cannot know which
+  steps are committed, and cannot delete keys a snapshot no longer mentions. So the
+  combination is refused, in either order, at the dry run and under the references
+  lock (`ConnectorDescription.Reads` against `Owns`), and the guide says what to use
+  instead. That withdraws something the guide had offered ("one pipeline's upsert sink
+  can be another's keyed input"); the `changes` format stays, for objects handed on by
+  whatever copies them. What it would take to allow it is Open for James 63.
+- **A file-loaded table whose object had been removed reported `Waiting`, and made the
+  node `Degraded`, after every takeover and restart.** "Never loaded" was a local of
+  the loader's run. It is the table's to say now: a table that has a version is not
+  waiting.
+- **`settle` compared the node's clock with the store's modification time.** It
+  compares the store's times with each other, or counts the reader's own time since
+  it first saw the object (the guide, and Open for James 52 for what it still trusts).
+
+**The documents.** S6's row for a takeover with one broker down said "killed" for a
+controlled shutdown; it says what was done, and the abrupt case is measured above.
+S7's tables cited scripts and records in a scratch directory that no longer exists;
+they say so, and the two rows the review could not reproduce are replaced by the runs
+above. The engine design's account of the 70-second outage is rewritten from them.
+
+**Public API added.** Core: none (`EvictionTracker.Forget` and the store's bound are
+internal). `Incremental.Kafka`: `LeadershipStatus.TakeoverFailed`. `Incremental.Service`:
+`NodeLeadershipStatus.TakeoverFailed`; `ConnectorDescription.Reads`. Behaviour that
+changed: a `files` input on a `files` sink's prefix, and a sink onto a prefix an input
+reads, are refused where they were accepted; a node whose own takeover failed exits 5
+where it exited 3; `AcquireWriterAsync`'s cancellation is unchanged, and the
+leadership's "heard the leader" no longer cancels an acquisition that has taken the
+transactional id; the `files` source's `settle` no longer reads the node's clock.
+Test seams (internal): `KafkaLog.BrokerAnswersOverride`, `WhyUnwritable`,
+`BrokerAnswersAsync`, `KafkaLeadership.Heard`, `RetryNotBefore`,
+`ChangelogStorageProvider.QueuedDeadlines`.
+
+**Tests.**
+
+- Core (`tests/Incremental.Tests`): `DeadlineStoreTests` — a store that is written and
+  never taken from keeps its queue to the size of its map (removals in and out of
+  order, keys that only move); a warm standby's queues after 3,000 steps of opening
+  and closing windows; the estimate counts the queue it has. `EventTimeRestartTests` —
+  a remembered lookup keeps one deadline per fact through 200 corrections, a
+  weight-two fact taken back once, a cold copy of the log, and the key's close; an
+  input named `$watermarks`, `$watermark-feed` or `$steps` keeps its position across a
+  restart; the clock's own keys are refused as names and nothing else is.
+  `MemoryEstimateTests` — a table keyed by a string and restored from a log that
+  decodes key and row apart is estimated within a tenth of what the heap holds and
+  within 2 % of its writer's figure, and holds every row under the row's own key, as a
+  follower does; a selector that has changed since the rows were written leaves the
+  log's keys.
+- Kafka (`tests/Incremental.Kafka.Tests`, one broker): a takeover that hears the
+  leader once it has taken the log goes through, at `initialised` and at `term-read`;
+  a takeover given up for a heard leader holds nothing back and one lost to a fence
+  waits; a leader heard while the standby was asking the brokers is not taken over
+  from; a takeover that cannot start says it failed by its own doing and one that
+  another node fenced does not; the probe asks each broker and judges what three
+  brokers look like with two gone; a broker id nobody has is a second and a half of
+  silence.
+- Service (`tests/Incremental.Service.Tests`): an input onto what a `files` sink
+  writes is refused and so is a sink onto what an input reads (prefix above, own
+  spec, dead-letter slot, suffix); the `changes` format through two pipelines with
+  the objects handed on; `settle` with the store's clock six seconds and an hour
+  behind the node's and ninety seconds ahead, a backlog, an object that changes while
+  it settles; a loaded table whose file was removed is not waiting after a takeover
+  or on a node from nothing; an input named as the clock's keys begin in a dead
+  letter's positions; exit codes 3, 4 and 5 and the supervisor's delay for each.
+
+**Mutations.** Core: 13, all killed by `DeadlineStoreTests`, `EventTimeRestartTests`
+and `MemoryEstimateTests` — the queue not swept at a removal, never rebuilt, not
+compacted when a key moves; the front sweep dropping live entries; the estimate
+counting the map for the queue; the lookup never forgetting a retracted fact,
+forgetting one still held, `Forget` doing nothing; the clock's keys skipped by prefix
+again, `$watermark` allowed as an input name; a restore and a follower holding the
+log's key; the row's key held without comparing. Five of them survived their first
+run and got a test each (a key that only moves; the estimate with stale entries in
+the queue; a weight-two fact taken back once; a selector that changed) or simpler
+code (the clock's keys are no longer skipped at all: an input cannot have them). The
+Kafka and service list (30 mutations: `fix/svc.py` in the session's scratch directory)
+has not been run yet as this is written.
+
+**Deviations.**
+
+- **Chaining two pipelines through files is refused, not fixed** (above).
+- **A takeover given up between two slices of `InitTransactions` can still have fenced
+  the leader.** It is answered — the standby takes over on the silence, with no wait
+  of its own first — and not prevented.
+- **The 40-second and 70-second rows of S7's table are replaced, not corrected in
+  place**, and the older rows of that table stand on runs whose records are gone.
+- **The no-quorum test restarts the brokers before it reads the standby's counter.**
+  Read first, the standby's status once took thirty seconds to come back — a
+  standby's table statistics ask the log for its last version, and wait out the
+  operation timeout when the partition's broker is dead — and the "40-second" outage
+  was 70. That wait is not fixed: `GET tables` on a standby can take as long during a
+  broker outage.
+- **`A_takeover_with_one_broker_down…` takes `INCREMENTAL_KAFKA_FAULT` and
+  `INCREMENTAL_KAFKA_BROKER`** and records the broker's roles; its default is what it
+  did before (broker 2 shut down 1.5 s before the kill).
+
+**Left undone.**
+
+- Series 2, the mutation runs of the Kafka and service changes, and the full
+  verification of this step are still to come as this is written; this section is
+  finished when they are.
+- A `files` sink still has no commit marker a streaming reader could follow (Open for
+  James 63).
+- The window between two slices of `InitTransactions` (Open for James 64).
+- Nothing was run on MSK or on a cluster whose controllers are not its brokers; the
+  probe's direct question to a broker was tried on the `kafka3` profile and on one
+  broker only, not behind SASL with ACLs (a refusal is counted as an answer, and that
+  path was not exercised).
+- The key instance a restored table holds was not measured at a million rows.
