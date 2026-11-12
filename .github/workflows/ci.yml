@@ -86,14 +86,15 @@ jobs:
         run: |
           set -o pipefail
           dotnet test --project tests/Incremental.Kafka.Tests -c Release --no-build | tee kafka-tests.log
-          grep -Eq '^\s*skipped: 0\s*$' kafka-tests.log
+          # The summary's lines carry colour codes on a runner: taken out before the match.
+          sed 's/\x1b\[[0-9;]*m//g' kafka-tests.log | grep -Eq '^\s*skipped: 0\s*$'
       - name: Test Service against the broker
         run: |
           set -o pipefail
           dotnet test --project tests/Incremental.Service.Tests -c Release --no-build | tee service-tests.log
           # Six, exactly: the tests that stop, kill and freeze brokers, which need three of
           # them (the kafka3 compose profile, not started here).
-          grep -Eq '^\s*skipped: 6\s*$' service-tests.log
+          sed 's/\x1b\[[0-9;]*m//g' service-tests.log | grep -Eq '^\s*skipped: 6\s*$'
       - name: Smoke, enrichment service on Kafka with a killed leader
         run: dotnet run -c Release --no-build --project examples/Incremental.EnrichmentService -- --headless --kafka
       - name: Measured failover times
