@@ -30,7 +30,7 @@ its topics when it ends (`--keep-topics` leaves them).
 | the state | `--state-keys` orders produced before anything is measured; each stateful pipeline reads them all |
 | the input | `--rate` (2,000) orders a second, each a new revision of an order the stateful pipelines hold, from the first steady second to the end of the run — through every kill |
 | table churn | `--churn` (500) rows a second rewritten on the leader, five versions a second |
-| the nodes | server GC, eight heaps (`SCALE_GC_HEAPS`), DATAS off; `TakeoverAfter` `--takeover-after-ms` (3,000), heartbeat 1 s; twelve state partitions, four row partitions per table |
+| the nodes | the collector settings the guide recommends for a node (`src/Incremental.Service/Node.Gc.props`: server, concurrent, eight heaps, not adaptive) unless `--gc` says otherwise; `TakeoverAfter` `--takeover-after-ms` (3,000), heartbeat 1 s; twelve state partitions, four row partitions per table |
 
 Then, in order:
 
@@ -42,8 +42,9 @@ Then, in order:
    to one copy of the rows;
 4. the state is filled — time, heap, bytes;
 5. a second node starts cold and becomes warm — time, heap, working set;
-6. `--steady-seconds` of steady input — the standby's state and table lag, sampled
-   every second;
+6. `--steady-seconds` of steady input — each node's memory and the standby's state and
+   table lag, read every second, and at the end what is live after a full collection
+   (`--memory-only` stops here);
 7. the leader is killed with `kill -9` — detection, every stage of the takeover, each
    pipeline's start, and the first record in every pipeline's sink after the kill;
 8. the dead node comes back as a cold standby and becomes warm;
@@ -58,12 +59,28 @@ machine cannot hold twice.
 
 ## Reading the numbers
 
-- `heap` is the managed heap after a forced, compacting collection: what is live.
-  `rss` is the working set at that moment, which with server GC is well above the
-  heap and also holds the Kafka client's buffers: about twice it on the standby
-  (3.6 GB for 1.8 GB live at a million orders of state), and on the leader 2.7 to 3.6
-  times it (7.8 GB for 2.2 GB live at a million rows, 12.5 GB for 4.7 GB at three
-  million). A node needs the working set: size a container from `rss`, not from `heap`.
+- `heap` and `live-heap` are the managed heap after a forced, compacting collection:
+  what is live. `rss` is the working set. Under `leader.steady.` and `standby.steady.`
+  the figures are read as the node runs, nothing forced: `rss`, `gc-committed` (what
+  the collector holds), `gc-live-at-last-collection`, and `not-the-collectors` (the
+  anonymous resident memory that is not the collector's: the Kafka client, the
+  runtime, stacks). A node needs the working set: size a container from `rss` and
+  from `rss-max`, not from `heap`. The guide's *Sizing a node* has what was measured
+  and the arithmetic.
+- `gc-pause-percent` under `steady.` is the collector's pauses during the steady load
+  over its length; `leader.gc-pause-percent` is over the process's life, which is
+  mostly the load and the state fill. `longest-stall` is the longest any thread of the
+  node stood still (a thread that asks every 5 ms), whatever stopped it;
+  `full-blocking-collections` are the collections that stop a node for as long as its
+  heap is large.
+- `table.estimated-by-the-node` and `state.estimated-by-the-node` are what the node
+  itself reports that it holds (`TableStats.Memory`, `PipelineStatus.StateSize`),
+  beside what the heap grew by: `leader.heap-after-load` and
+  `leader.heap-added-by-state`.
+- Beside `--out`, `<name>.timeline.tsv` has every node's working set every two
+  seconds, with the stage of the run; the work directory printed on the first line
+  keeps each node's stderr and its mappings (`leader.smaps`, `standby.smaps`) as they
+  were at the end of the steady load.
 - `first-sink-write` is measured where a reader of the sink would see it: the arrival of
   the first record that was produced after the moment in question.
 - `stages` are the takeover's own clock (`NodeStatus.Leadership.Kafka.LastTakeover` and
@@ -73,8 +90,24 @@ machine cannot hold twice.
   takeover started a circuit the standby already had.
 
 The run stops, rather than push the machine into swap, when less than 1.5 GB of memory
-is available. On a 30 GB machine with the broker on it, two nodes fit at three million
-rows and one node at five.
+is available.
+
+## The collector, and other experiments
+
+`--gc` sets the nodes' environment, which overrides what the project file builds in:
+
+| | |
+|---|---|
+| `--gc node` (the default) | nothing overridden: `Node.Gc.props` |
+| `--gc round2` | eight heaps and nothing conserved: what this rig ran before the settings were measured |
+| `--gc stock` | server collection as the runtime ships it: a heap per core, adaptive |
+| `--gc GCHeapCount=4,GCConserveMemory=5` | any runtime setting by its name, the value as the runtime reads it (hexadecimal for `GCHeapCount`, `GCHeapHardLimit`, `GCgen0MaxBudget`); a name with an underscore is an environment variable as written (`MALLOC_ARENA_MAX=2`) |
+
+`--client queued.max.messages.kbytes=16384` gives every Kafka client of the nodes a
+property. `--trim` and `--age 30` ask each node, at the end of the steady load, what the
+C allocator holds free and to give it back, and to collect thirty times and say what
+the collector then holds: the two experiments behind `MemoryKeeper`. `--hold-seconds`
+waits there for a profiler.
 
 Each node the rig starts runs under `NodeSupervisor` (the `node` command with
 `--supervise`): the process the rig holds is the supervisor, and the node is its child.

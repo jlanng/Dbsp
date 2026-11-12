@@ -95,8 +95,11 @@ internal sealed class Rig(Arguments arguments)
             "--supervise",
         };
         args.AddRange(Security.Forward(arguments));
-        var node = new NodeProcess(id, args, Path.Combine(_work, $"{id}-{_nodes.Count}.stderr.log"));
-        _nodes.Add(node);
+        if (arguments.Text("--client") is { Length: > 0 } client)
+            args.AddRange(["--client", client]);
+        var node = new NodeProcess(id, args, Path.Combine(_work, $"{id}-{_nodes.Count}.stderr.log"), GcSettings.Environment(arguments.Text("--gc", "node")));
+        lock (_nodes)
+            _nodes.Add(node);
         return node;
     }
 
@@ -106,6 +109,7 @@ internal sealed class Rig(Arguments arguments)
         Say($"prefix {_prefix}; work directory {_work}");
         Note("config", $"rows={_rows} stateKeys={_stateKeys} pipelines={_pipelines} (joins={_joins}, aggregates={_aggregates}) " +
                        $"rate={_rate}/s churn={_churn} rows/s replication={_replication} takeoverAfter={_takeoverAfterMs} ms bootstrap={_bootstrap}");
+        Note("config.gc", string.Join(" ", GcSettings.Environment(arguments.Text("--gc", "node")).Select(e => $"{e.Key}={e.Value}")));
         var ports = FreePorts(3);
         var producerBuilder = new ProducerBuilder<byte[], byte[]>(Client(new ProducerConfig { LingerMs = 5, CompressionType = CompressionType.Lz4 }));
         Security.Producer(_own)?.Invoke(producerBuilder);
@@ -113,6 +117,8 @@ internal sealed class Rig(Arguments arguments)
         SinkWatch? watch = null;
         var steady = new CancellationTokenSource();
         Task? steadyTask = null;
+        using var timelineStop = new CancellationTokenSource();
+        var timeline = arguments.Text("--out") is { Length: > 0 } outPath ? TimelineAsync(Path.ChangeExtension(outPath, ".timeline.tsv"), timelineStop.Token) : Task.CompletedTask;
         try
         {
             var pipelines = Pipelines();
@@ -123,17 +129,28 @@ internal sealed class Rig(Arguments arguments)
             var a = Start("a", ports[0], ports[1], plugins: true);
             var lead = await a.WaitForRoleAsync("Leader");
             Note("first-lead.from-process-start", T(lead) - startedA, "ms");
+            Running("leader.empty", (await a.StatusAsync()).GetProperty("memory"));
 
             // ── B: the table ───────────────────────────────────────────────────────────
             await a.RunAsync("declare " + JsonSerializer.Serialize(
                 new TableSpec { Name = Reference.Parties.Name, Definition = typeof(PartiesTable).FullName! }, Json), "declared");
+            _phase = "load";
             var loadClock = Stopwatch.StartNew();
             await a.RunAsync($"load 0 {_rows} {arguments.Number("--load-batch", 20_000)} 0", "loaded");
             Note("table.load", loadClock.ElapsedMilliseconds, "ms");
             Note("table.load.rows-per-second", (long)(_rows / loadClock.Elapsed.TotalSeconds));
+            var loaded = await a.StatusAsync();
+            Running("leader.after-load", loaded.GetProperty("memory"));
             var afterLoad = await a.GcAsync();
             Note("leader.heap-after-load", afterLoad.Heap, "MB");
             Note("leader.heap-per-million-rows", Math.Round(afterLoad.Heap / (_rows / 1e6)), "MB");
+
+            // What the node says the table holds, beside what the heap grew by.
+            var parties = loaded.GetProperty("tables").EnumerateArray().First(t => t.GetProperty("name").GetString() == Reference.Parties.Name);
+            Note("table.estimated-by-the-node", parties.GetProperty("memoryBytes").GetInt64() / 1048576, "MB");
+            Note("table.estimated-by-the-node.parts",
+                $"rows {parties.GetProperty("rowBytes").GetInt64() / 1048576} MB ({parties.GetProperty("meanRowBytes").GetDouble():F0} B of objects a row), " +
+                $"index {parties.GetProperty("indexBytes").GetInt64() / 1048576} MB, history {parties.GetProperty("historyBytes").GetInt64() / 1048576} MB");
             if (BrokerBytes($"{_prefix}.table.") is { } tableBytes)
             {
                 Note("broker.table-bytes", tableBytes / 1048576, "MB");
@@ -159,17 +176,20 @@ internal sealed class Rig(Arguments arguments)
             await a.StatusWhenAsync(s => Rows(s, "parties-feed") == fed, "the kafka loader to fill its table");
 
             // ── C: the pipelines, with nothing to read yet ─────────────────────────────
+            _phase = "deploy";
             var deployClock = Stopwatch.StartNew();
             foreach (var (id, definition) in pipelines)
                 await a.RunAsync("deploy " + JsonSerializer.Serialize(Spec(id, definition), Json), "deployed");
             await a.StatusWhenAsync(s => AllRunning(s, pipelines.Count), "every pipeline to run");
             Note("pipelines.deploy-all", deployClock.ElapsedMilliseconds, "ms");
+            Running("leader.after-deploy", (await a.StatusAsync()).GetProperty("memory"));
             var afterDeploy = await a.GcAsync();
             Note("leader.heap-after-deploy", afterDeploy.Heap, "MB");
             Note("leader.heap-added-by-pipelines", afterDeploy.Heap - afterLoad.Heap, "MB");
 
             // ── D: the state ───────────────────────────────────────────────────────────
             var heavy = pipelines.Where(p => p.Definition != "order-lookup").Select(p => p.Id).ToHashSet();
+            _phase = "fill";
             var fillClock = Stopwatch.StartNew();
             for (long id = 0; id < _stateKeys; id++)
             {
@@ -185,9 +205,21 @@ internal sealed class Rig(Arguments arguments)
                 "the stateful pipelines to have read every order", pollMs: 500);
             Note("state.fill", fillClock.ElapsedMilliseconds, "ms");
             Note("state.fill.orders-per-second-per-pipeline", (long)(_stateKeys / fillClock.Elapsed.TotalSeconds));
+            var filled = (await a.StatusAsync()).GetProperty("memory");
+            Running("leader.after-state", filled);
+            Note("leader.load-and-fill.longest-stall", filled.GetProperty("longestStallMs").GetDouble(), "ms");
+            // After this, a full blocking collection is the rig's own (GcAsync): the
+            // meter is marked again wherever the next measured stretch begins.
+            Note("leader.load-and-fill.last-full-blocking-collection", $"collection {filled.GetProperty("fullBlockingIndex").GetInt64()}, {filled.GetProperty("fullBlockingPauseMs").GetDouble():F0} ms");
             var afterFill = await a.GcAsync();
             Note("leader.heap-after-state", afterFill.Heap, "MB");
             Note("leader.heap-added-by-state", afterFill.Heap - afterDeploy.Heap, "MB");
+            var stateful = (await a.StatusAsync()).GetProperty("pipelines").EnumerateArray().Where(p => p.GetProperty("stateEntries").GetInt64() > 0).ToList();
+            Note("state.estimated-by-the-node", stateful.Sum(p => p.GetProperty("stateBytes").GetInt64()) / 1048576, "MB");
+            Note("state.entries", stateful.Sum(p => p.GetProperty("stateEntries").GetInt64()));
+            foreach (var group in stateful.GroupBy(p => p.GetProperty("definition").GetString()!))
+                Note($"state.estimated-by-the-node.{group.Key}",
+                    $"{group.Count()} pipelines, {group.Sum(p => p.GetProperty("stateEntries").GetInt64())} entries, {group.Sum(p => p.GetProperty("stateBytes").GetInt64()) / 1048576} MB");
             if (BrokerBytes($"{_prefix}.state-") is { } stateBytes)
                 Note("broker.state-bytes", stateBytes / 1048576, "MB");
 
@@ -201,14 +233,16 @@ internal sealed class Rig(Arguments arguments)
                 // takeover; the node is killed and one is started from nothing.
                 Note("leader.rss", (await a.GcAsync()).Rss, "MB");
                 await a.RunAsync($"churn {_churn} {_rows}", "churning");
-                await Task.Delay(TimeSpan.FromSeconds(_steadySeconds));
-                await ColdStartAsync(a, ports[2], watch, pipelines);
+                await SteadyMemoryAsync(a, null, null, null);
+                if (!arguments.Has("--memory-only"))
+                    await ColdStartAsync(a, ports[2], watch, pipelines);
                 steady.Cancel();
                 await steadyTask;
                 return 0;
             }
 
             // ── E: a cold standby ──────────────────────────────────────────────────────
+            _phase = "standby";
             var startedB = Now;
             var b = Start("b", ports[1], ports[0], plugins: false);
             var warm = await b.StatusWhenAsync(s => s.GetProperty("warm").GetBoolean() && s.GetProperty("leader").GetString() == "a", "the standby to be warm", pollMs: 250);
@@ -221,19 +255,12 @@ internal sealed class Rig(Arguments arguments)
             Note("leader.rss", (await a.GcAsync()).Rss, "MB");
             await a.StatusWhenAsync(s => s.GetProperty("peerReady").GetBoolean(), "the leader to see a ready standby");
 
+            _phase = "steady";
             // ── F: steady state ────────────────────────────────────────────────────────
             await a.RunAsync($"churn {_churn} {_rows}", "churning");
             var lags = new List<long>();
             var tableLags = new List<long>();
-            var steadyClock = Stopwatch.StartNew();
-            while (steadyClock.Elapsed < TimeSpan.FromSeconds(_steadySeconds))
-            {
-                await Task.Delay(1000);
-                RequireMemory();
-                var status = await b.StatusAsync();
-                lags.Add(status.GetProperty("stateLag").GetInt64());
-                tableLags.Add(status.GetProperty("tables").EnumerateArray().Sum(t => t.TryGetProperty("lag", out var lag) && lag.ValueKind == JsonValueKind.Number ? lag.GetInt64() : 0));
-            }
+            await SteadyMemoryAsync(a, b, lags, tableLags);
             lags.Sort();
             tableLags.Sort();
             Note("standby.state-lag.median", lags[lags.Count / 2], "records");
@@ -250,7 +277,14 @@ internal sealed class Rig(Arguments arguments)
             }
             Note("leader.gc-pause-percent", leaderSteady.GetProperty("memory").GetProperty("pausePercent").GetDouble());
             Note("leader.input-lag.max-per-pipeline", leaderSteady.GetProperty("pipelines").EnumerateArray().Max(p => p.GetProperty("lag").GetInt64()), "records");
+            if (arguments.Has("--memory-only"))
+            {
+                steady.Cancel();
+                await steadyTask;
+                return 0;
+            }
 
+            _phase = "kill";
             // ── G: kill -9 ─────────────────────────────────────────────────────────────
             a.Kill();
             var killedAt = Now;
@@ -267,6 +301,7 @@ internal sealed class Rig(Arguments arguments)
             await b.StatusWhenAsync(s => s.GetProperty("peerReady").GetBoolean(), "the leader to see a ready standby");
             await Task.Delay(3000);
 
+            _phase = "manual";
             // ── I: a manual takeover from under a healthy leader ───────────────────────
             var askedAt = Now;
             watch.Arm(askedAt);
@@ -294,6 +329,8 @@ internal sealed class Rig(Arguments arguments)
         }
         finally
         {
+            timelineStop.Cancel();
+            await timeline;
             steady.Cancel();
             watch?.Dispose();
             foreach (var node in _nodes)
@@ -306,6 +343,165 @@ internal sealed class Rig(Arguments arguments)
             Console.WriteLine("── summary ──");
             foreach (var line in _summary)
                 Console.WriteLine(line);
+        }
+    }
+
+    /// <summary>A node's memory as it runs — no collection forced — under
+    /// <paramref name="prefix"/>: the working set, what the collector has committed, what
+    /// it held after its last collection, and the rest of the process.</summary>
+    private void Running(string prefix, JsonElement memory)
+    {
+        Note($"{prefix}.rss", memory.GetProperty("rssMb").GetInt64(), "MB");
+        Note($"{prefix}.gc-committed", memory.GetProperty("committedMb").GetInt64(), "MB");
+        Note($"{prefix}.gc-live-at-last-collection", memory.GetProperty("liveMb").GetInt64(), "MB");
+        Note($"{prefix}.not-the-collectors", memory.GetProperty("otherMb").GetInt64(), "MB");
+        _results[$"{prefix}.memory"] = memory;
+    }
+
+    /// <summary>The steady load: <c>--steady-seconds</c> of it, each node's memory read
+    /// every second without forcing anything, then once more after a full collection so
+    /// that "live" is live. The pause share is the collector's pauses during these
+    /// seconds over these seconds, not over the process's life (which holds the load).</summary>
+    private async Task SteadyMemoryAsync(NodeProcess leader, NodeProcess? standby, List<long>? lags, List<long>? tableLags)
+    {
+        var nodes = standby is null ? new[] { ("leader", leader) } : [("leader", leader), ("standby", standby)];
+        var first = new Dictionary<string, JsonElement>();
+        var last = new Dictionary<string, JsonElement>();
+        var rss = nodes.ToDictionary(n => n.Item1, _ => new List<long>());
+        var stalls = nodes.ToDictionary(n => n.Item1, _ => 0.0);
+        var blocking = nodes.ToDictionary(n => n.Item1, _ => new Dictionary<long, double>());
+        foreach (var (_, node) in nodes)
+            await node.RunAsync("mark", "marked");
+        var clock = Stopwatch.StartNew();
+        while (clock.Elapsed < TimeSpan.FromSeconds(_steadySeconds))
+        {
+            await Task.Delay(1000);
+            RequireMemory();
+            foreach (var (name, node) in nodes)
+            {
+                var status = await node.StatusAsync();
+                var memory = status.GetProperty("memory");
+                // The first reading only empties the meter of what came before the steady load.
+                if (first.TryAdd(name, memory))
+                    blocking[name][memory.GetProperty("fullBlockingIndex").GetInt64()] = -1;
+                else
+                {
+                    stalls[name] = Math.Max(stalls[name], memory.GetProperty("longestStallSinceMarkMs").GetDouble());
+                    blocking[name].TryAdd(memory.GetProperty("fullBlockingIndex").GetInt64(), memory.GetProperty("fullBlockingPauseMs").GetDouble());
+                }
+                last[name] = memory;
+                rss[name].Add(memory.GetProperty("rssMb").GetInt64());
+                if (name == "standby")
+                {
+                    lags?.Add(status.GetProperty("stateLag").GetInt64());
+                    tableLags?.Add(status.GetProperty("tables").EnumerateArray().Sum(t => t.TryGetProperty("lag", out var lag) && lag.ValueKind == JsonValueKind.Number ? lag.GetInt64() : 0));
+                }
+            }
+        }
+        foreach (var (name, node) in nodes)
+        {
+            var (from, to) = (first[name], last[name]);
+            double Delta(string property) => to.GetProperty(property).GetDouble() - from.GetProperty(property).GetDouble();
+            var seconds = Math.Max(1, Delta("uptimeMs")) / 1000;
+            Running($"{name}.steady", to);
+            rss[name].Sort();
+            Note($"{name}.steady.rss-max", rss[name][^1], "MB");
+            Note($"{name}.steady.gc-pause-percent", Math.Round(100 * Delta("pauseMs") / 1000 / seconds, 2));
+            Note($"{name}.steady.collections", $"{Delta("gen0"):F0} gen0, {Delta("gen1"):F0} gen1, {Delta("gen2"):F0} gen2 in {seconds:F0} s");
+            Note($"{name}.steady.allocated-per-second", Math.Round(Delta("allocatedMb") / seconds), "MB");
+            Note($"{name}.steady.longest-stall", stalls[name], "ms");
+            var seen = blocking[name].Values.Where(pause => pause >= 0).ToList();
+            Note($"{name}.steady.full-blocking-collections", seen.Count == 0 ? "none seen" : $"{seen.Count} seen, the longest {seen.Max():F0} ms");
+            Note($"{name}.gc", to.GetProperty("gc").GetString());
+            Snapshot(name, to.GetProperty("pid").GetInt32());
+        }
+        if (arguments.Number("--hold-seconds", 0) is > 0 and var hold)
+        {
+            Say($"holding for {hold} s: " + string.Join(", ", nodes.Select(n => $"{n.Item1} is process {last[n.Item1].GetProperty("pid").GetInt32()}")));
+            await Task.Delay(TimeSpan.FromSeconds(hold));
+        }
+        if (arguments.Has("--trim"))
+        {
+            foreach (var (name, node) in nodes)
+                Note($"{name}.steady.malloc-trim", (await node.RunAsync("trim", "trimmed")).GetRawText());
+        }
+        if (arguments.Text("--age") is { Length: > 0 } age)
+        {
+            foreach (var (name, node) in nodes)
+            {
+                var round = 0;
+                foreach (var spec in age.Split(';', StringSplitOptions.RemoveEmptyEntries))
+                    Note($"{name}.steady.aged.{round++}", (await node.RunAsync("age " + spec.Replace(',', ' '), "aged")).GetRawText());
+            }
+        }
+        foreach (var (name, node) in nodes)
+        {
+            var collected = await node.RunAsync("gc", "gc");
+            Note($"{name}.steady.live-heap", collected.GetProperty("heapMb").GetInt64(), "MB");
+            Note($"{name}.steady.rss-after-full-collection", collected.GetProperty("rssMb").GetInt64(), "MB");
+            _results[$"{name}.steady.memory-after-full-collection"] = collected;
+        }
+    }
+
+    /// <summary>Every two seconds, every node's memory as the operating system and its
+    /// runtime report it, to a file beside <c>--out</c>: where the working set went, and
+    /// when. Read from outside the node (its <c>/proc</c> entries and nothing else), so
+    /// that watching costs the node nothing.</summary>
+    private async Task TimelineAsync(string path, CancellationToken stop)
+    {
+        await using var file = new StreamWriter(path) { AutoFlush = true };
+        await file.WriteLineAsync("seconds\tnode\tpid\trss_mb\tanon_mb\tphase");
+        var clock = Stopwatch.StartNew();
+        while (!stop.IsCancellationRequested)
+        {
+            NodeProcess[] nodes;
+            lock (_nodes)
+                nodes = [.. _nodes];
+            foreach (var node in nodes)
+            {
+                if (node.Pid is not { } pid || !File.Exists($"/proc/{pid}/status"))
+                    continue;
+                try
+                {
+                    long rss = 0, anon = 0;
+                    foreach (var line in File.ReadLines($"/proc/{pid}/status"))
+                    {
+                        if (line.StartsWith("VmRSS:", StringComparison.Ordinal))
+                            rss = long.Parse(line.Split(' ', StringSplitOptions.RemoveEmptyEntries)[1], CultureInfo.InvariantCulture) / 1024;
+                        else if (line.StartsWith("RssAnon:", StringComparison.Ordinal))
+                            anon = long.Parse(line.Split(' ', StringSplitOptions.RemoveEmptyEntries)[1], CultureInfo.InvariantCulture) / 1024;
+                    }
+                    await file.WriteLineAsync($"{clock.Elapsed.TotalSeconds:F0}\t{node.Id}\t{pid}\t{rss}\t{anon}\t{_phase}");
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or FormatException)
+                {
+                    // The process ended between the two looks.
+                }
+            }
+            try
+            {
+                await Task.Delay(2000, stop);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+    }
+
+    private volatile string _phase = "start";
+
+    /// <summary>Keeps the kernel's account of a node's mappings beside the run's logs, for
+    /// whoever asks where the working set is.</summary>
+    private void Snapshot(string name, int pid)
+    {
+        try
+        {
+            if (File.Exists($"/proc/{pid}/smaps"))
+                File.Copy($"/proc/{pid}/smaps", Path.Combine(_work, $"{name}.smaps"), overwrite: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Say($"smaps of {name} not read: {ex.Message}");
         }
     }
 
@@ -658,7 +854,7 @@ internal sealed class NodeProcess : IDisposable
     private readonly List<(int Pid, long At)> _starts = [];
     private readonly List<(int Code, long At)> _exits = [];
 
-    public NodeProcess(string id, IEnumerable<string> args, string stderrPath)
+    public NodeProcess(string id, IEnumerable<string> args, string stderrPath, IReadOnlyDictionary<string, string> environment)
     {
         Id = id;
         _stderrPath = stderrPath;
@@ -670,11 +866,10 @@ internal sealed class NodeProcess : IDisposable
             RedirectStandardError = true,
             WorkingDirectory = AppContext.BaseDirectory,
         };
-        // Twenty one-worker circuits do not need a GC heap per core; the value is hexadecimal.
-        info.Environment["DOTNET_GCHeapCount"] = Environment.GetEnvironmentVariable("SCALE_GC_HEAPS") ?? "8";
-        // SCALE_GC_SERVER=0: workstation GC, for a size whose server-GC working set this machine cannot hold twice.
-        if (Environment.GetEnvironmentVariable("SCALE_GC_SERVER") is { Length: > 0 } server)
-            info.Environment["DOTNET_gcServer"] = server;
+        // The collector's settings (and the C allocator's) are the process's environment:
+        // --gc chooses them, and the supervisor hands them on to the node it starts.
+        foreach (var (name, value) in environment)
+            info.Environment[name] = value;
         info.ArgumentList.Add(Path.Combine(AppContext.BaseDirectory, "Incremental.Service.Scale.dll"));
         foreach (var argument in args)
             info.ArgumentList.Add(argument);
@@ -705,6 +900,16 @@ internal sealed class NodeProcess : IDisposable
     }
 
     public string Id { get; }
+
+    /// <summary>The node's own process — the supervisor's child — as last started.</summary>
+    public int? Pid
+    {
+        get
+        {
+            lock (_stderr)
+                return _starts.Count > 0 ? _starts[^1].Pid : null;
+        }
+    }
 
     private List<JsonElement> Events(string kind)
     {
@@ -926,5 +1131,46 @@ internal sealed class NodeProcess : IDisposable
         _process.Dispose();
         lock (_stderr)
             _stderr.Dispose();
+    }
+}
+
+/// <summary>
+/// What <c>--gc</c> means: the environment of every node process, which overrides what
+/// the project file builds in. <c>node</c> is what the guide recommends for a node
+/// (<i>Sizing a node</i>; <c>src/Incremental.Service/Node.Gc.props</c>, which this
+/// project imports) and the default: nothing is overridden. <c>round2</c> is what this
+/// rig ran with before that was measured (eight heaps, nothing conserved); <c>stock</c>
+/// is server collection as the runtime ships it (a heap per core, adaptive). Anything
+/// else is a list of <c>name=value</c> pairs, separated
+/// by commas: a name without an underscore is a runtime setting and gets the
+/// <c>DOTNET_</c> prefix (its value as the runtime reads it — hexadecimal for
+/// <c>GCHeapCount</c>, <c>GCHeapHardLimit</c> and <c>GCgen0MaxBudget</c>), any other is an
+/// environment variable as written (<c>MALLOC_ARENA_MAX=2</c>).
+/// </summary>
+internal static class GcSettings
+{
+    public const string Node = "";
+    public const string RoundTwo = "GCHeapCount=8,GCConserveMemory=0";
+    public const string Stock = "GCHeapCount=0,GCConserveMemory=0,GCDynamicAdaptationMode=1";
+
+    public static IReadOnlyDictionary<string, string> Environment(string setting)
+    {
+        var pairs = setting switch
+        {
+            "node" => Node,
+            "round2" => RoundTwo,
+            "stock" => Stock,
+            _ => setting,
+        };
+        var environment = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var pair in pairs.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var equals = pair.IndexOf('=');
+            if (equals <= 0)
+                throw new ArgumentException($"--gc: '{pair}' is not name=value.");
+            var name = pair[..equals];
+            environment[name.Contains('_') ? name : "DOTNET_" + name] = pair[(equals + 1)..];
+        }
+        return environment;
     }
 }

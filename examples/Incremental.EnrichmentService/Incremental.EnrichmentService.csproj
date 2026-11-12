@@ -5,10 +5,14 @@
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
     <RootNamespace>Incremental.EnrichmentService</RootNamespace>
-    <CircuitWorkers>1</CircuitWorkers>   <!-- GC heap count; every pipeline spec this host seeds runs one worker -->
+    <!-- A node's collector settings (the import below). Four heaps, not the eight a
+         production node would have: this host is run on a laptop, beside a browser. -->
+    <NodeGcHeaps>4</NodeGcHeaps>
     <!-- The contract and plugin projects live in this directory too; their files are theirs. -->
     <DefaultItemExcludes>$(DefaultItemExcludes);Contracts/**;Pipelines/**;Pipelines.V2/**;Pipelines.Tests/**</DefaultItemExcludes>
   </PropertyGroup>
+
+  <Import Project="..\..\src\Incremental.Service\Node.Gc.props" />
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Incremental.Service\Incremental.Service.csproj" />

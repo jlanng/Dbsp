@@ -5,13 +5,13 @@
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
     <RootNamespace>Incremental.Service.Scale</RootNamespace>
-    <!-- The examples' GC configuration (examples/Directory.Build.props), without a heap
-         count: a node runs twenty circuits, one worker each. -->
-    <ServerGarbageCollection>true</ServerGarbageCollection>
-    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
-    <GarbageCollectionAdaptationMode>0</GarbageCollectionAdaptationMode>
     <DefaultItemExcludes>$(DefaultItemExcludes);Contracts/**;Pipelines/**</DefaultItemExcludes>
   </PropertyGroup>
+
+  <!-- A node's collector settings: what the guide recommends, and what "gc node" (the
+       rig's default) therefore runs. The rig's other settings override them through the
+       nodes' environment. -->
+  <Import Project="..\..\src\Incremental.Service\Node.Gc.props" />
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="8.0.1" />

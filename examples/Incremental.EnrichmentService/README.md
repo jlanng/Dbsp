@@ -155,6 +155,12 @@ var service = builder.Services.AddIncrementalService(o =>
     .AddSinkConnector("view", _ => new ViewConnector(world.Views));
 ```
 
+The project file is part of the host too: it imports
+`src/Incremental.Service/Node.Gc.props`, the collector's settings for a process that is
+a node (server, concurrent, not adaptive, and four heaps here where a production
+node would have eight). The guide's *Sizing a node* has what each is for and what a
+node's memory comes to; the cluster page of the admin UI shows this process's.
+
 ## Flags
 
 | | |

@@ -12,7 +12,8 @@ Option[] shared =
     new("--oauth", "principal", "Every client authenticates with SASL/OAUTHBEARER as this principal."),
     new("--oauth-lifetime-seconds", "N", "The life of one token (20)."),
     new("--log-level", "level", "The nodes' log level on stderr (Warning)."),
-    new("--gc", "name", "The nodes' GC settings: node (the default, what the guide recommends), stock, or name=value pairs."),
+    new("--client", "name=value,…", "Kafka client properties for every client of the nodes (librdkafka names)."),
+    new("--gc", "name", "The nodes' GC settings: node (the default, what the guide recommends), round2, stock, or name=value pairs."),
 ];
 Option[] run =
 [
@@ -27,6 +28,9 @@ Option[] run =
     new("--load-batch", "N", "Rows per table write while loading."),
     new("--single", null, "One node only: no standby, no failover."),
     new("--memory-only", null, "Stop after the steady load: memory figures, no failover."),
+    new("--trim", null, "At the end of the steady load, ask the C allocator how much it holds free and have it give that back."),
+    new("--age", "N[,generation]", "At the end of the steady load, have each node collect N times (generation 0 unless said) and say what the collector then holds."),
+    new("--hold-seconds", "N", "Wait this long at the end of the steady load, for a profiler to be attached."),
     new("--oauth-rig", "principal", "The rig's own clients use this principal instead of the nodes'."),
     new("--broker-container", "name", "The broker's container, to measure its topics' size on disk."),
     new("--broker-data", "dir", "The broker's log directory inside it (/tmp/kafka-logs)."),

@@ -52,6 +52,8 @@ internal static class NodeHost
             services.AddLogging(b => b.SetMinimumLevel(level).AddProvider(new StderrLogs(level)));
             services.AddSingleton<IHostApplicationLifetime>(lifetime);
             var clientConfig = Security.ClientConfig(arguments);
+            foreach (var pair in arguments.Text("--client").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                clientConfig[pair[..pair.IndexOf('=')]] = pair[(pair.IndexOf('=') + 1)..];
             services.AddIncrementalService(o =>
                 {
                     o.PluginDirectory = arguments.Text("--plugins") is { Length: > 0 } plugins ? plugins : null;
@@ -108,6 +110,7 @@ internal static class NodeHost
                     peerReady = status.Peer?.Ready ?? false,
                     memory = Memory(false),
                     tokens = Interlocked.Read(ref Security.TokensIssued),
+                    released = node.MemoryRelease,
                     takeover = kafka?.LastTakeover is { } t
                         ? new
                         {
@@ -135,6 +138,9 @@ internal static class NodeHost
                         lag = p.Sources.Sum(s => s.Stats.Lag ?? 0),
                         lagKnown = p.Sources.Count > 0 && p.Sources.All(s => s.Stats.Lag is not null),
                         step = p.CommittedStep ?? 0,
+                        stateEntries = p.StateSize?.Entries ?? 0,
+                        stateBytes = p.StateSize?.EstimatedBytes ?? 0,
+                        stateHeldTwice = p.StateSize?.EntriesHeldTwice ?? 0,
                         restarts = p.Restarts,
                         fault = p.Faults.LastOrDefault()?.Message,
                         start = p.LastStart is { } s
@@ -144,7 +150,12 @@ internal static class NodeHost
                     tables = node.Tables.Tables.Select(t =>
                     {
                         var stats = node.Tables.Stats(t.Name);
-                        return new { name = t.Name, state = t.State.ToString(), rows = stats.Rows, version = stats.Version, following = stats.Following, lag = stats.LagVersions };
+                        return new
+                        {
+                            name = t.Name, state = t.State.ToString(), rows = stats.Rows, version = stats.Version, following = stats.Following, lag = stats.LagVersions,
+                            memoryBytes = stats.Memory?.TotalBytes ?? 0, rowBytes = stats.Memory?.RowBytes ?? 0, indexBytes = stats.Memory?.IndexBytes ?? 0,
+                            historyBytes = stats.Memory?.HistoryBytes ?? 0, meanRowBytes = stats.Memory?.MeanRowBytes ?? 0,
+                        };
                     }),
                 };
             }
@@ -167,6 +178,63 @@ internal static class NodeHost
                         case "gc":
                             Emit("gc", Memory(true));
                             break;
+                        case "mark":
+                            Stalls.Mark();
+                            Emit("marked");
+                            break;
+                        case "age":
+                        {
+                            // An experiment's question: does the collector give back what a
+                            // burst left it holding once some collections have gone by?
+                            var count = int.Parse(parts[0], CultureInfo.InvariantCulture);
+                            var generation = parts.Length > 1 ? int.Parse(parts[1], CultureInfo.InvariantCulture) : 0;
+                            var background = parts.Length > 2 && parts[2] == "bg";
+                            var before = GC.GetGCMemoryInfo().TotalCommittedBytes / 1048576;
+                            var pauseBefore = GC.GetTotalPauseDuration();
+                            for (var i = 0; i < count; i++)
+                            {
+                                GC.Collect(generation, GCCollectionMode.Forced, blocking: !background);
+                                await Task.Delay(background ? 3000 : 100);
+                            }
+                            var soon = GC.GetGCMemoryInfo().TotalCommittedBytes / 1048576;
+                            await Task.Delay(5000);
+                            Emit("aged", new
+                            {
+                                count,
+                                generation,
+                                background,
+                                committedBeforeMb = before,
+                                committedAfterMb = soon,
+                                committedFiveSecondsLaterMb = GC.GetGCMemoryInfo().TotalCommittedBytes / 1048576,
+                                rssMb = Environment.WorkingSet / 1048576,
+                                pauseMs = (GC.GetTotalPauseDuration() - pauseBefore).TotalMilliseconds,
+                            });
+                            break;
+                        }
+                        case "trim":
+                        {
+                            // An experiment's question: how much of what the C allocator
+                            // holds is free memory it has not given back?
+                            var before = Malloc.Info();
+                            var rssBefore = Environment.WorkingSet / 1048576;
+                            var clock = System.Diagnostics.Stopwatch.StartNew();
+                            Malloc.malloc_trim(0);
+                            var ms = clock.Elapsed.TotalMilliseconds;
+                            var after = Malloc.Info();
+                            Emit("trimmed", new
+                            {
+                                ms,
+                                rssBeforeMb = rssBefore,
+                                rssAfterMb = Environment.WorkingSet / 1048576,
+                                arenaMb = (long)before.arena / 1048576,
+                                mmapMb = (long)before.hblkhd / 1048576,
+                                inUseMb = (long)before.uordblks / 1048576,
+                                freeMb = (long)before.fordblks / 1048576,
+                                freeAfterMb = (long)after.fordblks / 1048576,
+                                arenaAfterMb = (long)after.arena / 1048576,
+                            });
+                            break;
+                        }
                         case "declare":
                             var table = JsonSerializer.Deserialize<TableSpec>(rest, json)!;
                             await node.Tables.DeclareAsync(table, default, "rig");
@@ -267,7 +335,9 @@ internal static class NodeHost
     }
 
     /// <summary>The process's memory; with <paramref name="collect"/>, after a full blocking
-    /// collection, so that the heap figure is what is live and not what is waiting.</summary>
+    /// collection, so that the heap figure is what is live and not what is waiting. The
+    /// figures are the service's own (<see cref="ProcessMemory"/>) with the generations
+    /// beside them.</summary>
     private static object Memory(bool collect)
     {
         if (collect)
@@ -277,14 +347,99 @@ internal static class NodeHost
             GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: true);
         }
         var info = GC.GetGCMemoryInfo();
+        var blocking = GC.GetGCMemoryInfo(GCKind.FullBlocking);
+        var memory = ProcessMemory.Read();
+        static long Mb(long bytes) => bytes / 1048576;
+        var generations = info.GenerationInfo;
         return new
         {
-            heapMb = GC.GetTotalMemory(false) / 1048576,
-            committedMb = info.TotalCommittedBytes / 1048576,
-            rssMb = Environment.WorkingSet / 1048576,
-            pausePercent = info.PauseTimePercentage,
+            pid = Environment.ProcessId,
+            heapMb = Mb(memory.GcHeapBytes),
+            liveMb = Mb(memory.GcLiveBytes),
+            fragmentedMb = Mb(memory.GcFragmentedBytes),
+            committedMb = Mb(memory.GcCommittedBytes),
+            rssMb = Mb(memory.WorkingSetBytes),
+            otherMb = memory.OtherBytes is { } other ? Mb(other) : -1,
+            pausePercent = memory.GcPausePercent,
+            pauseRecentPercent = memory.GcPauseRecentPercent ?? -1,
+            pauseMs = (long)GC.GetTotalPauseDuration().TotalMilliseconds,
+            uptimeMs = (long)(DateTime.UtcNow - System.Diagnostics.Process.GetCurrentProcess().StartTime.ToUniversalTime()).TotalMilliseconds,
+            allocatedMb = Mb(GC.GetTotalAllocatedBytes()),
+            gen0 = GC.CollectionCount(0),
+            gen1 = GC.CollectionCount(1),
+            gen2 = GC.CollectionCount(2),
+            // After the last collection: gen0, gen1, gen2, large objects, pinned objects.
+            generationsMb = generations.ToArray().Select(g => Mb(g.SizeAfterBytes)).ToArray(),
+            gc = memory.Gc?.ToString(),
+            // The last full blocking collection — the one kind that stops a node for as
+            // long as its heap is large: which collection it was, and how long it paused.
+            fullBlockingIndex = blocking.Index,
+            fullBlockingPauseMs = blocking.PauseDurations.Length > 0 ? Math.Round(blocking.PauseDurations[0].TotalMilliseconds) : 0,
+            // The longest any thread of this process was held up, whatever held it — a
+            // timer thread that asks every 5 ms — since the process started, and since
+            // the `mark` command was last sent.
+            longestStallMs = Stalls.Longest,
+            longestStallSinceMarkMs = Stalls.SinceMark,
         };
     }
+}
+
+/// <summary>How long the process stood still: a thread that sleeps 5 ms at a time and
+/// remembers the longest it overslept. A collection that stops the world shows here as
+/// the node's other threads felt it.</summary>
+internal static class Stalls
+{
+    private static long _longestTicks;
+    private static long _sinceMarkTicks;
+
+    static Stalls()
+    {
+        new Thread(() =>
+        {
+            var last = System.Diagnostics.Stopwatch.GetTimestamp();
+            while (true)
+            {
+                Thread.Sleep(5);
+                var now = System.Diagnostics.Stopwatch.GetTimestamp();
+                var gap = now - last;
+                last = now;
+                Raise(ref _longestTicks, gap);
+                Raise(ref _sinceMarkTicks, gap);
+            }
+        }) { IsBackground = true, Name = "stall meter" }.Start();
+    }
+
+    private static void Raise(ref long target, long value)
+    {
+        long seen;
+        while (value > (seen = Interlocked.Read(ref target)) && Interlocked.CompareExchange(ref target, value, seen) != seen)
+        {
+        }
+    }
+
+    private static double Ms(long ticks) => Math.Max(0, Math.Round(System.Diagnostics.Stopwatch.GetElapsedTime(0, ticks).TotalMilliseconds - 5, 1));
+
+    public static double Longest => Ms(Interlocked.Read(ref _longestTicks));
+    public static double SinceMark => Ms(Interlocked.Read(ref _sinceMarkTicks));
+    public static void Mark() => Interlocked.Exchange(ref _sinceMarkTicks, 0);
+}
+
+/// <summary>glibc's allocator, which is the Kafka client's.</summary>
+internal static class Malloc
+{
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    public struct Mallinfo2
+    {
+        public nuint arena, ordblks, smblks, hblks, hblkhd, usmblks, fsmblks, uordblks, fordblks, keepcost;
+    }
+
+    [System.Runtime.InteropServices.DllImport("libc")]
+    public static extern int malloc_trim(nuint pad);
+
+    [System.Runtime.InteropServices.DllImport("libc")]
+    private static extern Mallinfo2 mallinfo2();
+
+    public static Mallinfo2 Info() => mallinfo2();
 }
 
 /// <summary>What a generic host would give the node: somewhere to say "stop this process".</summary>
