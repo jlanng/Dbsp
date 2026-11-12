@@ -1204,9 +1204,21 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         Assert.Equal("http://leader.example/admin/", refused.Body.GetProperty("error").GetProperty("leader").GetProperty("adminUrl").GetString());
         (await admin.SendAsync(HttpMethod.Post, "node/stepdown?confirm=node-b", baseUrl: standby)).IsError(409, "conflict");
 
-        // Except takeover, which is asked of the standby.
+        // Except takeover, which is asked of the standby — once it has built what it can,
+        // so that what its plan counts holds still.
+        await TestService.Eventually(() => admin.Host.Nodes[1].Node.Status.Standby is { PipelinesToBuild: 0 }, "the standby's builds done");
         var plan = await admin.SendAsync(HttpMethod.Post, "node/takeover?dryRun=true", baseUrl: standby);
-        Assert.Equal(2, plan["plan"].GetProperty("steps").GetArrayLength());
+        var steps = plan["plan"].GetProperty("steps").EnumerateArray().Select(x => x.GetString()!).ToList();
+        Assert.Equal(3, steps.Count);
+        // A warm standby starts what it has built; the plan says so rather than "builds".
+        // It counts what this standby has built and what it would still have to build.
+        var standbyNode = admin.Host.Nodes[1].Node;
+        var running = standbyNode.Pipelines.Pipelines.Where(p => p.Desired == DesiredState.Running).ToList();
+        var built = running.Count(p => p.State == PipelineState.Built);
+        Assert.InRange(built, 1, running.Count - 1);         // the host's pipelines include one that is built at takeover
+        Assert.Equal(
+            $"it starts the {built} pipeline(s) it has built while standing by, and builds and starts {running.Count - built} more from their committed state",
+            steps[2]);
         Assert.Equal(200, (await admin.SendAsync(HttpMethod.Post, "node/takeover?confirm=node-b", baseUrl: standby)).Code);
         await TestService.Eventually(() => admin.Host.Nodes[1].Node.IsLeader, "node-b leads");
         var after = await admin.Get("node");

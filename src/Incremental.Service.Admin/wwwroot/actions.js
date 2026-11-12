@@ -27,7 +27,14 @@
     };
   }
 
-  const planList = plan => h('ol', { class: 'plan' }, plan.steps.map(step => h('li', null, h('span', null, step))));
+  /** A plan's steps, and above them what the node saw that the caller should look at
+   *  first (`warnings`: an input whose file, prefix or topic is not there). */
+  const planList = plan => [
+    plan.warnings && plan.warnings.length > 0 && A.notice('warn', h('div', null,
+      h('strong', null, plan.warnings.length === 1 ? 'Goes ahead, but look first: ' : 'Goes ahead, but look first:'),
+      plan.warnings.length === 1 ? plan.warnings[0] : h('ul', null, plan.warnings.map(w => h('li', null, w))))),
+    h('ol', { class: 'plan' }, plan.steps.map(step => h('li', null, h('span', null, step)))),
+  ];
 
   /**
    * One guarded action.
@@ -168,7 +175,7 @@
       verb: takeover ? 'Take over' : 'Step down', danger: true, typed: nodeId, force: true, after,
       done: takeover ? 'Takeover started.' : 'Step-down started. This node’s process ends when it has resigned.',
       intro: takeover
-        ? 'This node fences the current leader and starts leading. Pipelines stop on the old leader and are rebuilt here from their committed state.'
+        ? 'This node fences the current leader and starts leading. Pipelines stop on the old leader and start here at their committed step: those this node has built while standing by are started as they are, any others are built first. The plan says how many of each.'
         : 'This node stops its pipelines and resigns. Resigning is final for this process: it ends, and its supervisor restarts it as a standby.',
       dry: force => (takeover ? api('node/takeover' + q({ dryRun: true, force }), { method: 'POST' }) : api('node/stepdown' + q({ dryRun: true, force }), { method: 'POST' })),
       run: force => (takeover ? api('node/takeover' + q({ confirm: nodeId, force }), { method: 'POST' }) : api('node/stepdown' + q({ confirm: nodeId, force }), { method: 'POST' })),

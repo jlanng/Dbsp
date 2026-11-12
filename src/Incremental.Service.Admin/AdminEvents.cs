@@ -103,13 +103,57 @@ internal sealed class AdminEventHub : IDisposable
         }
     }
 
-    internal static object Rates(MetricSample s) => new
+    /// <summary>
+    /// A sample's rates. With <paramref name="recent"/> (a pipeline's one-second samples,
+    /// oldest first, ending with <paramref name="s"/>) a pipeline that steps less often than
+    /// once a second and a half — a sink's minimum interval holds each step back — is
+    /// <c>batchedEveryS</c>, and its rates are taken over the last two of its intervals:
+    /// one second alone reads 100/s and then 0/s for a steady 50/s.
+    /// </summary>
+    internal static object Rates(MetricSample s, IReadOnlyList<MetricSample>? recent = null)
     {
-        @in = Math.Round(s.RecordsIn / s.Seconds, 1),
-        @out = Math.Round(s.RecordsOut / s.Seconds, 1),
+        double? every = null;
+        var window = s;
+        if (recent is { Count: > 1 })
+        {
+            // The spacing of steps over the last half minute, while the pipeline stepped at all.
+            double seconds = 0;
+            long steps = 0;
+            for (var i = recent.Count - 1; i >= 0 && i >= recent.Count - 30; i--)
+            {
+                seconds += recent[i].Seconds;
+                steps += recent[i].Steps;
+            }
+            if (steps > 0 && seconds / steps >= 1.5)
+            {
+                every = Math.Round(seconds / steps, 1);
+                double span = 0, @in = 0, @out = 0, stepSeconds = 0, stepMax = 0;
+                long windowSteps = 0;
+                for (var i = recent.Count - 1; i >= 0 && span < 2 * every; i--)
+                {
+                    var x = recent[i];
+                    span += x.Seconds;
+                    @in += x.RecordsIn;
+                    @out += x.RecordsOut;
+                    windowSteps += x.Steps;
+                    stepSeconds += x.StepSeconds;
+                    stepMax = Math.Max(stepMax, x.StepMaxSeconds);
+                }
+                window = s with { Seconds = span, RecordsIn = (long)@in, RecordsOut = (long)@out, Steps = windowSteps, StepSeconds = stepSeconds, StepMaxSeconds = stepMax };
+            }
+        }
+        return Rates(s, window, every);
+    }
+
+    private static object Rates(MetricSample s, MetricSample window, double? every) => new
+    {
+        @in = Math.Round(window.RecordsIn / window.Seconds, 1),
+        @out = Math.Round(window.RecordsOut / window.Seconds, 1),
+        batchedEveryS = every,
+        rateOverS = every is null ? (double?)null : Math.Round(window.Seconds, 1),
         steps = s.Steps,
-        stepMs = s.Steps > 0 ? Math.Round(s.StepSeconds * 1000 / s.Steps, 3) : (double?)null,
-        stepMaxMs = s.Steps > 0 ? Math.Round(s.StepMaxSeconds * 1000, 3) : (double?)null,
+        stepMs = window.Steps > 0 ? Math.Round(window.StepSeconds * 1000 / window.Steps, 3) : (double?)null,
+        stepMaxMs = window.Steps > 0 ? Math.Round(window.StepMaxSeconds * 1000, 3) : (double?)null,
         ackMs = s.Commits > 0 ? Math.Round(s.SinkAckWaitSeconds * 1000 / s.Commits, 3) : (double?)null,
         commits = s.Commits,
         lag = s.InputLag,
@@ -142,7 +186,7 @@ internal sealed class AdminEventHub : IDisposable
                 peer = status.Peer,
             },
             total = latest.TryGetValue("", out var total) ? Rates(total) : null,
-            pipelines = latest.Where(p => p.Key.Length > 0).ToDictionary(p => p.Key, p => Rates(p.Value)),
+            pipelines = latest.Where(p => p.Key.Length > 0).ToDictionary(p => p.Key, p => Rates(p.Value, _node.Metrics.Pipeline(p.Key).Seconds)),
         };
     }
 

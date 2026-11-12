@@ -62,12 +62,33 @@
       else a.setAttribute(name, value);
     }
     for (const { name } of [...a.attributes]) if (name !== keep && !b.hasAttribute(name)) a.removeAttribute(name);
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
-      if (tag === 'SELECT') morphKids(a, b);
-      if (document.activeElement !== a) {
-        if (a.type === 'checkbox' || a.type === 'radio') a.checked = b.hasAttribute('checked');
-        else if (a.value !== b.value) a.value = b.value;
+    // A form control shows its properties, not its attributes: once a select has been
+    // chosen from, a box ticked or a field typed in, the browser stops following
+    // `selected`, `checked` and `value` in the markup. So the properties are set here,
+    // from the new tree, and the control shows what the model says whatever was done to it.
+    if (tag === 'SELECT') {
+      // Read before the options are patched: an option the page did not have is moved
+      // out of `b`, and `b` no longer knows it was the selected one.
+      const selected = [...b.options].map(o => o.selected);
+      morphKids(a, b);
+      // After the patch the options are b's, in b's order.
+      const options = a.options;
+      if (a.multiple) {
+        for (let i = 0; i < options.length; i++) if (options[i].selected !== !!selected[i]) options[i].selected = !!selected[i];
+      } else {
+        const index = selected.indexOf(true);
+        if (a.selectedIndex !== index) a.selectedIndex = index;
       }
+      return a;
+    }
+    if (tag === 'INPUT' || tag === 'TEXTAREA') {
+      if (a.type === 'checkbox' || a.type === 'radio') {
+        const checked = b.hasAttribute('checked');
+        if (a.checked !== checked) a.checked = checked;
+      }
+      // What is being typed is the one thing left alone: the model follows it at each
+      // keystroke, and writing it back would move the caret.
+      else if (document.activeElement !== a && a.value !== b.value) a.value = b.value;
       return a;
     }
     morphKids(a, b);
@@ -267,6 +288,8 @@
     'pipeline-wedged': 'A pipeline is wedged on this node',
     'pipeline-blocked': 'A pipeline is blocked on something it needs',
     'loader-faulted': "A table's loader has faulted",
+    'loader-waiting': "A table's loader has been waiting a while for what it reads, which is not there",
+    'source-waiting': "A pipeline's input has been waiting a while for what it reads, which is not there",
     'table-faulted': 'A table has faulted',
     'no-ready-standby': 'No ready standby answers: a failure of this node stops the service',
     'every-pipeline-failed': 'Every pipeline that should run has failed',

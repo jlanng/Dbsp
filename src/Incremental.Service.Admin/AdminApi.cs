@@ -225,7 +225,7 @@ internal static class AdminApi
         {
             var spec = await ReadSpecAsync<TableSpec>(context, null);
             if (Flag(context, "dryRun"))
-                return Json(new { plan = node.Tables.PlanDeclare(spec) });
+                return Json(new { plan = await node.Tables.PlanDeclareAsync(spec, context.RequestAborted) });
             await node.Tables.DeclareAsync(spec, context.RequestAborted, AdminSecurity.Caller(context, options));
             return Json(new { table = await TableItemAsync(state, node.Tables.Tables.First(t => t.Name == spec.Name)) }, 201);
         }), options.TablePolicy);
@@ -278,7 +278,7 @@ internal static class AdminApi
             var latest = node.Metrics.Latest;
             var specs = PipelineSpecs(node).ToDictionary(s => s.Id, StringComparer.Ordinal);
             return Json(Paged(
-                all.Skip(skip).Take(limit).Select(p => PipelineItem(state, p, specs.GetValueOrDefault(p.Id), latest.GetValueOrDefault(p.Id))).ToList(),
+                all.Skip(skip).Take(limit).Select(p => PipelineItem(state, p, specs.GetValueOrDefault(p.Id), latest.GetValueOrDefault(p.Id), node.Metrics.Pipeline(p.Id).Seconds)).ToList(),
                 all.Count, skip, limit));
         });
 
@@ -314,7 +314,7 @@ internal static class AdminApi
             }
             return Json(new
             {
-                pipeline = PipelineItem(state, status, spec, node.Metrics.Latest.GetValueOrDefault(id)),
+                pipeline = PipelineItem(state, status, spec, node.Metrics.Latest.GetValueOrDefault(id), node.Metrics.Pipeline(id).Seconds),
                 spec = AdminJson.Spec(spec),
                 shape = status.Shape,
                 hasGraph = node.Pipelines.Graph(id) is not null,
@@ -327,6 +327,8 @@ internal static class AdminApi
                     pausedSince = s.Stats.PausedSince,
                     positions = s.Stats.Positions,
                     at = s.Stats.At,
+                    waitingFor = s.Stats.WaitingFor,
+                    waitingSince = s.WaitingSince,
                     committed = status.CommittedOffsets.Where(o => o.Key == s.Slot || o.Key.StartsWith(s.Slot + "#", StringComparison.Ordinal))
                         .ToDictionary(o => o.Key, o => o.Value),
                 }),
@@ -701,7 +703,7 @@ internal static class AdminApi
             }
         }).Where(s => s is not null).ToList()!;
 
-    private static object PipelineItem(AdminState state, PipelineStatus p, PipelineSpec? spec, MetricSample? latest)
+    private static object PipelineItem(AdminState state, PipelineStatus p, PipelineSpec? spec, MetricSample? latest, IReadOnlyList<MetricSample> recent)
     {
         var fault = p.Faults.Count > 0 ? p.Faults[^1] : null;
         return new
@@ -741,7 +743,11 @@ internal static class AdminApi
             inputs = spec?.Inputs.Keys.Order(StringComparer.Ordinal),
             sinks = spec?.Sinks.Keys.Order(StringComparer.Ordinal),
             lastFault = fault is null ? null : new { time = fault.Time, exceptionType = fault.ExceptionType, message = state.Message(fault.Message) },
-            rates = latest is null ? null : AdminEventHub.Rates(latest),
+            lastStart = p.LastStart,
+            // Inputs whose source says that what it reads is not there, and since when.
+            waiting = p.Sources.Where(s => s.Stats.WaitingFor is not null)
+                .Select(s => new { slot = s.Slot, waitingFor = s.Stats.WaitingFor, since = s.WaitingSince }).ToList() is { Count: > 0 } w ? w : null,
+            rates = latest is null ? null : AdminEventHub.Rates(latest, recent),
         };
     }
 
@@ -783,6 +789,8 @@ internal static class AdminApi
             unreadable = s.Loader.Unreadable,
             restarts = s.Loader.Restarts,
             fault = state.Fault(s.Loader.Fault),
+            waitingFor = s.Loader.WaitingFor,
+            waitingSince = s.Loader.WaitingSince,
         },
         readers = s.Readers.Count,
         floorHeldBy = s.FloorHeldBy,

@@ -76,11 +76,20 @@
             h('div', { class: 'text' }, pipelineLink(p.id),
               h('span', { class: 'sub' }, p.blockedOn ? blockedText(p.blockedOn) : p.lastFault ? `${p.lastFault.exceptionType}${p.lastFault.message ? ': ' + p.lastFault.message : ''}` : PIPELINE_STATES[p.state][2]))));
       }
+      for (const p of pipelines.items) {
+        if (!lastKnown() && p.waiting)
+          for (const w of p.waiting)
+            attention.push(h('li', { key: 'w' + p.id + '/' + w.slot }, h('span', { class: 'badge info' }, 'Waiting'),
+              h('div', { class: 'text' }, pipelineLink(p.id), h('span', { class: 'sub' }, `input ${w.slot} is waiting for ${w.waitingFor}${w.since ? `; it began ${ago(w.since)}` : ''}`))));
+      }
       for (const t of tables.items) {
         if (t.state !== 'Open' && t.state !== 'Opening')
           attention.push(h('li', { key: 't' + t.name }, tableBadge(t.state), h('div', { class: 'text' }, tableLink(t.name), h('span', { class: 'sub' }, t.fault || (t.loader && t.loader.fault) || 'See the table.'))));
+        else if (t.loader && t.loader.waitingFor)
+          attention.push(h('li', { key: 't' + t.name }, h('span', { class: 'badge info' }, 'Waiting'), h('div', { class: 'text' }, tableLink(t.name),
+            h('span', { class: 'sub' }, `its loader is waiting for ${t.loader.waitingFor}${t.loader.waitingSince ? `, which began ${ago(t.loader.waitingSince)}` : ''}; the table holds ${plural(t.rows, 'row')}`))));
       }
-      for (const reason of st.health.reasons.filter(r => !r.startsWith('pipeline-') && r !== 'loader-faulted' && r !== 'table-faulted' && r !== 'every-pipeline-failed'))
+      for (const reason of st.health.reasons.filter(r => !r.startsWith('pipeline-') && !['loader-faulted', 'table-faulted', 'every-pipeline-failed', 'loader-waiting', 'source-waiting'].includes(r)))
         attention.push(h('li', { key: 'r' + reason }, healthBadge(st.health.level), h('div', { class: 'text' }, reasonText(reason), h('span', { class: 'sub' }, h('a', { href: '#/cluster' }, 'See the cluster page')))));
 
       return h('div', { class: 'stack' },
@@ -222,7 +231,8 @@
                   td('In /s', 'r', rate(r.in)),
                   td('Last minute', 'spark', spark(seriesOf(p.id, 'in'), { label: `${p.id}: records in per second`, unit: '/s' })),
                   td('Out /s', 'r', rate(r.out)),
-                  td('Step', 'r', r.stepMs == null ? '–' : fmtMs(r.stepMs)),
+                  td('Step', 'r', r.batchedEveryS ? h('span', { title: `It has stepped about every ${r.batchedEveryS} s lately — a sink’s minimum interval, or an input that is quiet; rates are over the last ${r.rateOverS} s` }, `every ${r.batchedEveryS} s`)
+                    : r.stepMs == null ? '–' : fmtMs(r.stepMs)),
                   td('Lag', 'r', r.lag == null ? '–' : fmtNum(r.lag)),
                   td('Dead letters', 'r', p.deadLetters ? h('a', { href: '#/pipelines/' + enc(p.id) + '/dead-letters' }, fmtNum(p.deadLetters)) : '0'),
                   td('In state', 'r', timeEl(p.since)));
@@ -325,13 +335,16 @@
         timeEl(p.rolledBack.time), '.',
         p.rolledBack.problems && p.rolledBack.problems.length > 0 && h('ul', null, p.rolledBack.problems.map(x => h('li', null, x)))),
       p.replaceUnconfirmed && notice('info', 'A replace that kept state has not finished its first start yet: if it cannot read the state, the previous spec is put back.'),
+      p.waiting && !lastKnown() && notice('warn', h('strong', null, 'Waiting for its input. '),
+        p.waiting.map((w, i) => [i > 0 && ' ', `Input ${w.slot} has found nothing to read: it is waiting for ${w.waitingFor}`, w.since ? [' (it began ', timeEl(w.since), ')'] : '', '.']),
+        ' A file or topic yet to be delivered looks the same as a name with a mistake in it: check the binding.'),
       p.state === 'Built' && notice('info', 'This node is a standby: it has built this pipeline’s circuit on the state it follows and starts it when it takes over. Rates are on the leader.'),
       p.state === 'Unbuilt' && notice('info', 'This node has not built this pipeline’s circuit: it follows its state as bytes and builds the circuit if it takes over. ' + ((detail.history || []).filter(t => t.state === 'Unbuilt' && t.why).map(t => t.why).pop() || 'A standby builds a pipeline once the leader has run it; one that writes a table is built at takeover.')),
 
       h('div', { class: 'tiles' },
-        tile([h('span', { class: 'swatch in' }), 'Records in'], rate(r.in), '/s', `${fmtInt(r.steps || 0)} steps in the last second`, spark(seriesOf(id, 'in'), { label: 'Records in per second', unit: '/s' })),
+        tile([h('span', { class: 'swatch in' }), 'Records in'], rate(r.in), '/s', r.batchedEveryS ? `a step every ${r.batchedEveryS} s · rate over the last ${r.rateOverS} s` : `${fmtInt(r.steps || 0)} steps in the last second`, spark(seriesOf(id, 'in'), { label: 'Records in per second', unit: '/s' })),
         tile([h('span', { class: 'swatch out' }), 'Records out'], rate(r.out), '/s', 'upserts, deletes and appends', spark(seriesOf(id, 'out'), { cls: 'out', label: 'Records out per second', unit: '/s' })),
-        tile('Step latency', r.stepMs == null ? '–' : fmtMs(r.stepMs), '', r.stepMaxMs == null ? 'no steps in the last second' : `slowest ${fmtMs(r.stepMaxMs)}`, spark(seriesOf(id, 'stepMs'), { cls: 'neutral', label: 'Mean step latency', unit: ' ms' })),
+        tile('Step latency', r.stepMs == null ? '–' : fmtMs(r.stepMs), '', r.batchedEveryS ? `a step every ${r.batchedEveryS} s; a sink’s minimum interval is part of its step` : r.stepMaxMs == null ? 'no steps in the last second' : `slowest ${fmtMs(r.stepMaxMs)}`, spark(seriesOf(id, 'stepMs'), { cls: 'neutral', label: 'Mean step latency', unit: ' ms' })),
         tile('Sink-ack wait', r.ackMs == null ? '–' : fmtMs(r.ackMs), '', 'per commit, waiting for sinks', spark(seriesOf(id, 'ackMs'), { cls: 'neutral', label: 'Sink acknowledgement wait', unit: ' ms' })),
         tile('Checkpoint age', r.checkpointAgeS == null ? '–' : r.checkpointAgeS < 1 ? '< 1 s' : fmtMs(r.checkpointAgeS * 1000), '', p.committedStep == null ? 'no committed step' : `committed step ${fmtInt(p.committedStep)}`, spark(seriesOf(id, 'checkpointAgeS'), { cls: 'neutral', label: 'Checkpoint age', unit: ' s' })),
         tile('Input lag', r.lag == null ? '–' : fmtNum(r.lag), r.lag == null ? '' : 'records', r.lag == null ? 'its sources report no lag' : 'across its sources', spark(seriesOf(id, 'lag'), { cls: 'neutral', label: 'Input lag in records' }))),
@@ -735,6 +748,7 @@
               selected.detail && (selected.role === 'input' || selected.role === 'sink') && ['Bound to', selected.detail],
               source && ['Read so far', `${plural(source.records, 'record')} · lag ${source.lag == null ? 'not reported' : fmtInt(source.lag)} · ${plural(source.unreadable, 'unreadable record')}`],
               source && source.at && ['At', h('span', { class: 'mono' }, source.at)],
+              source && source.waitingFor && ['Waiting for', [source.waitingFor, source.waitingSince ? [' · began ', timeEl(source.waitingSince)] : '']],
               sink && ['Delivered', `${plural(sink.batches, 'batch', 'batches')}: ${fmtInt(sink.upserts)} upserts, ${fmtInt(sink.deletes)} deletes, ${fmtInt(sink.appends)} appends${sink.writeInFlightSince ? ' · a write is in flight' : ''}`],
               (selected.role === 'table' || selected.role === 'table-out') && ['Table', [tableLink(selected.label),
                 tableUse && tableUse.committedVersion != null && ` · this pipeline has committed version ${fmtInt(tableUse.committedVersion)} of ${fmtInt(tableUse.currentVersion)}`]],
@@ -770,6 +784,7 @@
   views.tables = {
     title: () => 'Tables',
     kinds: ['table', 'node', 'catalog'],
+    every: 3000,
     load: async () => ({ tables: await all('tables') }),
     render({ data }) {
       const { tables } = data;
@@ -791,7 +806,8 @@
                 td('Version', 'r', fmtInt(t.version)),
                 td(standby ? 'Behind' : 'Versions /s', 'r', standby ? (t.lagVersions == null ? '–' : fmtInt(t.lagVersions)) : fmtNum(t.versionsPerSecond)),
                 td('Written by', null, t.writer ? writerText(t.writer) : '–'),
-                td('Loader', null, t.loader ? [h('span', { class: 'tag' }, t.loader.kind), ' ', t.loader.state, t.loader.unreadable > 0 && h('span', { class: 'sub' }, plural(t.loader.unreadable, 'unreadable record'))] : h('span', { class: 'muted' }, 'none')),
+                td('Loader', null, t.loader ? [h('span', { class: 'tag' }, t.loader.kind), ' ', t.loader.state,
+                  t.loader.waitingFor && h('span', { class: 'sub' }, `for ${t.loader.waitingFor}`), t.loader.unreadable > 0 && h('span', { class: 'sub' }, plural(t.loader.unreadable, 'unreadable record'))] : h('span', { class: 'muted' }, 'none')),
                 td('Readers', 'r', fmtInt(t.readers)),
                 td('Floor held by', null, t.floorHeldBy ? pipelineLink(t.floorHeldBy) : h('span', { class: 'muted' }, 'nobody')))))))));
     },
@@ -800,6 +816,9 @@
   views.table = {
     title: args => args[0],
     kinds: ['table', 'pipeline'],
+    // A loader's rows arrive without an event of their own (a declare's first load among
+    // them): read again every few seconds, or the page shows the table as it was declared.
+    every: 3000,
     load: async ctx => ({ detail: await api('tables/' + enc(ctx.args[0])) }),
     render(ctx) {
       const name = ctx.args[0];
@@ -830,7 +849,9 @@
         h('div', { class: 'grid two' },
           card('Loader', t.loader ? t.loader.kind : null, t.loader ? h('div', { class: 'stack' },
             kv([
-              ['State', h('span', { class: ['badge', t.loader.state === 'Faulted' ? 'crit' : t.loader.state === 'Streaming' || t.loader.state === 'Idle' ? 'good' : 'info'] }, t.loader.state)],
+              ['State', h('span', { class: ['badge', t.loader.state === 'Faulted' ? 'crit' : t.loader.state === 'Waiting' ? 'warn' : t.loader.state === 'Streaming' || t.loader.state === 'Idle' ? 'good' : 'info'] }, t.loader.state)],
+              t.loader.waitingFor && ['Waiting for', [h('span', { class: 'mono' }, t.loader.waitingFor), t.loader.waitingSince ? [' · began ', timeEl(t.loader.waitingSince)] : '',
+                h('p', { class: 'help' }, 'Nothing has failed: what the loader reads is not there. A file yet to be delivered looks the same as a path with a mistake in it.')]],
               ['Position', h('span', { class: 'mono' }, t.loader.position)],
               ['Lag', t.loader.lag == null ? 'not reported' : plural(t.loader.lag, 'record')],
               ['Unreadable', `${plural(t.loader.unreadable, 'record')} · policy: ${detail.onUnreadable === 'Skip' ? 'skip and count' : 'fault at the record'}`],
@@ -1188,12 +1209,12 @@
     kinds: ['node', 'catalog', 'table'],
     every: 2000,
     async load() {
-      const [node, tables] = await Promise.all([api('node'), all('tables')]);
+      const [node, tables, pipelines] = await Promise.all([api('node'), all('tables'), all('pipelines')]);
       store.leader = node.leader;
-      return { node, tables };
+      return { node, tables, pipelines };
     },
     render(ctx) {
-      const { node, tables } = ctx.data;
+      const { node, tables, pipelines } = ctx.data;
       const st = node.status, lead = st.leadership, role = lead.role, kafka = lead.kafka, peer = st.peer, standby = st.standby;
       const acting = store.info && !store.info.readOnly;
       const take = st.lastTakeover;
@@ -1205,7 +1226,7 @@
         ['Leader record', take.leaderRecord, 'restore the catalog from its mirror where there is one; write who leads'],
         ['Plugin directory', take.pluginDirectory, 'import what the directory holds and the catalog lacks'],
         ['Seed tables', take.tableSeeds, 'declare the host’s seed tables, the first time only'],
-        ['Pipelines', take.pipelines, `build and start ${plural(take.pipelineCount, 'pipeline')} from committed state`],
+        ['Pipelines', take.pipelines, `start ${plural(take.pipelineCount, 'pipeline')} at their committed step — those built while standing by as they are, the rest built first`],
         ['Seed pipelines', take.pipelineSeeds, 'deploy the host’s seed pipelines, the first time only: each is built and started'],
         ['Finishing', take.finish, 'record the seeds, prune the plugin cache, start the loaders'],
       ].filter(([, v]) => v != null) : [];
@@ -1265,7 +1286,28 @@
               ['State', `${plural(standby.stateLagRecords, 'record')} behind the state log`],
               ['Tables', `${fmtInt(standby.tablesBehind)} opening, ${fmtInt(standby.tablesFaulted)} faulted`],
               ['Plugins', `${fmtInt(standby.pluginsPending)} versions still to fetch`],
+              ['Pipelines', (() => {
+                const of = s => pipelines.items.filter(p => p.desired === 'Running' && p.state === s).length;
+                const built = of('Built'), unbuilt = of('Unbuilt');
+                return [`${fmtInt(built)} built and ready to start`, ` · ${fmtInt(standby.pipelinesToBuild || 0)} still being built`,
+                  unbuilt > 0 && h('span', null, ` · ${fmtInt(unbuilt)} to be built at a takeover (`, h('a', { href: '#/pipelines' }, 'see why'), ')')];
+              })()],
             ])), { flush: false }),
+
+        (() => {
+          // How each pipeline's last start went: a takeover's cost is in here, pipeline by pipeline.
+          const started = pipelines.items.filter(p => p.lastStart).sort((a, b) => b.lastStart.total - a.lastStart.total);
+          if (started.length === 0) return null;
+          return card('Last start of each pipeline', `on this node · slowest first`,
+            h('div', { class: 'table-wrap' }, h('table', { class: 'data cards' },
+              h('thead', null, h('tr', null, ['Pipeline', 'When', 'How', 'Plugin', 'Build', 'Start', 'Edges', 'Total'].map((x, i) => h('th', { class: i >= 3 ? 'r' : null }, x)))),
+              h('tbody', null, started.map(p => h('tr', { key: p.id },
+                td('Pipeline', 'id', h('a', { href: '#/pipelines/' + encodeURIComponent(p.id) }, p.id)),
+                td('When', null, timeEl(p.lastStart.at)),
+                td('How', null, p.lastStart.warm ? h('span', { class: 'badge good', title: 'Built while standing by; the start ran it' }, 'warm') : h('span', { class: 'badge info', title: 'Built at the start' }, 'built at start')),
+                ...[['Plugin', 'plugin'], ['Build', 'build'], ['Start', 'start'], ['Edges', 'edges'], ['Total', 'total']].map(([l, k]) => td(l, 'r', fmtMs(p.lastStart[k])))))))),
+            { flush: true });
+        })(),
 
         h('div', { class: 'grid two' },
           card('State lag by partition', role === 'Standby' ? 'records this node has yet to read' : 'measured on a standby',
@@ -1333,7 +1375,9 @@
                 td('Who', null, callerCell(a.caller)),
                 td('Action', null, h('span', { class: 'tag' }, a.action)),
                 td('Target', 'id wrap', a.action.startsWith('pipeline.') && a.action !== 'pipeline.remove' ? pipelineLink(a.target) : a.target),
-                td('Generation', 'nowrap', a.generationBefore == null && a.generationAfter == null ? '' : `${a.generationBefore ?? '–'} → ${a.generationAfter ?? '–'}`),
+                td('Generation', 'nowrap', a.generationBefore == null && a.generationAfter == null ? ''
+                  : a.generationBefore === a.generationAfter ? h('span', { title: 'The action did not change the generation' }, `${a.generationAfter}, unchanged`)
+                  : `${a.generationBefore ?? '–'} → ${a.generationAfter ?? '–'}`),
                 td('Node · term', 'nowrap', `${a.node} · ${a.term}`),
                 td('What it did', 'wrap', a.plan && a.plan.length ? h('details', { class: 'more' }, h('summary', null, plural(a.plan.length, 'step')), A.planList({ steps: a.plan })) : '')))))),
           (audit.hasOlder || ctx.ui.before) && h('div', { class: 'pager' },

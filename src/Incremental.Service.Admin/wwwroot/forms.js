@@ -59,7 +59,8 @@
       p.tag && h('span', { class: 'tag', title: p.tagTitle || null }, p.tag),
     ];
     const hasDefault = p.default != null && p.default !== '';
-    const range = p.minimum != null || p.maximum != null ? `From ${p.minimum ?? '−∞'} to ${p.maximum ?? '∞'}.` : '';
+    const range = p.minimum != null && p.maximum != null ? `From ${p.minimum} to ${p.maximum}.`
+      : p.minimum != null ? `At least ${p.minimum}.` : p.maximum != null ? `At most ${p.maximum}.` : '';
     const help = [p.description, hasDefault && `Default ${p.default}.`, range].filter(Boolean).join(' ');
     const unset = value == null || value === '';
     let control;
@@ -113,13 +114,22 @@
     return field(id, p.name, control, help, tags);
   }
 
-  /** The inputs for a connector's or a loader's config. `values` is edited in place. */
-  function schemaFields(prefix, schema, values, changed) {
+  /**
+   * The inputs for a connector's or a loader's config. `values` is edited in place. `kind`,
+   * for a slot: a property the schema says is for other kinds of slot (`appliesTo`) is not
+   * offered — unless the spec sets it, and then it is shown, marked, so that it can be
+   * cleared: the connector refuses it.
+   */
+  function schemaFields(prefix, schema, values, changed, kind) {
     if (!schema)
       return h('p', { class: 'help' }, 'This kind does not describe its config. Whatever it needs is given in the JSON view.');
+    const shown = schema.properties
+      .filter(p => !kind || !p.appliesTo || p.appliesTo.includes(kind) || values[p.name] != null)
+      .map(p => !kind || !p.appliesTo || p.appliesTo.includes(kind) ? p
+        : { ...p, tag: `not for a ${kind}`, tagTitle: `For ${p.appliesTo.join(', ')} only: the connector refuses it here. Clear it.` });
     return [
       schema.description && h('p', { class: 'help' }, schema.description),
-      schema.properties.length > 0 && h('div', { class: 'fields' }, schema.properties.map(p =>
+      shown.length > 0 && h('div', { class: 'fields' }, shown.map(p =>
         propertyField(`${prefix}-${p.name}`, p, values[p.name], v => { if (v === undefined) delete values[p.name]; else values[p.name] = v; changed(); }))),
       schema.open && h('p', { class: 'help' }, 'It accepts properties not listed here; add those in the JSON view.'),
     ];
@@ -151,7 +161,7 @@
               : ofKind.includes(current) ? `${binding.connector} (does not carry this slot’s type)` : `${binding.connector} (cannot be bound to a ${kind})`),
           able.map(c => h('option', { value: c.name, selected: c.name === binding.connector }, c.name))),
         able.length === 0 ? `No registered connector can be bound to a ${kind}.` : null),
-      current && able.includes(current) && schemaFields(prefix, current.config, binding, changed),
+      current && able.includes(current) && schemaFields(prefix, current.config, binding, changed, kind),
     ];
   }
 
