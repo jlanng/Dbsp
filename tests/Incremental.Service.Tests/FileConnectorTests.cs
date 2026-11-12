@@ -205,6 +205,9 @@ public class FileConnectorTests : IDisposable
         {
             await first.DeployAsync(spec);
             await Eventually(() => Same(sink.Rows, Counts.Model(trades)), "the readable lines counted");
+            // The letter reaches the node's ring by a consumer of its own: the sink can
+            // have the last count a moment before it.
+            await Eventually(() => first.Pipelines.DeadLetters("counts").Count > 0, "the dead letter");
             var letter = Assert.Single(first.Pipelines.DeadLetters("counts"));
             Assert.Equal("input[trades]", letter.Operator);
             Assert.StartsWith("in/a.jsonl:8: { this is not json", letter.Record);

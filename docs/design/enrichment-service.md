@@ -5009,7 +5009,10 @@ did not look at the sample) and got an assertion.
 `KafkaLeadershipTests.A_step_down_whose_resignation_cannot_commit…` failed two runs in
 five on the unchanged tree — a heartbeat begun between the refused resignation and the
 close was counted after the test had read the count — and now waits three beats before
-reading it; with the close removed it still fails.
+reading it; with the close removed it still fails. And on a runner
+`FileConnectorTests.A_line_that_is_not_a_record…` asserted the dead letter the moment
+the sink had its last count, before the letter's own consumer had put it in the ring;
+it waits for the letter.
 
 **The core's hot paths** (they changed: a count in the indexed store, a count per row
 published). `benchmarks -- --assert`: all ten contracts hold. The throughput rig
