@@ -196,7 +196,7 @@ public sealed class Smoke(ExampleOptions options)
             Console.WriteLine($"0. The local stack under the prefix '{prefix}': three Postgres tables, a Debezium connector, a trades topic, three sink topics.");
             await _kafka.EnsureAsync(_shape);
             _world = new World(_shape, dataDirectory, _kafka, freshData: true);
-            _specs = new Specs(_kafka, TimeSpan.Zero);
+            _specs = new Specs(_kafka, TimeSpan.Zero, retain: null);
 
             // Node a is a process of its own, so that it can be killed.
             _child = StartChild(
@@ -215,7 +215,7 @@ public sealed class Smoke(ExampleOptions options)
         {
             Console.WriteLine($"0. {(options.Nodes >= 2 ? "Two nodes" : "One node")} on the in-memory backend, the admin API on a loopback port.");
             _world = new World(_shape, dataDirectory, null, freshData: true);
-            _specs = new Specs(null, TimeSpan.Zero);
+            _specs = new Specs(null, TimeSpan.Zero, retain: null);
             var cluster = new InMemoryServiceCluster();
             var ports = FreePorts(2);
             var nodeOptions = new ExampleOptions { SeedPipelines = false, Generate = false, Verbose = options.Verbose, Quiet = !options.Verbose };

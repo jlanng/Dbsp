@@ -19,6 +19,11 @@ internal sealed class Generation
     public List<(string Slot, IRunningSource Source)> Sources { get; } = [];
     public List<Task> Deliveries { get; } = [];
     public Dictionary<string, SinkSlotStats> SinkStats { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>Per input slot, since when its source has said that what it reads is not
+    /// there (UTC ticks), and whether that has been said as an event. Written by the
+    /// metrics sampler, once a second.</summary>
+    public System.Collections.Concurrent.ConcurrentDictionary<string, (long SinceTicks, bool Announced)> Waiting { get; } = new(StringComparer.Ordinal);
     public List<object> OwnedSinks { get; } = [];
     public Task DeadLetters { get; set; } = Task.CompletedTask;
 
@@ -205,7 +210,8 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         var spec = runtime.Spec;
         var generation = runtime.Current;
         var sinks = generation?.SinkStats.Select(s => s.Value.Status(s.Key)).ToList() ?? [];
-        var sources = generation?.Sources.Select(s => new SourceSlotStatus(s.Slot, s.Source.Stats)).ToList() ?? [];
+        var sources = generation?.Sources.Select(s => new SourceSlotStatus(
+            s.Slot, s.Source.Stats, generation.Waiting.TryGetValue(s.Slot, out var waiting) ? new DateTimeOffset(waiting.SinceTicks, TimeSpan.Zero) : null)).ToList() ?? [];
 
         var blockedOn = runtime.State switch
         {
@@ -371,12 +377,14 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                     if (since != 0 && (inFlightSince == 0 || since < inFlightSince))
                         inFlightSince = since;
                 }
-                foreach (var (_, source) in generation.Sources)
+                foreach (var (slot, source) in generation.Sources)
                 {
                     try
                     {
-                        if (source.Stats.Lag is { } sourceLag)
+                        var stats = source.Stats;
+                        if (stats.Lag is { } sourceLag)
                             lag = (lag ?? 0) + sourceLag;
+                        NoteWaiting(runtime, generation, slot, stats.WaitingFor);
                     }
                     catch
                     {
@@ -388,6 +396,51 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 runtime.Id, generation?.Number ?? 0, records, lag, runtime.DeadLetters.Total,
                 runtime.State, runtime.Spec.Desired == DesiredState.Running, inFlightSince));
         }
+    }
+
+    /// <summary>A source that says what it reads is not there: since when, and — once
+    /// that has lasted <see cref="ServiceOptions.MissingInputGrace"/> — an event, once.</summary>
+    private void NoteWaiting(PipelineRuntime runtime, Generation generation, string slot, string? waitingFor)
+    {
+        if (waitingFor is null)
+        {
+            if (generation.Waiting.TryRemove(slot, out var was) && was.Announced)
+                context.Events.Publish("pipeline", runtime.Id, $"input '{slot}' no longer waiting: what it reads is there");
+            return;
+        }
+        var now = DateTimeOffset.UtcNow.UtcTicks;
+        var mark = generation.Waiting.GetOrAdd(slot, _ => (now, false));
+        if (!mark.Announced && now - mark.SinceTicks >= context.Options.MissingInputGrace.Ticks)
+        {
+            generation.Waiting[slot] = (mark.SinceTicks, true);
+            _logger.LogWarning("Pipeline {Pipeline}: input '{Slot}' is still waiting for {What}", runtime.Id, slot, waitingFor);
+            context.Events.Publish("pipeline", runtime.Id, $"input '{slot}' waiting for {waitingFor}");
+        }
+    }
+
+    /// <summary>For a dry run: what the spec's inputs name that is not there, by the
+    /// connectors that can tell. Bounded, and never a refusal.</summary>
+    private async Task<IReadOnlyList<string>> MissingInputsAsync(PipelineSpec spec, PipelineShape shape, CancellationToken cancellationToken)
+    {
+        var warnings = new List<string>();
+        foreach (var input in shape.Inputs)
+        {
+            if (!spec.Inputs.TryGetValue(input.Name, out var config))
+                continue;
+            using var bound = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            bound.CancelAfter(TableRegistry.PresenceTimeout);
+            try
+            {
+                if (context.Connector(config) is IPresenceChecked presence
+                    && await presence.MissingAsync(config, input.Kind, bound.Token).ConfigureAwait(false) is { } missing)
+                    warnings.Add($"input '{input.Name}': {missing}. Check the name.");
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+            {
+                // A store or a broker that does not answer says nothing about what is there.
+            }
+        }
+        return warnings;
     }
 
     public IReadOnlyList<DeadLetterRecord> DeadLetters(string id, long afterSequence = 0, int limit = 256) =>
@@ -896,7 +949,8 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             steps.Add(spec.Desired == DesiredState.Running ? "start" : "leave stopped");
             var plan = new ActionPlan(existing is null ? "pipeline.deploy" : "pipeline.replace", spec.Id, options.DryRun, steps);
             if (options.DryRun)
-                return new DeployResult(Shown(spec with { Generation = existing?.Generation ?? 0 }), shape, plan);
+                return new DeployResult(Shown(spec with { Generation = existing?.Generation ?? 0 }), shape,
+                    plan with { Warnings = await MissingInputsAsync(spec, shape, cancellationToken).ConfigureAwait(false) });
 
             // Intent first: from here a successor knows everything. The tables and the
             // plugin version the spec names are checked again under the lock their removal
@@ -1625,7 +1679,9 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         try
         {
             var spec = runtime.Spec;
-            await CommitAsync(runtime, spec with { Previous = null }, "pipeline.replace.confirmed", "service", null, CancellationToken.None)
+            await CommitAsync(runtime, spec with { Previous = null }, "pipeline.replace.confirmed", "service",
+                    [$"generation {spec.Generation} runs on the state it kept: the spec of generation {spec.Previous?.Generation} is no longer held for a roll-back"],
+                    CancellationToken.None)
                 .ConfigureAwait(false);
         }
         catch (Exception ex)

@@ -891,6 +891,13 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
                     reasons.Add("loader-faulted");
                 if (tables.Any(t => t.State is TableState.Faulted or TableState.Failed))
                     reasons.Add("table-faulted");
+                // What a loader or a source reads has not been there for a while: nothing
+                // has failed, and a table or a pipeline is empty because of it.
+                var waitedSince = DateTimeOffset.UtcNow - _context.Options.MissingInputGrace;
+                if (tables.Any(t => t.LoaderWaitingSince is { } since && since <= waitedSince))
+                    reasons.Add("loader-waiting");
+                if (pipelines.Any(p => p.Sources.Any(s => s.WaitingSince is { } since && since <= waitedSince)))
+                    reasons.Add("source-waiting");
                 // The absence of a standby is something seen, not something that is not
                 // there — but only where a second node was configured at all.
                 if (_peerSampled && _context.Backend.Leadership.PeerExpected && _peer is not { Role: NodeRole.Standby, Ready: true })
@@ -935,11 +942,19 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         if (!readiness.TakeoverWouldBeWarm && !options.Force)
             throw new ServiceException(
                 "not-ready", $"Node '{NodeId}' is not ready to lead; pass force to take over anyway.", 409, readiness.NotWarmBecause);
+        // A warm standby has built most pipelines already, on the state it follows: those
+        // are started, not built (WarmStandbyPipelines). The plan says which is which.
+        var running = _context.Supervisor.Specs.Where(s => s.Desired == DesiredState.Running).Select(s => s.Id).ToHashSet(StringComparer.Ordinal);
+        var built = _context.Supervisor.Pipelines.Count(p => running.Contains(p.Id) && p.State == PipelineState.Built);
+        var cold = running.Count - built;
         var plan = new ActionPlan("node.takeover", NodeId, options.DryRun,
         [
             status.LeaderNodeId is { } leader ? $"node '{leader}' is fenced and ends" : "there is no leader to fence",
-            $"node '{NodeId}' promotes the catalog, {_context.Tables.Tables.Count} table(s) and the state, then builds and starts " +
-            $"{_context.Supervisor.Specs.Count(s => s.Desired == DesiredState.Running)} pipeline(s) from their committed state",
+            $"node '{NodeId}' promotes the catalog, {_context.Tables.Tables.Count} table(s) and the state",
+            running.Count == 0 ? "no pipeline is to run"
+                : built == running.Count ? $"it starts the {built} pipeline(s) it has built while standing by, at their committed step"
+                : built == 0 ? $"it builds and starts {cold} pipeline(s) from their committed state"
+                : $"it starts the {built} pipeline(s) it has built while standing by, and builds and starts {cold} more from their committed state",
         ]);
         if (options.DryRun)
             return plan;

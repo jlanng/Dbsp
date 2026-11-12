@@ -519,6 +519,34 @@ public class KafkaServiceTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public async Task A_dry_run_says_when_an_input_s_topic_or_a_loader_s_topic_does_not_exist_and_creates_neither()
+    {
+        await using var env = KafkaTestEnv.Create();
+        var trades = await env.CreateTopicAsync("trades");
+        var instruments = await env.CreateTopicAsync("instruments", compacted: true);
+        var missing = env.Prefix + ".no-such-topic";
+        await using var a = await env.StartNodeAsync("a", lead: true);
+
+        PipelineSpec Reading(string topic) => Spec("p", "counts") with
+        {
+            Inputs = new Dictionary<string, JsonElement> { ["trades"] = KafkaBinding(topic) },
+            Sinks = new Dictionary<string, JsonElement> { ["out"] = MemoryBinding("out") },
+        };
+        var dry = await a.Pipelines.DeployAsync(Reading(missing), new DeployOptions(DryRun: true), default);
+        var warning = Assert.Single(dry.Plan.Warnings);
+        Assert.Contains($"input 'trades': topic {missing} does not exist on connection log", warning);
+        Assert.Empty((await a.Pipelines.DeployAsync(Reading(trades), new DeployOptions(DryRun: true), default)).Plan.Warnings);
+
+        var table = await a.Tables.PlanDeclareAsync(InstrumentsFrom(missing), default);
+        Assert.Contains($"topic {missing} does not exist on connection log", Assert.Single(table.Warnings));
+        Assert.Empty((await a.Tables.PlanDeclareAsync(InstrumentsFrom(instruments), default)).Warnings);
+
+        // Asking did not make it: a broker that creates topics on a metadata request
+        // would turn the warning into a topic nobody meant.
+        Assert.Single((await a.Pipelines.DeployAsync(Reading(missing), new DeployOptions(DryRun: true), default)).Plan.Warnings);
+    }
+
+    [Fact]
     public async Task A_kafka_binding_may_name_a_connection_and_a_topic_and_nothing_of_the_cluster()
     {
         await using var env = KafkaTestEnv.Create();

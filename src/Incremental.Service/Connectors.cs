@@ -59,6 +59,13 @@ public sealed record SourceStats(
     /// <summary>Where the source stands, in its own words, when a partition and an offset
     /// do not say it: the <c>files</c> source's object and line.</summary>
     public string? At { get; init; }
+
+    /// <summary>Set while the source has read nothing because what it reads is not there:
+    /// what it is waiting for, in words ("objects under quotes/ in store lake"). A source
+    /// with no input yet and a source bound to a name nobody writes look the same from
+    /// the numbers; this is what tells the operator to check the name. Null once anything
+    /// has been found.</summary>
+    public string? WaitingFor { get; init; }
 }
 
 public interface IUpsertSinkConnector : IConnector
@@ -158,6 +165,19 @@ public sealed class KeyedSourceContext<TKey, TValue> : SlotContext
 
     /// <inheritdoc cref="SourceContext{T}.CommittedOffsets"/>
     public IReadOnlyDictionary<int, long> CommittedOffsets => Circuit.CommittedOffsets(Slot);
+}
+
+/// <summary>
+/// Optional on a connector: says, at a dry run, whether what a slot's config names is
+/// there to be read. Null when it is, when the connector cannot tell, or for a kind of
+/// slot where the question does not arise (a sink makes what it writes); otherwise what is
+/// missing, in words ("no object under quotes/ in store lake"). The pipeline can still be
+/// deployed: its plan carries the words as a warning, and the running source says the same
+/// in <see cref="SourceStats.WaitingFor"/>. It must return within a few seconds.
+/// </summary>
+public interface IPresenceChecked
+{
+    ValueTask<string?> MissingAsync(JsonElement config, SlotKind kind, CancellationToken cancellationToken);
 }
 
 public sealed class SinkContext : SlotContext

@@ -51,7 +51,7 @@ public class FileConnectorTests : IDisposable
     private static PipelineSpec CountsFromFiles(string id, string prefix, string sink) =>
         Spec(id, "counts", null, sink) with
         {
-            Inputs = new Dictionary<string, JsonElement> { ["trades"] = Files(prefix, "\"pollInterval\": \"00:00:00.05\"") },
+            Inputs = new Dictionary<string, JsonElement> { ["trades"] = Files(prefix, "\"pollInterval\": \"00:00:00.05\", \"settle\": \"00:00:00\"") },
         };
 
     private async Task<List<T>> AppendsAsync<T>(string prefix)
@@ -230,7 +230,7 @@ public class FileConnectorTests : IDisposable
         await PutAsync("in/1.jsonl", [new Trade(1, 1, 5, "a"), new Trade(2, 1, 6, "b")]);
         await service.DeployAsync(Spec("latest", "latest-trades", null, "latest") with
         {
-            Inputs = new Dictionary<string, JsonElement> { ["trades"] = Files("in/", "\"pollInterval\": \"00:00:00.05\", \"suffix\": \".jsonl\"") },
+            Inputs = new Dictionary<string, JsonElement> { ["trades"] = Files("in/", "\"pollInterval\": \"00:00:00.05\", \"settle\": \"00:00:00\", \"suffix\": \".jsonl\"") },
         });
         var sink = service.Memory.UpsertSink<long, Trade>("latest");
         await Eventually(() => sink.Rows.Count == 2, "two trades");
@@ -375,7 +375,7 @@ public class FileConnectorTests : IDisposable
         var counts = memory.UpsertSink<string, long>("counts");
         var big = Spec("big", "big-trades", null) with
         {
-            Inputs = new Dictionary<string, JsonElement> { ["trades"] = Files("in/", "\"pollInterval\": \"00:00:00.05\"") },
+            Inputs = new Dictionary<string, JsonElement> { ["trades"] = Files("in/", "\"pollInterval\": \"00:00:00.05\", \"settle\": \"00:00:00\"") },
             Sinks = new Dictionary<string, JsonElement> { ["out"] = Files("out/big-") },
         };
 
@@ -405,9 +405,16 @@ public class FileConnectorTests : IDisposable
         await EventuallyAsync(async () => (await AppendsAsync<Trade>("out/big-")).Order(ById).SequenceEqual(BigTrades.Model(trades)), "the file sink under the second leader: every record once");
         var read = b.Pipelines.Get("counts").Sources.Single().Stats.Records;
         Assert.InRange(read, 300, 599);                                         // resumed, not read again from the first object
-        var terms = (await FileSinkFormat.StepObjectsAsync(_store, "out/big-"))
-            .Select(n => FileSinkFormat.TryParse("out/big-", n, out _, out var term) ? term : -1).Distinct().Order().ToList();
-        Assert.Equal([a.Node.Status.Leadership.Term, b.Node.Status.Leadership.Term], terms);
+        var objects = (await FileSinkFormat.StepObjectsAsync(_store, "out/big-"))
+            .Select(n => FileSinkFormat.TryParse("out/big-", n, out FileSinkFormat.StepObject parsed) ? parsed : default).ToList();
+        Assert.Equal([a.Node.Status.Leadership.Term, b.Node.Status.Leadership.Term], objects.Select(o => o.Term).Distinct().Order());
+        // Each object's name carries the checkpoint its writer started from: nothing for
+        // the first leader, and for the second a step the first had committed — which is
+        // what voids anything the first might still write above it.
+        Assert.All(objects.Where(o => o.Term == a.Node.Status.Leadership.Term), o => Assert.Equal(0, o.Base));
+        var second = objects.Where(o => o.Term == b.Node.Status.Leadership.Term).ToList();
+        Assert.Single(second.Select(o => o.Base).Distinct());
+        Assert.InRange(second[0].Base, 1, second.Min(o => o.Step) - 1);
     }
 
     // ── the reader on its own: what a checkpoint may hold, and what a listing may miss ──
@@ -441,7 +448,7 @@ public class FileConnectorTests : IDisposable
         }
 
         public FileSourceReader Read(LocalObjectStore store, string prefix, IReadOnlyDictionary<int, long> committed, string more = "") =>
-            new(store, FilesSlotConfig.Parse(Files(prefix, "\"pollInterval\": \"00:00:00.02\"" + more)), committed,
+            new(store, FilesSlotConfig.Parse(Files(prefix, "\"settle\": \"00:00:00\", \"pollInterval\": \"00:00:00.02\"" + more)), committed,
                 async (text, offset, stop) =>
                 {
                     if (OnLine is { } hook)
@@ -717,7 +724,7 @@ public class FileConnectorTests : IDisposable
 
         // Its own prefix is its own across a replace; a source may read what a sink writes; a neighbouring prefix is free.
         await service.DeployAsync(Big("a", "out/a/") with { Circuit = new PipelineCircuitOptions { CheckpointInterval = 2 } });
-        await service.DeployAsync(Big("b", "out/a-2/") with { Inputs = new Dictionary<string, JsonElement> { ["trades"] = Files("out/a/", "\"pollInterval\": \"00:00:00.05\"") } });
+        await service.DeployAsync(Big("b", "out/a-2/") with { Inputs = new Dictionary<string, JsonElement> { ["trades"] = Files("out/a/", "\"pollInterval\": \"00:00:00.05\", \"settle\": \"00:00:00\"") } });
         await service.Running("b");
     }
 
@@ -733,7 +740,7 @@ public class FileConnectorTests : IDisposable
         {
             Circuit = new PipelineCircuitOptions { ErrorPolicy = RecordErrorPolicy.DeadLetter },
             DeadLetters = MemoryBinding("dlq"),
-            Inputs = new Dictionary<string, JsonElement> { ["trades"] = Files("in/", "\"pollInterval\": \"00:00:00.05\"") },
+            Inputs = new Dictionary<string, JsonElement> { ["trades"] = Files("in/", "\"pollInterval\": \"00:00:00.05\", \"settle\": \"00:00:00\"") },
         });
         var sink = service.Memory.AppendSink<DeadLetterEnvelope>("dlq");
         await Eventually(() => sink.Records.Count == 2, "the first object's dropped records");
@@ -782,5 +789,490 @@ public class FileConnectorTests : IDisposable
         Assert.Equal([SlotKind.AppendInput, SlotKind.KeyedInput, SlotKind.UpsertSink, SlotKind.AppendSink], connector.Kinds);
         Assert.True(connector.Resettable);
         Assert.False(connector.Config!.Open);
+    }
+
+    // ── listing: a page after the position, not the prefix ─────────────────────────────
+
+    /// <summary>A store that records how it is listed, and can run something just before
+    /// an object is opened. <paramref name="paged"/> false: a store written before
+    /// <see cref="IObjectStore.ListPageAsync"/>, which has only the whole listing.</summary>
+    private class RecordingStore(LocalObjectStore inner) : IObjectStore
+    {
+        public readonly List<string?> PagesAfter = [];
+        public int WholeListings;
+        public Func<string, Task>? BeforeOpen;
+
+        public ValueTask<ObjectInfo?> StatAsync(string path, CancellationToken cancellationToken) => inner.StatAsync(path, cancellationToken);
+
+        public async ValueTask<Stream> OpenReadAsync(string path, CancellationToken cancellationToken)
+        {
+            if (BeforeOpen is { } hook)
+                await hook(path);
+            return await inner.OpenReadAsync(path, cancellationToken);
+        }
+
+        public async ValueTask WriteAsync(string path, Func<Stream, CancellationToken, ValueTask> write, CancellationToken cancellationToken)
+        {
+            await inner.WriteAsync(path, write, cancellationToken);
+        }
+
+        public ValueTask DeleteAsync(string path, CancellationToken cancellationToken) => inner.DeleteAsync(path, cancellationToken);
+
+        public IAsyncEnumerable<ObjectInfo> ListAsync(string prefix, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref WholeListings);
+            return inner.ListAsync(prefix, cancellationToken);
+        }
+
+        protected ValueTask<ObjectPage> Page(string prefix, string? after, int limit, CancellationToken cancellationToken)
+        {
+            lock (PagesAfter)
+                PagesAfter.Add(after);
+            return inner.ListPageAsync(prefix, after, limit, cancellationToken);
+        }
+    }
+
+    private sealed class PagingStore(LocalObjectStore inner) : RecordingStore(inner), IObjectStore
+    {
+        public ValueTask<ObjectPage> ListPageAsync(string prefix, string? after, int limit, CancellationToken cancellationToken) => Page(prefix, after, limit, cancellationToken);
+    }
+
+    private FileSourceReader Read(IObjectStore store, FakeInput input, string prefix, string more) =>
+        new(store, FilesSlotConfig.Parse(Files(prefix, "\"pollInterval\": \"00:00:00.02\"" + more)), new Dictionary<int, long>(),
+            (text, offset, _) =>
+            {
+                lock (input.Lines)
+                    input.Lines.Add(text);
+                return ValueTask.CompletedTask;
+            },
+            (_, _, _, _) => ValueTask.CompletedTask,
+            (_, _, _) => ValueTask.CompletedTask);
+
+    [Fact]
+    public async Task A_poll_asks_for_the_names_after_the_one_it_is_at_and_never_for_the_whole_prefix()
+    {
+        for (var i = 1; i <= 4; i++)
+            await PutAsync($"in/{i:D4}.jsonl", Numbered($"{i:D4}", 2));
+        var store = new PagingStore(_store);
+        var input = new FakeInput();
+        await using var reader = Read(store, input, "in/", ", \"settle\": \"00:00:00\"");
+        await Eventually(() => input.Count == 8, "the four objects read");
+        int polls;
+        lock (store.PagesAfter)
+            polls = store.PagesAfter.Count;
+        await Eventually(() => { lock (store.PagesAfter) return store.PagesAfter.Count >= polls + 3; }, "three more polls");
+        lock (store.PagesAfter)
+        {
+            Assert.Null(store.PagesAfter[0]);                                   // the first: from the start of the prefix
+            Assert.All(store.PagesAfter.Skip(polls), after => Assert.Equal("in/0004.jsonl", after));
+        }
+        Assert.Equal(0, store.WholeListings);
+
+        await PutAsync("in/0005.jsonl", Numbered("0005", 2));
+        await Eventually(() => input.Count == 10, "the object that landed after the position");
+    }
+
+    [Fact]
+    public async Task A_store_without_a_paged_listing_is_paged_over_its_whole_listing()
+    {
+        for (var i = 1; i <= 10; i++)
+            await PutAsync($"in/{i:D4}.jsonl", Numbered($"{i:D4}", 1));
+        await PutAsync("other/0001.jsonl", Numbered("other", 1));
+        IObjectStore store = new RecordingStore(_store);                        // implements ListAsync only
+
+        var first = await store.ListPageAsync("in/", null, 4, default);
+        Assert.Equal(["in/0001.jsonl", "in/0002.jsonl", "in/0003.jsonl", "in/0004.jsonl"], first.Objects.Select(o => o.Path));
+        Assert.True(first.More);
+        var second = await store.ListPageAsync("in/", "in/0004.jsonl", 4, default);
+        Assert.Equal(["in/0005.jsonl", "in/0006.jsonl", "in/0007.jsonl", "in/0008.jsonl"], second.Objects.Select(o => o.Path));
+        Assert.True(second.More);
+        var last = await store.ListPageAsync("in/", "in/0008.jsonl", 4, default);
+        Assert.Equal(["in/0009.jsonl", "in/0010.jsonl"], last.Objects.Select(o => o.Path));
+        Assert.False(last.More);
+        Assert.Empty((await store.ListPageAsync("in/", "in/0010.jsonl", 4, default)).Objects);
+
+        // The local store's own paging says the same.
+        var local = await _store.ListPageAsync("in/", "in/0004.jsonl", 4, default);
+        Assert.Equal(second.Objects.Select(o => o.Path), local.Objects.Select(o => o.Path));
+        Assert.True(local.More);
+        Assert.False((await _store.ListPageAsync("in/", "in/0006.jsonl", 4, default)).More);
+
+        // And the source reads through it, in order.
+        var input = new FakeInput();
+        await using var reader = Read(store, input, "in/", ", \"settle\": \"00:00:00\"");
+        await Eventually(() => input.Count == 10, "every object read through the whole listing");
+        Assert.Equal(Enumerable.Range(1, 10).SelectMany(i => Numbered($"{i:D4}", 1)), input.Lines);
+    }
+
+    // ── settle: how far behind a greater name an object may arrive ─────────────────────
+
+    [Fact]
+    public async Task An_object_that_arrives_behind_a_greater_name_within_the_settle_time_is_read_in_its_place()
+    {
+        var input = new FakeInput();
+        await using var reader = Read(_store, input, "in/", ", \"settle\": \"00:00:01.5\"");
+        await PutAsync("in/0002.jsonl", Numbered("0002", 2));
+        await Task.Delay(400);
+        Assert.Equal(0, input.Count);                                           // seen, and left to settle
+        await PutAsync("in/0001.jsonl", Numbered("0001", 2));                   // behind it in name order, 0.4 s late
+        await Eventually(() => input.Count == 4, "both objects read");
+        Assert.Equal(Numbered("0001", 2).Concat(Numbered("0002", 2)), input.Lines);
+    }
+
+    [Fact]
+    public async Task Nothing_is_read_past_an_object_that_has_not_settled()
+    {
+        // 0003 has been there for a minute; 0001 has just landed. Reading 0003 now would
+        // put the position past 0001's place before 0001 may be read.
+        await PutAsync("in/0003.jsonl", Numbered("0003", 1));
+        File.SetLastWriteTimeUtc(Path.Combine(_root, "in", "0003.jsonl"), DateTime.UtcNow.AddMinutes(-1));
+        await PutAsync("in/0001.jsonl", Numbered("0001", 1));
+        var input = new FakeInput();
+        await using var reader = Read(_store, input, "in/", ", \"settle\": \"00:00:01\"");
+        await Task.Delay(300);
+        Assert.Equal(0, input.Count);
+        Assert.Equal(2, reader.Stats.Lag);                                      // both seen, neither read
+        await Eventually(() => input.Count == 2, "both read once the first has settled");
+        Assert.Equal(Numbered("0001", 1).Concat(Numbered("0003", 1)), input.Lines);
+    }
+
+    [Fact]
+    public async Task With_no_settle_time_an_object_that_arrives_behind_the_position_is_not_read()
+    {
+        // The bound, stated as a test: "settle": 0 is for names that only ever increase.
+        var input = new FakeInput();
+        await using var reader = Read(_store, input, "in/", ", \"settle\": \"00:00:00\"");
+        await PutAsync("in/0002.jsonl", Numbered("0002", 2));
+        await Eventually(() => input.Count == 2, "the first object read at once");
+        await PutAsync("in/0001.jsonl", Numbered("0001", 2));
+        await Task.Delay(300);
+        Assert.Equal(Numbered("0002", 2), input.Lines);
+    }
+
+    [Fact]
+    public async Task A_source_whose_prefix_holds_nothing_says_what_it_is_waiting_for_until_something_is_there()
+    {
+        var input = new FakeInput();
+        await using var reader = Read(_store, input, "typo/", ", \"settle\": \"00:00:00\"");
+        Assert.Equal("objects under typo/ in store landing", reader.Stats.WaitingFor);
+        await Task.Delay(100);
+        Assert.Equal("objects under typo/ in store landing", reader.Stats.WaitingFor);
+        await PutAsync("typo/0001.jsonl", Numbered("0001", 1));
+        await Eventually(() => input.Count == 1, "the object read");
+        Assert.Null(reader.Stats.WaitingFor);
+    }
+
+    // ── a keyed input's deletes ────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task A_keyed_input_in_the_changes_format_upserts_and_deletes_and_reads_what_an_upsert_sink_wrote()
+    {
+        await using var service = await StartAsync();
+        var keyed = "\"pollInterval\": \"00:00:00.05\", \"settle\": \"00:00:00\", \"format\": \"changes\"";
+        string Row(Trade trade) => $"{{\"key\":{trade.Id},\"row\":{JsonSerializer.Serialize(trade, Web)}}}";
+
+        // First pipeline: changes in, the latest trade per id out — to files, as an upsert sink.
+        await service.DeployAsync(Spec("first", "latest-trades") with
+        {
+            Inputs = new Dictionary<string, JsonElement> { ["trades"] = Files("in/", keyed) },
+            Sinks = new Dictionary<string, JsonElement> { ["out"] = Files("mid/") },
+        });
+        // Second pipeline: reads the first one's sink objects as its keyed input.
+        var rows = service.Memory.UpsertSink<long, Trade>("latest");
+        await service.DeployAsync(Spec("second", "latest-trades", null, "latest") with
+        {
+            Inputs = new Dictionary<string, JsonElement> { ["trades"] = Files("mid/", keyed) },
+        });
+
+        var trades = Trades(0, 6);
+        await PutAsync("in/0001.jsonl", trades.Select(Row));
+        await Eventually(() => Same(rows.Rows, trades.ToDictionary(t => t.Id)), "six rows through both pipelines");
+
+        var changed = trades[1] with { Quantity = 777 };
+        await PutAsync("in/0002.jsonl", [Row(changed), $"{{\"key\":{trades[3].Id},\"deleted\":true}}", $"{{\"key\":{trades[4].Id},\"deleted\":true}}"]);
+        var expected = trades.ToDictionary(t => t.Id);
+        expected[changed.Id] = changed;
+        expected.Remove(trades[3].Id);
+        expected.Remove(trades[4].Id);
+        await Eventually(() => Same(rows.Rows, expected), "an upsert and two deletes through both pipelines");
+        Assert.True(Same(await FileSinkFormat.ReadUpsertsAsync<long, Trade>(_store, "mid/"), expected));
+
+        // A line that is neither is rejected in its place, like any line that is not a record.
+        await PutAsync("in/0003.jsonl", ["{\"row\":{\"id\":1}}", "{\"key\":99}", Row(trades[3])]);
+        await Eventually(() => service.Pipelines.Get("first").Faults.Any(f => f.Message.Contains("in/0003.jsonl:1 is not a record") && f.Message.Contains("key")), "the line without a key faulting the pipeline");
+    }
+
+    [Fact]
+    public async Task The_settings_of_the_other_kinds_of_slot_are_refused_and_the_schema_says_which_kind_each_is_for()
+    {
+        await using var service = await StartAsync();
+        async Task<string> Refused(string definition, JsonElement input, JsonElement sink)
+        {
+            var spec = Spec("p", definition, null) with
+            {
+                Inputs = new Dictionary<string, JsonElement> { ["trades"] = input },
+                Sinks = new Dictionary<string, JsonElement> { ["out"] = sink },
+            };
+            var ex = await Assert.ThrowsAsync<ServiceException>(() => service.Pipelines.ValidateAsync(spec, default));
+            return string.Join(" ", ex.Details);
+        }
+
+        // big-trades: an append input and an append sink. latest-trades: keyed, and an upsert sink.
+        Assert.Contains("\"format\" is a keyed input's setting", await Refused("big-trades", Files("in/", "\"format\": \"changes\""), Files("out/")));
+        Assert.Contains("\"compactAfter\" is an upsert sink's setting", await Refused("big-trades", Files("in/"), Files("out/", "\"compactAfter\": 10")));
+        Assert.Contains("\"retain\" is an append sink's setting", await Refused("latest-trades", Files("in/"), Files("out/", "\"retain\": 10")));
+        Assert.Contains("are a source's settings", await Refused("big-trades", Files("in/"), Files("out/", "\"settle\": \"00:00:01\"")));
+        Assert.Contains("settle is a duration", await Refused("big-trades", Files("in/", "\"settle\": \"-00:00:01\""), Files("out/")));
+        Assert.Contains("format is \"rows\" or \"changes\"", await Refused("latest-trades", Files("in/", "\"format\": \"csv\""), Files("out/")));
+        Assert.Contains("compactAfter is a number of objects from 2", await Refused("latest-trades", Files("in/"), Files("out/", "\"compactAfter\": 1")));
+        Assert.Contains("retain is a number of objects from 1", await Refused("big-trades", Files("in/"), Files("out/", "\"retain\": 0")));
+
+        var properties = Assert.Single(service.Node.Discovery.Connectors, c => c.Name == "files").Config!.Properties.ToDictionary(p => p.Name, p => p.AppliesTo);
+        Assert.Null(properties["store"]);
+        Assert.Null(properties["prefix"]);
+        foreach (var source in new[] { "suffix", "pollInterval", "settle", "maxLineLength" })
+            Assert.Equal([SlotKind.AppendInput, SlotKind.KeyedInput], properties[source]);
+        Assert.Equal([SlotKind.KeyedInput], properties["format"]);
+        Assert.Equal([SlotKind.UpsertSink, SlotKind.AppendSink], properties["minInterval"]);
+        Assert.Equal([SlotKind.UpsertSink], properties["compactAfter"]);
+        Assert.Equal([SlotKind.AppendSink], properties["retain"]);
+        // Every property a kind is refused has that kind left out of its AppliesTo, and the
+        // other way round: the schema and RequireKind are one rule said twice.
+        var kafka = Assert.Single(service.Node.Discovery.Connectors, c => c.Name == "kafka").Config!.Properties.ToDictionary(p => p.Name, p => p.AppliesTo);
+        Assert.Equal([SlotKind.AppendInput, SlotKind.KeyedInput], kafka["startFrom"]);
+        Assert.Equal([SlotKind.KeyedInput], kafka["format"]);
+        Assert.Equal([SlotKind.UpsertSink, SlotKind.AppendSink], kafka["producer"]);
+    }
+
+    // ── sinks: retention, snapshots, and the object of a leader that was replaced ──────
+
+    [Fact]
+    public async Task An_append_sink_told_to_retain_keeps_that_many_of_its_newest_objects_across_a_restart()
+    {
+        await using var service = await StartAsync();
+        var log = service.Memory.Log<Trade>("in");
+        await service.DeployAsync(Spec("big", "big-trades", "in") with
+        {
+            Sinks = new Dictionary<string, JsonElement> { ["out"] = Files("out/kept-", "\"retain\": 3") },
+        });
+        var trades = Trades(0, 400).Where(t => t.Quantity >= BigTrades.Threshold).ToList();
+        async Task<List<long>> StepsAsync() =>
+            [.. (await FileSinkFormat.StepObjectsAsync(_store, "out/kept-")).Select(n => FileSinkFormat.TryParse("out/kept-", n, out var step, out _) ? step : -1)];
+
+        for (var i = 0; i < 8; i++)
+        {
+            log.Append(trades[i]);
+            var seen = i + 1;
+            await EventuallyAsync(async () => (await AppendsAsync<Trade>("out/kept-")).LastOrDefault() == trades[seen - 1], $"record {seen} written");
+        }
+        var before = await StepsAsync();
+        Assert.Equal(3, before.Count);
+        Assert.Equal(trades.Skip(5).Take(3), await AppendsAsync<Trade>("out/kept-"));
+
+        // A new generation finds the three and goes on counting from them.
+        await service.Pipelines.StopAsync("big", new ActionOptions(), default);
+        await service.Pipelines.StartAsync("big", new ActionOptions(), default);
+        await service.Running("big");
+        log.Append(trades[8]);
+        await EventuallyAsync(async () => (await AppendsAsync<Trade>("out/kept-")).LastOrDefault() == trades[8], "a record after the restart");
+        Assert.Equal(trades.Skip(6).Take(3), await AppendsAsync<Trade>("out/kept-"));
+        Assert.Equal(3, Directory.GetFiles(Path.Combine(_root, "out")).Length);
+    }
+
+    [Fact]
+    public async Task An_upsert_sink_told_to_compact_folds_its_objects_into_a_snapshot_that_reads_the_same()
+    {
+        await using var service = await StartAsync();
+        var keyed = "\"pollInterval\": \"00:00:00.02\", \"settle\": \"00:00:00\", \"format\": \"changes\"";
+        await service.DeployAsync(Spec("latest", "latest-trades") with
+        {
+            Inputs = new Dictionary<string, JsonElement> { ["trades"] = Files("in/", keyed) },
+            Sinks = new Dictionary<string, JsonElement> { ["out"] = Files("out/latest/", "\"compactAfter\": 4") },
+        });
+        string Row(Trade trade) => $"{{\"key\":{trade.Id},\"row\":{JsonSerializer.Serialize(trade, Web)}}}";
+        var expected = new Dictionary<long, Trade>();
+        var trades = Trades(0, 40);
+        var files = 0;
+        string[] Names() => Directory.Exists(Path.Combine(_root, "out", "latest")) ? [.. Directory.GetFiles(Path.Combine(_root, "out", "latest")).Select(Path.GetFileName).Order()!] : [];
+
+        // Thirty steps, one object in at a time so that each is a step: upserts, changes
+        // of rows already written, and deletes.
+        for (var round = 0; round < 30; round++)
+        {
+            var lines = new List<string>();
+            var fresh = trades[round];
+            expected[fresh.Id] = fresh;
+            lines.Add(Row(fresh));
+            if (round >= 2)
+            {
+                var changed = trades[round - 2] with { Quantity = 1000 + round };
+                if (expected.ContainsKey(changed.Id))
+                {
+                    expected[changed.Id] = changed;
+                    lines.Add(Row(changed));
+                }
+            }
+            if (round % 3 == 2)
+            {
+                var gone = trades[round - 1].Id;
+                expected.Remove(gone);
+                lines.Add($"{{\"key\":{gone},\"deleted\":true}}");
+            }
+            await PutAsync($"in/{files++:D4}.jsonl", lines);
+            await EventuallyAsync(async () => Same(await FileSinkFormat.ReadUpsertsAsync<long, Trade>(_store, "out/latest/"), expected), $"the sink after round {round}");
+            // Never more than the trigger's worth of step objects, one snapshot, and the
+            // step that set the fold off (it is above the checkpoint while it is written).
+            Assert.InRange(Names().Length, 1, 4 + 2);
+        }
+        var names = Names();
+        Assert.Single(names, n => n.EndsWith(".snapshot.jsonl"));
+        // The snapshot holds each live key once and no deleted one.
+        var snapshot = File.ReadAllLines(Path.Combine(_root, "out", "latest", names.Single(n => n.EndsWith(".snapshot.jsonl"))));
+        Assert.DoesNotContain(snapshot, line => line.Contains("\"deleted\""));
+        Assert.Equal(snapshot.Length, snapshot.Select(line => JsonDocument.Parse(line).RootElement.GetProperty("key").GetInt64()).Distinct().Count());
+
+        // A restart counts what is there and goes on; a reset takes the snapshot too.
+        await service.Pipelines.StopAsync("latest", new ActionOptions(), default);
+        await service.Pipelines.StartAsync("latest", new ActionOptions(), default);
+        await service.Running("latest");
+        expected[trades[35].Id] = trades[35];
+        await PutAsync($"in/{files++:D4}.jsonl", [Row(trades[35])]);
+        await EventuallyAsync(async () => Same(await FileSinkFormat.ReadUpsertsAsync<long, Trade>(_store, "out/latest/"), expected), "the sink after a restart");
+        await service.Pipelines.ResetAsync("latest", new ActionOptions(), default);
+        await service.Running("latest");
+        await EventuallyAsync(async () => Same(await FileSinkFormat.ReadUpsertsAsync<long, Trade>(_store, "out/latest/"), expected), "the sink after a reset: built again from the input");
+    }
+
+    [Fact]
+    public async Task A_reader_that_listed_before_a_fold_and_reads_after_it_starts_over_from_the_snapshot()
+    {
+        for (var step = 1; step <= 5; step++)
+            await PutAsync(FileSinkFormat.ObjectName("out/", step, 1, 0), [$"{{\"key\":{step % 3},\"row\":\"step {step}\"}}", $"{{\"key\":{10 + step},\"row\":\"only {step}\"}}"]);
+        await PutAsync(FileSinkFormat.ObjectName("out/", 6, 1, 0), ["{\"key\":11,\"deleted\":true}", "{\"key\":0,\"row\":\"step 6\"}"]);
+        var expected = new Dictionary<int, string> { [0] = "step 6", [1] = "step 4", [2] = "step 5", [12] = "only 2", [13] = "only 3", [14] = "only 4", [15] = "only 5" };
+        Assert.Equal(expected, await FileSinkFormat.ReadUpsertsAsync<int, string>(_store, "out/"));
+
+        // The fold happens between the reader's listing and its first read.
+        var store = new PagingStore(_store);
+        var folded = false;
+        store.BeforeOpen = async _ =>
+        {
+            if (folded)
+                return;
+            folded = true;
+            Assert.Equal(1, await FileSinkFormat.CompactAsync<int>(_store, "out/", upTo: 5, term: 1, Web, default));
+        };
+        Assert.Equal(expected, await FileSinkFormat.ReadUpsertsAsync<int, string>(store, "out/"));
+        Assert.True(folded);
+        Assert.Equal(
+            [FileSinkFormat.SnapshotName("out/", 5, 1), FileSinkFormat.ObjectName("out/", 6, 1, 0)],
+            await FileSinkFormat.StepObjectsAsync(_store, "out/"));
+        Assert.Equal(2, Directory.GetFiles(Path.Combine(_root, "out")).Length);
+
+        // Folding again with one step above the snapshot: the two become one, and a
+        // second fold of nothing writes nothing.
+        Assert.Equal(0, await FileSinkFormat.CompactAsync<int>(_store, "out/", upTo: 6, term: 2, Web, default));
+        Assert.Equal([FileSinkFormat.SnapshotName("out/", 6, 2)], await FileSinkFormat.StepObjectsAsync(_store, "out/"));
+        Assert.Equal(expected, await FileSinkFormat.ReadUpsertsAsync<int, string>(_store, "out/"));
+        Assert.Equal(0, await FileSinkFormat.CompactAsync<int>(_store, "out/", upTo: 6, term: 2, Web, default));
+        Assert.Equal(expected, await FileSinkFormat.ReadUpsertsAsync<int, string>(_store, "out/"));
+    }
+
+    [Fact]
+    public async Task A_fold_that_loses_an_object_to_another_writer_writes_nothing()
+    {
+        for (var step = 1; step <= 4; step++)
+            await PutAsync(FileSinkFormat.ObjectName("out/", step, 1, 0), [$"{{\"key\":{step},\"row\":\"step {step}\"}}"]);
+        var store = new PagingStore(_store);
+        store.BeforeOpen = name =>
+        {
+            File.Delete(Path.Combine(_root, FileSinkFormat.ObjectName("out/", 2, 1, 0)));
+            return Task.CompletedTask;
+        };
+        Assert.Equal(4, await FileSinkFormat.CompactAsync<int>(store, "out/", upTo: 4, term: 1, Web, default));
+        Assert.DoesNotContain(Directory.GetFiles(Path.Combine(_root, "out")), n => n.Contains("snapshot") || n.EndsWith(".tmp"));
+        Assert.Equal(3, Directory.GetFiles(Path.Combine(_root, "out")).Length);
+    }
+
+    [Fact]
+    public async Task The_late_object_of_a_replaced_leader_is_void_once_its_successor_has_written()
+    {
+        // Leader one (term 1) started from nothing and wrote steps 1 to 4; the checkpoint
+        // covers 2. It is replaced while step 4's object is still on its way.
+        await PutAsync(FileSinkFormat.ObjectName("out/", 1, 1, 0), ["{\"key\":1,\"row\":\"a1\"}"]);
+        await PutAsync(FileSinkFormat.ObjectName("out/", 2, 1, 0), ["{\"key\":2,\"row\":\"a2\"}"]);
+        // Leader two (term 2) starts from the checkpoint at 2, deletes what is above it,
+        // and runs the same input again cut into one step, 3 — and its step 4 gives this
+        // sink nothing, so it writes no object for it.
+        await PutAsync(FileSinkFormat.ObjectName("out/", 3, 2, 2), ["{\"key\":1,\"row\":\"b3: the latest\"}", "{\"key\":3,\"row\":\"b3\"}"]);
+        // Then leader one's write of step 4 lands: rows as of the middle of what leader
+        // two has since finished.
+        await PutAsync(FileSinkFormat.ObjectName("out/", 4, 1, 0), ["{\"key\":1,\"row\":\"a4: stale\"}", "{\"key\":9,\"row\":\"a4: never produced by leader two\"}"]);
+
+        Assert.Equal(
+            new Dictionary<int, string> { [1] = "b3: the latest", [2] = "a2", [3] = "b3" },
+            await FileSinkFormat.ReadUpsertsAsync<int, string>(_store, "out/"));
+        Assert.DoesNotContain(FileSinkFormat.ObjectName("out/", 4, 1, 0), await FileSinkFormat.StepObjectsAsync(_store, "out/"));
+
+        // The same object at a step the successor's base covers is not void: it was committed.
+        Assert.Contains(FileSinkFormat.ObjectName("out/", 2, 1, 0), await FileSinkFormat.StepObjectsAsync(_store, "out/"));
+        // A third leader from the checkpoint at 3 leaves leader two's step 3 alone and
+        // would void its step 5.
+        await PutAsync(FileSinkFormat.ObjectName("out/", 5, 2, 2), ["{\"key\":3,\"row\":\"b5: stale\"}"]);
+        await PutAsync(FileSinkFormat.ObjectName("out/", 4, 3, 3), ["{\"key\":4,\"row\":\"c4\"}"]);
+        Assert.Equal(
+            new Dictionary<int, string> { [1] = "b3: the latest", [2] = "a2", [3] = "b3", [4] = "c4" },
+            await FileSinkFormat.ReadUpsertsAsync<int, string>(_store, "out/"));
+
+        // A fold takes the void objects away with the rest and leaves the same rows.
+        await FileSinkFormat.CompactAsync<int>(_store, "out/", upTo: 5, term: 3, Web, default);
+        Assert.Equal([FileSinkFormat.SnapshotName("out/", 4, 3)], await FileSinkFormat.StepObjectsAsync(_store, "out/"));
+        Assert.Equal(
+            new Dictionary<int, string> { [1] = "b3: the latest", [2] = "a2", [3] = "b3", [4] = "c4" },
+            await FileSinkFormat.ReadUpsertsAsync<int, string>(_store, "out/"));
+        Assert.Single(Directory.GetFiles(Path.Combine(_root, "out")));
+    }
+
+    [Fact]
+    public void An_object_s_name_says_its_step_its_term_and_the_checkpoint_its_writer_started_from()
+    {
+        var name = FileSinkFormat.ObjectName("out/a-", 12, 3, 9);
+        Assert.Equal("out/a-0000000000000000012-000003-0000000000000000009.jsonl", name);
+        Assert.True(FileSinkFormat.TryParse("out/a-", name, out FileSinkFormat.StepObject parsed));
+        Assert.Equal(new FileSinkFormat.StepObject(name, 12, 3, 9, false), parsed);
+        Assert.True(FileSinkFormat.TryParse("out/a-", FileSinkFormat.SnapshotName("out/a-", 12, 3), out parsed));
+        Assert.Equal((12, 3, true), (parsed.Step, parsed.Term, parsed.Snapshot));
+        // The older form, without the base: read, and it voids nothing.
+        Assert.True(FileSinkFormat.TryParse("out/a-", FileSinkFormat.ObjectName("out/a-", 12, 3), out parsed));
+        Assert.Equal((12, 3, long.MaxValue, false), (parsed.Step, parsed.Term, parsed.Base, parsed.Snapshot));
+        foreach (var other in new[] { "out/a-12-3-9.jsonl", "out/a-0000000000000000012-000003-9.jsonl", "out/a-0000000000000000012-000003.snapshot.jsonl", "out/b-0000000000000000012-000003.jsonl", "out/a-0000000000000000012-000003.json", "out/a-readme.jsonl" })
+            Assert.False(FileSinkFormat.TryParse("out/a-", other, out parsed), other);
+    }
+
+    [Fact]
+    public async Task A_pipeline_whose_prefix_holds_nothing_says_so_at_the_dry_run_and_degrades_the_node_until_an_object_lands()
+    {
+        await using var service = await TestService.StartAsync(
+            options: o => o.MissingInputGrace = TimeSpan.FromMilliseconds(300),
+            configure: b => b.AddObjectStore("landing", _ => _store));
+        var spec = CountsFromFiles("counts", "tradse/", "counts");             // the typing mistake
+
+        var dry = await service.Pipelines.DeployAsync(spec, new DeployOptions(DryRun: true), default);
+        var warning = Assert.Single(dry.Plan.Warnings);
+        Assert.Contains("input 'trades': no object under tradse/ in store landing", warning);
+
+        await service.DeployAsync(spec);
+        await service.Running("counts");
+        await Eventually(() => service.Pipelines.Get("counts").Sources.Single() is { Stats.WaitingFor: "objects under tradse/ in store landing", WaitingSince: not null }, "the source waiting");
+        await Eventually(() => service.Node.Health.Reasons.Contains("source-waiting"), "the node saying so", TimeSpan.FromSeconds(10));
+        Assert.Equal(HealthLevel.Degraded, service.Node.Health.Level);
+        await Eventually(() => service.Node.RecentEvents().Any(e => e.Kind == "pipeline" && e.Message == "input 'trades' waiting for objects under tradse/ in store landing"), "the event");
+
+        await PutAsync("tradse/0001.jsonl", Trades(0, 10));
+        var sink = service.Memory.UpsertSink<string, long>("counts");
+        await Eventually(() => Same(sink.Rows, Counts.Model(Trades(0, 10))), "the object read");
+        await Eventually(() => service.Node.Health.Level == HealthLevel.Healthy, "the node healthy again", TimeSpan.FromSeconds(10));
+        Assert.Null(service.Pipelines.Get("counts").Sources.Single().WaitingSince);
+        Assert.Empty((await service.Pipelines.DeployAsync(spec with { Id = "again", Sinks = new Dictionary<string, JsonElement> { ["out"] = TestService.MemoryBinding("again") } }, new DeployOptions(DryRun: true), default)).Plan.Warnings);
     }
 }

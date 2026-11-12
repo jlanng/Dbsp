@@ -8,10 +8,20 @@ namespace Incremental.Service;
 /// <c>string</c>, <c>number</c>, <c>boolean</c>, <c>object</c> or <c>array</c>;
 /// <c>Values</c> are the values it may take, when they are a closed set; <c>Default</c> is
 /// what it is when left out, as text; a <c>Secret</c> one is returned by the admin API as
-/// <c>***</c>.</summary>
+/// <c>***</c>. <c>AppliesTo</c> are the kinds of slot the property means something on —
+/// null for all the connector can be bound to — so that a form shows a sink's settings on
+/// a sink only; a table source's properties leave it null. It describes, it does not
+/// enforce: the connector still refuses a property on a slot it does not apply to.</summary>
 public sealed record ConfigProperty(
     string Name, string JsonType, bool Required = false, string? Description = null, IReadOnlyList<string>? Values = null,
-    string? Default = null, bool Secret = false);
+    string? Default = null, bool Secret = false, IReadOnlyList<SlotKind>? AppliesTo = null)
+{
+    /// <summary>For <see cref="AppliesTo"/>: the two kinds of input.</summary>
+    public static IReadOnlyList<SlotKind> Sources { get; } = [SlotKind.AppendInput, SlotKind.KeyedInput];
+
+    /// <summary>For <see cref="AppliesTo"/>: the two kinds of sink.</summary>
+    public static IReadOnlyList<SlotKind> Sinks { get; } = [SlotKind.UpsertSink, SlotKind.AppendSink];
+}
 
 /// <summary>What a config may say. <c>Open</c>: properties not listed are accepted (and
 /// are the connector's own business); otherwise they are refused.</summary>

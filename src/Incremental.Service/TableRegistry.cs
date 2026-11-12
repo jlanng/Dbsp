@@ -21,6 +21,8 @@ internal interface ITableHandle : IAsyncDisposable
     ITableDefinition Definition { get; }
     TableState State { get; }
     string? Fault { get; }
+    string? LoaderWaitingFor { get; }
+    DateTimeOffset? LoaderWaitingSince { get; }
     object? Table { get; }
     bool IsFollowing { get; }
     Exception? FollowFault { get; }
@@ -60,6 +62,9 @@ internal sealed class TableHandle<TKey, TRow>(TableRegistry registry, TableDefin
     private long? _loaderLag;
     private string? _loaderFault;
     private int _loaderRestarts;
+    private volatile string? _waitingFor;
+    private long _waitingSinceTicks;
+    private bool _waitingAnnounced;
 
     private (DateTimeOffset Time, long Version) _rateSample;
     private double _rate;
@@ -226,6 +231,7 @@ internal sealed class TableHandle<TKey, TRow>(TableRegistry registry, TableDefin
                 if (IsFence(ex) || IsFence(await WriterFaultAsync().ConfigureAwait(false)))
                     return; // The node is ending; nothing here can mend it.
 
+                _waitingFor = null;
                 _loaderFaulted = true;
                 _loaderState = TableSourceState.Faulted;
                 _loaderFault = $"{ex.GetType().Name}: {ex.Message}";
@@ -299,8 +305,40 @@ internal sealed class TableHandle<TKey, TRow>(TableRegistry registry, TableDefin
         }
     }
 
+    public string? LoaderWaitingFor => _waitingFor;
+
+    public DateTimeOffset? LoaderWaitingSince =>
+        _waitingFor is not null && Interlocked.Read(ref _waitingSinceTicks) is > 0 and var ticks ? new DateTimeOffset(ticks, TimeSpan.Zero) : null;
+
+    /// <summary>The loader says that what it reads is not there. The first time starts
+    /// the clock; when the grace period has passed it is said once, as an event.</summary>
+    internal void ReportLoaderWaiting(string waitingFor)
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (_waitingFor is null)
+        {
+            Interlocked.Exchange(ref _waitingSinceTicks, now.UtcTicks);
+            _waitingAnnounced = false;
+        }
+        _waitingFor = waitingFor;
+        _loaderState = TableSourceState.Waiting;
+        _loaderFaulted = false;
+        if (!_waitingAnnounced && now - new DateTimeOffset(Interlocked.Read(ref _waitingSinceTicks), TimeSpan.Zero) >= registry.Context.Options.MissingInputGrace)
+        {
+            _waitingAnnounced = true;
+            _logger.LogWarning("Loader of table {Table} is still waiting for {What}; the table has {Rows} row(s)", Spec.Name, waitingFor, _table?.Count ?? 0);
+            registry.Context.Events.Publish("table", Spec.Name, $"loader waiting for {waitingFor}");
+        }
+    }
+
     internal void ReportLoader(TableSourceState state, string? position, long? lag)
     {
+        if (_waitingFor is not null)
+        {
+            _waitingFor = null;
+            if (_waitingAnnounced)
+                registry.Context.Events.Publish("table", Spec.Name, "loader no longer waiting: what it reads is there");
+        }
         _loaderState = state;
         if (position is not null)
             _loaderPosition = position;
@@ -399,7 +437,8 @@ internal sealed class TableHandle<TKey, TRow>(TableRegistry registry, TableDefin
         }).ToList();
 
         LoaderStats? loader = Spec.Loader is { } l
-            ? new LoaderStats(l.Kind, _loaderState, _loaderPosition, _loaderLag, _unreadable.Total, _loaderRestarts, _loaderFaulted || _failed ? _loaderFault : null)
+            ? new LoaderStats(l.Kind, _loaderState, _loaderPosition, _loaderLag, _unreadable.Total, _loaderRestarts, _loaderFaulted || _failed ? _loaderFault : null,
+                _loaderState == TableSourceState.Waiting ? _waitingFor : null, _loaderState == TableSourceState.Waiting ? LoaderWaitingSince : null)
             : null;
 
         return new TableStats(
@@ -562,7 +601,7 @@ internal sealed class TableRegistry(ServiceContext context) : ITableRegistry
 
     public IReadOnlyList<TableInfo> Tables =>
         _tables.Values.OrderBy(t => t.Spec.Name, StringComparer.Ordinal)
-            .Select(t => new TableInfo(t.Spec.Name, t.Spec.Definition, t.Definition.KeyType.Name, t.Definition.RowType.Name, t.State))
+            .Select(t => new TableInfo(t.Spec.Name, t.Spec.Definition, t.Definition.KeyType.Name, t.Definition.RowType.Name, t.State, t.LoaderWaitingFor, t.LoaderWaitingSince))
             .ToList();
 
     internal IEnumerable<ITableHandle> Handles => _tables.Values;
@@ -789,6 +828,44 @@ internal sealed class TableRegistry(ServiceContext context) : ITableRegistry
         ]);
     }
 
+    public async Task<ActionPlan> PlanDeclareAsync(TableSpec spec, CancellationToken cancellationToken)
+    {
+        var plan = PlanDeclare(spec);
+        if (spec.Loader is not { } loader)
+            return plan;
+        // A look, with a bound: a store or a broker that does not answer is not a reason
+        // to refuse the dry run, and says nothing about whether the object is there.
+        string? missing = null;
+        using var bound = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        bound.CancelAfter(PresenceTimeout);
+        try
+        {
+            if (context.Registrations.TableSources.TryGetValue(loader.Kind, out var factory))
+                missing = factory(context.Services) is ITableSourcePresence presence ? await presence.MissingAsync(loader, bound.Token).ConfigureAwait(false) : null;
+            else if (loader.Kind == "file")
+            {
+                var path = loader.Config!.Value.GetProperty("path").GetString()!;
+                if (await context.ObjectStore(loader.Connection).StatAsync(path, bound.Token).ConfigureAwait(false) is null)
+                    missing = $"object {path} is not in store {loader.Connection}";
+            }
+            else
+            {
+                var config = KafkaTableSource<string, string>.Check(context.KafkaConnections, loader);
+                if (await context.KafkaConnections.Get(loader.Connection).TopicMissingAsync(config.Topic!, bound.Token).ConfigureAwait(false))
+                    missing = $"topic {config.Topic} does not exist on connection {loader.Connection}";
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            missing = null;
+        }
+        return missing is null
+            ? plan
+            : plan with { Warnings = [$"{missing}: the table is declared empty and its loader {(loader.Kind == "file" ? "waits until it is there" : "faults and is retried until it is")}. Check the name."] };
+    }
+
+    internal static readonly TimeSpan PresenceTimeout = TimeSpan.FromSeconds(5);
+
     public async Task DeclareAsync(TableSpec spec, CancellationToken cancellationToken, string? caller = null)
     {
         CheckDeclare(spec);
@@ -988,7 +1065,13 @@ internal sealed class FileTableSource<TKey, TRow>(IObjectStore store) : ITableSo
                 loaded = info.Identity;
                 context.Logger.LogInformation("Table {Table} loaded from {Path} at version {Version}", context.Table.Name, path, context.Table.LatestVersion);
             }
-            context.Report(TableSourceState.Idle, path);
+            // Never loaded and nothing there: a file that is yet to be delivered, or a
+            // path with a typing mistake in it. Either way the table is as it was, and
+            // that is said. An object that goes away after a load leaves its rows.
+            if (info is null && loaded is null)
+                context.ReportWaiting($"object {path} in store {context.Loader.Connection}");
+            else
+                context.Report(TableSourceState.Idle, path);
             await Task.Delay(poll, cancellationToken).ConfigureAwait(false);
         }
     }

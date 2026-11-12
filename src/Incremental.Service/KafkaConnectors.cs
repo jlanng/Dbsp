@@ -55,6 +55,48 @@ public sealed class KafkaConnection
     }
 
     internal IReadOnlyDictionary<string, string> Config => new Dictionary<string, string>(ClientConfig);
+
+    /// <summary>
+    /// Whether the brokers say the topic does not exist — asked at a dry run, with a
+    /// consumer made for the question (it carries the connection's settings and its token
+    /// handler; it joins no group and reads nothing). False when it exists and when the
+    /// brokers do not answer in time: only a clear "no such topic" is a finding.
+    /// </summary>
+    internal Task<bool> TopicMissingAsync(string topic, CancellationToken cancellationToken) => Task.Run(() =>
+    {
+        var config = new ConsumerConfig { BootstrapServers = BootstrapServers, GroupId = "incremental-presence-check", EnableAutoCommit = false };
+        KafkaClientDefaults.Apply(config);
+        foreach (var (key, value) in ClientConfig)
+            config.Set(key, value);
+        var builder = new ConsumerBuilder<byte[], byte[]>(config);
+        ConfigureConsumer?.Invoke(builder);
+        using var consumer = builder.Build();
+        // A token handler runs only when the client is served: once before it is asked.
+        consumer.ServeCallbacks();
+        using var admin = new DependentAdminClientBuilder(consumer.Handle).Build();
+        try
+        {
+            // Twice, a moment apart: a topic made a moment ago can be unknown to the broker asked.
+            for (var attempt = 0; ; attempt++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var metadata = admin.GetMetadata(topic, TimeSpan.FromSeconds(3));
+                var found = metadata.Topics.FirstOrDefault(t => t.Topic == topic);
+                if (found is { Partitions.Count: > 0 } && !found.Error.IsError)
+                    return false;
+                var unknown = found is null || found.Error.Code is ErrorCode.UnknownTopicOrPart or ErrorCode.NoError;
+                if (!unknown)
+                    return false;
+                if (attempt == 1)
+                    return true;
+                Thread.Sleep(300);
+            }
+        }
+        catch (KafkaException)
+        {
+            return false;
+        }
+    }, cancellationToken);
 }
 
 /// <summary>The Kafka connections the host registered, by name. Resolved from DI; a custom
@@ -178,15 +220,27 @@ internal sealed record KafkaSlotConfig
 /// leader term on what they write.
 /// </summary>
 public sealed class KafkaConnector(KafkaConnections connections)
-    : IAppendSourceConnector, IKeyedSourceConnector, IUpsertSinkConnector, IAppendSinkConnector, IConfigDescribed
+    : IAppendSourceConnector, IKeyedSourceConnector, IUpsertSinkConnector, IAppendSinkConnector, IConfigDescribed, IPresenceChecked
 {
+    /// <summary>An input's topic that does not exist: a source never creates its topic,
+    /// so the pipeline would fault at every start until someone does.</summary>
+    public async ValueTask<string?> MissingAsync(JsonElement config, SlotKind kind, CancellationToken cancellationToken)
+    {
+        if (kind is not (SlotKind.AppendInput or SlotKind.KeyedInput))
+            return null;
+        var (parsed, connection) = Resolve(config);
+        return await connection.TopicMissingAsync(parsed.Topic!, cancellationToken).ConfigureAwait(false)
+            ? $"topic {parsed.Topic} does not exist on connection {parsed.Connection}: the pipeline faults at each start until it does"
+            : null;
+    }
+
     public ConfigSchema ConfigSchema { get; } = new(
     [
         new("connection", "string", Required: true, Description: "A Kafka connection the host registered; it holds the bootstrap servers and client settings."),
         new("topic", "string", Required: true, Description: "The topic read or written."),
-        new("startFrom", "string", Description: "Sources: where to start with no committed position.", Values: ["earliest", "latest"], Default: "earliest"),
-        new("format", "string", Description: "Keyed inputs: plain JSON values, or Debezium change events.", Values: ["json", "debezium"], Default: "json"),
-        new("producer", "string", Description: "Sinks: a producer of the sink's own, or the backend's transactional one (connection 'log' only).", Values: ["own", "log"], Default: "own"),
+        new("startFrom", "string", Description: "Where to start with no committed position.", Values: ["earliest", "latest"], Default: "earliest", AppliesTo: ConfigProperty.Sources),
+        new("format", "string", Description: "Plain JSON values, or Debezium change events.", Values: ["json", "debezium"], Default: "json", AppliesTo: [SlotKind.KeyedInput]),
+        new("producer", "string", Description: "A producer of the sink's own, or the backend's transactional one (connection 'log' only).", Values: ["own", "log"], Default: "own", AppliesTo: ConfigProperty.Sinks),
     ], "A topic as an append or keyed input, or as an upsert (compacted) or append sink.");
 
     private (KafkaSlotConfig Config, KafkaConnection Connection) Resolve(JsonElement json)

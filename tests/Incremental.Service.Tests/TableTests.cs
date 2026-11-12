@@ -434,4 +434,57 @@ public class TableTests
         await Assert.ThrowsAsync<ServiceException>(() => service.Tables.DeclareAsync(new TableSpec { Name = "svc.mine", Definition = typeof(InstrumentsTable).FullName! }, default));
         await Assert.ThrowsAsync<ServiceException>(() => service.Tables.DeclareAsync(new TableSpec { Name = "instruments", Definition = typeof(InstrumentsTable).FullName! }, default));
     }
+
+    // ── an input that is not there ─────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task A_table_whose_file_does_not_exist_says_so_at_the_dry_run_waits_visibly_and_degrades_the_node_until_it_arrives()
+    {
+        var directory = Directory.CreateTempSubdirectory("incremental-service-files").FullName;
+        await using var service = await StartAsync(
+            options: o => o.MissingInputGrace = TimeSpan.FromMilliseconds(400),
+            configure: b => b.AddObjectStore("refdata", _ => new LocalObjectStore(directory)));
+        var spec = new TableSpec
+        {
+            Name = "instruments", Definition = typeof(InstrumentsTable).FullName!,
+            Loader = new TableLoaderSpec("file", "refdata", Json("""{ "path": "nope.jsonl", "pollInterval": "00:00:00.03" }""")),
+        };
+
+        // The dry run goes ahead and says what it saw.
+        var plan = await service.Tables.PlanDeclareAsync(spec, default);
+        var warning = Assert.Single(plan.Warnings);
+        Assert.Contains("object nope.jsonl is not in store refdata", warning);
+        Assert.Contains("waits until it is there", warning);
+
+        await service.Tables.DeclareAsync(spec, default);
+        await Eventually(() => service.Tables.Stats("instruments").Loader is { State: TableSourceState.Waiting }, "the loader waiting");
+        var waiting = service.Tables.Stats("instruments");
+        Assert.Equal(TableState.Open, waiting.State);
+        Assert.Equal(0, waiting.Rows);
+        Assert.Equal("object nope.jsonl in store refdata", waiting.Loader!.WaitingFor);
+        Assert.NotNull(waiting.Loader.WaitingSince);
+        Assert.Null(waiting.Loader.Fault);
+        Assert.Equal(0, waiting.Loader.Restarts);
+
+        // Not at once: a file may be on its way. After the grace period it is an event,
+        // once, and a reason the node is Degraded.
+        await Eventually(() => service.Node.Health.Reasons.Contains("loader-waiting"), "the node saying so");
+        Assert.Equal(HealthLevel.Degraded, service.Node.Health.Level);
+        await Eventually(() => service.Node.RecentEvents().Any(e => e.Kind == "table" && e.Message == "loader waiting for object nope.jsonl in store refdata"), "the event");
+        await Task.Delay(200);
+        Assert.Single(service.Node.RecentEvents(), e => e.Kind == "table" && e.Message.StartsWith("loader waiting for"));
+
+        // The file arrives: loaded, no longer waiting, healthy.
+        await File.WriteAllLinesAsync(Path.Combine(directory, "nope.jsonl"), Instruments(3).Select(i => JsonSerializer.Serialize(i, JsonSerializerOptions.Web)));
+        await Eventually(() => service.Tables.Stats("instruments") is { Rows: 3, Loader.State: TableSourceState.Idle }, "the table loaded");
+        Assert.Null(service.Tables.Stats("instruments").Loader!.WaitingFor);
+        await Eventually(() => service.Node.Health.Level == HealthLevel.Healthy, "the node healthy again");
+        Assert.Contains(service.Node.RecentEvents(), e => e.Kind == "table" && e.Message.StartsWith("loader no longer waiting"));
+        Assert.Empty((await service.Tables.PlanDeclareAsync(spec with { Name = "again" }, default)).Warnings);
+
+        // An object that goes away after a load leaves its rows, and is not "waiting".
+        File.Delete(Path.Combine(directory, "nope.jsonl"));
+        await Task.Delay(150);
+        Assert.True(service.Tables.Stats("instruments") is { Rows: 3, Loader.State: TableSourceState.Idle });
+    }
 }

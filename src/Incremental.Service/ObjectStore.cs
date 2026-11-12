@@ -26,7 +26,48 @@ public interface IObjectStore
     /// cancelled, nothing changes under the name.</summary>
     ValueTask WriteAsync(string path, Func<Stream, CancellationToken, ValueTask> write, CancellationToken cancellationToken);
     ValueTask DeleteAsync(string path, CancellationToken cancellationToken);
+
+    /// <summary>Every object whose path starts with <paramref name="prefix"/>, in any order.</summary>
     IAsyncEnumerable<ObjectInfo> ListAsync(string prefix, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// One page of a listing: of the objects whose path starts with
+    /// <paramref name="prefix"/> and sorts after <paramref name="after"/> (ordinal; null:
+    /// from the first), the <paramref name="limit"/> that sort first, in that order, and
+    /// whether there are more. The next page is asked for with the last path of this one.
+    /// It is what the <c>files</c> source polls with, so that a poll costs the objects it
+    /// has not read and not the whole prefix — on S3 this is one <c>ListObjectsV2</c> with
+    /// <c>StartAfter</c> and <c>MaxKeys</c>, whose order is this order for names in ASCII.
+    /// <para>The default lists the whole prefix through
+    /// <see cref="ListAsync(string, CancellationToken)"/> and keeps the page: correct for
+    /// any store, and as costly as the prefix is long. A store that can start a listing at
+    /// a name should implement this member.</para>
+    /// </summary>
+    async ValueTask<ObjectPage> ListPageAsync(string prefix, string? after, int limit, CancellationToken cancellationToken)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
+        var first = new SortedSet<ObjectInfo>(ObjectPage.ByPath);
+        var more = false;
+        await foreach (var info in ListAsync(prefix, cancellationToken).ConfigureAwait(false))
+        {
+            if (after is not null && string.CompareOrdinal(info.Path, after) <= 0)
+                continue;
+            first.Add(info);
+            if (first.Count > limit)
+            {
+                first.Remove(first.Max!);
+                more = true;
+            }
+        }
+        return new ObjectPage([.. first], more);
+    }
+}
+
+/// <summary>One page of <see cref="IObjectStore.ListPageAsync"/>: objects in ordinal order
+/// of their paths, and whether the listing goes on after the last of them.</summary>
+public sealed record ObjectPage(IReadOnlyList<ObjectInfo> Objects, bool More)
+{
+    internal static readonly IComparer<ObjectInfo> ByPath = Comparer<ObjectInfo>.Create(static (a, b) => string.CompareOrdinal(a.Path, b.Path));
 }
 
 /// <summary>An <see cref="IObjectStore"/> over a local directory. It is rooted: a path
@@ -134,5 +175,42 @@ public sealed class LocalObjectStore : IObjectStore
             }
             yield return info;
         }
+    }
+
+    /// <summary>A page of the listing. A directory cannot be entered at a name, so the
+    /// prefix's directory is walked whole — but only names are compared, and only the
+    /// page's files are looked at.</summary>
+    public ValueTask<ObjectPage> ListPageAsync(string prefix, string? after, int limit, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(prefix);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
+        var slash = prefix.LastIndexOf('/');
+        var directory = slash <= 0 ? _root : Resolve(prefix[..slash]);
+        if (!Directory.Exists(directory))
+            return new ValueTask<ObjectPage>(new ObjectPage([], false));
+        var first = new SortedSet<string>(StringComparer.Ordinal);
+        var more = false;
+        foreach (var file in Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var path = Path.GetRelativePath(_root, file).Replace(Path.DirectorySeparatorChar, '/');
+            if (!path.StartsWith(prefix, StringComparison.Ordinal) || path.EndsWith(".tmp", StringComparison.Ordinal)
+                || (after is not null && string.CompareOrdinal(path, after) <= 0))
+                continue;
+            first.Add(path);
+            if (first.Count > limit)
+            {
+                first.Remove(first.Max!);
+                more = true;
+            }
+        }
+        var objects = new List<ObjectInfo>(first.Count);
+        foreach (var path in first)
+        {
+            var file = new FileInfo(Path.Combine(_root, path));
+            if (file.Exists)                // else deleted while the directory was being walked
+                objects.Add(new ObjectInfo(path, file.Length, file.LastWriteTimeUtc));
+        }
+        return new ValueTask<ObjectPage>(new ObjectPage(objects, more));
     }
 }

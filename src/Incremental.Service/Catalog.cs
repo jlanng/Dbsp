@@ -16,7 +16,12 @@ public sealed record AuditEntry(
 
 /// <summary>What an action will do, or did: the same record is returned by a dry run and by
 /// the real action, and is what the audit entry holds.</summary>
-public sealed record ActionPlan(string Action, string Target, bool DryRun, IReadOnlyList<string> Steps);
+public sealed record ActionPlan(string Action, string Target, bool DryRun, IReadOnlyList<string> Steps)
+{
+    /// <summary>What the action would go ahead with but the caller should look at first:
+    /// an input whose file, prefix or topic is not there. Empty when there is nothing.</summary>
+    public IReadOnlyList<string> Warnings { get; init; } = [];
+}
 
 public sealed record ActionOptions(long? ExpectedGeneration = null, bool DryRun = false, string? Caller = null);
 

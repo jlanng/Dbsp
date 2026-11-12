@@ -488,7 +488,9 @@ public sealed record DeadLetterSinkStatus(
 
 public sealed record SinkSlotStatus(string Slot, long Batches, long Upserts, long Deletes, long Appends, DateTimeOffset? WriteInFlightSince);
 
-public sealed record SourceSlotStatus(string Slot, SourceStats Stats);
+/// <summary><c>WaitingSince</c>: since when the source has said that what it reads is not
+/// there (<see cref="SourceStats.WaitingFor"/>); null while it does not.</summary>
+public sealed record SourceSlotStatus(string Slot, SourceStats Stats, DateTimeOffset? WaitingSince = null);
 
 public sealed record PipelineStatus(
     string Id, PipelineState State, DesiredState Desired, long Generation, string Plugin, string Version, string Definition,

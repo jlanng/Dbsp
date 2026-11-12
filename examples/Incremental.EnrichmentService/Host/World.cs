@@ -252,8 +252,6 @@ public sealed class World
                 // The source's position outlives the files it names: old ones can go.
                 if (next >= KeptQuoteFiles)
                     await Lake.DeleteAsync($"quotes/{next - KeptQuoteFiles:D8}.jsonl", default);
-                if (next % 10 == 0)
-                    await TrimSinkObjectsAsync();
             }
             Interlocked.Exchange(ref _quoteIntervals, next + 1);
         }
@@ -262,39 +260,16 @@ public sealed class World
 
     public const int KeptQuoteFiles = 30;
 
-    /// <summary>How many of the newest objects each files sink's prefix keeps.</summary>
+    /// <summary>How many of the newest objects each files sink's prefix keeps: the sinks'
+    /// own <c>retain</c>. A bucket would have a lifecycle rule; this directory has none,
+    /// and a process left running would fill it with an object every two seconds.</summary>
     public const int KeptSinkObjects = 200;
-
-    /// <summary>
-    /// The files sinks write an object per step and never delete one below their
-    /// checkpoint: retention is the bucket's business (a lifecycle rule, in production).
-    /// This directory has no such rule, so the example is its own: under each prefix of
-    /// <c>alerts/</c> and <c>dead-letters/</c> only the newest objects stay. Without it a
-    /// process left running fills the directory with a few objects a second.
-    /// </summary>
-    public async Task TrimSinkObjectsAsync()
-    {
-        foreach (var root in new[] { "alerts/", "dead-letters/" })
-        {
-            var perPrefix = new Dictionary<string, List<string>>(StringComparer.Ordinal);
-            await foreach (var info in Lake.ListAsync(root, default))      // in name order: oldest step first
-            {
-                var prefix = info.Path[..(info.Path.LastIndexOf('/') + 1)];
-                if (!perPrefix.TryGetValue(prefix, out var names))
-                    perPrefix[prefix] = names = [];
-                names.Add(info.Path);
-            }
-            foreach (var names in perPrefix.Values)
-                for (var i = 0; i < names.Count - KeptSinkObjects; i++)
-                    await Lake.DeleteAsync(names[i], default);
-        }
-    }
 }
 
 /// <summary>The example's table and pipeline specs. A spec is data: it names a definition,
 /// its settings, and what each of the definition's slots is bound to — and the bindings are
 /// the only thing that differs between the in-memory mode and Kafka.</summary>
-public sealed class Specs(KafkaStack? kafka, TimeSpan? fileSpacing = null)
+public sealed class Specs(KafkaStack? kafka, TimeSpan? fileSpacing = null, int? retain = World.KeptSinkObjects)
 {
     // The files sinks write one object per step; left alone that is several small objects
     // a second, so they are told to keep two seconds between objects. The smoke test,
@@ -314,11 +289,15 @@ public sealed class Specs(KafkaStack? kafka, TimeSpan? fileSpacing = null)
         : Json($$"""{ "connector": "kafka", "connection": "log", "topic": "{{kafka.SinkTopic(name)}}" }""");
 
     private JsonElement Quotes => kafka is null
-        ? Json("""{ "connector": "files", "store": "lake", "prefix": "quotes/", "pollInterval": "00:00:00.25" }""")
+        // The generator writes each file whole and names them in order, so the source need
+        // not wait for an object to settle before reading it (the default is five seconds).
+        ? Json("""{ "connector": "files", "store": "lake", "prefix": "quotes/", "pollInterval": "00:00:00.25", "settle": "00:00:00" }""")
         : Json($$"""{ "connector": "kafka", "connection": "log", "topic": "{{kafka.QuotesTopic}}" }""");
 
+    // Both files sinks here are append sinks (alerts, dead letters): "retain" keeps the
+    // newest objects of each. The smoke test, which counts every alert, keeps them all.
     private JsonElement Files(string prefix) =>
-        Json($$"""{ "connector": "files", "store": "lake", "prefix": "{{prefix}}", "minInterval": "{{_spacing}}" }""");
+        Json($$"""{ "connector": "files", "store": "lake", "prefix": "{{prefix}}", "minInterval": "{{_spacing}}"{{(retain is null ? "" : $", \"retain\": {retain}")}} }""");
 
     // <snippet:specs>
     public PipelineSpec TraderDesks(string version = "") => new()

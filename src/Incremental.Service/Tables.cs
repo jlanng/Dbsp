@@ -166,7 +166,9 @@ public sealed record TableSpec
     public UnreadablePolicy OnUnreadable { get; init; } = UnreadablePolicy.Fault;
 }
 
-public enum TableSourceState { Starting, Snapshotting, Streaming, Idle, Faulted }
+/// <summary><c>Waiting</c>: what the loader reads is not there yet (see
+/// <see cref="LoaderStats.WaitingFor"/>); the table holds what it held.</summary>
+public enum TableSourceState { Starting, Snapshotting, Streaming, Idle, Faulted, Waiting }
 
 /// <summary>
 /// A custom table loader: the snapshot + delta contract. An adapter with stable positions
@@ -196,6 +198,15 @@ public interface ITableSourceFactory
         where TRow : class;
 }
 
+/// <summary>Optional on an <see cref="ITableSourceFactory"/>: says, at a declare's dry
+/// run, whether what the loader would read is there. Null when it is, or when the source
+/// cannot tell; otherwise what is missing, in words ("view REF.PARTIES does not exist").
+/// It must return within a few seconds and open nothing it does not close.</summary>
+public interface ITableSourcePresence
+{
+    ValueTask<string?> MissingAsync(TableLoaderSpec loader, CancellationToken cancellationToken);
+}
+
 public sealed class TableSourceContext<TKey, TRow>
     where TKey : notnull
     where TRow : class
@@ -223,6 +234,17 @@ public sealed class TableSourceContext<TKey, TRow>
     public void Report(TableSourceState state, string? position = null, long? lag = null) =>
         _handle.ReportLoader(state, position, lag);
 
+    /// <summary>What the source reads is not there: it says what it is waiting for
+    /// ("object nope.jsonl in store refdata") and goes on looking. The table shows
+    /// <see cref="TableSourceState.Waiting"/> with these words, and when it has lasted
+    /// <see cref="ServiceOptions.MissingInputGrace"/> the node says so in an event and in
+    /// its health. Any other report ends it.</summary>
+    public void ReportWaiting(string waitingFor)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(waitingFor);
+        _handle.ReportLoaderWaiting(waitingFor);
+    }
+
     /// <summary>A record the source could not read. Under <see cref="UnreadablePolicy.Skip"/>
     /// it is counted and kept in the table's ring; under <see cref="UnreadablePolicy.Fault"/>
     /// this throws, which faults the loader at that record.</summary>
@@ -240,10 +262,17 @@ public sealed class TableRecordUnreadableException(string table, string position
 
 public enum TableState { Opening, Open, LoaderFaulted, Faulted, Failed }
 
-public sealed record TableInfo(string Name, string Definition, string KeyType, string RowType, TableState State);
+/// <summary><c>LoaderWaitingFor</c> and <c>LoaderWaitingSince</c>: set while the table's
+/// loader says that what it reads is not there.</summary>
+public sealed record TableInfo(
+    string Name, string Definition, string KeyType, string RowType, TableState State,
+    string? LoaderWaitingFor = null, DateTimeOffset? LoaderWaitingSince = null);
 
+/// <summary><c>WaitingFor</c>, with <c>State</c> <see cref="TableSourceState.Waiting"/>:
+/// what the loader is waiting for, in its own words, and since when.</summary>
 public sealed record LoaderStats(
-    string Kind, TableSourceState State, string? Position, long? Lag, long Unreadable, int Restarts, string? Fault);
+    string Kind, TableSourceState State, string? Position, long? Lag, long Unreadable, int Restarts, string? Fault,
+    string? WaitingFor = null, DateTimeOffset? WaitingSince = null);
 
 /// <summary>A pipeline that reads or writes a table, by what its checkpoint has committed.</summary>
 public sealed record TableReader(
@@ -342,6 +371,11 @@ public interface ITableRegistry
     /// is found in a loaded contract, that the loader's kind and connection exist and its
     /// config has what the kind requires.</summary>
     ActionPlan PlanDeclare(TableSpec spec);
+
+    /// <summary><see cref="PlanDeclare"/>, and a look at what the loader would read: when
+    /// it is not there, the plan says so in <see cref="ActionPlan.Warnings"/>. The table
+    /// can still be declared — it stays empty and its loader waits.</summary>
+    Task<ActionPlan> PlanDeclareAsync(TableSpec spec, CancellationToken cancellationToken);
 
     /// <summary>Leader: refused while a pipeline names the table. Its log is left alone,
     /// so declaring the name again brings the rows back.</summary>

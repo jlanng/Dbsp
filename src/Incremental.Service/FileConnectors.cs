@@ -69,6 +69,27 @@ internal sealed record FilesSlotConfig
     /// <summary>Sources only: the longest line, in characters, that is read as a record.</summary>
     public int? MaxLineLength { get; init; }
 
+    /// <summary>Sources only: how long an object has to have been left alone before it is
+    /// read (hh:mm:ss), and so how late an object may arrive behind a greater name.</summary>
+    public string? Settle { get; init; }
+
+    /// <summary>Keyed inputs only: <c>rows</c> (a line is a row) or <c>changes</c> (a line
+    /// is <c>{"key":…,"row":…}</c> or <c>{"key":…,"deleted":true}</c>).</summary>
+    public string? Format { get; init; }
+
+    /// <summary>Upsert sinks only: fold the step objects into one snapshot whenever this
+    /// many have been written since the last.</summary>
+    public int? CompactAfter { get; init; }
+
+    /// <summary>Append sinks only: keep this many of the newest step objects.</summary>
+    public int? Retain { get; init; }
+
+    public static readonly TimeSpan DefaultSettle = TimeSpan.FromSeconds(5);
+
+    public TimeSpan SettleFor => Settle is null ? DefaultSettle : TimeSpan.Parse(Settle, CultureInfo.InvariantCulture);
+
+    public bool Changes => Format == "changes";
+
     public const int DefaultMaxLineLength = 1 << 20;
 
     public int LineLimit => MaxLineLength ?? DefaultMaxLineLength;
@@ -94,7 +115,7 @@ internal sealed record FilesSlotConfig
         catch (JsonException ex)
         {
             throw new InvalidOperationException(
-                $"the files config accepts connector, store, prefix, suffix, pollInterval, maxLineLength and minInterval — where the store is belongs to the host ({ex.Message})");
+                $"the files config accepts connector, store, prefix, suffix, pollInterval, settle, maxLineLength, format, minInterval, compactAfter and retain — where the store is belongs to the host ({ex.Message})");
         }
         if (string.IsNullOrEmpty(parsed.Prefix))
             throw new InvalidOperationException("the files config needs a \"prefix\": the objects of this slot are the ones whose name starts with it");
@@ -106,6 +127,15 @@ internal sealed record FilesSlotConfig
         if (parsed.MinInterval is not null
             && (!TimeSpan.TryParse(parsed.MinInterval, CultureInfo.InvariantCulture, out var spacing) || spacing < TimeSpan.Zero))
             throw new InvalidOperationException($"minInterval is a duration (hh:mm:ss), not '{parsed.MinInterval}'");
+        if (parsed.Settle is not null
+            && (!TimeSpan.TryParse(parsed.Settle, CultureInfo.InvariantCulture, out var settle) || settle < TimeSpan.Zero))
+            throw new InvalidOperationException($"settle is a duration (hh:mm:ss), not '{parsed.Settle}'");
+        if (parsed.Format is not (null or "rows" or "changes"))
+            throw new InvalidOperationException($"format is \"rows\" or \"changes\", not '{parsed.Format}'");
+        if (parsed.CompactAfter is < 2 or > MaxObjects)
+            throw new InvalidOperationException($"compactAfter is a number of objects from 2 to {MaxObjects}, not {parsed.CompactAfter}");
+        if (parsed.Retain is < 1 or > MaxObjects)
+            throw new InvalidOperationException($"retain is a number of objects from 1 to {MaxObjects}, not {parsed.Retain}");
         if (parsed.MaxLineLength is < 1 or > MaxMaxLineLength)
             throw new InvalidOperationException($"maxLineLength is a number of characters from 1 to {MaxMaxLineLength}, not {parsed.MaxLineLength}");
         return parsed;
@@ -113,6 +143,9 @@ internal sealed record FilesSlotConfig
 
     // A line is held whole, as text, while it is parsed: this is what one costs at most.
     public const int MaxMaxLineLength = 1 << 26;
+
+    // A sink that keeps or counts objects holds their names: this many at most.
+    public const int MaxObjects = 100_000;
 }
 
 /// <summary>
@@ -156,16 +189,31 @@ internal sealed record FilesSlotConfig
 /// </summary>
 public sealed class FileConnector(ObjectStores stores)
     : IAppendSourceConnector, IKeyedSourceConnector, IAppendSinkConnector, IUpsertSinkConnector, IResettableSinkConnector, IConfigDescribed,
-        IPositionDescribing
+        IPositionDescribing, IPresenceChecked
 {
+    /// <summary>An input whose prefix holds no object: nothing wrong with that if the
+    /// first is yet to be delivered, and exactly what a mistyped prefix looks like.</summary>
+    public async ValueTask<string?> MissingAsync(JsonElement config, SlotKind kind, CancellationToken cancellationToken)
+    {
+        if (kind is not (SlotKind.AppendInput or SlotKind.KeyedInput))
+            return null;
+        var (parsed, store) = Resolve(config);
+        var page = await store.ListPageAsync(parsed.Prefix!, null, 1, cancellationToken).ConfigureAwait(false);
+        return page.Objects.Count == 0 ? $"no object under {parsed.Prefix} in store {parsed.Store}: the source waits until one is there" : null;
+    }
+
     public ConfigSchema ConfigSchema { get; } = new(
     [
         new("store", "string", Required: true, Description: "An object store the host registered; it holds the root and the credentials."),
         new("prefix", "string", Required: true, Description: "The objects of this slot are those whose name starts with it. One slot of one pipeline per prefix."),
-        new("suffix", "string", Description: "Sources: read only objects whose name ends with this."),
-        new("pollInterval", "string", Description: "Sources: how often the prefix is listed for new objects, as a duration (hh:mm:ss).", Default: "00:00:05"),
-        new("maxLineLength", "number", Description: "Sources: the longest line, in characters, read as a record. A longer one is rejected like a line that is not a record, without being held.", Default: "1048576"),
-        new("minInterval", "string", Description: "Sinks: the least time between two objects, as a duration (hh:mm:ss). The pipeline pauses to keep it, so steps and objects grow.", Default: "00:00:00"),
+        new("suffix", "string", Description: "Read only objects whose name ends with this.", AppliesTo: ConfigProperty.Sources),
+        new("pollInterval", "string", Description: "How often the prefix is asked for objects after the last one read, as a duration (hh:mm:ss).", Default: "00:00:05", AppliesTo: ConfigProperty.Sources),
+        new("settle", "string", Description: "An object is read once it has been left unchanged this long (hh:mm:ss), and nothing after it in name order is read before it. So an object may arrive up to this long after one with a greater name and still be read. 00:00:00 when names only ever increase and objects appear whole.", Default: "00:00:05", AppliesTo: ConfigProperty.Sources),
+        new("maxLineLength", "number", Description: "The longest line, in characters, read as a record. A longer one is rejected like a line that is not a record, without being held.", Default: "1048576", AppliesTo: ConfigProperty.Sources),
+        new("format", "string", Description: "rows: every line is a row, and nothing deletes. changes: a line is {\"key\":…,\"row\":…} or {\"key\":…,\"deleted\":true}, which is also what an upsert sink of this connector writes.", Values: ["rows", "changes"], Default: "rows", AppliesTo: [SlotKind.KeyedInput]),
+        new("minInterval", "string", Description: "The least time between two objects, as a duration (hh:mm:ss). The pipeline pauses to keep it, so steps and objects grow.", Default: "00:00:00", AppliesTo: ConfigProperty.Sinks),
+        new("compactAfter", "number", Description: "Fold the step objects into one snapshot object whenever this many have been written since the last, and delete them. Left out, nothing is folded and every step's object stays.", AppliesTo: [SlotKind.UpsertSink]),
+        new("retain", "number", Description: "Keep this many of the newest step objects and delete older ones. Left out, every object stays: retention is then the store's business.", AppliesTo: [SlotKind.AppendSink]),
     ], "JSON-lines objects under a prefix: read in name order as an append or keyed input, written one object per step as an append or upsert sink.");
 
     private (FilesSlotConfig Config, IObjectStore Store) Resolve(JsonElement json)
@@ -187,10 +235,17 @@ public sealed class FileConnector(ObjectStores stores)
     internal static void RequireKind(JsonElement json, SlotKind kind)
     {
         var config = FilesSlotConfig.Parse(json);
-        if (kind is SlotKind.AppendSink or SlotKind.UpsertSink && (config.Suffix is not null || config.PollInterval is not null || config.MaxLineLength is not null))
-            throw new InvalidOperationException("\"suffix\", \"pollInterval\" and \"maxLineLength\" are a source's settings");
-        if (kind is SlotKind.AppendInput or SlotKind.KeyedInput && config.MinInterval is not null)
+        var isSink = kind is SlotKind.AppendSink or SlotKind.UpsertSink;
+        if (isSink && (config.Suffix is not null || config.PollInterval is not null || config.MaxLineLength is not null || config.Settle is not null))
+            throw new InvalidOperationException("\"suffix\", \"pollInterval\", \"settle\" and \"maxLineLength\" are a source's settings");
+        if (!isSink && config.MinInterval is not null)
             throw new InvalidOperationException("\"minInterval\" is a sink's setting");
+        if (kind != SlotKind.KeyedInput && config.Format is not null)
+            throw new InvalidOperationException("\"format\" is a keyed input's setting (KeyedInput<TKey, TValue>): only that has rows to delete");
+        if (kind != SlotKind.UpsertSink && config.CompactAfter is not null)
+            throw new InvalidOperationException("\"compactAfter\" is an upsert sink's setting: only its objects have a latest row per key to fold into");
+        if (kind != SlotKind.AppendSink && config.Retain is not null)
+            throw new InvalidOperationException("\"retain\" is an append sink's setting; an upsert sink is kept short with \"compactAfter\"");
     }
 
     Task<IRunningSource> IAppendSourceConnector.StartAsync<T>(SourceContext<T> context, CancellationToken cancellationToken)
@@ -210,9 +265,21 @@ public sealed class FileConnector(ObjectStores stores)
         var (config, store) = Resolve(context.Config);
         var input = context.Input;
         var json = context.Json;
+        Func<string, long, CancellationToken, ValueTask> send = config.Changes
+            ? (text, offset, ct) =>
+            {
+                // What an upsert sink of this connector writes, and the one way a line can
+                // take a row away: {"key":…,"deleted":true}.
+                var change = FileSourceReader.Read<FileSinkFormat.UpsertLine<TKey, TValue>>(text, json);
+                if (change.Key is null)
+                    throw new JsonException("A change needs a \"key\".");
+                if (change.Deleted)
+                    return input.DeleteAsync(change.Key, 0, offset, ct);
+                return input.UpsertAsync(change.Row ?? throw new JsonException("A change carries a \"row\", or \"deleted\": true."), 0, offset, ct);
+            }
+            : (text, offset, ct) => input.UpsertAsync(FileSourceReader.Read<TValue>(text, json), 0, offset, ct);
         return Task.FromResult<IRunningSource>(new FileSourceReader(
-            store, config, context.CommittedOffsets,
-            (text, offset, ct) => input.UpsertAsync(FileSourceReader.Read<TValue>(text, json), 0, offset, ct),
+            store, config, context.CommittedOffsets, send,
             (record, error, offset, ct) => input.RejectAsync(record, error, 0, offset, ct),
             input.AdvanceAsync));
     }
@@ -220,35 +287,44 @@ public sealed class FileConnector(ObjectStores stores)
     IAppendSink<T> IAppendSinkConnector.Create<T>(SinkContext context)
     {
         var (config, store) = Resolve(context.Config);
-        return new AppendSink<T>(store, config.Prefix!, config.Spacing, context);
+        return new AppendSink<T>(store, config, context);
     }
 
     IUpsertSink<TKey, TRow> IUpsertSinkConnector.Create<TKey, TRow>(SinkContext context)
     {
         var (config, store) = Resolve(context.Config);
-        return new UpsertSink<TKey, TRow>(store, config.Prefix!, config.Spacing, context);
+        return new UpsertSink<TKey, TRow>(store, config, context);
     }
 
     async Task IResettableSinkConnector.ResetAsync(SinkContext context, CancellationToken cancellationToken)
     {
         var (config, store) = Resolve(context.Config);
-        await FileSinkFormat.DeleteAboveAsync(store, config.Prefix!, 0, cancellationToken).ConfigureAwait(false);
+        await FileSinkFormat.DeleteAboveAsync(store, config.Prefix!, 0, null, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>What both sinks share: the clean-up a generation owes before its first
     /// write, and one object per step.</summary>
-    private abstract class StepObjectSink(IObjectStore store, string prefix, TimeSpan spacing, SinkContext context)
+    private abstract class StepObjectSink(IObjectStore store, FilesSlotConfig config, SinkContext context)
     {
         private static readonly byte[] NewLine = "\n"u8.ToArray();
 
         // The checkpoint this generation started from. Read now and not at the first
         // write: by then the circuit may have committed steps that gave this sink
         // nothing, and an object an earlier generation left for one of them would pass
-        // for committed.
+        // for committed. It goes into every object's name: it is what tells a reader
+        // which objects of an earlier term this generation's replace.
         private readonly long _startedAt = context.CommittedStep ?? 0;
         private bool _cleaned;
 
+        protected IObjectStore Store => store;
+        protected FilesSlotConfig Config => config;
+        protected string Prefix => config.Prefix!;
         protected JsonSerializerOptions Json => context.Json;
+        protected long Term => context.Term;
+
+        /// <summary>The step the circuit's checkpoint covers now: what is at or below it
+        /// is never run again, by this node or by one that replaces it.</summary>
+        protected long Committed => Math.Max(_startedAt, context.CommittedStep ?? 0);
 
         protected async ValueTask WriteStepAsync<TState>(
             long sequence, TState state, Func<TState, Stream, CancellationToken, ValueTask> write, CancellationToken cancellationToken)
@@ -258,27 +334,39 @@ public sealed class FileConnector(ObjectStores stores)
                 // Steps above the checkpoint are about to be run again, and an auto-stepping
                 // circuit may cut them differently: what an earlier generation wrote for
                 // them is not the result.
-                await FileSinkFormat.DeleteAboveAsync(store, prefix, _startedAt, cancellationToken).ConfigureAwait(false);
+                await FileSinkFormat.DeleteAboveAsync(store, Prefix, _startedAt, Existing, cancellationToken).ConfigureAwait(false);
                 _cleaned = true;
             }
             // Whole or not at all: a write that fails or is cancelled part-way leaves
             // nothing under the step's name (IObjectStore.WriteAsync).
-            await store.WriteAsync(
-                FileSinkFormat.ObjectName(prefix, sequence, context.Term), (stream, ct) => write(state, stream, ct), cancellationToken).ConfigureAwait(false);
+            var name = FileSinkFormat.ObjectName(Prefix, sequence, Term, _startedAt);
+            await store.WriteAsync(name, (stream, ct) => write(state, stream, ct), cancellationToken).ConfigureAwait(false);
+            await WrittenAsync(new FileSinkFormat.StepObject(name, sequence, Term, _startedAt, false), cancellationToken).ConfigureAwait(false);
 
             // The object is written at once — the lease was checked a moment ago — and
             // the acknowledgement is what waits: the circuit commits, and steps again,
             // only after it.
-            if (spacing > TimeSpan.Zero)
-                await Task.Delay(spacing, cancellationToken).ConfigureAwait(false);
+            if (config.Spacing > TimeSpan.Zero)
+                await Task.Delay(config.Spacing, cancellationToken).ConfigureAwait(false);
         }
+
+        /// <summary>An object the clean-up found and left, in name order.</summary>
+        protected virtual ValueTask Existing(FileSinkFormat.StepObject found, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+
+        /// <summary>A step's object is in the store.</summary>
+        protected virtual ValueTask WrittenAsync(FileSinkFormat.StepObject written, CancellationToken cancellationToken) => ValueTask.CompletedTask;
 
         protected static ValueTask EndLineAsync(Stream stream, CancellationToken cancellationToken) => stream.WriteAsync(NewLine, cancellationToken);
     }
 
-    private sealed class AppendSink<T>(IObjectStore store, string prefix, TimeSpan spacing, SinkContext context)
-        : StepObjectSink(store, prefix, spacing, context), IAppendSink<T>
+    private sealed class AppendSink<T>(IObjectStore store, FilesSlotConfig config, SinkContext context)
+        : StepObjectSink(store, config, context), IAppendSink<T>
     {
+        // "retain": the names of the newest objects, oldest first — never more than the
+        // number kept, plus the one just written.
+        private readonly Queue<string>? _kept = config.Retain is null ? null : new Queue<string>();
+        private string? _newest;
+
         public ValueTask WriteAsync(AppendBatch<T> batch, CancellationToken cancellationToken) =>
             batch.Records.Count == 0
                 ? ValueTask.CompletedTask
@@ -290,12 +378,28 @@ public sealed class FileConnector(ObjectStores stores)
                         await EndLineAsync(stream, ct).ConfigureAwait(false);
                     }
                 }, cancellationToken);
+
+        protected override ValueTask Existing(FileSinkFormat.StepObject found, CancellationToken cancellationToken) => KeepAsync(found.Name, cancellationToken);
+
+        protected override ValueTask WrittenAsync(FileSinkFormat.StepObject written, CancellationToken cancellationToken) => KeepAsync(written.Name, cancellationToken);
+
+        private async ValueTask KeepAsync(string name, CancellationToken cancellationToken)
+        {
+            if (_kept is null || name == _newest)
+                return;                     // no retention, or the same step delivered again
+            _kept.Enqueue(_newest = name);
+            while (_kept.Count > Config.Retain)
+                await Store.DeleteAsync(_kept.Dequeue(), cancellationToken).ConfigureAwait(false);
+        }
     }
 
-    private sealed class UpsertSink<TKey, TRow>(IObjectStore store, string prefix, TimeSpan spacing, SinkContext context)
-        : StepObjectSink(store, prefix, spacing, context), IUpsertSink<TKey, TRow>
+    private sealed class UpsertSink<TKey, TRow>(IObjectStore store, FilesSlotConfig config, SinkContext context)
+        : StepObjectSink(store, config, context), IUpsertSink<TKey, TRow>
         where TKey : notnull
     {
+        // Step objects written since the newest snapshot, as far as this sink has seen.
+        private int _sinceSnapshot;
+
         public ValueTask WriteAsync(UpsertBatch<TKey, TRow> batch, CancellationToken cancellationToken) =>
             batch.Upserts.Count + batch.Deletes.Count == 0
                 ? ValueTask.CompletedTask
@@ -318,6 +422,19 @@ public sealed class FileConnector(ObjectStores stores)
                         await EndLineAsync(stream, ct).ConfigureAwait(false);
                     }
                 }, cancellationToken);
+
+        protected override ValueTask Existing(FileSinkFormat.StepObject found, CancellationToken cancellationToken)
+        {
+            _sinceSnapshot = found.Snapshot ? 0 : _sinceSnapshot + 1;
+            return ValueTask.CompletedTask;
+        }
+
+        protected override async ValueTask WrittenAsync(FileSinkFormat.StepObject written, CancellationToken cancellationToken)
+        {
+            _sinceSnapshot++;
+            if (Config.CompactAfter is { } limit && _sinceSnapshot >= limit)
+                _sinceSnapshot = await FileSinkFormat.CompactAsync<TKey>(Store, Prefix, Committed, Term, Json, cancellationToken).ConfigureAwait(false);
+        }
     }
 }
 
@@ -325,56 +442,226 @@ public sealed class FileConnector(ObjectStores stores)
 /// The names and lines the <c>files</c> sinks write, and how to read them back: the
 /// reader's half of the format, for tests, for a job that loads the objects somewhere, and
 /// as the definition of "the latest row per key".
+/// <para>
+/// A step's object is <c>{prefix}{step:D19}-{term:D6}-{base:D19}.jsonl</c>: the step's
+/// sequence number, the leader term it was written under, and the step of the checkpoint
+/// its writer had started from. A snapshot — what <c>compactAfter</c> folds an upsert
+/// sink's objects into — ends in <c>.snapshot.jsonl</c> and holds the latest row of every
+/// key as of its step. <b>The reader's rules</b>, which <see cref="StepObjectsAsync"/>
+/// applies and anything else that reads the objects must:
+/// </para>
+/// <list type="number">
+/// <item>Start from the snapshot of the highest step, if there is one, and ignore every
+/// object at or below its step.</item>
+/// <item>Where a step has objects of two terms, the higher term's is the step.</item>
+/// <item>An object of term <c>t</c> at step <c>s</c> is void when an object of a later
+/// term has a base below <c>s</c>: a later leader started from a checkpoint that does not
+/// cover the step, ran it again, and may have cut it differently — or given this sink
+/// nothing for it, which is why rule 2 alone is not enough.</item>
+/// <item>Read what is left in step order; within an upsert sink's objects the latest row
+/// of a key is the last line that names it, and <c>"deleted": true</c> takes it away.</item>
+/// <item>An object that was listed and is gone when it is opened was folded into a
+/// snapshot (or passed <c>retain</c>) meanwhile: an upsert reader lists again and starts
+/// over.</item>
+/// </list>
 /// </summary>
 public static class FileSinkFormat
 {
     private const string Extension = ".jsonl";
+    private const string SnapshotExtension = ".snapshot.jsonl";
 
     // The default for a caller that gives no options. Never used by the service itself:
     // a pipeline's types go through its plugin version's own options.
     private static readonly JsonSerializerOptions Web = new(JsonSerializerDefaults.Web);
 
-    /// <summary>The object a step is written to: <c>{prefix}{step:D19}-{term:D6}.jsonl</c>.</summary>
+    /// <summary>One object under a sink's prefix, as its name says. <c>Base</c> is the
+    /// step of the checkpoint its writer started from (<see cref="long.MaxValue"/> for a
+    /// name of the older form, which did not say).</summary>
+    public readonly record struct StepObject(string Name, long Step, long Term, long Base, bool Snapshot);
+
+    /// <summary>The object a step is written to:
+    /// <c>{prefix}{step:D19}-{term:D6}-{base:D19}.jsonl</c>.</summary>
+    public static string ObjectName(string prefix, long step, long term, long @base) =>
+        string.Create(CultureInfo.InvariantCulture, $"{prefix}{step:D19}-{term:D6}-{@base:D19}{Extension}");
+
+    /// <summary>A step's object as builds before the base was in the name wrote it:
+    /// <c>{prefix}{step:D19}-{term:D6}.jsonl</c>. Still read; it voids nothing.</summary>
     public static string ObjectName(string prefix, long step, long term) =>
         string.Create(CultureInfo.InvariantCulture, $"{prefix}{step:D19}-{term:D6}{Extension}");
 
-    /// <summary>The step and term a sink's object was written under; false for an object
-    /// that is not one of this prefix's step objects.</summary>
-    public static bool TryParse(string prefix, string name, out long step, out long term)
+    /// <summary>The snapshot of everything at or below a step.</summary>
+    public static string SnapshotName(string prefix, long step, long term) =>
+        string.Create(CultureInfo.InvariantCulture, $"{prefix}{step:D19}-{term:D6}-{step:D19}{SnapshotExtension}");
+
+    /// <summary>What a sink's object name says; false for an object that is not one of
+    /// this prefix's.</summary>
+    public static bool TryParse(string prefix, string name, out StepObject parsed)
     {
-        (step, term) = (0, 0);
+        parsed = default;
         if (!name.StartsWith(prefix, StringComparison.Ordinal) || !name.EndsWith(Extension, StringComparison.Ordinal))
             return false;
-        var middle = name.AsSpan(prefix.Length, name.Length - prefix.Length - Extension.Length);
-        var dash = middle.IndexOf('-');
-        return dash == 19
-            && long.TryParse(middle[..dash], NumberStyles.None, CultureInfo.InvariantCulture, out step)
-            && long.TryParse(middle[(dash + 1)..], NumberStyles.None, CultureInfo.InvariantCulture, out term);
+        var snapshot = name.EndsWith(SnapshotExtension, StringComparison.Ordinal);
+        var middle = name.AsSpan(prefix.Length, name.Length - prefix.Length - (snapshot ? SnapshotExtension : Extension).Length);
+        if (middle.Length < 26 || middle[19] != '-'
+            || !long.TryParse(middle[..19], NumberStyles.None, CultureInfo.InvariantCulture, out var step)
+            || !long.TryParse(middle.Slice(20, 6), NumberStyles.None, CultureInfo.InvariantCulture, out var term))
+            return false;
+        var @base = long.MaxValue;
+        if (middle.Length != 26
+            && (middle.Length != 46 || middle[26] != '-' || !long.TryParse(middle[27..], NumberStyles.None, CultureInfo.InvariantCulture, out @base)))
+            return false;
+        if (snapshot && middle.Length == 26)
+            return false;
+        parsed = new StepObject(name, step, term, @base, snapshot);
+        return true;
     }
 
-    /// <summary>The step objects under the prefix, in step order, one per step: where a
-    /// step was written under two terms, the higher term's.</summary>
-    public static async Task<IReadOnlyList<string>> StepObjectsAsync(IObjectStore store, string prefix, CancellationToken cancellationToken = default)
+    /// <summary>The step and term a sink's object was written under; false for an object
+    /// that is not one of this prefix's.</summary>
+    public static bool TryParse(string prefix, string name, out long step, out long term)
     {
-        var perStep = new SortedDictionary<long, (long Term, string Name)>();
-        await foreach (var info in store.ListAsync(prefix, cancellationToken).ConfigureAwait(false))
-        {
-            if (TryParse(prefix, info.Path, out var step, out var term) && (!perStep.TryGetValue(step, out var held) || term > held.Term))
-                perStep[step] = (term, info.Path);
-        }
-        return [.. perStep.Values.Select(v => v.Name)];
+        var known = TryParse(prefix, name, out StepObject parsed);
+        (step, term) = (parsed.Step, parsed.Term);
+        return known;
     }
 
-    internal static async Task DeleteAboveAsync(IObjectStore store, string prefix, long step, CancellationToken cancellationToken)
+    /// <summary>The objects under the prefix that are the sink's content, in the order to
+    /// read them: the newest snapshot first if there is one, then one object per step
+    /// above it — the reader's rules 1 to 3 applied.</summary>
+    public static async Task<IReadOnlyList<string>> StepObjectsAsync(IObjectStore store, string prefix, CancellationToken cancellationToken = default) =>
+        [.. Valid(await ListAsync(store, prefix, cancellationToken).ConfigureAwait(false)).Select(o => o.Name)];
+
+    private static async Task<List<StepObject>> ListAsync(IObjectStore store, string prefix, CancellationToken cancellationToken)
     {
-        var doomed = new List<string>();
+        var all = new List<StepObject>();
         await foreach (var info in store.ListAsync(prefix, cancellationToken).ConfigureAwait(false))
         {
-            if (TryParse(prefix, info.Path, out var written, out _) && written > step)
-                doomed.Add(info.Path);
+            if (TryParse(prefix, info.Path, out StepObject parsed))
+                all.Add(parsed);
         }
-        foreach (var name in doomed)
-            await store.DeleteAsync(name, cancellationToken).ConfigureAwait(false);
+        return all;
+    }
+
+    /// <summary>Rules 1 to 3 over a listing: what is left, in reading order.</summary>
+    internal static List<StepObject> Valid(IReadOnlyList<StepObject> listed)
+    {
+        StepObject? snapshot = null;
+        // The lowest base each term's objects carry: what a term started from.
+        var bases = new SortedDictionary<long, long>();
+        foreach (var found in listed)
+        {
+            if (found.Snapshot)
+            {
+                if (snapshot is not { } held || found.Step > held.Step || (found.Step == held.Step && found.Term > held.Term))
+                    snapshot = found;
+            }
+            else if (!bases.TryGetValue(found.Term, out var lowest) || found.Base < lowest)
+                bases[found.Term] = found.Base;
+        }
+        // For each term, the lowest base of any later term: a step above it was run again.
+        var rerunAbove = new Dictionary<long, long>();
+        var later = long.MaxValue;
+        foreach (var (term, lowest) in bases.Reverse())
+        {
+            rerunAbove[term] = later;
+            later = Math.Min(later, lowest);
+        }
+        var perStep = new SortedDictionary<long, StepObject>();
+        foreach (var found in listed)
+        {
+            if (found.Snapshot || (snapshot is { } from && found.Step <= from.Step) || found.Step > rerunAbove[found.Term])
+                continue;
+            if (!perStep.TryGetValue(found.Step, out var held) || found.Term > held.Term)
+                perStep[found.Step] = found;
+        }
+        var valid = new List<StepObject>(perStep.Count + 1);
+        if (snapshot is { } first)
+            valid.Add(first);
+        valid.AddRange(perStep.Values);
+        return valid;
+    }
+
+    /// <summary>
+    /// Deletes the objects of steps above <paramref name="step"/> — a generation's
+    /// clean-up before its first write, and with 0 a reset — and hands every object it
+    /// leaves to <paramref name="kept"/>, in name order. A page of names at a time.
+    /// </summary>
+    internal static async Task DeleteAboveAsync(
+        IObjectStore store, string prefix, long step, Func<StepObject, CancellationToken, ValueTask>? kept, CancellationToken cancellationToken)
+    {
+        string? after = null;
+        while (true)
+        {
+            var page = await store.ListPageAsync(prefix, after, 1024, cancellationToken).ConfigureAwait(false);
+            foreach (var info in page.Objects)
+            {
+                after = info.Path;
+                if (!TryParse(prefix, info.Path, out StepObject found))
+                    continue;
+                if (found.Step > step)
+                    await store.DeleteAsync(info.Path, cancellationToken).ConfigureAwait(false);
+                else if (kept is not null)
+                    await kept(found, cancellationToken).ConfigureAwait(false);
+            }
+            if (!page.More || page.Objects.Count == 0)
+                return;
+        }
+    }
+
+    /// <summary>
+    /// Folds an upsert sink's objects at or below <paramref name="upTo"/> — a step the
+    /// checkpoint covers, so one that is never run again — into one snapshot, then deletes
+    /// them. Returns how many step objects are left above the snapshot.
+    /// <para>The objects are read newest first and a key's first line is its latest, so
+    /// what is held is the set of keys, not the rows; a key whose latest line deletes it
+    /// is left out. The snapshot is written whole before anything is deleted, so a reader
+    /// sees either the objects or the snapshot that replaces them (rules 1 and 5). If an
+    /// object goes missing while it is being folded — another writer folded it — nothing
+    /// is written.</para>
+    /// </summary>
+    internal static async Task<int> CompactAsync<TKey>(
+        IObjectStore store, string prefix, long upTo, long term, JsonSerializerOptions json, CancellationToken cancellationToken)
+        where TKey : notnull
+    {
+        var listed = await ListAsync(store, prefix, cancellationToken).ConfigureAwait(false);
+        var valid = Valid(listed);
+        var folded = valid.Where(o => o.Step <= upTo).ToList();
+        var above = valid.Count - folded.Count;
+        if (folded.Count < 2)
+            return above + folded.Count(o => !o.Snapshot);
+        var snapshot = new StepObject(SnapshotName(prefix, folded[^1].Step, term), folded[^1].Step, term, folded[^1].Step, true);
+        try
+        {
+            await store.WriteAsync(snapshot.Name, async (stream, ct) =>
+            {
+                var seen = new HashSet<TKey>();
+                for (var i = folded.Count - 1; i >= 0; i--)
+                {
+                    await foreach (var line in LinesAsync(store, folded[i].Name, missingIsEmpty: false, ct).ConfigureAwait(false))
+                    {
+                        var change = JsonSerializer.Deserialize<UpsertLine<TKey, JsonElement>>(line, json)!;
+                        if (change.Key is null || !seen.Add(change.Key) || change.Deleted)
+                            continue;
+                        await stream.WriteAsync(Encoding.UTF8.GetBytes(line), ct).ConfigureAwait(false);
+                        await stream.WriteAsync("\n"u8.ToArray(), ct).ConfigureAwait(false);
+                    }
+                }
+            }, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return above + folded.Count(o => !o.Snapshot);
+        }
+        // Everything the snapshot stands for goes — and every void object with it, at
+        // whatever step: what makes one void is an object of a later term, and that
+        // object may be among the ones folded here.
+        var kept = new HashSet<string>(valid.Skip(folded.Count).Select(o => o.Name), StringComparer.Ordinal) { snapshot.Name };
+        foreach (var found in listed)
+        {
+            if (!kept.Contains(found.Name))
+                await store.DeleteAsync(found.Name, cancellationToken).ConfigureAwait(false);
+        }
+        return above;
     }
 
     /// <summary>Every record an append sink wrote under the prefix, in step order.</summary>
@@ -383,7 +670,8 @@ public static class FileSinkFormat
     {
         foreach (var name in await StepObjectsAsync(store, prefix, cancellationToken).ConfigureAwait(false))
         {
-            await foreach (var line in LinesAsync(store, name, cancellationToken).ConfigureAwait(false))
+            // Listed, then deleted by the sink's own clean-up or its retention: skipped.
+            await foreach (var line in LinesAsync(store, name, missingIsEmpty: true, cancellationToken).ConfigureAwait(false))
                 yield return JsonSerializer.Deserialize<T>(line, json ?? Web)!;
         }
     }
@@ -394,36 +682,47 @@ public static class FileSinkFormat
         IObjectStore store, string prefix, JsonSerializerOptions? json = null, CancellationToken cancellationToken = default)
         where TKey : notnull
     {
-        var rows = new Dictionary<TKey, TRow>();
-        foreach (var name in await StepObjectsAsync(store, prefix, cancellationToken).ConfigureAwait(false))
+        for (var attempt = 0; ; attempt++)
         {
-            await foreach (var line in LinesAsync(store, name, cancellationToken).ConfigureAwait(false))
+            var rows = new Dictionary<TKey, TRow>();
+            try
             {
-                var change = JsonSerializer.Deserialize<UpsertLine<TKey, TRow>>(line, json ?? Web)!;
-                if (change.Deleted)
-                    rows.Remove(change.Key);
-                else
-                    rows[change.Key] = change.Row!;
+                foreach (var name in await StepObjectsAsync(store, prefix, cancellationToken).ConfigureAwait(false))
+                {
+                    await foreach (var line in LinesAsync(store, name, missingIsEmpty: false, cancellationToken).ConfigureAwait(false))
+                    {
+                        var change = JsonSerializer.Deserialize<UpsertLine<TKey, TRow>>(line, json ?? Web)!;
+                        if (change.Deleted)
+                            rows.Remove(change.Key!);
+                        else
+                            rows[change.Key!] = change.Row!;
+                    }
+                }
+                return rows;
+            }
+            catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException && attempt < 20)
+            {
+                // Rule 5: an object was folded into a snapshot, or deleted to be run
+                // again, between the listing and the read. The listing is stale: again.
             }
         }
-        return rows;
     }
 
-    private sealed record UpsertLine<TKey, TRow>(
-        [property: JsonPropertyName("key")] TKey Key,
+    internal sealed record UpsertLine<TKey, TRow>(
+        [property: JsonPropertyName("key"), JsonRequired] TKey? Key,
         [property: JsonPropertyName("row")] TRow? Row,
         [property: JsonPropertyName("deleted")] bool Deleted = false);
 
-    private static async IAsyncEnumerable<string> LinesAsync(IObjectStore store, string name, [EnumeratorCancellation] CancellationToken cancellationToken)
+    private static async IAsyncEnumerable<string> LinesAsync(
+        IObjectStore store, string name, bool missingIsEmpty, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         Stream stream;
         try
         {
             stream = await store.OpenReadAsync(name, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        catch (Exception ex) when (missingIsEmpty && ex is FileNotFoundException or DirectoryNotFoundException)
         {
-            // Listed, then deleted by the sink's own clean-up: a step that is being run again.
             yield break;
         }
         await using (stream.ConfigureAwait(false))
@@ -551,7 +850,7 @@ internal static class FilePosition
 
 /// <summary>Reads the objects under a prefix, in name order, line by line, into an input.
 /// It holds one line — of at most <c>maxLineLength</c> characters — and a bounded list of
-/// names at a time.</summary>
+/// names at a time, and asks the store only for names after the one it is at.</summary>
 internal sealed class FileSourceReader : IRunningSource
 {
     private const int ListAhead = 1024;
@@ -568,6 +867,7 @@ internal sealed class FileSourceReader : IRunningSource
     private long _offset = -1;
     private long _unread;
     private volatile string? _at;
+    private volatile string? _waitingFor;
 
     public FileSourceReader(
         IObjectStore store, FilesSlotConfig config, IReadOnlyDictionary<int, long> committed,
@@ -585,6 +885,8 @@ internal sealed class FileSourceReader : IRunningSource
         if (committed.TryGetValue(0, out var offset))
             _offset = offset;
         var highest = FilePosition.Highest(committed);
+        if (position is null)
+            _waitingFor = $"objects under {config.Prefix} in store {config.Store}";     // until a listing shows one
         _run = Task.Run(() => RunAsync(position, highest, _stop.Token));
         Completion = _run.ContinueWith(
             t => t.IsFaulted && !_stop.IsCancellationRequested ? Task.FromException(t.Exception!.GetBaseException()) : Task.CompletedTask,
@@ -595,7 +897,7 @@ internal sealed class FileSourceReader : IRunningSource
 
     public SourceStats Stats => new(
         Interlocked.Read(ref _records), Interlocked.Read(ref _unreadable),
-        new Dictionary<int, long> { [0] = Interlocked.Read(ref _offset) }, Interlocked.Read(ref _unread)) { At = _at };
+        new Dictionary<int, long> { [0] = Interlocked.Read(ref _offset) }, Interlocked.Read(ref _unread)) { At = _at, WaitingFor = _waitingFor };
 
     public static T Read<T>(string text, JsonSerializerOptions json) =>
         JsonSerializer.Deserialize<T>(text, json) ?? throw new JsonException("The line is null.");
@@ -604,16 +906,22 @@ internal sealed class FileSourceReader : IRunningSource
     {
         var ordinal = position?.Ordinal ?? 0;
         var current = position?.Name;
-        var resumeLine = position?.Line ?? -1;
-        var resumeCurrent = current is not null;        // the committed object may have lines left
-        _at = current is null ? null : $"{current}:{resumeLine + 1}";
+        _at = current is null ? null : $"{current}:{position!.Value.Line + 1}";
+
+        // The committed object may have lines left: those first. It was old enough when it
+        // was started, and it is not listed again — a listing starts after it.
+        if (position is { } resumed)
+            await ReadObjectAsync(resumed.Name, ordinal, resumed.Line + 1, stop).ConfigureAwait(false);
 
         while (true)
         {
             stop.ThrowIfCancellationRequested();
-            var (next, unread) = await NextAsync(current, resumeCurrent, stop).ConfigureAwait(false);
+            var (next, unread, empty) = await NextAsync(current, stop).ConfigureAwait(false);
             var listed = Stopwatch.GetTimestamp();
             Interlocked.Exchange(ref _unread, unread);
+            // Nothing read and nothing there: the prefix may be a typing mistake, and a
+            // source that waits on one looks exactly like a source with no input yet.
+            _waitingFor = current is null && empty ? $"objects under {_config.Prefix} in store {_config.Store}" : null;
             if (next.Count == 0)
             {
                 await Task.Delay(_config.Poll, stop).ConfigureAwait(false);
@@ -621,50 +929,62 @@ internal sealed class FileSourceReader : IRunningSource
             }
             foreach (var name in next)
             {
-                long from = 0;
-                if (resumeCurrent && name == current)
-                    from = resumeLine + 1;
-                else
-                {
-                    // A new object: its name goes into the checkpoint before its first line.
-                    ordinal = highest = FilePosition.Next(ordinal, highest);
-                    foreach (var (partition, offset) in FilePosition.Name(ordinal, name))
-                        await _advance(partition, offset, stop).ConfigureAwait(false);
-                }
-                resumeCurrent = false;
+                // A new object: its name goes into the checkpoint before its first line.
+                ordinal = highest = FilePosition.Next(ordinal, highest);
+                foreach (var (partition, offset) in FilePosition.Name(ordinal, name))
+                    await _advance(partition, offset, stop).ConfigureAwait(false);
                 current = name;
-                await ReadObjectAsync(name, ordinal, from, stop).ConfigureAwait(false);
+                await ReadObjectAsync(name, ordinal, 0, stop).ConfigureAwait(false);
                 Interlocked.Decrement(ref _unread);
 
                 // A listing is good for one poll interval. With a backlog the names it
                 // gave can take long to read, and an object that arrives meanwhile with a
-                // name among them is only seen by listing again before passing it.
+                // name among them is only seen by asking again before passing it.
                 if (Stopwatch.GetElapsedTime(listed) >= _config.Poll)
                     break;
             }
         }
     }
 
-    /// <summary>The next names to read, in order, at most <see cref="ListAhead"/> of them,
-    /// and how many unread objects the listing showed in all.</summary>
-    private async Task<(List<string> Names, long Unread)> NextAsync(string? current, bool includeCurrent, CancellationToken stop)
+    /// <summary>
+    /// The next names to read, in order, at most <see cref="ListAhead"/> of them; how many
+    /// unread objects were seen (a floor: the listing is not followed to its end); and
+    /// whether the prefix showed nothing at all. The listing starts after
+    /// <paramref name="current"/> and stops at the first object that has not been left
+    /// alone for <c>settle</c>: nothing after it is read before it, which is what lets an
+    /// object arrive a little behind a greater name and still be read in its place.
+    /// </summary>
+    private async Task<(List<string> Names, long Unread, bool Empty)> NextAsync(string? current, CancellationToken stop)
     {
-        var smallest = new SortedSet<string>(StringComparer.Ordinal);
+        var names = new List<string>();
+        var settle = _config.SettleFor;
+        var after = current;
         long unread = 0;
-        await foreach (var info in _store.ListAsync(_config.Prefix!, stop).ConfigureAwait(false))
+        var empty = true;
+        while (true)
         {
-            var name = info.Path;
-            if (_config.Suffix is { } suffix && !name.EndsWith(suffix, StringComparison.Ordinal))
-                continue;
-            var order = current is null ? 1 : string.CompareOrdinal(name, current);
-            if (order < 0 || (order == 0 && !includeCurrent))
-                continue;
-            unread++;
-            smallest.Add(name);
-            if (smallest.Count > ListAhead)
-                smallest.Remove(smallest.Max!);
+            var page = await _store.ListPageAsync(_config.Prefix!, after, ListAhead, stop).ConfigureAwait(false);
+            if (page.Objects.Count > 0)
+                empty = false;
+            var held = false;
+            foreach (var info in page.Objects)
+            {
+                after = info.Path;
+                if (_config.Suffix is { } suffix && !info.Path.EndsWith(suffix, StringComparison.Ordinal))
+                    continue;
+                unread++;
+                if (held || names.Count == ListAhead)
+                    continue;
+                if (settle > TimeSpan.Zero && DateTimeOffset.UtcNow - info.Modified < settle)
+                    held = true;            // and everything after it waits with it
+                else
+                    names.Add(info.Path);
+            }
+            // Another page only while it could still add a name: with a suffix a page can
+            // hold none that match.
+            if (held || names.Count == ListAhead || !page.More || page.Objects.Count == 0)
+                return (names, unread, empty);
         }
-        return ([.. smallest], unread);
     }
 
     private async Task ReadObjectAsync(string name, long ordinal, long from, CancellationToken stop)

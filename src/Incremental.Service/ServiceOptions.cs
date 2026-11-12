@@ -46,6 +46,15 @@ public sealed class ServiceOptions
     /// cannot see where a standby's followers stand, so it keeps this much time of versions.</summary>
     public TimeSpan FollowerRetention { get; set; } = TimeSpan.FromMinutes(10);
 
+    /// <summary>
+    /// How long a table's loader or a pipeline's source may say that what it reads is not
+    /// there (<c>waiting for …</c>) before that is an event and a reason the node is
+    /// <c>Degraded</c> (<c>loader-waiting</c>, <c>source-waiting</c>). A file that is
+    /// about to be delivered is not a fault; a path with a typing mistake in it never
+    /// arrives, and this is when the node says so.
+    /// </summary>
+    public TimeSpan MissingInputGrace { get; set; } = TimeSpan.FromSeconds(30);
+
     /// <summary>The drain a pipeline's teardown is given before its outputs are abandoned.</summary>
     public TimeSpan StopTimeout { get; set; } = TimeSpan.FromSeconds(20);
 
