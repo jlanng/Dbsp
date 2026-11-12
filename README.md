@@ -435,7 +435,9 @@ so implementations never see cross-thread access to one store.
   admin API says what a deploy needs — a definition's slots and settings, the registered
   connectors and connections, a starting spec. A `files` connector reads and writes
   JSON-lines objects through `IObjectStore` (a directory is built in; S3 is yours to
-  plug in), a spec's `deadLetters` keeps dropped records in any append sink, at least
+  plug in), with a paged listing, a settle time for late objects, deletes, retention
+  and compaction; an input that is not there is a dry-run warning and a *waiting*
+  state; a spec's `deadLetters` keeps dropped records in any append sink, at least
   once and across a takeover, and `PipelineTestHarness` tests a definition with no node. See *Running many pipelines* in
   [docs/intro.md](docs/intro.md) and
   [docs/design/enrichment-service.md](docs/design/enrichment-service.md), *As built*.

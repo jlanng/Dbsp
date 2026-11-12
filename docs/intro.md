@@ -1437,9 +1437,16 @@ embedded in the package: nothing to build, nothing fetched from elsewhere.
 **Files, dead letters, and a test harness.** Besides `kafka` and `memory` a slot can be
 bound to the built-in `files` connector: JSON-lines objects under a prefix of an
 `IObjectStore` the host registered (a local directory is built in; S3 is five methods to
-write). As a source it reads objects in name order with the object and line in the
-checkpoint; as a sink it writes one object per step, named by the step so that a step
-delivered again overwrites itself. A spec's `deadLetters` binds any append sink
+write, a sixth to page its listing). As a source it reads objects in name order with
+the object and line in the checkpoint, asks only for names after its position, and
+waits `settle` for an object to be left alone so that one arriving a little late is
+still read in its place; a keyed input can read deletes (`"format": "changes"`). As a
+sink it writes one object per step, named by the step, its leader term and the
+checkpoint it started from, so that a step delivered again overwrites itself and a
+replaced leader's late object is void once its successor writes; `retain` and
+`compactAfter` keep a prefix short. An input whose file, prefix or topic is not there
+is a warning at the dry run and a visible *waiting* state, and after a grace period a
+`Degraded` node. A spec's `deadLetters` binds any append sink
 connector as the pipeline's dead-letter sink: dropped records are delivered there, at
 least once, before the checkpoint that passes them, and a sink that will not take them
 stops the pipeline and says why. And `Incremental.Service.Testing.PipelineTestHarness`

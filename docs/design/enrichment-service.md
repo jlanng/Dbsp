@@ -1701,7 +1701,9 @@ Each has a default this design is built on.
     step. *Alternative:* a marker object per term, written when a generation starts and
     naming the step it starts at, so that a reader discards older terms' objects at or
     above it. Exact; one more object per generation start, and every reader — the
-    owner's included — has to read the markers first.
+    owner's included — has to read the markers first. *S7:* the generation's base step
+    is now in every object's name and a reader voids an older term's objects above a
+    later term's base, which closes this once the successor has written (item 53).
 22. **A files source's position is encoded into the checkpoint's partition → offset
     map** (S6: up to 2 + 2·64 entries per input, name limited to 256 bytes).
     *Alternative:* an opaque position per input in the checkpoint, which is a change to
@@ -1807,7 +1809,9 @@ Each has a default this design is built on.
     *Alternative:* list before every object, which makes "an object whose name sorts
     after the position is read" exact up to the moment of the listing, at one listing
     per object — on a store that cannot list "after this name", a backlog of n objects
-    then costs n² names.
+    then costs n² names. *S7:* a source now lists only after its position, a page at a
+    time, and holds back behind an object that has not settled (item 52); the rule a
+    producer keeps is "within `settle` of the greater names".
 40. **Only the `files` sink claims what it writes** (`ConnectorDescription.Owns`; S6,
     second review). Two pipelines may still share a Kafka sink topic or a view, which
     for an append topic is a legitimate fan-in. *Alternative:* the `kafka` connector
@@ -1877,6 +1881,35 @@ Each has a default this design is built on.
     separate controllers (MSK) does not have. *Alternative:* a controller container
     of its own and three plain brokers: the broker-loss figure is then the 9 s case
     only, and the controller failover goes untested.
+
+52. **A files source waits `settle` (5 s) for an object to be left alone before it reads
+    it, and reads nothing after one that has not settled** (S7). It closes "an object
+    that arrives behind the position" for objects that arrive within `settle` of the
+    greater names, at `settle` of latency on every object. *Alternative:* `0` by default
+    and the rule "names must increase", as before — no latency, and the hole is open for
+    any writer that is not strictly ordered; or a seen-set over a look-back window,
+    which reads late objects out of order without holding the others back, and needs a
+    position the checkpoint cannot hold today (Open for James 22).
+53. **A replaced leader's late sink object is void once its successor writes** (S7: the
+    generation's base step is in every object name). *Alternative:* the marker object of
+    item 21, written when a generation starts — exact from the start, but it is a write
+    outside a step, which the lease rule allows only from the sink's `WriteAsync`, and
+    the circuit does not deliver empty steps; so it would need a core change to deliver
+    one batch per generation.
+54. **Object names changed** (S7): `{step}-{term}-{base}.jsonl`, and snapshots
+    `….snapshot.jsonl`. CLAUDE.md's rule was "a new connector name, not an edit"; this
+    is an edit because readers and the sink's clean-up still read the old form and a
+    deployed sink's next generation writes the new one beside it — nothing loses its
+    place. A reader written against the old form does not see the new objects.
+    *Alternative:* a connector `files2`.
+55. **A missing input is a warning, never a refusal** (S7). A dry run says what is not
+    there and the deploy goes ahead; after `MissingInputGrace` (30 s) the node is
+    `Degraded`. *Alternative:* refuse the deploy unless `force`; that stops a typing
+    mistake at the door, and refuses the ordinary case of a pipeline deployed before its
+    first file is delivered.
+56. **The morph test runs a real Chrome with `--dump-dom`** (S7) and is skipped where
+    there is none. *Alternative:* a DOM shim in Node (tests the shim's idea of a select,
+    not a browser's), or Playwright in CI (a package and a browser download per run).
 
 ## Not verified
 
@@ -4549,3 +4582,108 @@ Script and results: `h1/mut.py` and `h1/mutations.txt` beside the gaps file.
   pass a stop request on and kills the child.
 - No state-size, memory or latency figure was taken under a broker fault; the reader's
   two timings are what was measured.
+
+#### Files, a missing input, the admin UI, CI and the front door (H3, H5, H8–H12)
+
+**The files connector (H9, and the S3 half of H7's listing).**
+
+- *Paged listing.* `IObjectStore` gains `ListPageAsync(prefix, after, limit)`: the
+  objects after a name, in ordinal order, a page at a time. It is a default interface
+  member over `ListAsync`, so a store written before it (the owner's S3 store) still
+  compiles and is correct, at the cost of a whole-prefix listing per call.
+  `LocalObjectStore` implements it (it still walks the prefix's directory, but opens
+  only the page's files). The source asks only for names after its position, 1,024 at a
+  time; the sink's clean-up pages too. An S3 store implements it as one `ListObjectsV2`
+  with `StartAfter` and `MaxKeys`.
+- *An object that arrives behind the position.* Closed for objects that arrive within
+  `settle` (default 5 s) of the greater names: a listing stops at the first object
+  whose modification time is younger than `settle`, and nothing after it is read before
+  it. The seen-set alternative was not built: it reads late objects out of order, and
+  its window would have to be in the checkpoint, which the partition → offset encoding
+  cannot hold (Open for James 22, 52). The cost is `settle` of latency on every object;
+  the example's quote files set `"settle": "00:00:00"`, which is right for a writer
+  that names in order and writes whole.
+- *Deletes from files.* A keyed input with `"format": "changes"` reads
+  `{"key":…,"row":…}` and `{"key":…,"deleted":true}` — what the upsert sink writes.
+- *Keeping a prefix short.* `retain: N` on an append sink; `compactAfter: N` on an
+  upsert sink folds committed objects into a `….snapshot.jsonl` that is written before
+  anything it replaces is deleted. The reader's rules (`FileSinkFormat`) start from the
+  newest snapshot and list again when an object goes missing under them. The example's
+  ad-hoc pruning (`World.TrimSinkObjectsAsync`) is gone: its sinks say `"retain": 200`.
+- *A replaced leader's late object.* Reasoned again: the lease check before each write
+  leaves the write in flight across a takeover, and the old reader rule (highest term
+  per step) cannot void an object for a step the successor gave this sink nothing for.
+  Object names now carry the base — the checkpoint step the writing generation started
+  from — and a reader voids an older term's objects above any later term's base. It is
+  reproduced in `The_late_object_of_a_replaced_leader_is_void_once_its_successor_has_written`
+  (objects placed as the two leaders would leave them, then read). The gap that remains:
+  until the successor's first object in that prefix, the late object reads as real
+  (Open for James 53). Old names are still read (Open for James 54).
+- *Settings per kind of slot (H10).* `ConfigProperty.AppliesTo` says which kinds of slot a
+  property means something on; the `files` and `kafka` connectors fill it in, and the
+  form shows a slot only its own (a property the spec sets anyway is shown, tagged
+  "not for a …", so it can be cleared). The connectors refuse another kind's settings
+  as before.
+
+**A file, prefix or topic that is not there (H8).** A table's `file` loader that finds
+no object, and never loaded one, reports `Waiting` (new `TableSourceState`) with what
+it waits for; a `files` source that has found nothing under its prefix says so in
+`SourceStats.WaitingFor`. After `ServiceOptions.MissingInputGrace` (30 s) each is one
+event and a health reason, `loader-waiting` or `source-waiting`, which makes the node
+`Degraded`; both end with an event when the first object is there. Dry runs look first:
+`PlanDeclareAsync` (the admin's declare dry run) for a table's object or topic, and a
+pipeline deploy dry run for each input through the optional `IPresenceChecked` (the
+`files` and `kafka` connectors implement it; a custom table source can implement
+`ITableSourcePresence`). What they find is `ActionPlan.Warnings`, shown above the plan in
+the UI; the action is never refused for it (Open for James 55). Each look is bounded at
+5 s and a store or broker that does not answer gives no warning. The Kafka look is a
+metadata request on a consumer built from the connection (its settings and token
+handler, `ServeCallbacks` first), which does not create the topic — the test asks twice
+and still finds it missing. Kafka sources and loaders on a missing topic still fault at
+start and are retried, as before; only the files paths have a waiting state.
+
+**The admin UI (H5, H10, H11).**
+
+- `morph` now sets the properties of form controls from the new tree: a select's
+  selection (read from the new options before they are moved into the page), a
+  checkbox's or radio's `checked`, and a field's `value` unless it has the focus. The
+  deploy form can no longer show one definition and deploy another.
+- The morph test (`AdminUiMorphTests`, `tests/Incremental.Service.Tests/Ui/`) runs ten
+  cases in a headless Chrome with the UI's own `app.js` and no package: it starts the
+  browser with `--dump-dom` and reads the result the page writes. It is skipped where no
+  Chrome or Chromium is found; GitHub's Ubuntu runner has one. Against the morph from
+  before this change it fails two cases, one of them with H5's exact symptom (the
+  definition select reads `desk-exposure` after a notice came and went above it).
+- Numeric help reads "At least 1." instead of "From 1 to ∞."
+- The takeover dialog and its plan say what a warm standby does: start what it built,
+  build the rest. The plan counts each.
+- The cluster page's readiness card has a *Pipelines* line (built, still being built,
+  to be built at a takeover) and a new card lists each pipeline's last start (warm or
+  built at start, and the plugin, build, start, edges and total times).
+- A pipeline that has stepped less than once a second and a half over the last half
+  minute — a sink's `minInterval`, or an input that is quiet — has its rates over its
+  last two intervals and shows *every 2 s* in the list's step column; the rates carry
+  `batchedEveryS` and `rateOverS`. The page does not say which of the two causes it is.
+- The tables list and the table page read again every three seconds: a loader's first
+  load publishes no event, so the page showed the table as declared ("Rows 0") beside a
+  row browse of 27.
+- `pipeline.replace.confirmed` has a plan line, and the audit shows "2, unchanged"
+  instead of "2 → 2".
+- The example's second plugin build is version 2.0.0, so the version list tells the
+  two apart by more than the import time.
+- Waiting tables and inputs show on the overview's attention list, the table page, the
+  tables list, the pipeline page and the topology's input panel; dry-run warnings show
+  above the plan in every dialog.
+
+**CI (H3).** The workflow runs on pushes to `enrichment-service` and by hand. The first
+runs failed in the connector-stack job for two reasons, each fixed at its root: the
+summary line carries colour codes on a runner (`\e[m  skipped: 0`), so the anchored grep
+never matched; and `LeadershipProbe`'s listener could throw "Not listening" from
+`DisposeAsync` when stopped just after an answer — a real race, reproduced by a new test
+that stops a listener the moment it has answered, 300 times (it failed 3 runs of 3
+before the fix).
+
+**The front door (H12).** The example, AdminHost, the scale rig and both failover apps
+print their usage for `--help` and exit 2 on an option they do not have
+(`tests/Shared/CommandLine.cs`, linked into the four; the example's own table in
+`ExampleOptions`).

@@ -331,7 +331,9 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   - Every sink a connector creates is wrapped in `leadership.Leased` by the supervisor;
     a connector must not write from anywhere but the sink's `WriteAsync`.
   - The `files` connector's formats are persisted: the sink's object names
-    (`{prefix}{step:D19}-{term:D6}.jsonl`) and line shapes (`FileSinkFormat`), and the
+    (`{prefix}{step:D19}-{term:D6}-{base:D19}.jsonl`, snapshots `….snapshot.jsonl`;
+    the older `{step}-{term}.jsonl` is still read), the reader's rules and line shapes
+    (`FileSinkFormat`), and the
     source's position in the checkpoint's partition → offset map (`FilePosition`:
     partition 0 the line, 1 the name's length, 2… the name in two banks, each offset
     prefixed by the object's ordinal so that it only rises). Change either and deployed
@@ -399,7 +401,10 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     (`ConnectorDescription.Owns`) is checked at the dry run and again under the
     references lock — never in `Build`, where two stored specs would stop each other.
   - Objects are written through `IObjectStore.WriteAsync`: whole when the callback
-    returns, nothing when it throws. The `files` source holds one line of at most
+    returns, nothing when it throws. A source or a sink's clean-up lists with
+    `ListPageAsync` (after a name, a page at a time), never the whole prefix per poll; a
+    source holds back behind an object younger than `settle`. A missing input is a
+    warning and a `Waiting` state, never a refusal or a fault of the files paths. The `files` source holds one line of at most
     `maxLineLength` characters; its ordinals only rise, past anything a checkpoint may
     hold of a half-sent name (`FilePosition.Next`).
   - `ITableSourceFactory.Create` and `ITypedConnector.RequireTypes` run at dry runs:
@@ -433,6 +438,9 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     render goes through `morph`, and handlers are `on:` properties found by the delegated
     listener — `addEventListener` on a rendered node is lost at the next patch. A path the
     scripts call must be a route the API maps: `The_UI_is_served_whole…` checks it.
+    `morph` sets form controls' properties (selection, `checked`, an unfocused
+    field's `value`) from the new tree: `AdminUiMorphTests` runs `Ui/morph-tests.js`
+    in a headless Chrome and is the check.
     A field whose text may not be a value yet (JSON for an array or object setting)
     keeps the text as a draft, and a form with a draft on screen is not sent; a dialog
     is closed when the route moves to another page.

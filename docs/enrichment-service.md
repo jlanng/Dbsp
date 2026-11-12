@@ -1245,18 +1245,33 @@ and the table loaders `file`, `kafka` and `debezium`.
 
 **`files`** reads and writes JSON-lines objects under a prefix of an object store the
 host registered (`AddObjectStore(name, …)`: `LocalObjectStore` for a directory; S3 or
-anything else is an `IObjectStore` you write — five methods):
+anything else is an `IObjectStore` you write — five methods, and a sixth,
+`ListPageAsync`, worth writing; see below):
 
 ```json
 { "connector": "files", "store": "lake", "prefix": "quotes/", "pollInterval": "00:00:05", "suffix": ".jsonl" }
-{ "connector": "files", "store": "lake", "prefix": "alerts/sanctions/", "minInterval": "00:00:02" }
+{ "connector": "files", "store": "lake", "prefix": "alerts/sanctions/", "minInterval": "00:00:02", "retain": 200 }
 ```
 
+Each setting is for some kinds of slot only, and the connector refuses it on another:
+`suffix`, `pollInterval`, `settle` and `maxLineLength` are a source's; `format` a keyed
+input's; `minInterval` a sink's; `compactAfter` an upsert sink's and `retain` an append
+sink's. The connector's config schema says which (`appliesTo`), and the deploy form
+offers a slot only its own.
+
 *As a source* it reads the objects under the prefix in ordinal order of their names, one
-record per line, then lists the prefix again every `pollInterval` for objects that sort
-after the last one read. Its position is the object and the line, and it is in the
-pipeline's checkpoint: a restart or a takeover carries on at the next line, and reads
-nothing twice. Three things follow from reading in name order:
+record per line, then asks every `pollInterval` for objects that sort after the last one
+read. Its position is the object and the line, and it is in the pipeline's checkpoint: a
+restart or a takeover carries on at the next line, and reads nothing twice. A poll asks
+the store for the names after the position, a page of 1,024 at a time
+(`IObjectStore.ListPageAsync(prefix, after, limit)`), so it costs what has not been read,
+not the whole prefix — on a store that implements that member. On S3 it is one
+`ListObjectsV2` with `StartAfter` and `MaxKeys`, whose order is this order for ASCII
+names. The default implementation, which an `IObjectStore` written before it gets,
+lists the whole prefix and keeps the page: correct, and as costly as the prefix is long.
+`LocalObjectStore` walks the directory the prefix names and opens only the page's files.
+
+What reading in name order asks of whoever writes the objects:
 
 - an object must be whole when it appears — write it elsewhere and move it, or put it in
   one request — and must not change afterwards. What happens to lines added to an object
@@ -1264,13 +1279,16 @@ nothing twice. Three things follow from reading in name order:
   and they are read if it restarts or fails over while that object is still the last
   one it read. A last line that was half written when it was read was rejected as
   malformed, and its completed form is never read;
-- an object is read if, when it is first listed, its name sorts after the object the
-  source is in. One that arrives with a name sorting before the position is never read.
-  With a backlog the source reads the names one listing gave it, for at most one
-  `pollInterval`, before it lists again: an object that arrives with a name among them
-  is read in its place if the source has not passed it by the next listing, and
-  skipped, without a trace, if it has. So names must increase: name objects by time or
-  by a counter, zero-padded, and never write a name that sorts before one already there;
+- **`settle`** (five seconds unless the slot says otherwise) is how late an object may
+  arrive behind one with a greater name. An object is read only once it has been left
+  unchanged that long (its modification time), and nothing after it in name order is
+  read before it: the source stops at the first object that has not settled and waits.
+  So two writers that finish a moment apart, or a store whose listing shows a new name a
+  moment late, lose nothing as long as each object appears within `settle` of the
+  objects that sort after it. One that arrives later than that, behind the position, is
+  never read, and nothing says so. Every object is read at least `settle` after it was
+  written; `"settle": "00:00:00"` reads at once, and is right where names only ever
+  increase and each object appears whole (the example's quote files);
 - old objects can be deleted. The position does not need the object it names.
 
 A line that is not a record is rejected in its place: it faults the pipeline under the
@@ -1279,47 +1297,88 @@ default error policy and is a dead letter — with its object and line — under
 the slot says otherwise; at most 67,108,864): it is read past without being held, and
 the dead letter carries its first 4,096 characters. That is what an object that is not
 JSON lines turns into — a JSON array on one line, a Parquet file, a gzip — whatever its
-size; `suffix` keeps such neighbours out of a prefix. A keyed input takes every line as
-an upsert; there is no line that deletes. Names of up to 256 bytes can be checkpointed.
-The listing is the store's: every poll lists the whole prefix, so keep a prefix to what
-is still arriving. (`LocalObjectStore` walks the directory the prefix names — the part
-up to its last `/` — and not the rest of the store.)
+size; `suffix` keeps such neighbours out of a prefix. Names of up to 256 bytes can be
+checkpointed.
+
+A keyed input takes every line as an upsert unless its slot says `"format": "changes"`:
+then a line is `{"key":…,"row":…}` (an upsert) or `{"key":…,"deleted":true}` (a
+delete) — what an upsert sink of this connector writes, so one pipeline's upsert sink
+can be another's keyed input with its deletes.
+
+A source that has found nothing under its prefix says so: the pipeline's page shows the
+input *waiting for objects under quotes/ in store lake*, and after
+`ServiceOptions.MissingInputGrace` (30 s) that is an event and the reason
+`source-waiting` the node reports itself `Degraded` for. A dry run that binds an input
+to a prefix with nothing under it goes ahead and carries the same words as a warning in
+its plan. A first file still to be delivered and a prefix with a typing mistake in it
+look the same; this is what tells the operator to look.
 
 *As a sink* it writes one object per step that has output:
 
 ```
-alerts/sanctions/0000000000000000412-000003.jsonl        {prefix}{step, 19 digits}-{leader term, 6 digits}.jsonl
+alerts/sanctions/0000000000000000412-000003-0000000000000000398.jsonl
+    {prefix}{step, 19 digits}-{leader term, 6 digits}-{base, 19 digits}.jsonl
 ```
 
-An append sink's lines are the records. An upsert sink's are changes, at most one per
-key in an object:
+The base is the step of the checkpoint the writing generation started from. An append
+sink's lines are the records. An upsert sink's are changes, at most one per key in an
+object:
 
 ```json
 {"key":"Equity@2026-01-05T09:00:00Z","row":{"assetClass":"Equity","priced":41,"unpriced":9,"slippageBps":88.21}}
 {"key":"FX@2026-01-05T08:56:00Z","deleted":true}
 ```
 
-A reader takes the objects in name order and, for an upsert sink, keeps the last line
-for each key: that is the key's latest row, and a key whose last line says `deleted`
-has none. `FileSinkFormat.ReadAppendsAsync` and `ReadUpsertsAsync` do exactly this over
-an `IObjectStore`. Delivery is at least once, and the names are what make it harmless:
-a step delivered again writes the same name with the same content, and a generation
-that starts deletes the objects of steps above its checkpoint, because those steps are
-about to be run again and may be cut differently. A pipeline that is reset has its
+Delivery is at least once, and the names are what make it harmless: a step delivered
+again writes the same name with the same content, and a generation that starts deletes
+the objects of steps above its checkpoint before its first write, because those steps
+are about to be run again and may be cut differently. A pipeline that is reset has its
 objects deleted. So a prefix belongs to one sink slot of one pipeline, and the service
 holds to it: a spec whose sink, or dead-letter sink, names a store and prefix that
 another sink slot already writes — its own or another pipeline's — is refused at the dry
 run and at the deploy. (A source may read a prefix a sink writes; that is one pipeline
 feeding another.) An object is written whole or not at all: a write that fails or is
-cancelled part-way leaves nothing under the step's name. Nothing merges, compacts or
-expires the objects; an upsert sink's prefix is a change log, what reads it folds it,
-and how long objects are kept is the bucket's lifecycle rule.
+cancelled part-way leaves nothing under the step's name.
+
+**The reader's rules** — what `FileSinkFormat.ReadAppendsAsync` and `ReadUpsertsAsync`
+do over an `IObjectStore`, and what anything else that reads the objects must do:
+
+1. Start from the snapshot of the highest step (`….snapshot.jsonl`, below), if there is
+   one, and ignore every object at or below its step.
+2. Where a step has objects of two terms, the higher term's is the step.
+3. An object of term *t* at step *s* is void when an object of a later term has a base
+   below *s*: a later leader started from a checkpoint that does not cover the step and
+   ran it again. This is what deals with a leader that was replaced and finished a
+   write it had begun: its late object names a step its successor ran again, and the
+   successor's first object voids it — even when the successor gave this sink nothing
+   for that step, which rule 2 alone cannot see. Until the successor has written its
+   first object, the late object reads as real.
+4. Read what is left in step order; for an upsert sink the latest row of a key is the
+   last line that names it, and `"deleted": true` takes it away.
+5. An object that was listed and is gone when it is opened was folded into a snapshot,
+   or passed `retain`, meanwhile: an upsert reader lists again and starts over.
+
+Objects written by builds before the base was in the name (`{step}-{term}.jsonl`) are
+still read, and void nothing.
+
+Left to itself a sink keeps every object, and how long objects are kept is the bucket's
+lifecycle rule. Two settings keep a prefix short instead. **`retain: N`** (append sinks)
+deletes all but the newest *N* step objects as it writes. **`compactAfter: N`** (upsert
+sinks) folds the objects at or below the committed step into one snapshot whenever *N*
+have been written since the last: the snapshot holds the latest row of every key that
+has one, is written whole before anything it replaces is deleted, and reads the same as
+the objects it replaces. A fold reads every key of the sink once, newest object first,
+and holds the set of keys while it does: a sink of a hundred million keys pays that in
+memory at each fold. A lifecycle rule that expires an upsert sink's objects loses rows;
+use `compactAfter`.
 
 `minInterval` is for the number of objects. Having written a step's object the sink
 waits that long before it acknowledges the step; the pipeline's checkpoint waits for
 the acknowledgement, so the pipeline pauses, its inputs queue up behind their bounded
 channels, and the next step and its object are larger. Every sink of that pipeline is
-that much later.
+that much later. The admin then shows the pipeline's rates over its last two intervals
+and its step as *every 2 s*, rather than a second of 100/s and a second of nothing (a
+pipeline whose input is quiet is shown the same way).
 
 ## Run the example
 
@@ -1365,8 +1424,8 @@ directory the program prints as `files:`.
 It can be left running. Trade ids come round again after 20,000 and what is keyed by
 time closes with the watermark, so the pipelines' state is bounded; the in-memory
 backend compacts its state log as it goes (`InMemoryBackendOptions.StateCompactAbove`);
-and the example deletes what its files sinks wrote beyond the newest 200 objects of
-each prefix, because a directory has no lifecycle rule (`World.TrimSinkObjectsAsync`).
+and its two files sinks keep the newest 200 objects each (`"retain": 200`), because a
+directory has no lifecycle rule.
 A Release build at the default rate reaches about 650 MB of resident memory in twenty
 minutes and was between 640 and 720 MB from then to the fortieth, with 170 to 310
 thousand records in the state log throughout and 760 to 1,700 objects, under 10 MB,
@@ -1614,7 +1673,10 @@ with the operator, the exception, the weight and the record.
 
 **Cluster.** Both nodes with their role and what their process holds — working set, GC
 heap, the share of its life spent in GC pauses; in memory the two nodes are one process
-and the page says so. On a standby, how ready it is to lead, and why not if it is not.
+and the page says so. On a standby, how ready it is to lead, and why not if it is not,
+with how many pipelines it has built, is still building and leaves to be built at a
+takeover. Below, each pipeline's last start on this node: warm (built while standing by)
+or built at the start, and what the plugin, the build, the start and the sources took.
 
 ![A standby](images/enrichment-service/standby.png)
 
@@ -1721,6 +1783,21 @@ few records behind at most instants and caught up between them.
 A step-down whose resignation cannot be committed does not leave a leader that leads
 nothing: the node closes its writer and ends as fenced (exit code 3), and the standby
 takes over on the silence instead.
+
+**A file, prefix or topic that is not there.** A table whose `file` loader names an
+object that does not exist is declared, empty, and its loader shows `Waiting` with what
+it waits for (`object nope.jsonl in store refdata`) instead of `Idle`; a `files` input
+whose prefix holds nothing shows *waiting for objects under …* on its pipeline. Nothing
+has failed — a file yet to be delivered looks the same — so neither is a fault. After
+`ServiceOptions.MissingInputGrace` (30 s) each is an event (`loader waiting for …`,
+`input 'quotes' waiting for …`) and a reason the node is `Degraded`: `loader-waiting`,
+`source-waiting`. Both end, with an event, when the first object is there. The dry run
+of a declare or a deploy looks first and goes ahead with a warning in its plan
+(`warnings`): an object, a prefix with nothing under it, or a Kafka topic that does not
+exist — the latter for a `kafka` input and a `kafka` or `debezium` loader, whose start
+faults until the topic exists. The look is bounded (5 s) and a store or broker that does
+not answer gives no warning. A custom connector or table source can answer the same
+question (`IPresenceChecked`, `ITableSourcePresence`).
 
 **What a replaced node logs.** One warning: `Service node a is Fenced; it will not lead
 again in this process`. It abandons its circuits without draining them, since nothing of
@@ -2325,12 +2402,12 @@ resources are ARNs (`…:topic/<cluster>/<uuid>/{prefix}.*`,
   it deletes, which leaves a window of one call in which it can delete a file the new
   leader has just stored again. Importing the version again puts the file back.
 - **The `files` connector is plain.** JSON lines only; no compression, no Parquet, no
-  partitioned paths. A source lists its whole prefix at every poll and reads strictly in
-  name order. A sink writes one object per step and never merges them. A keyed input
-  from files has no deletes. And one hole is known: a leader that has been replaced and
-  finishes a write it had begun can leave an object for a step the new leader then
-  produces nothing for, which a reader cannot tell from a real one — the lease check
-  before every write narrows this to a write in flight across the takeover.
+  partitioned paths. A source reads strictly in name order: an object that arrives more
+  than `settle` behind one with a greater name is never read, and nothing says so. A
+  store without a paged listing (`ListPageAsync`) is listed whole at every poll. A
+  replaced leader's late sink object reads as real until its successor's first object
+  in that prefix voids it (rule 3); a successor that never writes to the prefix never
+  voids it. A fold (`compactAfter`) holds the sink's set of keys while it runs.
 - **An append input counts what it is given.** A producer that retries without
   idempotence can put a record into a topic twice, and to `p.Input<T>` those are two
   records: an aggregate counts both, and a join into an upsert sink asserts the same row
