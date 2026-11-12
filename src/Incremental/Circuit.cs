@@ -352,13 +352,12 @@ public sealed class Circuit : IAsyncDisposable
                     continue;
                 }
 
-                // The clock's entries: put back below, all together.
-                if (key.StartsWith(OffsetKeys.Watermark, StringComparison.Ordinal))
-                    continue;
-
                 // Plain keys are unstamped running counts; "{name}#p{partition}" keys are a
                 // stamped input's per-partition positions (see OffsetKeys). Entries for
-                // inputs this circuit no longer declares are ignored, as ever.
+                // inputs this circuit no longer declares are ignored, as ever — and so are
+                // the clock's ("$watermark", "$watermark#s{n}"), which no input can be
+                // named; they are put back below, all together. Nothing is skipped by how
+                // a key starts: "$watermark-feed" is an input, and this is its position.
                 var (name, partition) = OffsetKeys.TryDecode(key, out var decodedName, out var decodedPartition)
                     ? (decodedName, (int?)decodedPartition)
                     : (key, null);

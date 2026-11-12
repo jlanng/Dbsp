@@ -60,7 +60,9 @@ internal sealed class TableLookupOperator<TKey, TFact, TRow, TOut> : IStepOperat
         _errors = context.Errors;
 
         // The grouping's policy closes keys; the state here is per fact, so each fact is
-        // tracked and closes with its key.
+        // tracked and closes with its key. A fact that is taken back whole is forgotten
+        // (EvictionTracker.Forget): the deadlines are the facts remembered, one each, and
+        // not every version a corrected fact ever had.
         if (eviction is not null)
             _eviction = new EvictionTracker<KeyedValue<TKey, TFact>>(
                 context, new KeyEviction<KeyedValue<TKey, TFact>>(eviction.Clock, fact => eviction.ClosesAt(fact.Key)));
@@ -156,6 +158,8 @@ internal sealed class TableLookupOperator<TKey, TFact, TRow, TOut> : IStepOperat
                 // A retraction of a held fact: the rows it was emitted as, scaled.
                 for (var h = heldStart; h < heldEnd; h++)
                     Move(output, fact, _held[h].Value, change);
+                if (_eviction is not null && _held[heldStart].Weight + change == 0)
+                    _eviction.Forget(fact);
                 continue;
             }
 
@@ -166,7 +170,10 @@ internal sealed class TableLookupOperator<TKey, TFact, TRow, TOut> : IStepOperat
 
             var total = checked(weight + change);
             if (total == 0)
+            {
+                _eviction?.Forget(fact);
                 continue;
+            }
             var rowStart = probe == 0 ? 0 : _rowBounds[probe - 1];
             var rowEnd = _rowBounds[probe];
             if (_errors is not null)

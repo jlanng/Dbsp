@@ -249,6 +249,144 @@ public class DeadlineStoreTests
     }
 
     [Fact]
+    public void A_store_that_is_written_and_never_taken_from_keeps_its_queue_to_the_size_of_its_map()
+    {
+        // What a follower does to it: every deadline a leader sets is set, every key the
+        // leader took is removed, and nothing is ever taken here.
+        var store = new InMemoryStorageProvider.DeadlineStore<int>();
+        var bound = InMemoryStorageProvider.DeadlineStore<int>.Slack;
+        for (var key = 0; key < 100_000; key++)
+        {
+            store.Set(key, Base + key);
+            if (key >= 50)
+                store.Remove(key - 50);
+            Assert.True(store.QueueCount <= 2 * store.Entries.Count + bound, $"{store.QueueCount} queued for {store.Entries.Count} held");
+        }
+        Assert.Equal(50, store.Entries.Count);
+        Assert.Equal(50, store.QueueCount);
+        Assert.True(store.QueueCapacity <= 4 * (2 * 50 + bound), $"the queue's array has room for {store.QueueCapacity}");
+
+        // Removed against the order of the deadlines, and moved again and again: the
+        // stale entries are not at the front, and the bound is the rebuild's.
+        for (var key = 200_000; key < 300_000; key++)
+        {
+            store.Set(key, Base + 10_000_000 - key);
+            store.Set(key, Base + 20_000_000 - key);
+            if (key >= 200_500)
+                store.Remove(key - 500);
+            Assert.True(store.QueueCount <= 2 * store.Entries.Count + bound, $"{store.QueueCount} queued for {store.Entries.Count} held");
+        }
+
+        // Moved and never removed, as a session's deadline is: each move leaves the old
+        // entry behind, and nothing but the move is there to notice.
+        var moved = new InMemoryStorageProvider.DeadlineStore<int>();
+        for (var round = 0; round < 500; round++)
+        {
+            for (var key = 0; key < 100; key++)
+                moved.Set(key, Base + 50_000_000 - round * 1000 - key);
+            Assert.True(moved.QueueCount <= 2 * moved.Entries.Count + bound, $"{moved.QueueCount} queued for {moved.Entries.Count} held");
+        }
+
+        // And it still takes exactly what is held, each key once.
+        var expected = store.Entries.Keys.Order().ToList();
+        var due = new List<int>();
+        store.TakeDue(long.MaxValue, due);
+        Assert.Equal(expected, due.Order());
+        Assert.Equal(0, store.QueueCount);
+    }
+
+    [Fact]
+    public async Task A_deadline_stores_estimate_counts_the_queue_it_has_stale_entries_and_all()
+    {
+        var log = new InMemoryStateChangelog(partitions: 1);
+        await using var storage = await ChangelogStorage.OpenAsync(log).WaitAsync(Timeout);
+        var provider = storage.Pipeline("p");
+        var store = provider.CreateDeadlineStore<int>("d");
+        for (var key = 0; key < 16_000; key++)
+            store.Set(key, Base + key);
+        provider.Commit(new Dictionary<string, long>());
+        var once = provider.EstimateSize().Stores.Single(s => s.Kind == "deadline");
+        Assert.Equal(16_000, provider.QueuedDeadlines);
+
+        // The later half moved, latest first: the map is what it was, and the entries
+        // left behind are in the middle of the queue, where nothing sweeps them — half as
+        // many as the live ones, so within the bound.
+        for (var key = 15_999; key >= 8_000; key--)
+            store.Set(key, Base + 100_000 + key);
+        provider.Commit(new Dictionary<string, long>());
+        var after = provider.EstimateSize().Stores.Single(s => s.Kind == "deadline");
+        Assert.Equal(16_000, after.Entries);
+        Assert.Equal(24_000, provider.QueuedDeadlines);
+        Assert.True(after.EstimatedBytes - once.EstimatedBytes >= 8_000 * 16,
+            $"{once.EstimatedBytes} bytes with 16,000 queued, {after.EstimatedBytes} with 24,000");
+    }
+
+    private sealed record Tick(int Id, int Key, long AtMs)
+    {
+        public DateTimeOffset At => new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero).AddMilliseconds(AtMs);
+    }
+
+    [Fact]
+    public async Task A_warm_standbys_deadline_queues_stay_the_size_of_the_leaders_however_long_it_stands_by()
+    {
+        // Twenty one-second windows open at every step and twenty close: the leader's
+        // stores hold a few dozen deadlines at any moment. The standby holds the stores
+        // typed (its circuit is built), applies every record and takes nothing.
+        var log = new InMemoryStateChangelog(partitions: 1);
+        await using var leader = await ChangelogStorage.OpenAsync(log).WaitAsync(Timeout);
+        await using var standby = ChangelogStorage.Follow(log);
+
+        static (CircuitBuilder Builder, InputStream<Tick> Input, Output<WindowedValue<int, long>> Output) Define(IStorageProvider storage)
+        {
+            var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Workers = 1, Storage = storage });
+            var input = builder.Input<Tick>("ticks");
+            var counts = input.WithEventTime(t => t.At, TimeSpan.FromSeconds(1))
+                .GroupBy(t => t.Key).TumblingWindow(TimeSpan.FromSeconds(1)).Count();
+            return (builder, input, counts.ToOutput(bootstrap: false));
+        }
+
+        var leading = Define(leader.Pipeline("p"));
+        var standing = Define(standby.Pipeline("p"));
+        await using var circuit = leading.Builder.Build();
+        await using var built = standing.Builder.Build();
+        circuit.Start();
+        var input = circuit.Handle(leading.Input);
+        var reader = circuit.Handle(leading.Output).Reader;
+
+        const int Steps = 3000;
+        var id = 0;
+        for (var step = 0; step < Steps; step++)
+        {
+            for (var key = 0; key < 20; key++)
+                await input.SendAsync(new Tick(++id, key, step * 1000L + 10), 1);
+            await circuit.StepAsync().WaitAsync(Timeout);
+            while (reader.TryRead(out _))
+            {
+            }
+        }
+        await standby.WhenCaughtUpAsync().WaitAsync(Timeout);
+        for (var i = 0; i < 500 && standby.Pipeline("p").CommitSequence < leader.Pipeline("p").CommitSequence; i++)
+            await Task.Delay(10);
+        Assert.Equal(leader.Pipeline("p").CommitSequence, standby.Pipeline("p").CommitSequence);
+
+        var led = leader.Pipeline("p").EstimateSize().Stores.Where(store => store.Kind == "deadline").ToList();
+        var followed = standby.Pipeline("p").EstimateSize().Stores.Where(store => store.Kind == "deadline").ToList();
+        Assert.NotEmpty(led);
+        Assert.True(led.Sum(store => store.Entries) is > 0 and < 200, $"the leader holds {led.Sum(store => store.Entries)} deadlines");
+        Assert.Equal(led.Sum(store => store.Entries), followed.Sum(store => store.Entries));
+
+        // 3,000 steps set and removed 60,000 deadlines per store.
+        var slack = InMemoryStorageProvider.DeadlineStore<int>.Slack * led.Count;
+        Assert.True(standby.Pipeline("p").QueuedDeadlines <= 2 * followed.Sum(store => store.Entries) + slack,
+            $"the standby queues {standby.Pipeline("p").QueuedDeadlines} deadlines for {followed.Sum(store => store.Entries)} held; " +
+            $"the leader queues {leader.Pipeline("p").QueuedDeadlines}");
+
+        // The estimate counts the queue it has: what the standby reports is what it holds.
+        Assert.True(followed.Sum(store => store.EstimatedBytes) <= 4 * led.Sum(store => store.EstimatedBytes) + 64 * 1024,
+            $"the standby's deadline stores are estimated at {followed.Sum(store => store.EstimatedBytes)} bytes, the leader's at {led.Sum(store => store.EstimatedBytes)}");
+    }
+
+    [Fact]
     public async Task On_the_changelog_a_deadline_is_one_record_however_its_key_is_written()
     {
         // 10.0m equals 10.00m and serializes differently: the record written under the

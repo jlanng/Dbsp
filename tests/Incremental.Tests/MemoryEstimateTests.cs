@@ -208,6 +208,102 @@ public class MemoryEstimateTests
         }
     }
 
+    private sealed record Coded(string Code, string Name, long Number);
+
+    private static Coded MakeCoded(long id) => new("LEI-" + id.ToString("D16"), "Counterparty " + id.ToString("D9"), id);
+
+    /// <summary>A log that reads a key and a row apart, as one that keeps them as bytes
+    /// does: every key it hands over is an object of its own, equal to the row's.</summary>
+    private sealed class ApartLog(InMemoryTableLog<string, Coded> inner) : ITableLog<string, Coded>
+    {
+        private static string Copy(string text) => new(text.AsSpan());
+        private static Coded? Copy(Coded? row) => row is null ? null : new Coded(Copy(row.Code), Copy(row.Name), row.Number);
+
+        public string Epoch => inner.Epoch;
+        public long OldestRetainedVersion => inner.OldestRetainedVersion;
+        public ValueTask<long> LastVersionAsync(CancellationToken cancellationToken = default) => inner.LastVersionAsync(cancellationToken);
+        public ValueTask AppendAsync(TableVersion<string, Coded> version, CancellationToken cancellationToken = default) => inner.AppendAsync(version, cancellationToken);
+        public ValueTask TrimBeforeAsync(long version, CancellationToken cancellationToken = default) => inner.TrimBeforeAsync(version, cancellationToken);
+
+        public ValueTask<TableHead> RestoreAsync(Action<string, Coded> row, CancellationToken cancellationToken = default) =>
+            inner.RestoreAsync((key, held) => row(Copy(key), Copy(held)!), cancellationToken);
+
+        private static TableVersion<string, Coded> Apart(TableVersion<string, Coded> version) => new(
+            version.Version,
+            version.Changes.Select(change => new TableChange<string, Coded>(Copy(change.Key), Copy(change.Old), Copy(change.New))).ToList(),
+            version.Offsets);
+
+        public async IAsyncEnumerable<TableVersion<string, Coded>> ReadAsync(
+            long fromExclusive, long toInclusive, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await foreach (var version in inner.ReadAsync(fromExclusive, toInclusive, cancellationToken))
+                yield return Apart(version);
+        }
+
+        public async IAsyncEnumerable<TableVersion<string, Coded>> FollowAsync(
+            long fromExclusive, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await foreach (var version in inner.FollowAsync(fromExclusive, cancellationToken))
+                yield return Apart(version);
+        }
+    }
+
+    [Fact]
+    public async Task A_table_restored_from_a_log_holds_each_row_under_the_rows_own_key_and_its_estimate_says_what_it_holds()
+    {
+        // Keyed by a string: a log hands the key over as an object beside the row's own.
+        // Held as given, that is a string per row which the estimate — a reference per
+        // key — does not count, and which a writer that built the same table never had.
+        const int rows = 120_000;
+        var log = new InMemoryTableLog<string, Coded>();
+        var written = await SharedTable<string, Coded>.OpenAsync("coded", r => r.Code, log);
+        for (var id = 0; id < rows; id++)
+        {
+            await written.Writer.UpsertAsync(MakeCoded(id));
+            if (id % 5000 == 4999)
+                await written.Writer.CommitAsync().AsTask().WaitAsync(Timeout);
+        }
+        await written.Writer.CommitAsync().AsTask().WaitAsync(Timeout);
+
+        var (bytes, restored) = await RetainedAsync(
+            async () => await SharedTable<string, Coded>.OpenAsync("coded", r => r.Code, new ApartLog(log.Connect())));
+        var estimate = restored.EstimateMemory();
+        Assert.Equal(rows, estimate.Rows);
+        AssertWithin(bytes, estimate.TotalBytes, 0.10, "a table keyed by a string, restored from a log");
+        AssertWithin(written.EstimateMemory().RowBytes, estimate.RowBytes, 0.02, "the restored table against the one its writer holds");
+        foreach (var (key, row) in restored.CurrentRows())
+            Assert.Same(row.Code, key);
+
+        // A follower applies the log's versions the same way: new keys are the rows' own.
+        await using var follower = await SharedTable<string, Coded>.FollowAsync("coded", r => r.Code, new ApartLog(log.Connect()));
+        for (var id = rows; id < rows + 500; id++)
+            await written.Writer.UpsertAsync(MakeCoded(id));
+        await written.Writer.CommitAsync().AsTask().WaitAsync(Timeout);
+        for (var i = 0; i < 500 && follower.LatestVersion < written.LatestVersion; i++)
+            await Task.Delay(10);
+        Assert.Equal(rows + 500, follower.Count);
+        foreach (var (key, row) in follower.CurrentRows())
+            Assert.Same(row.Code, key);
+    }
+
+    [Fact]
+    public async Task A_table_opened_with_another_key_selector_than_it_was_written_with_keeps_the_logs_keys()
+    {
+        // The row's own key is held only where it equals the log's. A selector that has
+        // changed since the rows were written gives another key, and the log's stands:
+        // it is what the log's later changes will name.
+        var log = new InMemoryTableLog<string, Coded>();
+        var written = await SharedTable<string, Coded>.OpenAsync("coded", r => r.Code, log);
+        await written.Writer.UpsertAsync(new Coded("lei-1", "One", 1));
+        await written.Writer.CommitAsync().AsTask().WaitAsync(Timeout);
+
+        var restored = await SharedTable<string, Coded>.OpenAsync("coded", r => r.Code.ToUpperInvariant(), new ApartLog(log.Connect()));
+        using var snapshot = restored.Snapshot();
+        Assert.True(snapshot.TryGet("lei-1", out var row));
+        Assert.Equal("One", row!.Name);
+        Assert.False(snapshot.TryGet("LEI-1", out _));
+    }
+
     [Fact]
     public async Task A_table_s_history_is_the_rows_its_recent_versions_replaced_and_no_more_than_the_tail_holds()
     {

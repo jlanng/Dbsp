@@ -42,8 +42,11 @@ internal static class OffsetKeys
     /// <summary>The key the committed step sequence travels under, beside the offsets.</summary>
     public const string StepMarker = "$step";
 
-    /// <summary>The key the frozen event-time watermark (UTC ticks) travels under, and the
-    /// prefix of every key the clock commits.</summary>
+    /// <summary>The key the frozen event-time watermark (UTC ticks) travels under. It is
+    /// refused as an input's name, and the sources' keys below have a <c>'#'</c>, which
+    /// no input name may: so no input's key is one of the clock's, and nothing that
+    /// reads the marker has to tell them apart by more than the name — an input called
+    /// <c>$watermarks</c> or <c>$watermark-feed</c> is an input.</summary>
     public const string Watermark = "$watermark";
 
     /// <summary>The key one <c>WithEventTime</c> source's max event time seen travels

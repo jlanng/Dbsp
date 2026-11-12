@@ -939,6 +939,17 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         }
     }
 
+    /// <summary>Entries in the deadline stores' queues, stale ones included, summed: what
+    /// a store that is written and never taken from (a follower's) must keep bounded.</summary>
+    internal long QueuedDeadlines
+    {
+        get
+        {
+            lock (_lock)
+                return _stores.Values.Sum(s => (long)s.QueuedCount);
+        }
+    }
+
     /// <summary>Takes the records <see cref="ReleaseStores"/> has a store write, keyed by
     /// the entry part of the record key.</summary>
     private sealed class ReleasingTransaction : IStateChangelogTransaction
@@ -1283,6 +1294,9 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
 
         /// <summary>Entries touched since the last commit.</summary>
         public abstract int TouchedCount { get; }
+
+        /// <summary>Entries in the store's queue, if it orders its entries with one.</summary>
+        public virtual int QueuedCount => 0;
 
         /// <summary>Entries the touched-entry map has room for without growing.</summary>
         public abstract int TouchedCapacity { get; }
@@ -1734,7 +1748,10 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
 
     /// <summary>Deadlines live in the heap store's map and queue, so a follower that holds
     /// this store typed keeps the order as it applies records: a takeover starts with the
-    /// queue already built, whatever the number of open keys.</summary>
+    /// queue already built, whatever the number of open keys. A follower never takes what
+    /// is due — it applies the leader's tombstones — so the heap store bounds its queue
+    /// at removal, not only at <c>TakeDue</c>; a standby's queue is the size of the
+    /// leader's however long it has stood by.</summary>
     private sealed class DeadlineStore<TKey> : ChangelogStore, IDeadlineStore<TKey> where TKey : notnull
     {
         private readonly InMemoryStorageProvider.DeadlineStore<TKey> _live = new();
@@ -1792,12 +1809,14 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         public override int TouchedCapacity => _touched.EnsureCapacity(0);
         public override int HeldCount => _held.Count;
         public override long EntryCount => _live.Entries.Count;
+        public override int QueuedCount => _live.QueueCount;
         public override string Kind => "deadline";
 
         // The map, and the queue that orders it: a key and a deadline per entry in each.
+        // The queue is counted as the array it has, which holds stale entries too.
         public override long StructureBytes =>
             (long)_live.Entries.EnsureCapacity(0) * Diagnostics.ObjectSize.DictionaryEntryBytes<TKey, long>()
-            + _live.Entries.Count * (long)System.Runtime.CompilerServices.Unsafe.SizeOf<(TKey, long)>();
+            + _live.QueueCapacity * (long)System.Runtime.CompilerServices.Unsafe.SizeOf<(TKey, long)>();
 
         public override void WriteChanges(RecordEncoder encoder)
         {

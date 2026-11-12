@@ -141,7 +141,7 @@ public sealed class SharedTable<TKey, TRow> : ITableNode, IAsyncDisposable
         var head = await log.RestoreAsync(
             (key, row) =>
             {
-                table._rows.Seed(key, 0, row);
+                table._rows.Seed(table.KeyToHold(key, row), 0, row);
                 table._rowSizes.Offer(row);
             }, cancellationToken).ConfigureAwait(false);
         table._count = table._rows.KeyCount;
@@ -688,6 +688,20 @@ public sealed class SharedTable<TKey, TRow> : ITableNode, IAsyncDisposable
         }
     }
 
+    /// <summary>The instance to hold a row from a log under. A log reads the key and the
+    /// row apart, so a key that is an object arrives as a second one beside the row's own
+    /// — for a table keyed by a string, a string more per row that nothing but the map
+    /// refers to. Where the selector gives an equal key off the row, that one is held and
+    /// the log's is left to the collector: what a table restored or followed holds is then
+    /// what the writer that built it holds, and what <see cref="EstimateMemory"/> counts.</summary>
+    private TKey KeyToHold(TKey key, TRow row)
+    {
+        if (typeof(TKey).IsValueType)
+            return key;
+        var own = KeySelector(row);
+        return EqualityComparer<TKey>.Default.Equals(own, key) ? own : key;
+    }
+
     // ── writer side: called only by TableWriter, one commit at a time ──────────────────
 
     /// <summary>The current row for <paramref name="key"/>, as the writer sees it.</summary>
@@ -725,9 +739,10 @@ public sealed class SharedTable<TKey, TRow> : ITableNode, IAsyncDisposable
         // The indexes go in the same way, so a reader never sees rows of one version
         // through an index of another.
         var superseded = 0;
+        var followed = !typeof(TKey).IsValueType && Writer.Following;
         foreach (var change in version.Changes)
         {
-            _rows.Write(change.Key, version.Version, change.New);
+            _rows.Write(followed && change.New is { } held ? KeyToHold(change.Key, held) : change.Key, version.Version, change.New);
             if (change.New is { } row)
                 _rowSizes.Offer(row);
             if (change.Old is not null)
@@ -836,9 +851,11 @@ public sealed class SharedTable<TKey, TRow> : ITableNode, IAsyncDisposable
     /// <para>
     /// What it does not see: a row that shares an object with other rows (one string
     /// instance for a country code) is sized as if it had its own, so such a table is
-    /// overstated; superseded rows a slow reader's pin keeps in the chains are not
-    /// counted; a log that keeps history in this process (the in-memory log) is the
-    /// log's to report.
+    /// overstated; a key that is an object the selector makes rather than reads off the
+    /// row (two members joined into a string) is an object per row beside it, counted
+    /// only as its reference; superseded rows a slow reader's pin keeps in the chains
+    /// are not counted; a log that keeps history in this process (the in-memory log) is
+    /// the log's to report.
     /// </para>
     /// </summary>
     public TableMemoryEstimate EstimateMemory()

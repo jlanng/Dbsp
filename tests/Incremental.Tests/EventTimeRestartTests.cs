@@ -664,6 +664,149 @@ public class EventTimeRestartTests
     }
 
     [Fact]
+    public async Task A_remembered_lookup_keeps_a_deadline_per_fact_it_remembers_not_per_version_a_fact_ever_had()
+    {
+        // The upsert's shape: an order is corrected by taking the old fact back and
+        // asserting the new one. The lookup remembers one fact per order; its deadlines
+        // are what bound that state, and are state themselves — a record each in the
+        // changelog, followed by the standby, read at a cold restore.
+        var rates = new SharedTable<int, Rate>("rates", r => r.Id);
+        await rates.Writer.UpsertAsync(new Rate(1, "low"));
+        await rates.Writer.CommitAsync();
+        var log = new InMemoryStateChangelog(partitions: 1);
+        await using var storage = await ChangelogStorage.OpenAsync(log).WaitAsync(Timeout);
+        var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Storage = storage.Pipeline("p") });
+        var input = builder.Input<Ev>("a");
+        var output = input.WithEventTime(e => e.At, Lateness)
+            .GroupBy(e => e.Key).EvictWhen(_ => T0.AddDays(1))
+            .Lookup(builder.Table(rates), (_, e, rate) => (e.Id, e.Amount, rate.Tier), (_, e) => (e.Id, e.Amount, "none"))
+            .ToOutput();
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var handle = circuit.Handle(input);
+        var reader = circuit.Handle(output).Reader;
+
+        int Count(string kind) => storage.Pipeline("p").DescribeState().Count(line => line.Contains(kind));
+
+        // Three orders under key 1 and one under key 2; order 1 is corrected 200 times.
+        await handle.SendAsync(new Ev(2, 1, 1000, 7), 1);
+        await handle.SendAsync(new Ev(3, 1, 1000, 8), 1);
+        await handle.SendAsync(new Ev(4, 2, 1000, 9), 1);
+        var last = new Ev(1, 1, 1000, 0);
+        await handle.SendAsync(last, 1);
+        await circuit.StepAsync().WaitAsync(Timeout);
+        Assert.Equal(4, Count(".remembered."));
+        Assert.Equal(4, Count(".deadlines."));
+        for (var version = 1; version <= 200; version++)
+        {
+            var next = last with { Amount = version };
+            await handle.SendAsync(last, -1);
+            await handle.SendAsync(next, 1);
+            last = next;
+            await circuit.StepAsync().WaitAsync(Timeout);
+            Assert.Equal(4, Count(".remembered."));
+            Assert.Equal(4, Count(".deadlines."));
+        }
+
+        // An order taken back whole leaves nothing; asserted again, it is bounded again.
+        await handle.SendAsync(last, -1);
+        await circuit.StepAsync().WaitAsync(Timeout);
+        Assert.Equal(3, Count(".remembered."));
+        Assert.Equal(3, Count(".deadlines."));
+        await handle.SendAsync(last, 1);
+        await circuit.StepAsync().WaitAsync(Timeout);
+        Assert.Equal(4, Count(".deadlines."));
+
+        // A fact held twice and taken back once is still remembered, and still bounded:
+        // its deadline goes with the last of it, not the first.
+        await handle.SendAsync(new Ev(5, 2, 1000, 3), 2);
+        await circuit.StepAsync().WaitAsync(Timeout);
+        await handle.SendAsync(new Ev(5, 2, 1000, 3), -1);
+        await circuit.StepAsync().WaitAsync(Timeout);
+        Assert.Equal(5, Count(".remembered."));
+        Assert.Equal(5, Count(".deadlines."));
+
+        // A cold copy of the log holds the same: no deadline of a version long corrected.
+        await using (var cold = ChangelogStorage.Follow(log))
+        {
+            await cold.WhenCaughtUpAsync().WaitAsync(Timeout);
+            Assert.Equal(storage.Pipeline("p").DescribeState(), cold.Pipeline("p").DescribeState());
+        }
+
+        // And the keys still close: past the day, everything remembered goes.
+        while (reader.TryRead(out _))
+        {
+        }
+        await handle.SendAsync(new Ev(9, 3, 3 * 86_400_000L, 1), 1);
+        await circuit.StepAsync().WaitAsync(Timeout);
+        await circuit.StepAsync().WaitAsync(Timeout);
+        Assert.Equal(0, Count(".remembered."));
+        Assert.Equal(0, Count(".deadlines."));
+    }
+
+    [Theory]
+    [InlineData("$watermarks")]
+    [InlineData("$watermark-feed")]
+    [InlineData("$steps")]
+    [InlineData("trades")]
+    public async Task An_input_named_like_the_clocks_keys_keeps_its_position_across_a_restart(string name)
+    {
+        // The clock's entries in the offsets marker are "$watermark" and "$watermark#s{n}".
+        // An input may have any other name, and its position is restored like any input's.
+        var storage = new InMemoryCheckpointStorageProvider();
+        (CircuitBuilder Builder, InputStream<Ev> Input, Output<KeyedValue<int, long>> Output) Define()
+        {
+            var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Storage = storage });
+            var input = builder.Input<Ev>(name);
+            var timed = builder.Input<Ev>("timed");
+            timed.WithEventTime(e => e.At, Lateness).GroupBy(e => e.Key).TumblingWindow(TimeSpan.FromSeconds(5)).Count().ToOutput(bootstrap: false);
+            return (builder, input, input.GroupBy(e => e.Key).Count().ToOutput(bootstrap: false));
+        }
+
+        var first = Define();
+        await using (var circuit = first.Builder.Build())
+        {
+            circuit.Start();
+            for (var offset = 0; offset < 5; offset++)
+                await circuit.Handle(first.Input).SendAsync(new Ev(offset, 1, 0, 1), 1, 0, (long)offset);
+            await circuit.StepAsync().WaitAsync(Timeout);
+        }
+        Assert.Equal(4, storage.CommittedOffsets[$"{name}#p0"]);
+
+        // An at-least-once source sends what it sent before: everything at or below the
+        // committed offset has been applied and must not be applied again.
+        var second = Define();
+        await using var restarted = second.Builder.Build();
+        restarted.Start();
+        Assert.Equal(4, restarted.CommittedOffsets(name)[0]);
+        for (var offset = 0; offset < 6; offset++)
+            await restarted.Handle(second.Input).SendAsync(new Ev(offset, 1, 0, 1), 1, 0, (long)offset);
+        await restarted.StepAsync().WaitAsync(Timeout);
+        var said = new List<string>();
+        while (restarted.Handle(second.Output).Reader.TryRead(out var delta))
+            foreach (var (value, weight) in delta)
+                said.Add($"{value.Key}={value.Value} x{weight}");
+        Assert.Equal(["1=5 x-1", "1=6 x1"], said.Order());
+    }
+
+    [Fact]
+    public async Task The_clocks_own_keys_are_refused_as_input_names_and_nothing_else_that_starts_like_them_is()
+    {
+        static CircuitBuilder Named(string name)
+        {
+            var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false });
+            builder.Input<Ev>(name).Select(e => e.Id).ToOutput();
+            return builder;
+        }
+
+        Assert.Throws<ArgumentException>(() => Named("$watermark").Build());
+        Assert.Throws<ArgumentException>(() => Named("$step").Build());
+        Assert.Throws<ArgumentException>(() => Named("$watermark#s0").Build());
+        await using var plural = Named("$watermarks").Build();
+        await using var feed = Named("$watermark-feed").Build();
+    }
+
+    [Fact]
     public async Task A_checkpoint_from_before_event_time_state_was_kept_is_refused_only_where_it_matters()
     {
         // Format 6 held no watermark and no deadlines. A circuit without event time lost

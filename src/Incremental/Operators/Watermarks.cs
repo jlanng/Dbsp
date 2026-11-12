@@ -241,6 +241,13 @@ internal sealed class EvictionTracker<TKey> where TKey : notnull
 
     public void Track(TKey key) => _touched.Add(key);
 
+    /// <summary>Drops the deadline of a key the operator holds nothing for any more. For
+    /// an operator whose tracked keys are not the grouping's but something that comes and
+    /// goes under one (the remembered lookup tracks facts): without it every key ever
+    /// tracked keeps a deadline, and a record in the changelog, until its group closes.
+    /// A key forgotten and tracked again later gets its deadline again.</summary>
+    public void Forget(TKey key) => _deadlines.Remove(key);
+
     /// <summary>Removes and returns every tracked key whose deadline the watermark has
     /// passed, as one list so callers can evict their state in a single batched store call.
     /// Every operator calls this once per step, on every way out of the step, after its

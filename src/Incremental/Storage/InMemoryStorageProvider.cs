@@ -329,17 +329,30 @@ public sealed class InMemoryStorageProvider : IStorageProvider
     }
 
     /// <summary>The deadlines as a map, for the lookups, and as a queue, for the order.
-    /// The queue is never searched: an entry whose key has since moved or gone is skipped
-    /// when it reaches the front, which it does once the watermark passes the deadline it
-    /// was queued under — so the queue holds at most one entry per deadline ever set and
-    /// not yet passed.</summary>
+    /// The queue is never searched: an entry whose key has since moved or gone is stale,
+    /// and is skipped when it reaches the front. Nothing has to take it for that to
+    /// happen — a store that is only ever written (a follower's, which applies a leader's
+    /// records and takes nothing) drops stale entries off the front at every removal, and
+    /// rebuilds the queue from the map when stale entries outnumber the live ones — so
+    /// the queue holds at most twice the map's entries and <see cref="Slack"/> more,
+    /// whoever writes it and for however long.</summary>
     internal sealed class DeadlineStore<TKey> : IDeadlineStore<TKey> where TKey : notnull
     {
+        /// <summary>Stale queue entries allowed beyond the number of live ones before
+        /// the queue is rebuilt: a small store is not rebuilt at every other write.</summary>
+        internal const int Slack = 64;
+
         private readonly Dictionary<TKey, long> _deadlines = new();
         private readonly PriorityQueue<TKey, long> _queue = new();
 
         /// <summary>Every key with its deadline.</summary>
         internal Dictionary<TKey, long> Entries => _deadlines;
+
+        /// <summary>Entries in the queue, stale ones included.</summary>
+        internal int QueueCount => _queue.Count;
+
+        /// <summary>Entries the queue's array has room for: what it costs in memory.</summary>
+        internal int QueueCapacity => _queue.EnsureCapacity(0);
 
         internal bool TryGet(TKey key, out long deadline) => _deadlines.TryGetValue(key, out deadline);
 
@@ -347,6 +360,7 @@ public sealed class InMemoryStorageProvider : IStorageProvider
         {
             _deadlines.Clear();
             _queue.Clear();
+            _queue.TrimExcess();
         }
 
         public void AddAll(IReadOnlyList<TKey> keys, Func<TKey, long> deadlineOf)
@@ -369,9 +383,38 @@ public sealed class InMemoryStorageProvider : IStorageProvider
                 return;
             slot = deadline;
             _queue.Enqueue(key, deadline);
+
+            // A key that moved left its old entry behind.
+            if (held)
+                Compact();
         }
 
-        public void Remove(TKey key) => _deadlines.Remove(key);
+        public void Remove(TKey key)
+        {
+            if (_deadlines.Remove(key))
+                Compact();
+        }
+
+        /// <summary>Keeps the queue within its bound after a write that left an entry
+        /// stale. Keys mostly go in the order of their deadlines (a leader takes what is
+        /// due and a follower applies the tombstones), so the stale entry is usually at
+        /// the front and goes at once; one that is not waits there, and when such entries
+        /// outnumber the live ones the queue is built again from the map — a cost in
+        /// proportion to the writes that made them stale.</summary>
+        private void Compact()
+        {
+            while (_queue.TryPeek(out var front, out var deadline)
+                   && !(_deadlines.TryGetValue(front, out var current) && current == deadline))
+                _queue.Dequeue();
+
+            if (_queue.Count <= 2 * (long)_deadlines.Count + Slack)
+                return;
+            _queue.Clear();
+            foreach (var (key, deadline) in _deadlines)
+                _queue.Enqueue(key, deadline);
+            if (_queue.EnsureCapacity(0) > 2 * (long)_queue.Count + Slack)
+                _queue.TrimExcess();
+        }
 
         public void TakeDue(long upTo, List<TKey> into) => TakeDue(upTo, into, null);
 
