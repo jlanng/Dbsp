@@ -2279,15 +2279,20 @@ the ceiling in half the runs and the sink was silent for up to a minute.
 **The leadership does not move for one broker.** If the brokers lose their quorum for
 longer than `TakeoverCeiling`, the standby asks them whether anybody could commit
 before it takes over from a leader that still answers; while a partition of the log has
-no leader, or fewer replicas in sync than `min.insync.replicas`, it waits, and for a
-few seconds after they are back, so that the leader can be heard first. What a leader
+no leader that answers, or fewer replicas in sync that answer than
+`min.insync.replicas`, it waits, and for a few seconds after they are back, so that the
+leader can be heard first. It asks each broker itself: the cluster's own lists of who
+leads and who is in sync stop changing when the controllers have lost their quorum,
+and go on naming brokers that are gone. What a leader
 does not survive is `KafkaLogOptions.TransactionTimeout` (60 s) without a commit: its
 open transaction fails for good, the node ends with exit code 3, and the standby — or
 the node itself, started again — leads when the brokers return. Raise that timeout if
 your brokers may be without a quorum for longer and you would rather keep the leader.
 
-A standby that does start a takeover stops if the leader is heard again before the
-fence. And a takeover that is itself fenced before it has committed anything — which a replaced
+A standby that does start a takeover stops if the leader is heard again before it has
+taken the log (the transactional id). Once it has, the leader is fenced whatever it
+did a moment before, and the takeover goes through — a standby that stood down there
+would leave nobody leading. And a takeover that is itself fenced before it has committed anything — which a replaced
 leader's Kafka client can do to its successor through the transaction coordinator, and
 once did, leaving two fenced nodes — no longer ends the node: it stands by again and
 takes over a few seconds later. The node that *was* the writer and is fenced still
