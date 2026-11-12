@@ -441,13 +441,29 @@ internal sealed class TableHandle<TKey, TRow>(TableRegistry registry, TableDefin
                 _loaderState == TableSourceState.Waiting ? _waitingFor : null, _loaderState == TableSourceState.Waiting ? LoaderWaitingSince : null)
             : null;
 
+        // A log that keeps its history in this process holds the superseded rows of every
+        // version it retains, not only of the table's recent ones; the newest are the
+        // same objects, so the larger of the two counts is the one that stands.
+        var memory = table?.EstimateMemory();
+        if (memory is not null && log is InMemoryTableLog<TKey, TRow> held && held.RetainedChanges > memory.HistoryChanges)
+        {
+            var changes = held.RetainedChanges;
+            memory = memory with
+            {
+                HistoryChanges = changes,
+                HistoryRows = changes,
+                HistoryBytes = (long)(changes * (memory.MeanRowBytes + System.Runtime.CompilerServices.Unsafe.SizeOf<TableChange<TKey, TRow>>())),
+            };
+        }
+
         return new TableStats(
             Spec.Name, typeof(TKey).Name, typeof(TRow).Name, table?.Epoch ?? "", table?.IsFollowing ?? false,
             State, Fault,
             table?.Count ?? 0, version, log?.OldestRetainedVersion ?? 0, _rate,
             _configured.Indexes.Select(i => i.Name).ToList(), writer,
             loader, lag, readerStats, _floorHeldBy,
-            _configured.Indexes.ToDictionary(i => i.Name, i => i.KeyType.Name, StringComparer.Ordinal));
+            _configured.Indexes.ToDictionary(i => i.Name, i => i.KeyType.Name, StringComparer.Ordinal),
+            memory);
     }
 
     // Rows are contract types, which never unload, so one options instance serves.

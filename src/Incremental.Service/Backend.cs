@@ -125,41 +125,6 @@ public sealed record KafkaLeadershipDetail(
 public sealed record PeerInfo(
     string NodeId, NodeRole Role, long Term, bool Ready, string? NotReadyReason, string? AdminUrl = null, ProcessMemory? Memory = null);
 
-/// <summary>What a node's process holds, read from the runtime when asked.
-/// <c>WorkingSetBytes</c> is the operating system's figure for the process;
-/// <c>GcHeapBytes</c> the managed heap in use as of the last collection plus what was
-/// allocated since (<see cref="GC.GetTotalMemory"/>, not forcing a collection);
-/// <c>GcCommittedBytes</c> what the collector has committed for it;
-/// <c>GcPausePercent</c> the share of the process's life spent paused in collections
-/// (<see cref="GCMemoryInfo.PauseTimePercentage"/>); <c>Gen2Collections</c> how many full
-/// collections there have been. Two in-memory nodes share a process and report the same.</summary>
-public sealed record ProcessMemory(long WorkingSetBytes, long GcHeapBytes, long GcCommittedBytes, double GcPausePercent, int Gen2Collections)
-{
-    public static ProcessMemory Read()
-    {
-        var info = GC.GetGCMemoryInfo();
-        return new ProcessMemory(
-            Environment.WorkingSet, GC.GetTotalMemory(false), info.TotalCommittedBytes, info.PauseTimePercentage, GC.CollectionCount(2));
-    }
-
-    /// <summary>One token for the probe line: five numbers, comma-separated.</summary>
-    internal string Encode() => string.Create(System.Globalization.CultureInfo.InvariantCulture,
-        $"{WorkingSetBytes},{GcHeapBytes},{GcCommittedBytes},{GcPausePercent:0.##},{Gen2Collections}");
-
-    internal static ProcessMemory? Decode(string text)
-    {
-        var parts = text.Split(',');
-        var culture = System.Globalization.CultureInfo.InvariantCulture;
-        return parts.Length == 5
-            && long.TryParse(parts[0], System.Globalization.NumberStyles.Integer, culture, out var workingSet)
-            && long.TryParse(parts[1], System.Globalization.NumberStyles.Integer, culture, out var heap)
-            && long.TryParse(parts[2], System.Globalization.NumberStyles.Integer, culture, out var committed)
-            && double.TryParse(parts[3], System.Globalization.NumberStyles.Float, culture, out var pause)
-            && int.TryParse(parts[4], System.Globalization.NumberStyles.Integer, culture, out var gen2)
-            ? new ProcessMemory(workingSet, heap, committed, pause, gen2)
-            : null;
-    }
-}
 
 public sealed record LeadershipCallbacks(
     Func<CancellationToken, Task> PrepareAsync,

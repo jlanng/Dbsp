@@ -121,7 +121,7 @@
             card('Tables', plural(tables.total, 'table'),
               tables.items.length === 0 ? empty('No tables are declared', 'Shared tables appear here once the host or the API declares them.')
                 : h('div', { class: 'table-wrap' }, h('table', { class: 'data cards' },
-                  h('thead', null, h('tr', null, h('th', null, 'Table'), h('th', null, 'State'), h('th', { class: 'r' }, 'Rows'), h('th', { class: 'r' }, 'Version'), h('th', { class: 'r' }, standby ? 'Behind' : 'Readers'))),
+                  h('thead', null, h('tr', null, h('th', null, 'Table'), h('th', null, 'State'), h('th', { class: 'r' }, 'Rows'), h('th', { class: 'r', title: 'Managed heap on this node, estimated: rows, indexes and retained history' }, 'Memory'), h('th', { class: 'r' }, 'Version'), h('th', { class: 'r' }, standby ? 'Behind' : 'Readers'))),
                   h('tbody', null, tables.items.map(t => h('tr', { key: t.name },
                     td('Table', 'id', tableLink(t.name)),
                     td('State', null, tableBadge(t.state)),
@@ -160,6 +160,7 @@
     in: p => (ratesOf(p.id) || p.rates || {}).in ?? -1, out: p => (ratesOf(p.id) || p.rates || {}).out ?? -1,
     step: p => (ratesOf(p.id) || p.rates || {}).stepMs ?? -1, lag: p => (ratesOf(p.id) || p.rates || {}).lag ?? -1,
     dead: p => p.deadLetters, since: p => -new Date(p.since || 0).getTime(),
+    'state-size': p => (p.stateSize ? p.stateSize.bytes : -1),
   };
 
   function sortHeader(ctx, key, label, cls) {
@@ -221,7 +222,7 @@
               h('thead', null, h('tr', null,
                 sortHeader(ctx, 'id', 'Pipeline'), sortHeader(ctx, 'state', 'State'), sortHeader(ctx, 'definition', 'Definition'),
                 sortHeader(ctx, 'in', 'In /s', 'r'), h('th', null, h('span', { class: 'sr' }, 'Records in, last minute')), sortHeader(ctx, 'out', 'Out /s', 'r'),
-                sortHeader(ctx, 'step', 'Step', 'r'), sortHeader(ctx, 'lag', 'Lag', 'r'), sortHeader(ctx, 'dead', 'Dead letters', 'r'), sortHeader(ctx, 'since', 'In state', 'r'))),
+                sortHeader(ctx, 'step', 'Step', 'r'), sortHeader(ctx, 'lag', 'Lag', 'r'), sortHeader(ctx, 'state-size', 'State size', 'r'), sortHeader(ctx, 'dead', 'Dead letters', 'r'), sortHeader(ctx, 'since', 'In state', 'r'))),
               h('tbody', null, shown.map(p => {
                 const r = ratesOf(p.id) || p.rates || {};
                 return h('tr', { key: p.id },
@@ -234,6 +235,8 @@
                   td('Step', 'r', r.batchedEveryS ? h('span', { title: `It has stepped about every ${r.batchedEveryS} s lately — a sink’s minimum interval, or an input that is quiet; rates are over the last ${r.rateOverS} s` }, `every ${r.batchedEveryS} s`)
                     : r.stepMs == null ? '–' : fmtMs(r.stepMs)),
                   td('Lag', 'r', r.lag == null ? '–' : fmtNum(r.lag)),
+                  td('State size', 'r', !p.stateSize || !p.stateSize.entries ? h('span', { class: 'muted' }, 'none')
+                    : [fmtNum(p.stateSize.entries), h('span', { class: 'sub' }, '≈ ' + fmtBytes(p.stateSize.bytes))]),
                   td('Dead letters', 'r', p.deadLetters ? h('a', { href: '#/pipelines/' + enc(p.id) + '/dead-letters' }, fmtNum(p.deadLetters)) : '0'),
                   td('In state', 'r', timeEl(p.since)));
               })))),
@@ -380,6 +383,8 @@
                 h('td', { class: 'id' }, sink.slot), h('td', { class: 'r' }, fmtNum(sink.batches)), h('td', { class: 'r' }, fmtNum(sink.upserts)),
                 h('td', { class: 'r' }, fmtNum(sink.deletes)), h('td', { class: 'r' }, fmtNum(sink.appends)),
                 h('td', null, sink.writeInFlightSince ? ['in flight since ', timeEl(sink.writeInFlightSince)] : h('span', { class: 'muted' }, 'idle'))))))))),
+
+      stateCard(detail),
 
       h('div', { class: 'grid two' },
         card('Tables', 'the version its checkpoint has committed, beside the table’s',
@@ -803,6 +808,7 @@
                 td('Table', 'id', tableLink(t.name), h('span', { class: 'sub' }, `${t.keyType} → ${t.rowType}`)),
                 td('State', null, tableBadge(t.state)),
                 td('Rows', 'r', fmtNum(t.rows)),
+                td('Memory', 'r', t.memory ? '≈ ' + fmtBytes(t.memory.totalBytes) : '–'),
                 td('Version', 'r', fmtInt(t.version)),
                 td(standby ? 'Behind' : 'Versions /s', 'r', standby ? (t.lagVersions == null ? '–' : fmtInt(t.lagVersions)) : fmtNum(t.versionsPerSecond)),
                 td('Written by', null, t.writer ? writerText(t.writer) : '–'),
@@ -895,23 +901,60 @@
     },
   };
 
-  /** What the table holds, estimated — and said to be. */
+  /** What the table holds in this node's memory, estimated — and said to be. */
   function sizeCard(detail) {
-    const z = detail.size;
-    if (!z) return card('Estimated size', null, empty('Not estimated', 'The table is not open on this node.'));
-    const total = z.rowsBytes + (z.historyBytes || 0);
-    return card('Estimated size', `about ${fmtBytes(Math.round(total))} of row data on this node`,
+    const z = detail.size, m = detail.table.memory;
+    if (!m) return card('Memory', null, empty('Not estimated', 'The table is not open on this node.'));
+    const rows = detail.table.rows;
+    const perRow = rows ? m.rowBytes / rows : 0;
+    return card('Memory', `about ${fmtBytes(m.totalBytes)} of this node’s managed heap`,
       h('div', { class: 'stack' },
         h('div', { class: 'tiles plain' },
-          tile('Rows', '≈ ' + fmtBytes(Math.round(z.rowsBytes)), '', `${fmtInt(z.rows)} rows × ${fmtNum(z.meanRowBytes)} B`),
-          tile('Retained history', z.historyBytes == null ? 'not here' : '≈ ' + fmtBytes(Math.round(z.historyBytes)), '',
-            z.historyBytes == null ? `${fmtInt(z.retainedVersions)} versions, held by the log’s brokers` : `${fmtInt(z.historyChanges)} row changes in ${plural(z.retainedVersions, 'version')}`),
-          tile('Mean row', fmtNum(z.meanRowBytes), 'B', `as JSON, over ${plural(z.sampledRows, 'sampled row')}`)),
+          tile('Rows', '≈ ' + fmtBytes(m.rowBytes), '', `${fmtInt(rows)} rows × ${fmtNum(Math.round(perRow))} B, the key map included`),
+          tile('Indexes', '≈ ' + fmtBytes(m.indexBytes), '', detail.table.indexes.length === 0 ? 'none declared' : `${plural(detail.table.indexes.length, 'index', 'indexes')}: their own maps and groups`),
+          tile('Retained history', '≈ ' + fmtBytes(m.historyBytes), '', `${plural(m.historyRows, 'superseded row')} in ${plural(m.historyChanges, 'recent change')}`),
+          tile('One row', fmtNum(m.meanRowBytes), 'B', m.sampledRows ? `its objects, over ${plural(m.sampledRows, 'row')} sized as written` : 'no row sized yet')),
         h('p', { class: 'help' },
-          `How this is estimated: the first ${fmtInt(z.sampledRows)} rows in the table’s own order are written as JSON, and their mean length in UTF-8 bytes is multiplied by the row count`,
-          z.historyChanges != null ? ' and by the row changes the retained history holds' : '',
-          '. It is the size of the data, not of the process’s memory: a row is held as a .NET object beside the key map and the indexes, which is usually a few times more and is not measured. ',
-          'The process’s memory as a whole is on the ', h('a', { href: '#/cluster' }, 'cluster page'), '. Estimated ', timeEl(z.at), '; kept for half a minute.')),
+          'How this is estimated: rows are sized as they are written or restored — each of the first 256, then one in 512 — by reading their fields: the object, its strings and whatever else only it refers to, with headers and rounding as the runtime allocates them. ',
+          'The mean is multiplied by the row count, and the key map’s cost per row added. An index is its own map per group and one key per row; history is the rows the recent versions replaced or removed, which only those versions keep alive. ',
+          'A string instance shared by many rows is counted in each, so a table of such rows is overstated. ',
+          z ? ['As data the rows are smaller: about ', h('strong', { class: 'num' }, fmtBytes(Math.round(z.rowsBytes))), ` (${fmtNum(z.meanRowBytes)} B a row as JSON, from ${plural(z.sampledRows, 'sampled row')}`,
+            z.historyBytes == null ? `; ${fmtInt(z.retainedVersions)} versions of history are held by the log’s brokers, not here` : `; the log holds ${fmtInt(z.historyChanges)} row changes of history in this process`, '). '] : '',
+          'The process as a whole is on the ', h('a', { href: '#/cluster' }, 'cluster page'), '.')),
+      { flush: false });
+  }
+
+  const STORE_KINDS = {
+    value: 'one value per key', indexed: 'weighted values under a key', weight: 'weighted values', deadline: 'a deadline per key',
+    bytes: 'as bytes: no circuit built on this node has given it types',
+  };
+
+  /** What the pipeline's state holds in this node's memory, store by store. */
+  function stateCard(detail) {
+    const z = detail.pipeline.stateSize, stores = detail.stateStores || [];
+    if (!z || (!z.entries && stores.length === 0))
+      return card('State', null, empty('No state', 'This pipeline keeps nothing between steps on this node, or has not committed yet.'));
+    return card('State', `${plural(z.entries, 'entry', 'entries')} · about ${fmtBytes(z.bytes)} of this node’s managed heap`,
+      h('div', { class: 'stack' },
+        z.entriesHeldTwice > 0 && notice('info', h('strong', null, `${fmtNum(z.entriesHeldTwice)} entries are held twice. `),
+          `The circuit was built on restored state and has not committed since, so the bytes it was built from are still kept beside it — about ${fmtBytes(z.bytesHeldTwice)}. They go at its first commit after a record arrives`,
+          detail.pipeline.state === 'Built' ? ' on the leader.' : '.'),
+        z.entriesAsBytes > 0 && z.entriesAsBytes === z.entries && notice('info', 'This node follows the state as bytes: it has no circuit built for this pipeline.'),
+        h('div', { class: 'table-wrap' }, h('table', { class: 'data' },
+          h('thead', null, h('tr', null, h('th', null, 'Store'), h('th', null, 'Kind'), h('th', { class: 'r' }, 'Entries'), h('th', { class: 'r' }, 'Memory'),
+            h('th', { class: 'r', title: 'The objects of one entry’s key and value, from entries sized as they were written or read' }, 'One entry'),
+            h('th', { class: 'r', title: 'Mean size of the store’s records in the state changelog, before compression' }, 'One record'))),
+          h('tbody', null, stores.map(st => h('tr', { key: st.name },
+            h('td', { class: 'id wrap' }, st.name),
+            h('td', null, h('span', { class: 'tag', title: STORE_KINDS[st.kind] || '' }, st.kind)),
+            h('td', { class: 'r' }, fmtInt(st.entries)),
+            h('td', { class: 'r' }, '≈ ' + fmtBytes(st.estimatedBytes)),
+            h('td', { class: 'r' }, st.sampledEntries ? fmtNum(st.meanEntryBytes) + ' B' : '–'),
+            h('td', { class: 'r' }, st.meanRecordBytes ? fmtNum(st.meanRecordBytes) + ' B' : '–')))))),
+        z.stores > stores.length && h('p', { class: 'help' }, `The ${fmtInt(stores.length)} largest of ${fmtInt(z.stores)} stores.`),
+        h('p', { class: 'help' },
+          'Entries are counted. Memory is estimated: the objects of an entry — sized as entries are written to the changelog or read from it, each of a store’s first 256 and then one in 512 — times the entries, plus the store’s own maps. ',
+          'An object two stores share is counted in both. A state that grows without end shows here first.')),
       { flush: false });
   }
 
@@ -1231,10 +1274,16 @@
         ['Finishing', take.finish, 'record the seeds, prune the plugin cache, start the loaders'],
       ].filter(([, v]) => v != null) : [];
       const stageTotal = stages.reduce((a, [, v]) => a + v, 0) || 1;
+      const gcText = g => [g.server ? 'server' : 'workstation', g.server && (g.dynamic ? 'heaps adapt' : g.heaps > 0 ? plural(g.heaps, 'heap') : 'a heap per core'),
+        g.concurrent ? 'concurrent' : 'not concurrent', g.conserveMemory > 0 && `conserve ${g.conserveMemory}`, g.heapHardLimitBytes > 0 && `limit ${fmtBytes(g.heapHardLimitBytes)}`].filter(Boolean).join(' · ');
       const memoryRows = m => (m ? [
         ['Working set', [h('strong', { class: 'num' }, fmtBytes(m.workingSetBytes)), h('span', { class: 'muted' }, ' · what the operating system counts for the process')]],
-        ['GC heap', [h('strong', { class: 'num' }, fmtBytes(m.gcHeapBytes)), h('span', { class: 'muted' }, ` in use · ${fmtBytes(m.gcCommittedBytes)} committed`)]],
-        ['GC pauses', [h('strong', { class: 'num' }, fmtNum(m.gcPausePercent) + ' %'), h('span', { class: 'muted' }, ` of the process’s life · ${plural(m.gen2Collections, 'full collection')}`)]],
+        ['GC heap', [h('strong', { class: 'num' }, fmtBytes(m.gcLiveBytes || m.gcHeapBytes)), h('span', { class: 'muted' },
+          m.gcLiveBytes ? ` live at the last collection · ${fmtBytes(m.gcCommittedBytes)} committed` : ` in use · ${fmtBytes(m.gcCommittedBytes)} committed`)]],
+        m.otherBytes != null && ['Not the collector’s', [h('strong', { class: 'num' }, fmtBytes(m.otherBytes)), h('span', { class: 'muted' }, ' · the Kafka client’s buffers, the runtime, thread stacks')]],
+        ['GC pauses', [h('strong', { class: 'num' }, fmtNum(m.gcPauseRecentPercent != null ? m.gcPauseRecentPercent : m.gcPausePercent) + ' %'), h('span', { class: 'muted' },
+          m.gcPauseRecentPercent != null ? ` of the last minute · ${fmtNum(m.gcPausePercent)} % of the process’s life · ${plural(m.gen2Collections, 'full collection')}` : ` of the process’s life · ${plural(m.gen2Collections, 'full collection')}`)]],
+        m.gc && ['Collector', h('span', { class: 'muted' }, gcText(m.gc))],
       ] : []);
 
       const selfCard = h('section', { class: 'card nodecard self', 'aria-label': 'This node' },
@@ -1294,6 +1343,8 @@
               })()],
             ])), { flush: false }),
 
+        holdsCard(node),
+
         (() => {
           // How each pipeline's last start went: a takeover's cost is in here, pipeline by pipeline.
           const started = pipelines.items.filter(p => p.lastStart).sort((a, b) => b.lastStart.total - a.lastStart.total);
@@ -1345,6 +1396,54 @@
   // ── audit ───────────────────────────────────────────────────────────────────────────
 
   /** Who made a change, and how far that is known. */
+  /** Where this node's memory is: what it holds by name, set against the process's figures. */
+  function holdsCard(node) {
+    const m = node.memory, x = node.holds;
+    if (!m || !x) return null;
+    const named = x.tableBytes + x.stateBytes;
+    const live = m.gcLiveBytes || m.gcHeapBytes;
+    const rest = Math.max(0, live - named);
+    const slack = Math.max(0, m.gcCommittedBytes - live);
+    const parts = [
+      ['Tables', x.tableBytes, 'hold-1', `${plural(x.tableCount, 'table')}: rows, indexes and retained history, estimated`],
+      ['Pipeline state', x.stateBytes, 'hold-2', `${plural(x.stateEntries, 'entry', 'entries')} in ${plural(x.pipelineCount, 'pipeline')}, estimated`],
+      ['Everything else on the heap', rest, 'hold-3', 'circuits, buffers in flight, the plugins’ and the runtime’s own objects — and whatever the two estimates miss'],
+      ['Committed and not in use', slack, 'hold-4', 'what the collector keeps ready beyond what was live at its last collection'],
+      m.otherBytes != null && ['Not the collector’s', m.otherBytes, 'hold-5', 'the Kafka client’s buffers, the runtime, thread stacks'],
+      m.otherBytes != null && ['The program itself', Math.max(0, m.workingSetBytes - m.gcCommittedBytes - m.otherBytes), 'hold-6', 'the runtime’s and the assemblies’ code, and other files mapped into the process'],
+    ].filter(Boolean);
+    const total = Math.max(1, parts.reduce((a, [, v]) => a + v, 0));
+    const bar = h('div', { class: 'holdbar', role: 'img', 'aria-label': 'This node’s memory by what holds it: ' + parts.map(([l, v]) => `${l} ${fmtBytes(v)}`).join(', ') },
+      parts.map(([label, value, fill]) => {
+        const piece = h('span', { class: fill, title: `${label}: ${fmtBytes(value)}` });
+        piece.style.width = (100 * value / total).toFixed(2) + '%';
+        return piece;
+      }));
+    return card('Memory', `${fmtBytes(m.workingSetBytes)} working set · ${fmtBytes(named)} of it is tables and state by name`,
+      h('div', { class: 'stack' },
+        bar,
+        h('table', { class: 'data' },
+          h('tbody', null, parts.map(([label, value, fill, help]) => h('tr', { key: label },
+            h('td', null, h('span', { class: ['swatch', fill] }), ' ', label, h('span', { class: 'sub' }, help)),
+            h('td', { class: 'r num' }, (label === 'Tables' || label === 'Pipeline state' ? '≈ ' : '') + fmtBytes(value)))))),
+        h('div', { class: 'grid two' },
+          x.tables.length > 0 && h('div', null, h('h3', { class: 'minor' }, 'Largest tables'),
+            h('table', { class: 'data' }, h('tbody', null, x.tables.map(t => h('tr', { key: t.name },
+              h('td', { class: 'id' }, tableLink(t.name)), h('td', { class: 'r' }, fmtNum(t.rows) + ' rows'), h('td', { class: 'r' }, '≈ ' + fmtBytes(t.bytes))))))),
+          x.pipelines.some(p => p.bytes > 0) && h('div', null, h('h3', { class: 'minor' }, 'Largest state'),
+            h('table', { class: 'data' }, h('tbody', null, x.pipelines.filter(p => p.bytes > 0).map(p => h('tr', { key: p.id },
+              h('td', { class: 'id' }, pipelineLink(p.id)), h('td', { class: 'r' }, fmtNum(p.entries) + ' entries'), h('td', { class: 'r' }, '≈ ' + fmtBytes(p.bytes)))))))),
+        node.memoryRelease && h('p', { class: 'help' },
+          'Given back to the operating system since this process started: ', h('strong', { class: 'num' }, fmtBytes(node.memoryRelease.nativeReturnedBytesTotal)),
+          ' the Kafka client had freed and the C allocator kept',
+          node.memoryRelease.collectionsInducedTotal > 0 ? `; ${plural(node.memoryRelease.collectionsInducedTotal, 'young collection')} asked for so that the collector would let go of what a burst left it holding` : '',
+          '. Last looked at ', timeEl(node.memoryRelease.at), '.'),
+        h('p', { class: 'help' },
+          'The working set is what a machine or a container has to give this node. Tables and state are estimates made from sampled rows and entries (each table’s and pipeline’s page says how); the rest are the runtime’s own figures, read a moment ago. ',
+          'The guide’s “Sizing a node” has the arithmetic for a deployment that does not exist yet.')),
+      { flush: false });
+  }
+
   function callerCell(caller) {
     const stated = ' (self-declared)';
     if (caller === 'local') return h('span', { class: 'muted', title: 'An unauthenticated loopback caller who gave no name: nothing more is known. Set your name with the button in the header, or have the host authenticate operators.' }, 'local · unnamed');

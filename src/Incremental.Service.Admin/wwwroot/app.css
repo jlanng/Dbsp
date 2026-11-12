@@ -19,6 +19,7 @@
   --series-in: #2a78d6;
   --series-out: #eb6834;
   --series-neutral: #898781;
+  --cat-1: #2a78d6; --cat-2: #eb6834; --cat-3: #1baf7a; --cat-4: #eda100; --cat-5: #e87ba4; --cat-6: #008300;
   --good: #0ca30c;
   --good-ink: #006300;
   --good-wash: #e4f4e2;
@@ -45,6 +46,7 @@
     --line: #2c2c2a; --line-strong: #454541;
     --accent: #86b6ef; --accent-ink: #0b0b0b; --accent-wash: #15273d; --focus: #6da7ec;
     --series-in: #3987e5; --series-out: #d95926; --series-neutral: #898781;
+  --cat-1: #3987e5; --cat-2: #d95926; --cat-3: #199e70; --cat-4: #c98500; --cat-5: #d55181; --cat-6: #008300;
     --good-ink: #5fd05f; --good-wash: #10280f;
     --warn-ink: #fab219; --warn-wash: #2e2206;
     --serious-ink: #f2a384; --serious-wash: #33180c;
@@ -60,6 +62,7 @@
   --line: #2c2c2a; --line-strong: #454541;
   --accent: #86b6ef; --accent-ink: #0b0b0b; --accent-wash: #15273d; --focus: #6da7ec;
   --series-in: #3987e5; --series-out: #d95926; --series-neutral: #898781;
+  --cat-1: #3987e5; --cat-2: #d95926; --cat-3: #199e70; --cat-4: #c98500; --cat-5: #d55181; --cat-6: #008300;
   --good-ink: #5fd05f; --good-wash: #10280f;
   --warn-ink: #fab219; --warn-wash: #2e2206;
   --serious-ink: #f2a384; --serious-wash: #33180c;
@@ -303,6 +306,12 @@ dl.kv dd { min-width: 0; overflow-wrap: anywhere; }
 .statebar span { min-width: 4px; }
 .fill-good { background: var(--good); } .fill-warn { background: var(--warn); } .fill-serious { background: var(--serious); }
 .fill-crit { background: var(--crit); } .fill-idle { background: var(--line-strong); } .fill-info { background: var(--series-in); }
+/* Parts of a whole by what they are (never by state): six fixed hues, a surface gap between them. */
+.holdbar { display: flex; height: 14px; border-radius: 4px; overflow: hidden; gap: 2px; background: var(--surface); }
+.holdbar span { min-width: 2px; }
+.hold-1 { background: var(--cat-1); } .hold-2 { background: var(--cat-2); } .hold-3 { background: var(--cat-3); }
+.hold-4 { background: var(--cat-4); } .hold-5 { background: var(--cat-5); } .hold-6 { background: var(--cat-6); }
+h3.minor { font-size: 12px; color: var(--ink-3); font-weight: 600; margin-bottom: 4px; }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12.5px; color: var(--ink-2); }
 .legend li { display: flex; align-items: center; gap: 6px; }
 .meter { height: 6px; border-radius: 3px; background: var(--sunken); overflow: hidden; min-width: 60px; }

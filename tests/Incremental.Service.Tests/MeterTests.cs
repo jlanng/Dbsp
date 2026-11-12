@@ -154,6 +154,23 @@ public class MeterTests
         Assert.Equal(service.Tables.Stats("instruments").Version, Value(seen, "incremental.service.table.version", n, ("table", "instruments")));
         Assert.Null(Value(seen, "incremental.service.table.lag", n, ("table", "instruments")));               // a leader follows nothing
 
+        // What it holds: a table by part, a pipeline's state, and the process around them.
+        var held = service.Tables.Stats("instruments").Memory!;
+        Assert.Equal(held.RowBytes, Value(seen, "incremental.service.table.memory", n, ("table", "instruments"), ("part", "rows")));
+        Assert.Equal(held.IndexBytes, Value(seen, "incremental.service.table.memory", n, ("table", "instruments"), ("part", "indexes")));
+        Assert.Equal(held.HistoryBytes, Value(seen, "incremental.service.table.memory", n, ("table", "instruments"), ("part", "history")));
+        Assert.True(held.RowBytes > 10 * 100, $"ten rows estimated at {held.RowBytes} bytes");
+        Assert.Equal(3, seen.Count(m => m.Instrument == "incremental.service.table.memory"));
+        Assert.Equal(5, Value(seen, "incremental.service.pipeline.state_entries", n, ("pipeline", "ok")));  // one count per trader
+        Assert.InRange(Value(seen, "incremental.service.pipeline.state_memory", n, ("pipeline", "ok"))!.Value, 5 * 30, 5 * 2000);
+        Assert.Equal(0, Value(seen, "incremental.service.pipeline.state_entries", n, ("pipeline", "bad")));
+        var working = Value(seen, "incremental.service.process.working_set", n)!.Value;
+        var live = Value(seen, "incremental.service.process.gc.live", n)!.Value;
+        var committed = Value(seen, "incremental.service.process.gc.committed", n)!.Value;
+        Assert.True(working > live && committed >= live && live > 0, $"working set {working}, committed {committed}, live {live}");
+        if (OperatingSystem.IsLinux())
+            Assert.InRange(Value(seen, "incremental.service.process.other", n)!.Value, 0, working);
+
         // What happened: the takeover and its stages, the faults and the restarts between them.
         var events = collected.Events;
         Assert.Equal(1, Value(events, "incremental.service.takeovers", n));
@@ -164,8 +181,9 @@ public class MeterTests
         Assert.Equal(policy.MaxRestarts, events.Count(e => e.Instrument == "incremental.service.pipeline.restarts" && e.Tags["pipeline"] == "bad"));
         Assert.DoesNotContain(events, e => e.Instrument.StartsWith("incremental.service.pipeline.") && e.Tags["pipeline"] == "ok");
 
-        // Tags: the node, a pipeline or table name, or one of three closed sets. Nothing else.
-        string[] allowed = ["node", "pipeline", "table", "state", "role", "stage"];
+        // Tags: the node, a pipeline or table name, or one of four closed sets. Nothing else.
+        string[] allowed = ["node", "pipeline", "table", "state", "role", "stage", "part"];
+        Assert.Equal(["history", "indexes", "rows"], seen.Where(m => m.Tags.ContainsKey("part")).Select(m => m.Tags["part"]).Distinct().Order());
         Assert.All(seen.Concat(events), m => Assert.Subset(allowed.ToHashSet(), m.Tags.Keys.ToHashSet()));
         Assert.All(seen.Concat(events), m => Assert.StartsWith("incremental.service.", m.Instrument));
     }
@@ -195,6 +213,10 @@ public class MeterTests
         Assert.Equal(0, Value(onB, "incremental.service.node.state_lag", nb));
         Assert.Equal(0, Value(onB, "incremental.service.table.lag", nb, ("table", "instruments")));
         Assert.Equal(5, Value(onB, "incremental.service.table.rows", nb, ("table", "instruments")));
+        // A standby holds what the leader holds: the rows, and the state it follows.
+        Assert.True(Value(onB, "incremental.service.table.memory", nb, ("table", "instruments"), ("part", "rows")) > 5 * 100);
+        Assert.Equal(5, Value(onB, "incremental.service.pipeline.state_entries", nb, ("pipeline", "p")));
+        Assert.True(Value(onB, "incremental.service.pipeline.state_memory", nb, ("pipeline", "p")) > 0);
         Assert.Equal(1, Value(onB, "incremental.service.pipelines", nb, ("state", "Built")));
         // A standby runs nothing: it says nothing of whether a pipeline is up.
         Assert.Null(Value(onB, "incremental.service.pipeline.up", nb, ("pipeline", "p")));

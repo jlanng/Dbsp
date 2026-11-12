@@ -281,6 +281,11 @@ public sealed record TableReader(
 public sealed record UnreadableRecord(
     long Sequence, DateTimeOffset Time, string Position, string ExceptionType, string Message, string? Record);
 
+/// <remarks><c>Memory</c>: what the table holds on this node's managed heap — rows,
+/// indexes and retained history — estimated as
+/// <see cref="SharedTable{TKey,TRow}.EstimateMemory"/> says; where the table's log keeps
+/// its history in this process (the in-memory backend), that history is counted too.
+/// Null while the table is not open.</remarks>
 public sealed record TableStats(
     string Name, string KeyType, string RowType, string Epoch, bool Following,
     TableState State, string? Fault,
@@ -290,7 +295,8 @@ public sealed record TableStats(
     long? LagVersions,
     IReadOnlyList<TableReader> Readers,
     string? FloorHeldBy,
-    IReadOnlyDictionary<string, string>? IndexKeyTypes = null);
+    IReadOnlyDictionary<string, string>? IndexKeyTypes = null,
+    TableMemoryEstimate? Memory = null);
 
 /// <summary>
 /// An estimate of what a table holds on this node, made from a sample: the first

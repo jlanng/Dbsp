@@ -23,7 +23,8 @@ public sealed record PipelineMetrics(string Pipeline, IReadOnlyList<MetricSample
 
 internal readonly record struct PipelineSampleInput(
     string Id, long Generation, long RecordsOut, long? InputLag, long DeadLetters,
-    PipelineState State = PipelineState.Unbuilt, bool DesiredRunning = false, long SinkInFlightSinceTicks = 0);
+    PipelineState State = PipelineState.Unbuilt, bool DesiredRunning = false, long SinkInFlightSinceTicks = 0,
+    long StateEntries = 0, long StateBytes = 0);
 
 /// <summary>
 /// The numbers an operator looks at, kept in the process: one <see cref="MeterListener"/>
@@ -247,7 +248,7 @@ public sealed class ServiceMetrics : IDisposable
                 gauges[at++] = new PipelineGauge(
                     input.Id, input.State, input.DesiredRunning, input.InputLag, age,
                     input.SinkInFlightSinceTicks == 0 ? 0 : Math.Max(0, (now.UtcTicks - input.SinkInFlightSinceTicks) / (double)TimeSpan.TicksPerSecond),
-                    input.DeadLetters);
+                    input.DeadLetters, input.StateEntries, input.StateBytes);
 
                 steps += sample.Steps;
                 stepSeconds += sample.StepSeconds;

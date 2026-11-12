@@ -112,6 +112,16 @@ public sealed class ServiceOptions
     /// </summary>
     public bool WarmStandbyPipelines { get; set; } = true;
 
+    /// <summary>
+    /// How often the node gives back memory it holds and does not use: the Kafka
+    /// client's freed buffers, which the C allocator keeps, and the regions the collector
+    /// holds on to after a burst (<c>docs/enrichment-service.md</c>, <i>Sizing a node</i>).
+    /// The first is a call that costs about 0.1 s per 2 GB returned; the second is some
+    /// young-generation collections, asked for only while the collector has committed
+    /// well over what is live and is collecting seldom. Zero: never. Default 30 s.
+    /// </summary>
+    public TimeSpan ReleaseUnusedMemoryEvery { get; set; } = TimeSpan.FromSeconds(30);
+
     /// <summary>A test hook: awaited, with the pipeline's id, after a generation has been
     /// found not to fit the kept state and before the catalog commit that puts the previous
     /// spec back.</summary>

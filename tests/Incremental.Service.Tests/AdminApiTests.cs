@@ -366,6 +366,51 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         Assert.True(size.GetProperty("historyChanges").GetInt64() >= 300); // the in-memory log holds its history here
         Assert.True(size.GetProperty("historyBytes").GetInt64() >= size.GetProperty("rowsBytes").GetInt64());
 
+        // What the table takes of this node's heap is another figure, in three parts.
+        var table = (await Admin.Get("tables/instruments"))["table"];
+        var held = table.GetProperty("memory");
+        Assert.InRange(held.GetProperty("sampledRows").GetInt64(), 256, 300);
+        Assert.InRange(held.GetProperty("meanRowBytes").GetDouble(), 80, 600);
+        Assert.InRange(held.GetProperty("rowBytes").GetInt64(), (long)(300 * held.GetProperty("meanRowBytes").GetDouble()), (long)(300 * (held.GetProperty("meanRowBytes").GetDouble() + 150)));
+        Assert.Equal(
+            held.GetProperty("rowBytes").GetInt64() + held.GetProperty("indexBytes").GetInt64() + held.GetProperty("historyBytes").GetInt64(),
+            held.GetProperty("totalBytes").GetInt64());
+        Assert.True(held.GetProperty("rowBytes").GetInt64() > size.GetProperty("rowsBytes").GetInt64(), "objects outweigh their JSON");
+        Assert.Equal(
+            held.GetProperty("totalBytes").GetInt64() > 0,
+            (await Admin.Get("tables?limit=50"))["items"].EnumerateArray().Single(t => t.GetProperty("name").GetString() == "instruments").GetProperty("memory").GetProperty("totalBytes").GetInt64() > 0);
+
+        // A pipeline's state: entries and bytes in the list, store by store on its page.
+        var pipeline = await Admin.Get("pipelines/enrich-orders");
+        var state = pipeline["pipeline"].GetProperty("stateSize");
+        Assert.True(state.GetProperty("stores").GetInt32() >= 1);
+        Assert.Equal(0, state.GetProperty("entriesHeldTwice").GetInt64());
+        var stores = pipeline["stateStores"].EnumerateArray().ToList();
+        // The largest, and no more of them than any list here returns.
+        var maxRows = (await Admin.Get("info"))["maxRows"].GetInt32();
+        Assert.Equal(Math.Min(maxRows, state.GetProperty("stores").GetInt32()), stores.Count);
+        Assert.True(state.GetProperty("entries").GetInt64() >= stores.Sum(s => s.GetProperty("entries").GetInt64()));
+        Assert.All(stores, s => Assert.Contains(s.GetProperty("kind").GetString(), new[] { "weight", "indexed", "value", "deadline", "bytes" }));
+        Assert.Equal(stores.Select(s => s.GetProperty("estimatedBytes").GetInt64()).OrderDescending(), stores.Select(s => s.GetProperty("estimatedBytes").GetInt64()));
+        var listed = (await Admin.Get("pipelines?limit=50"))["items"].EnumerateArray().Single(p => p.GetProperty("id").GetString() == "enrich-orders");
+        Assert.Equal(state.GetProperty("stores").GetInt32(), listed.GetProperty("stateSize").GetProperty("stores").GetInt32());
+
+        // The node sets the two against its process: totals, the largest of each, and the
+        // collector's settings beside the figures they explain.
+        JsonElement holds = default;
+        await TestService.Eventually(() =>
+        {
+            holds = Admin.Get("node").GetAwaiter().GetResult().Body.TryGetProperty("holds", out var h) ? h : default;
+            return holds.ValueKind == JsonValueKind.Object && holds.GetProperty("tableBytes").GetInt64() > 0;
+        }, "the node's account of what it holds");
+        Assert.Equal((await Admin.Get("tables?limit=50"))["total"].GetInt32(), holds.GetProperty("tableCount").GetInt32());
+        Assert.InRange(holds.GetProperty("tables").GetArrayLength(), 1, 10);
+        Assert.InRange(holds.GetProperty("pipelines").GetArrayLength(), 1, 10);
+        Assert.Equal(holds.GetProperty("pipelines").EnumerateArray().Select(p => p.GetProperty("bytes").GetInt64()).OrderDescending(),
+            holds.GetProperty("pipelines").EnumerateArray().Select(p => p.GetProperty("bytes").GetInt64()));
+        Assert.True(memory.GetProperty("gc").TryGetProperty("server", out _));
+        Assert.True(memory.TryGetProperty("gcLiveBytes", out _));
+
         // A contract is used by the tables declared from its definitions.
         var contract = (await Admin.Get("plugins?limit=5"))["items"].EnumerateArray().Single(p => p.GetProperty("kind").GetString() == "Contract");
         Assert.Contains("instruments", contract.GetProperty("tables").EnumerateArray().Select(t => t.GetString()));

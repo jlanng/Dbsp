@@ -12,9 +12,9 @@ namespace Incremental.Service;
 /// (<c>AddMeter("Incremental", "Incremental.Service")</c>).
 /// <para>
 /// Tags are bounded by what is deployed: <c>node</c> (this node's id), <c>pipeline</c> (a
-/// pipeline id), <c>table</c> (a declared table's name), and three closed sets —
-/// <c>state</c>, <c>role</c>, <c>stage</c>. Nothing is tagged by key, record, offset,
-/// exception text or plugin version.
+/// pipeline id), <c>table</c> (a declared table's name), and four closed sets —
+/// <c>state</c>, <c>role</c>, <c>stage</c>, <c>part</c>. Nothing is tagged by key, record,
+/// offset, exception text or plugin version.
 /// </para>
 /// <para>
 /// The gauges are read from a snapshot each node refreshes once a second (tables every
@@ -101,7 +101,37 @@ public static class ServiceMeter
         Meter.CreateObservableGauge("incremental.service.table.loader_lag", () => Each<long>(g => g.Tables.Where(t => t.LoaderLag is not null).Select(t =>
                 new Measurement<long>(t.LoaderLag!.Value, Tag("node", g.Node), Tag("table", t.Name)))),
             "{record}", "On the leader: what the table's loader reports it has still to read from its source.");
+
+        // What the node holds, and what the process around it takes.
+        Meter.CreateObservableGauge("incremental.service.table.memory", () => Each<long>(g => g.Tables.SelectMany(t => new[]
+            {
+                new Measurement<long>(t.RowBytes, Tag("node", g.Node), Tag("table", t.Name), Tag("part", "rows")),
+                new Measurement<long>(t.IndexBytes, Tag("node", g.Node), Tag("table", t.Name), Tag("part", "indexes")),
+                new Measurement<long>(t.HistoryBytes, Tag("node", g.Node), Tag("table", t.Name), Tag("part", "history")),
+            })),
+            "By", "Estimated bytes of managed heap the table holds on this node, by part: rows (with the key map), indexes, history (superseded rows kept for readers).");
+        Meter.CreateObservableGauge("incremental.service.pipeline.state_entries", () => Each<long>(g => g.Pipelines.Select(p =>
+                new Measurement<long>(p.StateEntries, Tag("node", g.Node), Tag("pipeline", p.Id)))),
+            "{entry}", "Entries the pipeline's state holds on this node: one per record the state changelog holds for it.");
+        Meter.CreateObservableGauge("incremental.service.pipeline.state_memory", () => Each<long>(g => g.Pipelines.Select(p =>
+                new Measurement<long>(p.StateBytes, Tag("node", g.Node), Tag("pipeline", p.Id)))),
+            "By", "Estimated bytes of managed heap the pipeline's state holds on this node.");
+        Meter.CreateObservableGauge("incremental.service.process.working_set", () => Process(m => m.WorkingSetBytes),
+            "By", "The process's working set, as the operating system counts it.");
+        Meter.CreateObservableGauge("incremental.service.process.gc.live", () => Process(m => m.GcLiveBytes),
+            "By", "What the managed heap held at the end of the last collection, less the free space inside it.");
+        Meter.CreateObservableGauge("incremental.service.process.gc.committed", () => Process(m => m.GcCommittedBytes),
+            "By", "What the collector has committed for the managed heap.");
+        Meter.CreateObservableGauge("incremental.service.process.other", () => Process(m => m.OtherBytes),
+            "By", "Anonymous resident memory that is not the collector's: the Kafka client's buffers, the runtime, thread stacks. Linux only.");
+        Meter.CreateObservableGauge("incremental.service.process.gc.pause_ratio", () => Each<double>(g => g.Memory?.GcPauseRecentPercent is { } percent
+                ? [new Measurement<double>(percent / 100, Tag("node", g.Node))]
+                : []),
+            "1", "The share of the last minute the process spent paused in collections, 0 to 1.");
     }
+
+    private static IEnumerable<Measurement<long>> Process(Func<ProcessMemory, long?> of) =>
+        Each<long>(g => g.Memory is { } memory && of(memory) is { } value ? [new Measurement<long>(value, Tag("node", g.Node))] : []);
 
     private static readonly NodeRole[] Roles = Enum.GetValues<NodeRole>();
     private static readonly PipelineState[] States = Enum.GetValues<PipelineState>();
@@ -127,11 +157,14 @@ public static class ServiceMeter
 }
 
 internal readonly record struct PipelineGauge(
-    string Id, PipelineState State, bool DesiredRunning, long? SourceLag, double? CheckpointAgeSeconds, double SinkAckWaitSeconds, long DeadLetters);
+    string Id, PipelineState State, bool DesiredRunning, long? SourceLag, double? CheckpointAgeSeconds, double SinkAckWaitSeconds, long DeadLetters,
+    long StateEntries = 0, long StateBytes = 0);
 
-internal readonly record struct TableGauge(string Name, TableState State, long Rows, long Version, long? FollowerLag, long? LoaderLag);
+internal readonly record struct TableGauge(
+    string Name, TableState State, long Rows, long Version, long? FollowerLag, long? LoaderLag,
+    long RowBytes = 0, long IndexBytes = 0, long HistoryBytes = 0);
 
 /// <summary>What one node last knew of itself, for the gauges to read.</summary>
 internal sealed record GaugeSnapshot(
     string Node, NodeRole Role, long Term, int Health, bool? StandbyReady, long? StateLag, long CatalogVersion,
-    IReadOnlyDictionary<PipelineState, int> PipelinesByState, PipelineGauge[] Pipelines, TableGauge[] Tables);
+    IReadOnlyDictionary<PipelineState, int> PipelinesByState, PipelineGauge[] Pipelines, TableGauge[] Tables, ProcessMemory? Memory = null);

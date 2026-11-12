@@ -492,6 +492,10 @@ public sealed record SinkSlotStatus(string Slot, long Batches, long Upserts, lon
 /// there (<see cref="SourceStats.WaitingFor"/>); null while it does not.</summary>
 public sealed record SourceSlotStatus(string Slot, SourceStats Stats, DateTimeOffset? WaitingSince = null);
 
+/// <remarks><c>StateSize</c>: what the pipeline's state holds on this node — entries,
+/// counted, and bytes of managed heap, estimated as
+/// <see cref="Incremental.Storage.ChangelogStorageProvider.EstimateSize"/> says — on a
+/// leader and on a standby alike.</remarks>
 public sealed record PipelineStatus(
     string Id, PipelineState State, DesiredState Desired, long Generation, string Plugin, string Version, string Definition,
     string? BlockedOn, DateTimeOffset? Since, string? Operation, int Restarts, long DeadLetters,
@@ -502,7 +506,8 @@ public sealed record PipelineStatus(
     PipelineRollback? RolledBack = null,
     bool ReplaceUnconfirmed = false,
     DeadLetterSinkStatus? DeadLetterSink = null,
-    PipelineStartTimings? LastStart = null);
+    PipelineStartTimings? LastStart = null,
+    Incremental.Storage.StateSizeEstimate? StateSize = null);
 
 /// <summary>
 /// Where the last start of a pipeline on this node spent its time. <c>Plugin</c>: getting

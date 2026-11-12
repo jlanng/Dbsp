@@ -609,6 +609,11 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
                         await WatchCatalogWriterAsync(stop).ConfigureAwait(false);
                 }
 
+                // In every role, and off this loop: a standby that has just read
+                // everything holds the most it does not use.
+                if (_keeping is null || _keeping.IsCompleted)
+                    _keeping = MemoryKeeper.Shared.RunIfDueAsync(options.ReleaseUnusedMemoryEvery, _logger, NodeId, stop);
+
                 if (!_context.IsLeader)
                     continue;
                 if (now - lastTrim >= options.TrimInterval)
@@ -628,6 +633,12 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
             }
         }
     }
+
+    private Task? _keeping;
+
+    /// <summary>What this process last did to give memory back; null before the first
+    /// time, and when <see cref="ServiceOptions.ReleaseUnusedMemoryEvery"/> is zero.</summary>
+    public MemoryRelease? MemoryRelease => MemoryKeeper.Shared.Last;
 
     private async Task<PeerInfo?> ProbePeerAsync(CancellationToken cancellationToken)
     {
@@ -835,7 +846,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         Gauges = new GaugeSnapshot(
             NodeId, role, status.Leadership.Term, (int)status.Health.Level, standbyReady,
             role == NodeRole.Standby ? Interlocked.Read(ref _stateLag) : null, status.CatalogVersion,
-            status.PipelinesByState, Metrics.Gauges, _tableGauges);
+            status.PipelinesByState, Metrics.Gauges, _tableGauges, ProcessMemory.Read());
 
         // The leadership's own stages are known only once it calls the takeover done.
         if (status.Leadership.Kafka?.LastTakeover is { } kafka && role == NodeRole.Leader
@@ -858,7 +869,9 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
                 try
                 {
                     var stats = await _context.Tables.StatsAsync(table.Name).ConfigureAwait(false);
-                    gauges.Add(new TableGauge(stats.Name, stats.State, stats.Rows, stats.Version, stats.LagVersions, stats.Loader?.Lag));
+                    gauges.Add(new TableGauge(
+                        stats.Name, stats.State, stats.Rows, stats.Version, stats.LagVersions, stats.Loader?.Lag,
+                        stats.Memory?.RowBytes ?? 0, stats.Memory?.IndexBytes ?? 0, stats.Memory?.HistoryBytes ?? 0));
                 }
                 catch (Exception ex) when (ex is ServiceException or ObjectDisposedException or InvalidOperationException)
                 {

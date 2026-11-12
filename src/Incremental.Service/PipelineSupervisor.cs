@@ -227,9 +227,12 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         };
 
         IReadOnlyDictionary<string, long> committed;
+        StateSizeEstimate? stateSize = null;
         try
         {
-            committed = context.Storage.Pipeline(runtime.Id).CommittedOffsets;
+            var provider = context.Storage.Pipeline(runtime.Id);
+            committed = provider.CommittedOffsets;
+            stateSize = provider.EstimateSize();
         }
         catch (ObjectDisposedException)
         {
@@ -242,7 +245,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             runtime.Id, runtime.State, spec.Desired, spec.Generation, spec.Plugin, spec.Version, spec.Definition,
             blockedOn, runtime.Since, runtime.Operation, runtime.Restarts, runtime.DeadLetters.Total,
             generation?.Circuit.CommittedStep, committed, faults, runtime.Shape, sources, sinks, runtime.History.After(),
-            runtime.RolledBack, spec.Previous is not null, DeadLetterSink(runtime, spec, generation), runtime.LastStart);
+            runtime.RolledBack, spec.Previous is not null, DeadLetterSink(runtime, spec, generation), runtime.LastStart, stateSize);
     }
 
     private DeadLetterSinkStatus? DeadLetterSink(PipelineRuntime runtime, PipelineSpec spec, Generation? generation)
@@ -392,9 +395,18 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                     }
                 }
             }
+            long stateEntries = 0, stateBytes = 0;
+            try
+            {
+                var size = context.Storage.Pipeline(runtime.Id).EstimateSize();
+                (stateEntries, stateBytes) = (size.Entries, size.EstimatedBytes);
+            }
+            catch (ObjectDisposedException)
+            {
+            }
             into.Add(new PipelineSampleInput(
                 runtime.Id, generation?.Number ?? 0, records, lag, runtime.DeadLetters.Total,
-                runtime.State, runtime.Spec.Desired == DesiredState.Running, inFlightSince));
+                runtime.State, runtime.Spec.Desired == DesiredState.Running, inFlightSince, stateEntries, stateBytes));
         }
     }
 

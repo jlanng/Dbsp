@@ -100,6 +100,8 @@ internal static class AdminApi
                     .ToDictionary(n => n, n => ContractAssemblies.VersionOf(n) ?? "built-in", StringComparer.Ordinal),
                 liveContexts = node.Plugins.LiveContexts,
                 memory = ProcessMemory.Read(),
+                holds = Holds(node, options),
+                memoryRelease = node.MemoryRelease,
                 processShared = node.Backend.Describe().Kind == "in-memory",
                 stateLag,
                 rates = latest.TryGetValue("", out var total) ? AdminEventHub.Rates(total) : null,
@@ -333,6 +335,7 @@ internal static class AdminApi
                         .ToDictionary(o => o.Key, o => o.Value),
                 }),
                 sinks = status.Sinks,
+                stateStores = status.StateSize?.Stores.OrderByDescending(s => s.EstimatedBytes).Take(options.MaxRows),
                 committedOffsets = status.CommittedOffsets,
                 tables,
                 faults = status.Faults.Reverse().Select(f => new
@@ -744,6 +747,16 @@ internal static class AdminApi
             sinks = spec?.Sinks.Keys.Order(StringComparer.Ordinal),
             lastFault = fault is null ? null : new { time = fault.Time, exceptionType = fault.ExceptionType, message = state.Message(fault.Message) },
             lastStart = p.LastStart,
+            // What its state holds on this node: counted entries, estimated bytes.
+            stateSize = p.StateSize is null ? null : new
+            {
+                entries = p.StateSize.Entries,
+                bytes = p.StateSize.EstimatedBytes,
+                entriesAsBytes = p.StateSize.EntriesAsBytes,
+                entriesHeldTwice = p.StateSize.EntriesHeldTwice,
+                bytesHeldTwice = p.StateSize.BytesHeldTwice,
+                stores = p.StateSize.Stores.Count,
+            },
             // Inputs whose source says that what it reads is not there, and since when.
             waiting = p.Sources.Where(s => s.Stats.WaitingFor is not null)
                 .Select(s => new { slot = s.Slot, waitingFor = s.Stats.WaitingFor, since = s.WaitingSince }).ToList() is { Count: > 0 } w ? w : null,
@@ -794,7 +807,40 @@ internal static class AdminApi
         },
         readers = s.Readers.Count,
         floorHeldBy = s.FloorHeldBy,
+        memory = s.Memory is null ? null : new
+        {
+            totalBytes = s.Memory.TotalBytes,
+            rowBytes = s.Memory.RowBytes,
+            indexBytes = s.Memory.IndexBytes,
+            historyBytes = s.Memory.HistoryBytes,
+            historyRows = s.Memory.HistoryRows,
+            historyChanges = s.Memory.HistoryChanges,
+            meanRowBytes = s.Memory.MeanRowBytes,
+            sampledRows = s.Memory.SampledRows,
+        },
     };
+
+    /// <summary>What the node holds by name — its tables and its pipelines' state, as the
+    /// meter's snapshot last had them — for the working set to be read against: the
+    /// largest of each, and the totals over all of them.</summary>
+    private static object? Holds(ServiceNode node, ServiceAdminOptions options)
+    {
+        if (node.Gauges is not { } gauges)
+            return null;
+        var top = Math.Min(10, options.MaxRows);
+        return new
+        {
+            tableBytes = gauges.Tables.Sum(t => t.RowBytes + t.IndexBytes + t.HistoryBytes),
+            tableCount = gauges.Tables.Length,
+            stateBytes = gauges.Pipelines.Sum(p => p.StateBytes),
+            stateEntries = gauges.Pipelines.Sum(p => p.StateEntries),
+            pipelineCount = gauges.Pipelines.Length,
+            tables = gauges.Tables.OrderByDescending(t => t.RowBytes + t.IndexBytes + t.HistoryBytes).Take(top)
+                .Select(t => new { name = t.Name, rows = t.Rows, bytes = t.RowBytes + t.IndexBytes + t.HistoryBytes }),
+            pipelines = gauges.Pipelines.OrderByDescending(p => p.StateBytes).Take(top)
+                .Select(p => new { id = p.Id, entries = p.StateEntries, bytes = p.StateBytes }),
+        };
+    }
 
     private static object PluginItem(ServiceNode node, PluginInfo p, IReadOnlyList<PipelineSpec> specs)
     {
