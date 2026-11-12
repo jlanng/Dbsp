@@ -331,6 +331,25 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public async Task A_probe_listener_stopped_the_moment_it_has_answered_stops_cleanly()
+    {
+        // Its accept loop can be on its way back to the next accept when the listener is
+        // stopped: that is a stop, not a failure (once seen as "Not listening" on CI).
+        await using var env = KafkaEnv.Create();
+        await using var a = await StartAsync(env, "a", begin: false);
+        for (var i = 0; i < 300; i++)
+        {
+            var free = new TcpListener(IPAddress.Loopback, 0);
+            free.Start();
+            var port = ((IPEndPoint)free.LocalEndpoint).Port;
+            free.Stop();
+            var listener = LeadershipProbe.Listen(a.Leadership, new IPEndPoint(IPAddress.Loopback, port));
+            Assert.NotNull(await LeadershipProbe.QueryAsync("127.0.0.1", port));
+            await listener.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task The_tcp_probe_tells_a_leader_from_a_standby_and_from_nobody()
     {
         await using var env = KafkaEnv.Create();

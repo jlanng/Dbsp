@@ -109,7 +109,7 @@ public static class LeadershipProbe
         {
             try
             {
-                while (true)
+                while (!_stop.IsCancellationRequested)
                 {
                     using var client = await _listener.AcceptTcpClientAsync(_stop.Token).ConfigureAwait(false);
                     try
@@ -125,6 +125,11 @@ public static class LeadershipProbe
             }
             catch (Exception ex) when (ex is OperationCanceledException or SocketException or ObjectDisposedException)
             {
+            }
+            catch (InvalidOperationException) when (_stop.IsCancellationRequested)
+            {
+                // Stopped between one answer and the next accept: the listener says "not
+                // listening" rather than that it was cancelled (seen on a CI runner).
             }
         }
 
