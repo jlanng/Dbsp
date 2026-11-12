@@ -1060,7 +1060,10 @@ If the worker count is only known at launch — a command-line flag, a container
 hexadecimal**, so twelve heaps is `DOTNET_GCHeapCount=c`.
 
 Every example in this repo ships with this applied; see `examples/Directory.Build.props` and
-the `<CircuitWorkers>` property in each example's `.csproj`.
+the `<CircuitWorkers>` property in each example's `.csproj`. A service node — many
+one-worker circuits over gigabytes of tables and state that stay — is another kind of
+process with settings of its own (`src/Incremental.Service/Node.Gc.props`: eight
+heaps, not adaptive), measured in [enrichment-service.md](enrichment-service.md#sizing-a-node).
 
 ### Hosting it
 
@@ -1298,7 +1301,10 @@ definitions run on the standby too, though no step of a circuit does
 at the takeover). When the leader is killed the standby fences it, promotes the catalog,
 the tables and the state, starts the circuits it built and starts the sources at their
 committed offsets. Locally that is about 3 s to notice and about a second to take over,
-whatever the tables and the pipelines hold. A leader that is alive but cannot commit
+whatever the tables and the pipelines hold. Each node needs what it holds and one to
+two gigabytes more of working set, says what it holds table by table and pipeline by pipeline,
+and gives back what a load or a restore leaves it holding
+([Sizing a node](enrichment-service.md#sizing-a-node)). A leader that is alive but cannot commit
 still answers its peer's probe, and is taken over only after `TakeoverCeiling` (30 s).
 
 A table loaded from a topic, and a pipeline bound to topics, name a connection and a
@@ -1411,12 +1417,12 @@ app.MapIncrementalHealth("/health");        // /live, /ready, /status: for a loa
 
 | | Path | |
 |---|---|---|
-| GET | `info`, `node`, `node/metrics` | what the API allows; role, terms, health, readiness, peer, last takeover; the node's rates |
+| GET | `info`, `node`, `node/metrics` | what the API allows; role, terms, health, readiness, peer, last takeover, the process's memory and what the node holds of it by name; the node's rates |
 | POST | `node/takeover`, `node/stepdown` | `force=`, `confirm=<node id>` |
-| GET | `tables`, `tables/{name}` | statistics, loader, readers and who holds the floor, unreadable records |
+| GET | `tables`, `tables/{name}` | statistics, memory (rows, indexes, retained history), loader, readers and who holds the floor, unreadable records |
 | GET | `tables/{name}/rows` | `limit`, `from`, `contains` — or `key`, or `index`, `key` and `skip` |
 | POST | `tables`, `tables/{name}/loader/restart`, `tables/{name}/reopen`; DELETE `tables/{name}` | |
-| GET | `pipelines`, `pipelines/{id}` | `q=`, `state=`; detail adds the spec, sources, sinks, committed table versions, faults, history |
+| GET | `pipelines`, `pipelines/{id}` | `q=`, `state=`; each with what its state holds on the node (entries, estimated bytes); detail adds the spec, sources, sinks, the state store by store, committed table versions, faults, history |
 | GET | `pipelines/{id}/graph`, `/metrics`, `/dead-letters` | the circuit; 60 one-second and 60 one-minute samples; the ring, newest first by `before=` |
 | PUT | `pipelines/{id}?state=keep\|reset` | deploy or replace |
 | POST | `pipelines/validate`, `pipelines/{id}/start`, `/stop`, `/restart`, `/reset`; DELETE `pipelines/{id}` | |

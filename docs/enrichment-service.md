@@ -1598,7 +1598,10 @@ is cut short with *show all*.
 **A pipeline.** Rates, step latency, how long commits wait for sinks, checkpoint age and
 input lag; per source the position read and the position committed; per sink what was
 delivered; per table the version the pipeline's checkpoint has committed beside the
-table's current one. The buttons are the actions: each shows its plan first, and reset
+table's current one; and its state, store by store — entries, counted, and the bytes
+of this node's heap they take, estimated, with the size of one entry and of one record
+in the state log. A definition whose state grows without end shows there first; the
+list of pipelines has the same two figures as a column. The buttons are the actions: each shows its plan first, and reset
 and remove want the id typed. *Generation* is the generation of the pipeline's spec
 everywhere — the header, the timeline, the audit, `If-Match`; a fault also says which
 *run* it was, since a restart builds the same generation again.
@@ -1648,11 +1651,13 @@ config, what to do with an unreadable record; dry run, then declare.
 A table's page has its rows, version, who writes it, its loader's state and position,
 its indexes, and its readers — the pipeline furthest behind holds the retention floor,
 and "until cut loose" says how much history is left before a stopped reader would need a
-reset. *Estimated size* is the bytes of row data the table and its retained history
-hold, and how the number was made: the mean JSON size of a sample of 256 rows times the
-row count (and times the row changes of the retained history, where the history is in
-this process — on Kafka it is on the brokers). It is the size of the data, not of the
-process's memory, which is usually a few times more.
+reset. *Memory* is what the table takes of this node's managed heap, in three parts —
+the rows with their key map, the secondary indexes, and the retained history (rows the
+recent versions replaced, which only those versions keep alive) — with what one row
+costs and how the figures were made: rows are sized as they are written, each of the
+first 256 and then one in 512, and the mean is multiplied by the count. The same rows
+as data (their mean JSON size times the count) are beside it, for comparison with what
+the brokers hold. The tables list has the total as a column.
 
 ![A table](images/enrichment-service/table.png)
 
@@ -1671,9 +1676,15 @@ with the operator, the exception, the weight and the record.
 
 ![Dead letters](images/enrichment-service/dead-letters.png)
 
-**Cluster.** Both nodes with their role and what their process holds — working set, GC
-heap, the share of its life spent in GC pauses; in memory the two nodes are one process
-and the page says so. On a standby, how ready it is to lead, and why not if it is not,
+**Cluster.** Both nodes with their role and what their process holds — working set,
+what was live on the managed heap at its last collection and what the collector has
+committed, what is not the collector's, the share of the last minute spent in GC
+pauses, and how the collector is set; in memory the two nodes are one process and the
+page says so. *Memory* sets this node's working set against what it holds by name: its
+tables and its pipelines' state (the largest of each listed), the rest of the heap,
+what the collector has committed and is not using, and what is not the collector's —
+and says what the node has given back to the operating system since it started
+(*Sizing a node*). On a standby, how ready it is to lead, and why not if it is not,
 with how many pipelines it has built, is still building and leaves to be built at a
 takeover. Below, each pipeline's last start on this node: warm (built while standing by)
 or built at the start, and what the plugin, the build, the start and the sources took.
@@ -2031,7 +2042,7 @@ or any other exporter is the same two `AddMeter` calls. Every node exports: the 
 series are how you know it is ready.
 
 **The instruments of `Incremental.Service`.** Tags are `node`, `pipeline`, `table` and
-three closed sets (`state`, `role`, `stage`) — never a key, an offset or a message.
+four closed sets (`state`, `role`, `stage`, `part`) — never a key, an offset or a message.
 Gauges are read from a snapshot each node refreshes once a second (tables every five).
 
 | Instrument | Tags | |
@@ -2055,6 +2066,17 @@ Gauges are read from a snapshot each node refreshes once a second (tables every 
 | `incremental.service.table.rows`, `.version` | node, table | |
 | `incremental.service.table.lag` | node, table | on a standby: versions of the table's log not yet applied |
 | `incremental.service.table.loader_lag` | node, table | on the leader: what the loader reports it has still to read |
+| `incremental.service.table.memory` (bytes) | node, table, part | the table on this node's heap, estimated, by part: `rows` (with the key map), `indexes`, `history` (superseded rows kept for readers) |
+| `incremental.service.pipeline.state_entries` | node, pipeline | entries its state holds on this node, counted — on a standby too |
+| `incremental.service.pipeline.state_memory` (bytes) | node, pipeline | the same state on this node's heap, estimated |
+| `incremental.service.process.working_set` (bytes) | node | what the operating system counts for the process: the figure to set against a container's limit |
+| `incremental.service.process.gc.live`, `.gc.committed` (bytes) | node | what the managed heap held at its last collection, and what the collector has committed for it |
+| `incremental.service.process.other` (bytes) | node | resident memory that is not the collector's: the Kafka client, the runtime, stacks (Linux) |
+| `incremental.service.process.gc.pause_ratio` | node | the share of the last minute spent paused in collections, 0 to 1 |
+
+The process's instruments are the node's own view of what *Sizing a node* is about;
+the runtime's meter (`System.Runtime`, .NET 9 and later) has the collector's in more
+detail, and `AddMeter("System.Runtime")` beside the two above exports it.
 
 **What to alert on.** The thresholds are starting points for a service whose pipelines
 commit every step; a pipeline with `checkpointMaxDelay` or slow sinks needs its own.
@@ -2075,6 +2097,9 @@ commit every step; a pipeline with `checkpointMaxDelay` or slow sinks needs its 
 | A replace was rolled back | `increase(pipeline.rollbacks[1h]) > 0` (ticket) | Someone's deploy did not take; the audit says why. |
 | Loader stuck | `tables{state="LoaderFaulted"} > 0` for 5 min, or `table.loader_lag` rising | Readers keep the last version; the data is going stale. |
 | Table faulted | `tables{state="Faulted"} + tables{state="Failed"} > 0` | Pipelines that read it are `Blocked`. |
+| Node near its memory | `process.working_set` above 85 % of the container's limit for 10 min | The next bulk load or restore may not fit (*Sizing a node*). Which table or pipeline grew is in `table.memory` and `pipeline.state_memory`. |
+| State growing without end | `pipeline.state_entries` rising for a day in a pipeline whose keys should be bounded | A join or a lookup that never evicts keeps every key it has seen: the definition wants `EvictWhen`, a window, or `LookupAppendOnly`. |
+| Collector busy | `process.gc.pause_ratio > 0.1` for 10 min | The node is short of memory for what it allocates, or its collector is not set as *Sizing a node* says. |
 | Takeover slow | on Kafka, `takeover.duration{stage="total"}` above about 3 s, and `{stage="silence"}` above your failover budget | `total` is the takeover from the decision to leading: `fence`, `storage`, `catalog`, `tables`, then `start_leading` (the leader record, seeds, `pipelines`, loaders). It is about a second locally, half of it the `fence`, and does not grow with state when the standby was warm — so a long one is a slow fence (the brokers), or a `pipelines` stage that had to build circuits the standby had not (`standby.pipelines_to_build` was not 0). `silence` is how long the leader had been quiet when the standby went: 3 s for a dead leader, 30 s for one that still answered its probe. `start_leading` alone leaves out the fence and the wait, which is where a slow takeover is slow. |
 
 ## How large, how fast
@@ -2132,25 +2157,26 @@ restart from being an outage of that length.
 **Memory.** A node holds each table once, whatever reads it: twenty pipelines over a
 table of one to five million rows added 1–5 MB.
 
-| per node | |
-|---|---|
-| a million of these rows | 1.3 GB of heap (a 520-byte JSON row is about 1.3 KB of objects) |
-| a million orders of state: one join pipeline (its keyed input and its join) and one total per party, together | 330–480 MB |
-| the standby | the same as the leader: it holds the rows and the typed state |
-| working set | well above the heap: on the leader 7.8 GB for 2.2 GB live at one million rows, 12.5 GB for 4.7 GB at three million, 12.3 GB for 7.2 GB at five million (one node); on the standby 4.0 and 8.6 GB |
+| per node, steady state | a million rows, a million orders of state | five million rows, a million orders |
+|---|---|---|
+| what is live on the managed heap | 2.1–2.4 GB | 7.2–7.4 GB |
+| working set, leader | 3.5 GB | 8.2 GB |
+| working set, standby | 3.6 GB | 9.3 GB |
+| the collector's pauses, share of the leader's steady state | 1.9 % | 1.5 % |
+| the longest the leader stood still in the steady state | 33 ms | 30 ms |
+| `kill -9` → first record in every sink | 4.0 s | 4.1 s |
 
-The working set is the number to size a machine or a container by. Of the difference,
-about 2 GB was the Kafka client's buffers and the runtime, and the rest memory the
-collector had committed and not yet given back after a burst of allocation;
-`DOTNET_GCHeapHardLimit` holds the collector's share at a figure you choose. Give it too
-little and a standby cannot open its tables: the open fails with `OutOfMemoryException`,
-the table shows `Faulted`, and the node never becomes warm. On the broker the same
-million rows are 134 MB (141 bytes a row, zstd), and the state of the four pipelines
-142 MB.
+Two nodes of five million rows run side by side on a 30 GB machine with the broker
+beside them. That was not so before the settings and fixes of *Sizing a node*, the
+next section, which also has what a row and a state entry cost and how to work a
+node's size out for a deployment that does not exist yet: the same million rows took
+7.7 GB on the leader and 5.3 GB on the standby, and five million took 15 GB on one
+node, and two did not fit. On the broker a million of these rows are 134 MB (141 bytes a row, zstd), and
+the state of the four pipelines 141 MB.
 
-**What was not measured**: ten million rows, and two nodes at five million — the
-machine had 20–25 GB free, and two nodes at three million rows used 21 of them. Nothing in a takeover reads the rows, so the failover numbers
-should hold; the loading, the cold start and the memory scale as above.
+**What was not measured**: ten million rows. Nothing in a takeover reads the rows, so
+the failover numbers should hold — they were the same at one and at five million — and
+the loading, the cold start and the memory scale as above.
 
 **Through a broker failure** (three brokers, each also a controller, replication factor
 3, `min.insync.replicas` 2 — `docker compose --profile kafka3`; two supervised node
@@ -2229,6 +2255,168 @@ will have other figures, and the two that matter to set against them are
 `TakeoverCeiling` (30 s: longer than your brokers take to give a broker up, with room)
 and `KafkaLogOptions.TransactionTimeout` (60 s: how long a leader survives brokers that
 cannot commit).
+
+## Sizing a node
+
+A node needs its **working set**: what the operating system counts for the process, and
+what a machine or a container limit has to cover. Both nodes need the same — a standby
+holds the tables and the state the leader holds. The working set is three things: what
+the node holds (rows and state, on the managed heap), what the collector keeps ready on
+top of that, and what is not the collector's at all (the Kafka client, the runtime).
+The first is yours to work out; the other two are what this section's settings keep
+small.
+
+### What a node holds
+
+**Rows.** A row is held as the object the table's definition declares, so it costs what
+.NET objects cost: 16 bytes of header per object, 22 bytes and two bytes a character per
+string, eight per reference. Measured, a million rows at a time (the heap after a full
+collection, before and after):
+
+| a row of | bytes on the heap per row | of which the row's own objects | the same row as JSON |
+|---|---|---|---|
+| 4 columns: a key, an int, a decimal, a short code | 193 | 88 | 56 |
+| 9 columns, four of them strings | 401 | 295 | 177 |
+| 21 columns, fifteen of them strings (the scale rig's rows are of this kind: 1,300) | 1,248 | 1,143 | 613 |
+| … with a secondary index whose key every row has to itself | + 133 | | |
+| … with a secondary index whose key many rows share | + 9 | | |
+
+The rule the table gives: a row's objects are about twice its JSON — strings are
+UTF-16 in memory — and the table's key map adds about 100 bytes a row whatever the
+row. A secondary index is its own map: about 130 bytes per distinct key, and eight per
+row under it.
+
+**State.** A pipeline's state is entries in stores — the definition decides which —
+and an entry costs its key and value as objects plus a slot in the store's map:
+
+| an entry of | bytes on the heap |
+|---|---|
+| a keyed input's record (`KeyedInput`: one per key; 9 columns) | 269 |
+| a join's side: the same record under its join key (`Join`, `LeftJoin`: one per record) | 359 |
+| a running total or count per key (`Sum`, `Count`) | 61 |
+| a count per string key | 87 |
+| a deadline (`EvictWhen`, a window: one per open key) | 56 |
+
+A join over a keyed input keeps each record twice, once in each of the first two rows.
+`Lookup` remembers what it emitted per record; `LookupAppendOnly` and everything
+stateless keep nothing.
+
+**Ask the node.** Do not work these out for a deployment that exists: every node says
+what it holds. A table's page shows its rows, indexes and retained history in bytes; a
+pipeline's page shows its state store by store, entries and bytes; the cluster page
+sets the two totals against the process's working set (*The admin UI*). The same
+figures are instruments (`table.memory`, `pipeline.state_entries`,
+`pipeline.state_memory`, `process.*`; *Operating it: monitoring*). They are estimates,
+and each page says how its own is made: rows and entries are sized as they are written
+or read — each of the first 256, then one in 512 — by reading their fields, and the
+mean is multiplied by the count. Against the heap they were within 2 % for the tables
+above and within 5 % for the state. What they cannot see is sharing: a string instance
+that every row refers to is counted in each row (a table of such rows read 14 % high),
+and a record that two stores of one pipeline both hold is counted in both on the node
+that read it from its source.
+
+![The cluster page's memory card](images/enrichment-service/memory.png)
+
+### The arithmetic
+
+```
+held         =  for each table:     rows × (row's objects + 100 B)  +  its indexes
+             +  for each pipeline:  state entries × bytes per entry
+
+working set  ≈  held + 2 GB                    in the steady state
+peak         ≈  held × 2 + 2.5 GB              while it loads, restores or starts cold
+```
+
+The 2 GB covers what was measured on top of what was live, with the settings below, at
+both ends of the range: 0.5 to 1.7 GB that the collector keeps ready on eight heaps,
+and 0.3 GB of Kafka clients (twenty pipelines' and the node's own) and the runtime.
+
+| measured (two nodes, twenty pipelines, the scale rig) | a million rows, a million orders | five million rows, a million orders |
+|---|---|---|
+| held, by the arithmetic: the node's own figures for its table and its state | 2.2 GB | 7.3 GB |
+| live on the heap after a full collection | 2.1–2.4 GB | 7.2–7.4 GB |
+| working set, leader / standby, steady | 3.5 / 3.6 GB | 8.2 / 9.3 GB |
+| working set at its peak: the leader at the end of its first load and state fill | 6.8 GB | 14.5 GB |
+| the same under `GCHeapHardLimit` of 10 GB | | 10.8 GB |
+
+The peak is real memory and a container limit has to cover it, or cap it: with
+`DOTNET_GCHeapHardLimit` (hexadecimal bytes; `System.GC.HeapHardLimit` in the runtime
+configuration) the collector works harder as it nears the limit instead of growing —
+at 1.35 times what the node holds the peak was 10.8 GB for 14.5, the table loaded in
+34 s for 33, the state fill took a seventh longer, and the collector's share of the
+leader's time rose from 8 to 10 %; in the steady state the leader then paused for
+2.1 % of the time, for 1.5 %. Set the
+limit too near what the node holds and a table cannot be opened: the open fails with
+`OutOfMemoryException`, the table shows `Faulted`, and a standby never becomes warm.
+Leave a quarter over the arithmetic, and room in the container for the 0.5 GB that is
+not the collector's.
+
+### The collector's settings
+
+They are startup configuration, so they belong to the host's project file. The example
+and the scale rig import them from `src/Incremental.Service/Node.Gc.props`; copy the
+file or its four settings:
+
+| setting | value | why (a million rows and a million orders of state, per node) |
+|---|---|---|
+| `ServerGarbageCollection` | `true` | Workstation collection, in the one run of it, spent 17 % of the leader's steady state paused and fell behind its inputs |
+| `ConcurrentGarbageCollection` | `true` | Old-generation collections that do not stop the node: in the steady state there was no full blocking collection, and the longest the leader stood still was 33 ms |
+| `GarbageCollectionAdaptationMode` | `0` | The adaptive mode (the runtime's default for server collection) held the same memory as these settings and paused three times as long |
+| `System.GC.HeapCount` | `8`, or the node's cores if fewer | Each heap keeps memory ready of its own, and a heap per core on a large machine is more than twenty one-worker circuits fill. Four heaps held 0.3 GB less than eight and paused nearly three times as long |
+| `System.GC.ConserveMemory` | not set | It has the old generation compacted once that much of it is free space (at `5` a half, at `7` three tenths). It took a tenth off the leader's working set at a million rows — 3.1 GB at `5` and 3.0 GB at `7` for 3.4 GB, and 6.0 and about 5.2 GB for 6.7 GB at the peak — and nothing at five million in the steady state. The state fill, a backlog of a million orders through four stateful pipelines, took a sixth longer in some runs of every setting, more of them the more was conserved (one of seven without, three of seven at `5`, seven of nine at `7`); the slower runs also tended to follow the largest ones, so the setting's part in it is not established. A setting that asks for full blocking collections was not taken on that evidence; a node that wants the memory sets it |
+
+Two things about pauses. A full blocking collection takes 0.1 to 0.15 s per gigabyte of
+heap on eight heaps, and a bulk load is where they happen: loading five million rows
+into an empty node, the leader stood still for 1.7 to 2.2 s at a time — with these
+settings and without them. It leads nothing that anybody waits for at that moment, but
+`TakeoverAfter` (3 s) is not far off: load tables of that size before the standby is
+started, or raise it for the load. `ConserveMemory`, where it is set, asks for such
+collections when the heap is fragmented; none was seen in two minutes of steady load
+with a twentieth of the rows rewritten, and a node with tens of gigabytes that churns
+should measure its longest pause before setting it (`GC.GetGCMemoryInfo(GCKind.FullBlocking)`,
+or the scale rig's `longest-stall`). Nothing here ran for longer than four minutes.
+
+### What the service does itself
+
+Before these, a node's working set was three to five times what it held: 7.7 GB on a
+leader holding 2.2 GB, 5.3 GB on its standby. Where it was, and what was done:
+
+- **The Kafka client's fetch queues: 2 GB.** The client keeps a queue of fetched
+  records per partition, not per consumer, and fills it while the consumer is behind;
+  at the 16 MB a source's was set to, twenty pipelines reading a backlog from a topic
+  of four partitions held 2 GB. A source's default is now 2 MB
+  (`KafkaSourceOptions.FetchBufferKilobytes`): 0.8 GB at the same point, with the
+  state fill and the steady state no slower. A connection's
+  `queued.max.messages.kbytes` still overrides it. The logs' own readers keep 8 MB
+  (`KafkaLogOptions.FetchBufferKilobytes`): a node uses them only while it restores or
+  follows, and at 2 MB a restore was, if anything, slower (a table of a million rows
+  read in 4.3 to 6.0 s over five runs, against 3.9 to 5.0 s at 8 MB).
+- **The C allocator kept what the client freed.** Of 2.1 GB the allocator held at the
+  end of a state fill, 34 MB was in use: glibc keeps freed memory in per-thread arenas
+  and returns it only when asked. The node asks (`malloc_trim`) every
+  `ServiceOptions.ReleaseUnusedMemoryEvery` (30 s; zero turns it off): about 0.1 s for
+  2 GB, nothing when there is nothing to return. `MALLOC_ARENA_MAX`, the usual advice,
+  is not the fix: with two arenas the state fill took two and a half times as long.
+- **The collector kept what a burst had needed: 2 to 3.5 GB.** After a load or a
+  restore the collector holds the memory the burst allocated into, and lets a region go
+  only after some twenty collections have passed without a use for it. A leader under
+  steady load gets there in a minute or two; a standby that has become warm, or a
+  leader whose inputs are quiet, collects a few times an hour. So the same keeper asks
+  for young-generation collections — 20 to 30 ms each on these heaps, twenty-five of
+  them, a quarter of a second apart — while the collector holds a quarter more than is
+  live and the process is collecting seldom, and rests for longer and longer when
+  asking does not help. It never asks for a full collection.
+- **An idle pipeline held its state twice.** A circuit built on restored state keeps
+  the bytes it was built from until its types have committed (*Limits*); a pipeline
+  with nothing to read never commits. It now commits once, without a step, two seconds
+  after such a start. The pipeline's page says how many entries are held twice while
+  they are.
+
+What was looked at and is not waste: 0.5 GB of the heap at a million rows is large
+arrays — the maps of the table and of the state stores themselves, not garbage from
+the load; a table's retained history is bounded at 65,536 row changes
+(`SharedTableOptions.TailChanges`), 1 MB after a load of five million rows and at most
+some 85 MB of superseded rows for rows of this width.
 
 ## On Amazon MSK
 
@@ -2379,13 +2567,14 @@ resources are ARNs (`…:topic/<cluster>/<uuid>/{prefix}.*`,
   circuit the leader builds on state that is there already — at a cold start, a
   restart, a takeover that had to build, a replace that keeps state — reads the stored
   bytes into its typed stores and keeps the bytes until it has committed once, because
-  until then a roll-back, or the build that wrote them, may need them as they were. A
-  checkpoint needs a step and a step needs input, so a pipeline whose inputs are quiet
-  holds both copies for as long as they are quiet: roughly twice its state, with no
-  bound on how long. A standby keeps the second copy only for a pipeline that has not
-  checkpointed since its spec was deployed or replaced; once the leader has, the
-  standby's build needs no way back. The memory table's figures are for pipelines that
-  are running.
+  until then the build that wrote them may need them as they were. A pipeline with
+  something to read commits within its first steps; one whose inputs are quiet commits
+  once by itself, two seconds after it started, so the second copy is not kept for as
+  long as it is idle. That commit is the checkpoint as it was recovered under the new
+  build's manifest: from then on a replace that keeps state carries over what the
+  running build's types hold, as it does after any other commit. A standby keeps the
+  second copy only until the leader has checkpointed under the spec it built. The
+  pipeline's page shows the entries held twice while there are any.
 - **Both nodes are upgraded together** across the build that introduced layouts: a
   node from before it refuses the records a newer leader writes (a new format byte in
   the state log). Stop the standby, replace the leader, start the standby.

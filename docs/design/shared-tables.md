@@ -760,6 +760,14 @@ As built (`Tables/DerivedTable.cs`: `ToTable`, `DerivedTablePort`, `TableLineage
   holding the row it replaced until it leaves the tail (and one version beyond that
   budget, if a single commit exceeds it). Each retroactive join adds its fact-side state; each
   remembered lookup adds its enriched facts; an append-only lookup adds nothing.
+  `table.EstimateMemory()` says what a table holds, in bytes of managed heap and in
+  those parts — rows with the key map (about 100 bytes a row on top of the row's own
+  objects), each secondary index (about 130 bytes per distinct key and eight per row
+  under it), and the tail's superseded rows — from rows sized as they were written,
+  each of the first 256 and one in 512 after; it costs counters and one short lock,
+  never a walk. Measured against the heap a million rows at a time it was within 2 %
+  (`MemoryEstimateTests`; docs/design/enrichment-service.md, S7, *Memory*); a string
+  instance shared by many rows is counted in each.
 - **Probe.** One concurrent-map read plus one chain step, no allocation.
 - **Not bounded by this design.** A retroactive join still emits one retraction and one
   assertion per matching fact when a hot reference row changes; that is what lookup is

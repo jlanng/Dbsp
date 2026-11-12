@@ -2130,6 +2130,18 @@ put back, returns to the very bytes it had. An idle pipeline therefore holds its
 twice on a follower — typed and as the bytes it was read from — until its first
 checkpoint under the layout.
 
+*Since S7 of the service* that checkpoint does not wait for a record. A provider that
+is keeping such a copy says so (`ICheckpointStorageProvider.HoldsRestoredCopy`), and an
+auto-stepping circuit that starts on restored state and has had nothing to read for two
+seconds (`Circuit.RestoredCopyGrace`) commits once without a step: the offsets, the
+clock and the step marker as it recovered them, under its own manifest. The leader's
+copy goes with that commit and a follower's when it reads it. What this gives up is
+the last case in which "types that have committed nothing have changed nothing" held
+for longer than a moment: a build that ran idle has, after two seconds, committed. The
+log is not touched beyond the commit record — every entry is still there as it was last
+written. `ChangelogStorageProvider.EstimateSize()` reports the entries held twice
+(`EntriesHeldTwice`) for as long as there are any.
+
 **`StoreEpoch`** counts the times the typed stores were given up, by a call or by the
 follower. A circuit built on a provider is good to start only while the epoch is what it
 was before the circuit was built; the service checks this at a takeover.

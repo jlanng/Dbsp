@@ -497,7 +497,11 @@ so implementations never see cross-thread access to one store.
   join and aggregate state, and then `kill -9` of the leader. The standby builds every
   pipeline's circuit on the state it follows, so a takeover starts circuits rather than
   building them: about a second after the three seconds of silence that decide it,
-  whether the pipelines hold a quarter of a million orders or four million. That is
+  whether the pipelines hold a quarter of a million orders or four million. A node's
+  working set is what it holds plus one to two gigabytes — 3.5 GB on a leader holding
+  2.2 GB at a million rows, 8.2 GB holding 7.2 GB at five million, two such nodes side
+  by side on a 30 GB machine — and every node says what it holds, table by table and pipeline by
+  pipeline, in the admin UI and as instruments (the guide, *Sizing a node*). That is
   for a leader whose process is gone; one that is alive and cannot commit still
   answers its peer's probe and is taken over after `TakeoverCeiling`, 30 s. The loss of
   one broker of three is neither: the sink is silent for 8 to 15 s — the brokers' own

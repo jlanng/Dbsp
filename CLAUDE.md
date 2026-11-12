@@ -116,7 +116,12 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   `kill -9`, a manual takeover and a node from nothing, each timed by stage; about three
   minutes at a million rows, and it needs the memory (its README says how much). Run it
   after changing anything a takeover or a standby does; the numbers of record are in
-  docs/design/enrichment-service.md (S6, *Scale*).
+  docs/design/enrichment-service.md (S6, *Scale*; S7, *Memory*). `--memory-only` stops
+  after the steady load (memory figures, no failover); `--gc` overrides the nodes'
+  collector settings (`node`, the default, is `src/Incremental.Service/Node.Gc.props`;
+  `round2`, `stock`, or `name=value` pairs); the working set over time is in
+  `<out>.timeline.tsv`. Run it after changing what a node holds or how it gives memory
+  back.
 - Throughput rig: `dotnet run -c Release --project benchmarks/Incremental.Torture -- --workers 4`
   runs the showcase pipeline flat out over a sliding order population and reports records/s,
   the process CPU split (workers vs GC), and allocation per record (`--alloc-types` for a
@@ -175,6 +180,12 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     `examples/Directory.Build.props` plus a `<CircuitWorkers>` property per example csproj —
     keep that property in step with the worker count the example's `CircuitOptions` actually
     uses. The torture rig deliberately opts out so its published numbers stay stock-GC.
+    A service node is another kind of process (many one-worker circuits over gigabytes
+    that stay): its settings are `src/Incremental.Service/Node.Gc.props`, which the
+    enrichment example and the scale rig import — eight heaps (four in the example),
+    and deliberately no `ConserveMemory` (measured: 0.3 GB at a million rows, nothing
+    at five, and it asks for full blocking collections). Change them only with the
+    scale rig's numbers beside the change.
 - The cross-process exchange wire format is the dense codec in `Cluster/ShardCodec.cs`
   (compiled per type from the same structural rules as `StableHash`), with a JSON fallback for
   types it cannot round-trip and a format byte on every frame. Redis state serialization is
@@ -197,6 +208,30 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   socket timeout 6 s, a metadata refresh every 2 s), applied before the caller's own
   settings: librdkafka's defaults leave a healthy leader silent for 10 to 60 s after a
   broker goes, which is a takeover. A new client that skips them brings that back.
+- Memory a node holds and does not use (docs/enrichment-service.md, *Sizing a node*;
+  docs/design/enrichment-service.md, S7, *Memory*). Three things made a node's working
+  set three to five times its live heap, and each has one answer that must stay:
+  the Kafka client's fetch queues are per partition, so a source's
+  `FetchBufferKilobytes` is 2 MB, not the 16 it was (the logs' readers keep 8: a
+  node holds theirs only while it restores, and 2 was no faster);
+  glibc keeps what
+  the client frees, so `MemoryKeeper` calls `malloc_trim` every
+  `ServiceOptions.ReleaseUnusedMemoryEvery`; and the collector holds a burst's regions
+  until some twenty collections have passed, so the keeper asks a quiet node for
+  young-generation collections. The keeper never asks for a full blocking collection
+  (seconds on a leader with a large heap), and `MALLOC_ARENA_MAX` is not the fix (it
+  more than doubled a state fill).
+- What a node says it holds is estimated from samples taken as rows and entries are
+  written or read, never by walking a table or a store: `SharedTable.EstimateMemory`,
+  `ChangelogStorageProvider.EstimateSize` (`Diagnostics/ObjectSize.cs`). A sampler and
+  the type layouts it has learnt belong to one table or one store and to nothing
+  static — a store's types are a plugin's. `MemoryEstimateTests` holds each estimate to
+  what the collector reports; keep it so when a store's or the table's structure changes.
+- A provider that keeps a second copy of restored state until its next commit says so
+  (`ICheckpointStorageProvider.HoldsRestoredCopy`), and an auto-stepping circuit that
+  starts on such state and stays idle commits once, without a step, two seconds after
+  its start (`Circuit.RestoredCopyGrace`): the checkpoint as recovered, under the new
+  manifest. Without it an idle pipeline holds its state twice for as long as it is idle.
 - Kafka clients, wherever one is made (found on three brokers and on a broker with ACLs;
   docs/design/durability-and-standby.md, last section). Consume through
   `AssignedConsumer.ConsumeAssigned`, never `consumer.Consume`: the client reports a
@@ -376,7 +411,7 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     outlives the plugin version it was read from. It compares what state stores hold
     (`CircuitBuilder.DescribeState`), not what the assembly declares.
   - `ServiceMeter` (the meter `Incremental.Service`): tags are `node`, `pipeline`, `table`
-    and the closed sets `state`, `role`, `stage` — nothing unbounded, nothing from a
+    and the closed sets `state`, `role`, `stage`, `part` — nothing unbounded, nothing from a
     record. Gauges read the snapshot a node refreshes once a second; a callback must not
     touch a circuit, a table or the backend.
   - Discovery (`IServiceDiscovery`, the admin's `connectors`, `connections`,

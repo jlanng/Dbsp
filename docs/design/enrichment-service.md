@@ -1736,7 +1736,8 @@ Each has a default this design is built on.
     size of a sample times the row count). *Alternative:* account for bytes as rows are
     written — a counter in `SharedTable`'s write path and a size function per row type,
     which is core work on the hot path of every table writer for a number that the
-    working set already bounds from above.
+    working set already bounds from above. *S7:* the alternative was built, sampled
+    (item 60); the JSON figure stays beside it as the size of the data.
 29. **A file loader without a `path` is refused when the table is declared** (S6); it
     used to be accepted and fault the loader at its first run. *Alternative:* as
     before, which lets a table be declared ahead of knowing its file.
@@ -1798,6 +1799,14 @@ Each has a default this design is built on.
     without a step. The copy goes at once; it costs a transaction per start, and it
     makes a keep that started a keep that is confirmed — the roll-back would then cover
     "could not start" and nothing after it, which is all it covers in practice.
+    *S7: the alternative is now what happens*, two seconds after a start on restored
+    state that has had nothing to read (`Circuit.RestoredCopyGrace`). What it gives up:
+    a build that ran idle and never wrote an entry has, after those two seconds, had
+    its say — a replace that keeps state then carries over what that build's types
+    hold in memory, where before it carried the bytes untouched. The changelog still
+    holds every entry as it was last written. *The other way:* leave it as S6 had it
+    and accept twice the state on quiet pipelines; the pipeline's page now shows the
+    entries held twice either way.
 38. **`IObjectStore.WriteAsync(path, write, ct)` replaced `OpenWriteAsync`** (S6, second
     review): the store makes the object from what the callback wrote, and only if it
     returned. A stream that renames when disposed cannot tell success from failure.
@@ -1847,7 +1856,9 @@ Each has a default this design is built on.
     `ChangelogStorageProvider.CountEntries()` walks the state, so it is not in the
     status the UI polls. *Alternative:* keep a running count per store and show it per
     pipeline; it is what would let an operator see a definition whose state grows for
-    ever (the second review's `execution-quality`).
+    ever (the second review's `execution-quality`). *Later in S7:* built — the stores
+    count their entries, `EstimateSize()` reads the counts, and the pipeline's page, the
+    pipelines list and two instruments show them.
 47. **Every Kafka client starts from the service's settings, not the client
     library's** (S7, `KafkaClientDefaults`): a reconnect delay of at most 1 s, a socket
     timeout of 6 s, a metadata refresh every 2 s. They are what keeps the loss of a
@@ -1910,6 +1921,44 @@ Each has a default this design is built on.
 56. **The morph test runs a real Chrome with `--dump-dom`** (S7) and is skipped where
     there is none. *Alternative:* a DOM shim in Node (tests the shim's idea of a select,
     not a browser's), or Playwright in CI (a package and a browser download per run).
+57. **The node asks its own collector for collections** (S7, `MemoryKeeper`): young
+    ones only, twenty-five at a time, and only while the collector has committed a
+    quarter more than is live and the process is collecting seldom. It is what takes a
+    standby that has just restored 2.4 GB of rows and state from 5.2 GB to 3.6. *Alternative:*
+    never call `GC.Collect` from a library, and document that a quiet node holds what
+    its last burst needed until some twenty collections have passed by themselves —
+    hours, on a standby. `ServiceOptions.ReleaseUnusedMemoryEvery = TimeSpan.Zero` is
+    that alternative, and turns off the allocator's trim with it.
+58. **`System.GC.ConserveMemory` is not set in the node's settings** (S7,
+    `Node.Gc.props`). At 5 and 7 it took 0.3 and 0.4 GB off a leader's 3.4 GB at a
+    million rows and 0.7 to 1.3 GB off its peak, and nothing off the steady state at
+    five million. It works by asking for full blocking collections, and the state fill
+    was the slower of its two speeds more often the more was conserved — which the
+    order of the runs may explain instead. *Alternative:* set it to 7 for the memory;
+    the numbers are in S7.
+59. **A Kafka source's fetch queue is 2 MB per partition** (S7), down from 16:
+    0.8 GB of client memory at the end of a state fill instead of 2 GB, with no time
+    lost in the fill or the steady state on one local broker. *Alternative:* keep the
+    larger queue where the brokers are a network away and a refill costs a round trip
+    — that was not measured; a connection's `queued.max.messages.kbytes` sets it
+    either way. The logs' readers were tried at 2 MB too and left at 8: a restore was
+    no faster for it.
+60. **What a node says it holds is estimated from samples taken on the write path**
+    (S7): each of a table's or a store's first 256 rows or entries and then one in
+    512 is sized by reading its fields. *Alternative:* a walk of a sample when asked
+    (nothing on the write path, and a figure that follows the rows there now rather
+    than the rows as written), which reads a table of any size in hash order — biased
+    wherever a row's size goes with its key — or needs a full scan to avoid that.
+61. **A bulk load can stop the leader for two seconds** (S7, measured at five million
+    rows: a full blocking collection of a heap growing through 7 to 13 GB; the same
+    with the settings before this step). `TakeoverAfter` is 3 s. Nothing was done
+    about it. *Alternatives:* load a large table before the standby is started;
+    raise `TakeoverAfter` for the load; or have the table writer pace a bulk load —
+    which is the one that needs building.
+62. **Eight heaps, fixed in the node's settings** (S7), four in the example.
+    *Alternative:* leave the count to the runtime (a heap per core): on this machine's
+    twenty cores that was not run with the rest of the settings, and the adaptive mode
+    that chooses the count by itself paused three times as long.
 
 ## Not verified
 
@@ -4693,3 +4742,325 @@ threads and a 1 s back-off; that test compacted in 2 s here afterwards).
 print their usage for `--help` and exit 2 on an option they do not have
 (`tests/Shared/CommandLine.cs`, linked into the four; the example's own table in
 `ExampleOptions`).
+
+#### Memory: where a node's working set was, and what it is now (H6)
+
+**The finding.** A node's working set was three to five times what it held. Measured
+again on the build this step started from (`ceb4c5e`; the scale rig, a million wide
+rows, a million orders of state, twenty pipelines, one local broker):
+
+| | leader | standby |
+|---|---|---|
+| live on the managed heap, after a full collection | 2,140–2,170 MB | 2,300–2,350 MB |
+| working set | 7,700–7,900 MB | 5,000–5,300 MB |
+| of it, committed by the collector | 5,400–5,800 MB | 4,600–4,750 MB |
+| of it, anonymous memory that is not the collector's | 2,040–2,390 MB | 310–370 MB |
+
+It was read from the processes themselves: `GCMemoryInfo` for the collector's side,
+`/proc/<pid>/smaps` and glibc's `mallinfo2` for the rest (a `dotnet-gcdump` of the
+leader stops at ten million objects and says nothing at this size). Three things, none
+of them the rows:
+
+1. **The Kafka client's fetch queues, kept by the C allocator: 2 GB.** `smaps` shows
+   the memory in 64 MB-aligned anonymous mappings — glibc's per-thread arenas — and
+   `mallinfo2` says what is in them: 2,135 MB held, **34 MB in use**. `malloc_trim(0)`
+   returned 1.7 GB of it in 80 ms. What had filled the arenas was the client's queue of
+   fetched records, which is per partition (the documentation says per consumer) and
+   was 16 MB for a source and 8 MB for a log reader: twenty pipelines reading a
+   backlog of a million orders from a four-partition topic. With every queue at 2 MB
+   the same point of the run had 0.8 GB there, and no stage was slower.
+2. **The collector kept what the burst had needed: 3.3–3.6 GB on the leader, 2.3 on
+   the standby.** Not garbage — after a forced full collection the committed figure on
+   the standby did not move — but free regions the collector holds for its next
+   allocations. It gives one back only when it has gone unused through some twenty
+   collections. The leader under steady load collected 3 times in 30 s on eight
+   heaps; the standby, which allocates 16 MB a second once warm, not at all.
+3. **The settings.** Eight heaps and nothing else: no fragmentation limit, so the old
+   generation was never compacted after the load.
+
+What it was not. The large-object heap holds 460–590 MB at a million rows and all of it
+is live: the arrays of the table's map and of the state stores' dictionaries (33 MB
+each for a store of a million entries), not what the bootstrap threw away. The
+retained history of a table is bounded by `SharedTableOptions.TailChanges` (65,536 row
+changes): 1 MB after a load of five million rows, and at most the superseded rows of
+65,536 changes — some 85 MB at this width. The state held twice (item 37) is not in
+these numbers at all: the rig's stateful pipelines commit continuously and a warm
+standby's copies go at the leader's first checkpoint; it is an idle pipeline's
+problem, dealt with below. A cap on the young generation's budget
+(`GCgen0MaxBudget`) changed nothing, as S6 had found.
+
+**What was tried** (the leader at the end of the steady load; 30 s of it in the first
+block, 90 s in the second; every run a fresh prefix; the first block before any fix):
+
+| the nodes' settings | committed by the collector | pauses, share of the steady load | the state fill | |
+|---|---|---|---|---|
+| eight heaps (round two) | 5,578 MB | 0.4 % | 24.6 s | 3 collections in 30 s |
+| four heaps | 3,785 MB | 1.8 % | 29.9 s | |
+| four heaps, young-generation budget capped at 64 MB | 3,632 MB | 1.6 % | 29.4 s | no effect |
+| four heaps, conserve memory 7 | 2,919 MB | 1.6 % | 29.5 s | |
+| … and `MALLOC_ARENA_MAX=2` | 3,280 MB | 1.4 % | **75.1 s** | 1.75 GB still in the arenas |
+| workstation collection (and two arenas) | 2,434 MB | **17.5 %** | 99 s | input lag 3,300 records |
+| four heaps, conserve 7 — 90 s | 2,621 MB | 2.1 % | 29.7 s | |
+| eight heaps, conserve 7 — 90 s | 2,955 MB | **0.8 %** | 25.5 s | |
+| adaptive (DATAS) — 90 s | 2,658 MB | 2.3 % | 28.6 s | |
+| four heaps, conserve 7, fetch queues 2 MB — 90 s | 2,613 MB | 2.2 % | 29.4 s | not the collector's: 803 MB, from 2,024 |
+
+And with the fixes in, the conserve setting alone (eight heaps, 90–150 s of steady
+load, the leader's working set at the end and at its peak, the standby's at the end;
+the state fill of every eight-heap run of each setting, those before the fixes among
+them):
+
+| | runs | leader | leader's peak | standby | state fill |
+|---|---|---|---|---|---|
+| nothing conserved | 4 | 3,389–3,464 MB | 6,640–6,820 MB | 3,570–3,680 MB | 24.1–24.7 s in six runs, 28.7 s in one |
+| conserve 5 | 5 | 3,045–3,215 MB | 5,650–6,100 MB | 3,450–3,570 MB | 24.1–24.9 s in four runs, 28.7–29.1 s in three |
+| conserve 7 | 4 | 2,927–3,042 MB | 4,750–5,510 MB | 3,450–3,640 MB | 24.1 and 25.5 s in two runs, 28.7–29.3 s in seven |
+
+The fill has two speeds, about 24.5 s and about 29 s. It was the slower one more often
+the more was conserved — but the slower runs also came after the five-million-row
+runs, whose topics the broker was still deleting, and the settings were not run in an
+order that would tell the two apart. What happens in a slow fill was not looked into
+(the longest stall in one was 0.4 s, so it is not one long collection). The node's
+settings were written with 7, then 5, and end with the setting left out: 0.3 GB at a
+million rows and nothing at five million does not pay for a setting that asks for
+full blocking collections on a leader. The runs under *After* are without it.
+
+The workstation row and the arena row have a second variable in them (the workstation
+run also had two arenas); the workstation run was not repeated without it, because 240
+young collections in 30 s is the collector's own doing.
+
+**What was built.**
+
+- *A source's fetch queue of 2 MB* (`KafkaSourceOptions.FetchBufferKilobytes`; it was
+  16), and both options' documentation corrected to "per partition". The logs' readers
+  (`KafkaLogOptions.FetchBufferKilobytes`) were run at 2 MB for most of this step and
+  put back to 8: over five runs each a table of a million rows restored in 4.3–6.0 s
+  at 2 MB and in 3.9–5.0 s at 8, and a node holds those queues only while it restores.
+- *`MemoryKeeper`* (`src/Incremental.Service/MemoryKeeper.cs`), run by every node every
+  `ServiceOptions.ReleaseUnusedMemoryEvery` (30 s), one per process. It asks glibc for
+  `mallinfo2` and, with 64 MB or more free, calls `malloc_trim(0)`; on another C
+  library it finds no such function and does nothing, for good. And it ages the
+  collector: while the committed figure is over what was live at the last collection
+  by 256 MB and by a quarter, and fewer than twenty-five collections have happened
+  since the last look, it asks for twenty-five young-generation collections a quarter
+  of a second apart (20–30 ms each at these sizes). If the committed figure has not
+  come down by a tenth of the excess at the next look, it rests — a minute, two, four,
+  up to ten — and starts afresh when the excess is gone. The decision is a class of
+  its own (`CollectorAgeing`) so that it is tested without a heap. It never asks for a
+  full collection.
+- *The node's collector settings* in one file, `src/Incremental.Service/Node.Gc.props`
+  (server, concurrent, not adaptive, eight heaps; conserve-memory deliberately not
+  set, item 58), imported by the
+  scale rig and by the example (with four heaps; it had one).
+- *An idle pipeline's second copy* (item 37): `ICheckpointStorageProvider.HoldsRestoredCopy`
+  (a default member, false; `ChangelogStorageProvider` answers from its origins), and
+  in `Circuit`'s pump: a circuit that started on such state and has been idle for
+  `RestoredCopyGrace` (2 s) commits once without a step — the offsets, the clock and
+  the step marker as recovered, under its own manifest. A follower that reads that
+  commit drops its own copy, as it does for any checkpoint under its layout.
+- *What a node holds, said by the node.*
+  - `Incremental.Diagnostics.ObjectSize` (internal): what an object costs on the heap,
+    by reading its fields — headers, strings at two bytes a character, arrays, what
+    the references lead to, each object once per walk; the empty string and a
+    collection's comparer left out as shared, and a walk ended at 4,096 objects so
+    that a row which leads to something vast is not sized to the end. `SizeSampler`
+    keeps a running mean over the first 256 items offered and one in 512 after, and
+    stops sizing for good if sizing ever throws: it runs where a table publishes and a
+    store commits, and may cost the estimate but never the write. Both belong to one table or one
+    store and hold no static: a store's types are a plugin's.
+  - `SharedTable.EstimateMemory()` → `TableMemoryEstimate`: rows (the mean of rows
+    sized as they were published or restored, plus the key map: 100 bytes for an
+    eight-byte key), indexes (each index counts its groups and its entries as the
+    writer changes them), history (the tail counts, per version, the changes that
+    replaced or removed a row).
+  - `ChangelogStorageProvider.EstimateSize()` → `StateSizeEstimate`, store by store:
+    entries (the indexed store now counts its own as they come and go; the others
+    are a dictionary's count), the objects of an entry (sampled where the entry is
+    written to the log, or applied from it on a follower), the store's own maps from
+    their capacity, the mean record size, and the entries that wait as bytes or are
+    held twice.
+  - Service: `TableStats.Memory` (with the in-memory log's history counted where the
+    log is in this process), `PipelineStatus.StateSize`, `ProcessMemory` extended
+    (live at the last collection, fragmented, not the collector's, the pause share of
+    the last minute, the collector's settings) and carried in the peer probe,
+    `ServiceNode.MemoryRelease`.
+  - Meter: `incremental.service.table.memory` (tag `part`: rows, indexes, history),
+    `pipeline.state_entries`, `pipeline.state_memory`, `process.working_set`,
+    `process.gc.live`, `process.gc.committed`, `process.other`,
+    `process.gc.pause_ratio`.
+  - Admin API: `memory` on a table, `stateSize` on a pipeline and `stateStores` on its
+    page (the largest, at most `MaxRows`), `holds` and `memoryRelease` on `node`.
+  - Admin UI: a *Memory* column on the tables list and a *State size* column on the
+    pipelines list; the table's page has *Memory* where it had *Estimated size* (the
+    JSON figure is in its text); the pipeline's page has a *State* card, store by
+    store, with a notice while entries are held twice; the cluster page has the
+    process's figures for both nodes and a *Memory* card that sets the working set
+    against tables, state, the rest of the heap, what the collector holds ready, what
+    is not the collector's and the program's own files, as one bar and a table, with
+    the largest tables and states under it. Verified in Chromium at 1440 px and
+    390 px, light and dark: no console message, no horizontal overflow.
+- *The rig*: `--gc` (the nodes' environment: `node`, `round2`, `stock`, or pairs),
+  `--client` (a client property for every client), `--memory-only`, `--trim`, `--age`,
+  `--hold-seconds`; memory read every second of the steady load from each node,
+  without forcing a collection; the pause share of the steady load alone; the longest
+  stall (a thread that sleeps 5 ms) and the last full blocking collection; the node's
+  own estimates beside the heap's growth; a timeline of every node's working set; the
+  nodes' `smaps` kept.
+
+**After** (the same two scenarios; every figure from one run unless a range is given):
+
+| a million rows, a million orders of state | before | after |
+|---|---|---|
+| leader: working set / live | 7,704 / 2,159 MB | 3,464 / 2,158 MB |
+| standby: working set / live | 5,297 / 2,299 MB | 3,579 / 2,354 MB |
+| leader's working set at its peak (the end of the state fill) | 7,739–7,923 MB | 6,817 MB |
+| collector's pauses, share of the leader's life | 7.3 % | 4.8 % |
+| … of the steady load | 0.4 % | 1.9 % (the keeper's collections among them) |
+| the longest the leader stood still, steady load / load and fill | not measured | 33 ms / 418 ms |
+| `kill -9` → the standby decides | 3,029 ms | 3,001 ms |
+| … → leader | 3,916 ms | 3,845 ms |
+| … → first record in the first / last sink | 4,094 / 4,118 ms | 3,896 / 4,039 ms |
+| takeover by hand: longest silence in a sink | 1,848 ms | 1,689 ms |
+| a cold standby until warm | 12.2 s | 12.7 s |
+| one node from nothing → first record in the last sink | 12.6 s | 13.2 s |
+
+| five million rows, a million orders of state | before | after |
+|---|---|---|
+| two nodes on this machine | did not fit (S6) | fit: the whole scenario, exit 0, three times |
+| leader: working set / live | 15,132 / 7,221 MB (one node) | 8,156 / 7,211 MB |
+| standby: working set / live | — | 9,276 / 7,421 MB |
+| leader's working set at its peak | not read | 14,471 MB; 10,846 MB under a 10 GB heap limit |
+| collector's pauses, share of the leader's steady load | not read | 1.5 % |
+| the longest the leader stood still, steady load / load and fill | not read | 30 ms / 1.7 s |
+| `kill -9` → first record in the last sink | — | 4,100 ms |
+| takeover by hand: longest silence in a sink | — | 1,812 ms |
+| a cold standby until warm | — | 38.9 s |
+| one node from nothing → first record in the last sink | 33.9 s | 35.4 s |
+
+The same scenario was run through with the two conserve settings on the way: at a
+million rows the leader's working set was 3,215 MB (5) and 2,960 MB (7), the last sink
+had its record 4,296 and 4,031 ms after the kill, one node from nothing took 13.4 and
+13.8 s; at five million the leader's was 8,127 and 8,115 MB, the standby's 9,265 and
+8,648 MB, the peak 14,387 and 12,700 MB, the last sink 4,061 and 3,994 ms, the hand
+takeover's silence 2,400 and 1,708 ms. Failover does not move with any of it.
+
+Under `GCHeapHardLimit` of 10 GB (two nodes at five million rows, the shipped
+settings): the peak 10,846 MB for 14,471, the table loaded in 34.4 s for 32.7, the
+state fill in 32.8 s for 28.8, the collector's share of the leader's life 10.1 % for
+7.7 % and of its steady load 2.1 % for 1.5 %, the standby's working set 8,444 MB for
+9,276 and warm in 42.8 s for 38.9.
+
+The 1.7 s is a full blocking collection while five million rows are being loaded; it
+was 2.0 and 1.9 s with conserve 7, 2.1 s in an earlier run without, and 1.7 and 2.2 s
+under the heap limit, so it is the load's and not a setting's (item 61). One node from
+nothing led after 12.4 to 13.7 s in five full runs at a million rows, against 12.4 s in
+the one run before; the difference is in reading the table back (3.9 to 6.0 s against
+4.4 s). In four runs that load, fill and start cold without the failovers in between
+it led after 12.0 to 12.4 s. With one run to compare with, whether it is slower at all
+is not established; the fetch queue is not the reason (the same spread at 2 MB and at
+8).
+
+**The estimates against the heap.** At five million rows the node said its table held
+6,506 MB (rows 5,875 MB at 1,132 bytes of objects a row, the index 629 MB, history
+1 MB); the heap after the load was 6,490 MB. It said the state of the four stateful
+pipelines held 796 MB (six million entries); the heap had grown by 736 MB. And a
+million rows or entries at a time, in a process of their own (the harness is
+`scratchpad/h6/bytes/bytes.cs`; the figures are in the guide's table):
+
+| | measured | estimated |
+|---|---|---|
+| a row of 4 columns | 193 B | 189 B |
+| … of 9 columns | 401 B | 396 B |
+| … of 21 columns | 1,248 B | 1,245 B |
+| … the same with one string instance shared by every row | 1,088 B | 1,245 B |
+| … with a unique secondary index | 1,381 B | 1,377 B |
+| a keyed input's record | 269 B | 268 B |
+| a join's side, three records to a key | 359 B | 340 B |
+| a decimal total per key | 61 B | 61 B |
+| a count per string key | 87 B | 87 B |
+| a deadline | 56 B | 55 B |
+
+**Public API added.** Core: `SharedTable<,>.EstimateMemory()`, `TableMemoryEstimate`;
+`ChangelogStorageProvider.EstimateSize()`, `.HoldsRestoredCopy`, `StateSizeEstimate`,
+`StateStoreSize`; `ICheckpointStorageProvider.HoldsRestoredCopy` (default member).
+Kafka: the two defaults. Service: `TableStats.Memory`, `PipelineStatus.StateSize`,
+`ProcessMemory`'s new members and `GcSettingsInfo`, `MemoryRelease`,
+`ServiceNode.MemoryRelease`, `ServiceOptions.ReleaseUnusedMemoryEvery`; eight
+instruments and the `part` tag; `Node.Gc.props`. Admin JSON as above.
+
+**Tests.** Core, `MemoryEstimateTests` (11; a collection of their own, not run beside
+other tests): an object's estimate equals the bytes the collector allocates for it —
+strings, arrays, records, nested collections, a dictionary — to the byte; a table's
+estimate is within a tenth of what the heap holds for 120,000 narrow rows and for
+120,000 wide rows with two indexes; history follows replaced and removed rows and
+stops at the tail's bound; an index's estimate follows its groups to nothing; a
+pipeline's four kinds of store, 100,000 orders, within a quarter of the heap and each
+store's maps within bounds of their own; state as bytes, held twice, committed,
+released; the indexed store's count against a model through 20,000 random operations.
+`RestoredCopyTests` (3): the idle commit happens once, not at once, changes neither
+state nor positions, and a follower agrees; a circuit with input commits by itself and
+no extra checkpoint is written; a new state commits nothing. Service:
+`MemoryFiguresTests` (4), `MemoryKeeperTests` (5: the decision, its rests of 1, 2, 4,
+8, 10, 10 minutes, 250 MB of freed blocks returned to the operating system, the
+interval, a node running it), the meter's two tests and the admin API's extended.
+Thirty-nine mutations, all killed in the end; one survived its first run (a
+follower's entries left unsized: the tests asked were the wrong ones, and the right one
+did not look at the sample) and got an assertion.
+`KafkaLeadershipTests.A_step_down_whose_resignation_cannot_commit…` failed two runs in
+five on the unchanged tree — a heartbeat begun between the refused resignation and the
+close was counted after the test had read the count — and now waits three beats before
+reading it; with the close removed it still fails.
+
+**The core's hot paths** (they changed: a count in the indexed store, a count per row
+published). `benchmarks -- --assert`: all ten contracts hold. The throughput rig
+(Release, `--workers 4 --seconds 20 --warmup 8`, the heap provider), the unchanged tree
+and this one in turn, three runs each:
+
+| | before | after |
+|---|---|---|
+| records a second | 373.6k, 382.2k, 370.2k | 373.6k, 371.0k, 368.4k |
+| allocated per record | 565–566 B | 566–567 B |
+| worker CPU per record | 7.83–7.98 µs | 7.93–8.03 µs |
+
+The means are 1 % apart and inside each other's spread; allocation did not move. The
+rig's pipeline does not use a checkpointing provider, so the sampling at a commit is not
+in these figures: it is one sizing per 512 entries written, which the scale rig's state
+fill (24.1–24.9 s in six runs of this build, 24.6 s before) does not show.
+
+**Deviations.**
+
+- The service calls `GC.Collect` and `malloc_trim` (item 57). The second is a P/Invoke
+  into `libc.so.6`.
+- A source's fetch queue default changed (item 59).
+- An idle pipeline commits a checkpoint nobody asked for, two seconds after it starts
+  on restored state (item 37). Metrics count it as a commit.
+- The core's write paths gained counters: one increment per row published to a table
+  and one in 512 sized; the indexed store counts entries on every change; a store
+  sizes one in 512 of the entries it writes at a commit or applies on a follower.
+  Benchmarks and the throughput rig below.
+- `ICheckpointStorageProvider` has a new default member; `TableStats`,
+  `PipelineStatus` and `ProcessMemory` new optional members. The probe line's `mem=`
+  part is longer; a node from before reads none of it and shows "it did not say".
+- The example's collector settings changed: four heaps for one.
+- The table page's *Estimated size* card is gone; its figure is a sentence of the
+  *Memory* card.
+- The core suite takes 45 s where it took 31: the memory tests collect in full
+  between their readings.
+
+**Left undone.**
+
+- Ten million rows. A soak: nothing here ran for more than four minutes, so the
+  keeper's rests, the conserve setting under hours of churn and fragmentation's own
+  full collections are reasoned, not watched.
+- The bulk load's 2 s pause (item 61).
+- The collector's longest pause is not an instrument: the rig measures it, a node does
+  not say it.
+- At five million rows the node's reading of its own `/proc/self/status` came back
+  empty once per run, at the end of the state fill (*not the collector's* shows as
+  unknown there), and the rig's timeline, which reads the same file from outside,
+  has a gap of a minute at the same place. Not explained.
+- The large-object threshold was not looked at for a node (the example has the
+  examples' 1 MB; the rig the runtime's 85 KB).
+- Nothing on three brokers, behind SASL, on MSK, on Windows or on another C library
+  than glibc; there the keeper's allocator half does nothing and `process.other` is
+  not reported.
