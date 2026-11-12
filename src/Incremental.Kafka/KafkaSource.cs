@@ -42,10 +42,16 @@ public sealed class KafkaSourceOptions
     public IsolationLevel IsolationLevel { get; init; } = IsolationLevel.ReadCommitted;
 
     /// <summary>The most the client may hold of records fetched and not yet handed on
-    /// (<c>queued.max.messages.kbytes</c>), in kilobytes. With the input's bounded channel
-    /// this is the source's whole memory: when the circuit is slow the channel fills, the
-    /// source stops polling, and the client stops fetching at this limit. Default 16 MB.</summary>
-    public int FetchBufferKilobytes { get; init; } = 16 * 1024;
+    /// (<c>queued.max.messages.kbytes</c>), in kilobytes, for each partition of the topic:
+    /// the client keeps a queue per partition. With the input's bounded channel this is
+    /// the source's whole memory: when the circuit is slow the channel fills, the source
+    /// stops polling, and the client stops fetching once every partition's queue is this
+    /// full — so a source that is behind holds this times the topic's partitions, and
+    /// the client's allocator keeps it after the records are gone. Default 2 MB: at
+    /// 16 MB, twenty pipelines reading a backlog from a four-partition topic left a
+    /// node with 2 GB there; at 2 MB with 0.8 GB, and they read it no more slowly
+    /// (docs/design/enrichment-service.md, S7, <i>Memory</i>).</summary>
+    public int FetchBufferKilobytes { get; init; } = 2 * 1024;
 
     /// <summary>How long a write to a full input (or a table commit) may wait before the
     /// source pauses its partitions, so that the client asks the brokers for nothing until

@@ -87,10 +87,15 @@ public sealed class KafkaLogOptions
     public int MaxAbortRetries { get; init; } = 5;
 
     /// <summary>The most each of this log's consumers may hold of records fetched and not yet
-    /// applied (<c>queued.max.messages.kbytes</c>), in kilobytes. A follower or a restore
-    /// runs one consumer per state partition and one per followed table, so while it is
-    /// behind it can hold this much native memory for each. Default 8 MB (the client's own
-    /// default is 64).</summary>
+    /// applied (<c>queued.max.messages.kbytes</c>), in kilobytes — for each partition it
+    /// reads: the client keeps a queue per partition and fetches for one until that
+    /// queue is this full. A follower or a restore runs one consumer per state partition
+    /// and one per followed table (which has several), so while it is behind it holds
+    /// about this much native memory per partition, and the client's allocator keeps it
+    /// after the records are gone unless it is asked to give it back (the service asks).
+    /// Default 8 MB (the client's own default is 64). At 2 MB a restore was if anything
+    /// slower, for a few hundred megabytes that a node holds only while it restores
+    /// (docs/design/enrichment-service.md, S7, <i>Memory</i>).</summary>
     public int FetchBufferKilobytes { get; init; } = 8 * 1024;
 
     /// <summary>Timeout of admin calls, and of a read that makes no progress.</summary>

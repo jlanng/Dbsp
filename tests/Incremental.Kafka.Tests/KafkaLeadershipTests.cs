@@ -929,6 +929,11 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         Assert.True(leadershipA.WhenFinished.IsCompleted);
         Assert.False(a.IsWriter);
         Assert.True(a.IsFenced);
+
+        // One heartbeat may be in flight: the writer was idle past its interval while the
+        // resignation was being refused, so it began one in the moment between that
+        // failure and the close. It lands or fails within a beat; none begins after it.
+        await Task.Delay(Beat * 3);
         var beats = a.IdleHeartbeats;
 
         await LeadsAsync(b);
