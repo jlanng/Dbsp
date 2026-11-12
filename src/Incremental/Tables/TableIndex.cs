@@ -21,6 +21,10 @@ internal abstract class TableIndex<TKey, TRow>
     public abstract void Apply(long version);
 
     public abstract void Trim(long floor);
+
+    /// <summary>An estimate of the index's own bytes on the managed heap: its map and
+    /// its groups, not the rows they lead to.</summary>
+    public abstract long EstimatedBytes { get; }
 }
 
 /// <summary>
@@ -41,6 +45,18 @@ internal sealed class TableIndex<TIndexKey, TKey, TRow>(Func<TRow, TIndexKey?> s
     // What the version being committed does to the groups; filled by Prepare, emptied by Apply.
     private readonly List<(TIndexKey IndexKey, TKey Key, bool Add)> _pending = [];
 
+    // Groups held and primary keys across them: the writer's counts, read by anyone.
+    private long _groupCount;
+    private long _entryCount;
+
+    /// <summary>Per group the map's share (<see cref="VersionChains{TKey,TValue}.BytesPerKey"/>)
+    /// and an array's header; per indexed row one primary key in a group's array. An
+    /// index key the selector makes rather than reads from the row is counted as a
+    /// reference, like one it reads.</summary>
+    public override long EstimatedBytes =>
+        Volatile.Read(ref _groupCount) * (VersionChains<TIndexKey, TKey[]>.BytesPerKey + 24)
+        + Volatile.Read(ref _entryCount) * (typeof(TKey).IsValueType ? System.Runtime.CompilerServices.Unsafe.SizeOf<TKey>() : 8);
+
     /// <summary>Indexes rows that were in the table before the index was declared. Called by
     /// the writer between versions, with <paramref name="version"/> the latest one.</summary>
     public void Build(IEnumerable<KeyValuePair<TKey, TRow>> rows, long version)
@@ -54,8 +70,14 @@ internal sealed class TableIndex<TIndexKey, TKey, TRow>(Func<TRow, TIndexKey?> s
                 groups[indexKey] = group = [];
             group.Add(key);
         }
+        long entries = 0;
         foreach (var (indexKey, group) in groups)
+        {
             _groups.Seed(indexKey, version, group.ToArray());
+            entries += group.Count;
+        }
+        Volatile.Write(ref _groupCount, _groupCount + groups.Count);
+        Volatile.Write(ref _entryCount, _entryCount + entries);
     }
 
     /// <summary>The primary keys under <paramref name="indexKey"/> as of
@@ -97,7 +119,13 @@ internal sealed class TableIndex<TIndexKey, TKey, TRow>(Func<TRow, TIndexKey?> s
         foreach (var (indexKey, key, add) in _pending)
         {
             var group = _groups.Current(indexKey);
-            _groups.Write(indexKey, version, add ? With(group, key) : Without(group!, key));
+            var next = add ? With(group, key) : Without(group!, key);
+            _groups.Write(indexKey, version, next);
+            Volatile.Write(ref _entryCount, _entryCount + (add ? 1 : -1));
+            if (group is null)
+                Volatile.Write(ref _groupCount, _groupCount + 1);
+            else if (next is null)
+                Volatile.Write(ref _groupCount, _groupCount - 1);
         }
         _pending.Clear();
     }

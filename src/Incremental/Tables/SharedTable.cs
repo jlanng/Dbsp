@@ -68,6 +68,9 @@ public sealed class SharedTable<TKey, TRow> : ITableNode, IAsyncDisposable
 
     private readonly VersionChains<TKey, TRow> _rows = new();
 
+    // What a row costs on the heap, from rows sized as they are written or restored.
+    private readonly Diagnostics.SizeSampler _rowSizes = new();
+
     // Secondary indexes. The list is the writer's, touched only while it holds the commit
     // gate; the name lookup is what a circuit under construction reads, on any thread.
     private readonly List<TableIndex<TKey, TRow>> _indexes = [];
@@ -116,6 +119,7 @@ public sealed class SharedTable<TKey, TRow> : ITableNode, IAsyncDisposable
         _log = log;
         Epoch = log?.Epoch ?? Guid.NewGuid().ToString("N");
         _tail = new TableVersion<TKey, TRow>[Math.Min(_options.TailVersions, 16)];
+        _tailSuperseded = new int[_tail.Length];
         Writer = new TableWriter<TKey, TRow>(this, log);
     }
 
@@ -135,7 +139,11 @@ public sealed class SharedTable<TKey, TRow> : ITableNode, IAsyncDisposable
         // Restored rows carry version 0: they are the table as of the head, and every pin is
         // at or above the head, so they are visible to all of them.
         var head = await log.RestoreAsync(
-            (key, row) => table._rows.Seed(key, 0, row), cancellationToken).ConfigureAwait(false);
+            (key, row) =>
+            {
+                table._rows.Seed(key, 0, row);
+                table._rowSizes.Offer(row);
+            }, cancellationToken).ConfigureAwait(false);
         table._count = table._rows.KeyCount;
         table._committedOffsets = head.Offsets;
         table.Writer.SeedPositions(head.Offsets);
@@ -481,6 +489,12 @@ public sealed class SharedTable<TKey, TRow> : ITableNode, IAsyncDisposable
     private long _tailEnd;
     private long _tailChanges;
 
+    // Beside each version in the ring, how many of its changes replaced or removed a row:
+    // the superseded rows that version keeps alive, which nothing else does once the
+    // chains are trimmed. The total is what the tail's history costs in rows.
+    private int[] _tailSuperseded;
+    private long _tailSupersededRows;
+
     private readonly List<TailReader> _readers = [];
 
     // What a waiting writer and waiting circuit pumps are parked on; null when nobody is.
@@ -710,8 +724,15 @@ public sealed class SharedTable<TKey, TRow> : ITableNode, IAsyncDisposable
         // these entries by their version number, so a half-applied batch is never visible.
         // The indexes go in the same way, so a reader never sees rows of one version
         // through an index of another.
+        var superseded = 0;
         foreach (var change in version.Changes)
+        {
             _rows.Write(change.Key, version.Version, change.New);
+            if (change.New is { } row)
+                _rowSizes.Offer(row);
+            if (change.Old is not null)
+                superseded++;
+        }
         foreach (var index in _indexes)
             index.Apply(version.Version);
         Volatile.Write(ref _count, _count + countDelta);
@@ -727,9 +748,11 @@ public sealed class SharedTable<TKey, TRow> : ITableNode, IAsyncDisposable
 
             if (_tailCount == _tail.Length)
                 GrowTail();
+            _tailSuperseded[(_tailStart + _tailCount) % _tail.Length] = superseded;
             _tail[(_tailStart + _tailCount++) % _tail.Length] = version;
             _tailEnd = version.Version;
             _tailChanges += version.Changes.Count;
+            _tailSupersededRows += superseded;
             // Normally what leaves makes room for what arrived. More than the bounds stay
             // only when a reader attached, needing the oldest, after the writer checked for
             // room — and the version just published stays whatever its size: evicting it
@@ -739,6 +762,7 @@ public sealed class SharedTable<TKey, TRow> : ITableNode, IAsyncDisposable
                 && Evictable(TailOldest))
             {
                 _tailChanges -= _tail[_tailStart].Changes.Count;
+                _tailSupersededRows -= _tailSuperseded[_tailStart];
                 _tail[_tailStart] = null!;
                 _tailStart = (_tailStart + 1) % _tail.Length;
                 _tailCount--;
@@ -765,9 +789,13 @@ public sealed class SharedTable<TKey, TRow> : ITableNode, IAsyncDisposable
     private void GrowTail()
     {
         var grown = new TableVersion<TKey, TRow>[_tail.Length * 2];
+        var grownSuperseded = new int[grown.Length];
         for (var i = 0; i < _tailCount; i++)
+        {
             grown[i] = _tail[(_tailStart + i) % _tail.Length];
-        (_tail, _tailStart) = (grown, 0);
+            grownSuperseded[i] = _tailSuperseded[(_tailStart + i) % _tail.Length];
+        }
+        (_tail, _tailSuperseded, _tailStart) = (grown, grownSuperseded, 0);
     }
 
     /// <summary>Cuts every changed key's chain back to the newest entry a pinned reader can
@@ -785,6 +813,55 @@ public sealed class SharedTable<TKey, TRow> : ITableNode, IAsyncDisposable
         _rows.Trim(floor);
         foreach (var index in _indexes)
             index.Trim(floor);
+    }
+
+    // ── what it costs ──────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// An estimate of what this table holds on the managed heap of this process, in three
+    /// parts. Cheap enough to ask every few seconds: counters and one short lock, never a
+    /// walk of the rows.
+    /// <para>
+    /// How it is made. A row's cost is the mean over rows sized as they were written or
+    /// restored — each of the first 256, then one in 512 — where sizing a row means
+    /// reading its fields: the object, its strings and whatever else only it refers to,
+    /// with headers and rounding as the runtime allocates them
+    /// (<see cref="TableMemoryEstimate.SampledRows"/> says how many). To that is added what
+    /// the key map costs per row, which follows from the map's layout. An index costs its
+    /// own map per group and one primary key per indexed row. History is the recent
+    /// versions kept for attached circuits (<see cref="SharedTableOptions.TailChanges"/>):
+    /// the rows those versions replaced or removed, which nothing else keeps alive, at the
+    /// same mean, and the change lists themselves.
+    /// </para>
+    /// <para>
+    /// What it does not see: a row that shares an object with other rows (one string
+    /// instance for a country code) is sized as if it had its own, so such a table is
+    /// overstated; superseded rows a slow reader's pin keeps in the chains are not
+    /// counted; a log that keeps history in this process (the in-memory log) is the
+    /// log's to report.
+    /// </para>
+    /// </summary>
+    public TableMemoryEstimate EstimateMemory()
+    {
+        long tailChanges, supersededRows;
+        int tailVersions;
+        lock (_lock)
+        {
+            tailChanges = _tailChanges;
+            supersededRows = _tailSupersededRows;
+            tailVersions = _tailCount;
+        }
+        var rows = Count;
+        var mean = _rowSizes.Mean;
+        long indexBytes = 0;
+        foreach (var index in _indexesByName.Values)
+            indexBytes += ((TableIndex<TKey, TRow>)index).EstimatedBytes;
+        return new TableMemoryEstimate(
+            rows, _rowSizes.Sampled, Math.Round(mean, 1),
+            (long)(rows * mean) + rows * VersionChains<TKey, TRow>.BytesPerKey,
+            indexBytes,
+            tailChanges, supersededRows,
+            (long)(supersededRows * mean) + tailChanges * System.Runtime.CompilerServices.Unsafe.SizeOf<TableChange<TKey, TRow>>() + tailVersions * 96L);
     }
 
     // ── test and diagnostics hooks ─────────────────────────────────────────────────────
@@ -814,6 +891,18 @@ public sealed class SharedTable<TKey, TRow> : ITableNode, IAsyncDisposable
                 return _tailCount;
         }
     }
+}
+
+/// <summary>What <see cref="SharedTable{TKey,TRow}.EstimateMemory"/> answers: bytes of
+/// managed heap, estimated. <c>MeanRowBytes</c> is one row's objects, from
+/// <c>SampledRows</c> rows sized as they were written; <c>RowBytes</c> is the rows at that
+/// mean plus the key map; <c>IndexBytes</c> the secondary indexes' own maps and groups;
+/// <c>HistoryBytes</c> the <c>HistoryRows</c> superseded rows and <c>HistoryChanges</c>
+/// change entries that the recent versions kept for attached circuits hold.</summary>
+public sealed record TableMemoryEstimate(
+    long Rows, long SampledRows, double MeanRowBytes, long RowBytes, long IndexBytes, long HistoryChanges, long HistoryRows, long HistoryBytes)
+{
+    public long TotalBytes => RowBytes + IndexBytes + HistoryBytes;
 }
 
 /// <summary>

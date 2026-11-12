@@ -125,6 +125,13 @@ public sealed class Circuit : IAsyncDisposable
     private readonly string _stateManifest = "";
     private Dictionary<string, long> _committedOffsets = new();
     private int _stepsSinceCommit;
+
+    // The pump's: whether a commit has happened since the start (or none is owed), and
+    // when the pump began. How long an idle circuit waits before it commits the state it
+    // was started on, to let the provider drop its copy of it.
+    private bool _restoredCopyReleased;
+    private long _pumpStarted;
+    internal static readonly TimeSpan RestoredCopyGrace = TimeSpan.FromSeconds(2);
     private long _uncommittedSince; // timestamp of the first step since the last commit
 
     // Commit after delivery. Without an acknowledged output a step commits and then
@@ -1011,6 +1018,7 @@ public sealed class Circuit : IAsyncDisposable
             table.CheckpointCommitted();
 
         _stepsSinceCommit = 0;
+        _restoredCopyReleased = true;
         Volatile.Write(ref _committedOffsets, offsets);
 
         var elapsed = Stopwatch.GetElapsedTime(started);
@@ -1174,6 +1182,7 @@ public sealed class Circuit : IAsyncDisposable
     {
         var cancellationToken = _shutdown.Token;
         var waits = new Task<bool>?[_inputs.Length];
+        _pumpStarted = Stopwatch.GetTimestamp();
         try
         {
             while (!cancellationToken.IsCancellationRequested)
@@ -1215,6 +1224,26 @@ public sealed class Circuit : IAsyncDisposable
                     if (!_inputs[i].IsCompleted)
                         waits[i] ??= _inputs[i].WaitToReadAsync(cancellationToken);
 
+                // Started on restored state and idle ever since: the provider may still be
+                // keeping the copy that state was made from, until a commit (see
+                // ICheckpointStorageProvider.HoldsRestoredCopy). Nothing would commit until
+                // a record arrives, so commit once without a step — the checkpoint as it
+                // was recovered, under this circuit's manifest — after a short grace in
+                // which a circuit with something to read commits by itself.
+                TimeSpan? wake = null;
+                if (!_restoredCopyReleased && _checkpoint is not null)
+                {
+                    if (_cluster is not null || !_checkpoint.HoldsRestoredCopy)
+                        _restoredCopyReleased = true;
+                    else if (RestoredCopyGrace - Stopwatch.GetElapsedTime(_pumpStarted) is var grace && grace > TimeSpan.Zero)
+                        wake = grace;
+                    else
+                    {
+                        await CommitOutstandingAsync(cancellationToken).ConfigureAwait(false);
+                        continue;
+                    }
+                }
+
                 // Idle with steps uncommitted and a time bound on that: wake when it runs
                 // out and commit, rather than leave them until the next record arrives.
                 if (_checkpoint is not null && _stepsSinceCommit > 0 && _options.CheckpointMaxDelay is { } maxDelay)
@@ -1225,10 +1254,14 @@ public sealed class Circuit : IAsyncDisposable
                         await CommitOutstandingAsync(cancellationToken).ConfigureAwait(false);
                         continue;
                     }
+                    wake = wake is { } sooner && sooner < remaining ? sooner : remaining;
+                }
 
+                if (wake is { } delay)
+                {
                     using var timerStop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                     await Task.WhenAny(IdleWaits(waits, flush)
-                        .Append(Task.Delay(remaining, timerStop.Token))).ConfigureAwait(false);
+                        .Append(Task.Delay(delay, timerStop.Token))).ConfigureAwait(false);
                     timerStop.Cancel();
                 }
                 else

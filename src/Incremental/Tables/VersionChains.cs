@@ -110,6 +110,14 @@ internal sealed class VersionChains<TKey, TValue>
     /// <summary>Keys physically held, deletions awaiting a trim included.</summary>
     public int KeyCount => _heads.Count;
 
+    /// <summary>What one key costs in this map beside the value it leads to, in bytes of
+    /// managed heap: the dictionary's node (header, key, value, link, hash code), the
+    /// chain entry (header, version, value, link) and the key's share of the bucket
+    /// array, which the dictionary keeps between one and two slots per key. A key that is
+    /// an object is counted as its reference: for a table it is one of the row's own.</summary>
+    public static int BytesPerKey { get; } =
+        (16 + (typeof(TKey).IsValueType ? System.Runtime.CompilerServices.Unsafe.SizeOf<TKey>() : 8) + 8 + 8 + 4 + 7) / 8 * 8 + 40 + 12;
+
     /// <summary>Entries in <paramref name="key"/>'s chain (0 when the key is absent).</summary>
     public int ChainLength(TKey key)
     {

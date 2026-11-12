@@ -87,6 +87,15 @@ public interface ICheckpointStorageProvider : IStorageProvider
         return default;
     }
 
+    /// <summary>Whether the provider is keeping, beside the stores a circuit was built on,
+    /// a second copy of the committed state they were made from, which it lets go of at
+    /// the next commit (<see cref="ChangelogStorageProvider"/> does: the bytes, so that
+    /// types that have committed nothing have changed nothing). An auto-stepping circuit
+    /// that starts on such state and has nothing to read commits once, without a step,
+    /// so that an idle pipeline does not hold its state twice for as long as it is idle.
+    /// False by default.</summary>
+    bool HoldsRestoredCopy => false;
+
     /// <summary>The state manifest committed with the last checkpoint under
     /// <paramref name="scope"/> (one scope per process sharing the physical store), or null
     /// when none has been committed. The circuit compares it against its own state layout on

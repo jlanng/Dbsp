@@ -7,6 +7,25 @@ using System.Text.Json;
 
 namespace Incremental.Storage;
 
+/// <summary>One store of a pipeline's state, as <see cref="ChangelogStorageProvider.EstimateSize"/>
+/// sees it. <c>Kind</c> is <c>weight</c>, <c>indexed</c>, <c>value</c> or <c>deadline</c> for
+/// a store a circuit has created, <c>bytes</c> for records waiting for one.
+/// <c>EstimatedBytes</c> is the store on the managed heap: <c>Entries</c> at
+/// <c>MeanEntryBytes</c> (the objects of one entry's key and value, from
+/// <c>SampledEntries</c> sized entries) plus the store's maps. <c>MeanRecordBytes</c> is
+/// the mean size of the records written for the store or read into it — the entry's part
+/// of the key, and the value — before the log compresses them.</summary>
+public sealed record StateStoreSize(
+    string Name, string Kind, long Entries, long EstimatedBytes, double MeanEntryBytes, double MeanRecordBytes, long SampledEntries);
+
+/// <summary>What a pipeline's state holds in this process, estimated
+/// (<see cref="ChangelogStorageProvider.EstimateSize"/>): <c>Entries</c> in all and
+/// <c>EstimatedBytes</c> of managed heap; of the entries, <c>EntriesAsBytes</c> wait as
+/// bytes for a circuit to give them types; <c>EntriesHeldTwice</c> are held typed with
+/// their bytes still beside them, which cost <c>BytesHeldTwice</c> of the total.</summary>
+public sealed record StateSizeEstimate(
+    long Entries, long EstimatedBytes, long EntriesAsBytes, long EntriesHeldTwice, long BytesHeldTwice, IReadOnlyList<StateStoreSize> Stores);
+
 /// <summary>
 /// One pipeline's checkpointing storage on a <see cref="ChangelogStorage"/>: state lives on
 /// the heap, in the same stores the default provider uses, and every checkpoint appends
@@ -97,6 +116,11 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
     private bool _typedRefused;
     private long _storeEpoch;
 
+    // Records kept as bytes so far (no store of theirs existed, or its types were given
+    // up) and their bytes — the entry part of the key and the value: the mean size of an
+    // entry that waits as bytes.
+    private long _byteRecords, _byteRecordBytes;
+
     // The store the follower last applied a record to, found again by comparing bytes.
     private byte[] _lastStoreName = [];
     private ChangelogStore? _lastStore;
@@ -156,6 +180,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         _storeEpoch++;
         var collect = new ReleasingTransaction();
         _encoder.Begin(collect, _partition, 0);
+        var (records, bytes) = (_encoder.Records, _encoder.RecordBytes);
         foreach (var (name, store) in _stores)
         {
             if (_origins.Remove(name, out var origin))
@@ -171,6 +196,8 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             _encoder.Store(store.NameUtf8);
             store.WriteEntries(_encoder);
         }
+        _byteRecords += _encoder.Records - records;
+        _byteRecordBytes += _encoder.RecordBytes - bytes;
         _stores.Clear();
         _origins.Clear();
         _lastStore = null;
@@ -326,6 +353,85 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             return _stores.Values.Sum(store => store.EntryCount) + _pending.Values.Sum(entries => (long)entries.Count);
     }
 
+    /// <summary>
+    /// An estimate of what the pipeline's state holds on the managed heap of this process,
+    /// store by store. Cheap enough to ask every few seconds: counts the stores keep and
+    /// one lock, never a walk of the state — but, unlike everything else here, it may be
+    /// asked while a circuit on this provider is stepping, and then the counts are a
+    /// moment old.
+    /// <para>
+    /// How it is made. <c>Entries</c> are counted. An entry's bytes are in two parts.
+    /// The objects — its key and its value, with their strings and whatever else only
+    /// they refer to, headers and rounding as the runtime allocates them — are a mean
+    /// over entries sized as they were written to the changelog or read from it: each of
+    /// the first 256 of a store, then one in 512 (<see cref="StateStoreSize.SampledEntries"/>).
+    /// The store's own maps are computed from their capacity and the layout of one of
+    /// their slots. A store nothing has been written to or read into since it was
+    /// created has no sample, and only its maps are counted.
+    /// </para>
+    /// <para>
+    /// State that waits as bytes — a pipeline no circuit has been built for here, or
+    /// whose types were given up — is counted at the mean size of the records that
+    /// arrived as bytes, plus what two arrays and a dictionary slot cost.
+    /// <see cref="StateSizeEstimate.EntriesHeldTwice"/> is the part of the typed state
+    /// whose bytes are still kept beside it: from the moment a circuit is built on
+    /// restored state until its types first commit (or, on a standby, until the leader's
+    /// do).
+    /// </para>
+    /// <para>
+    /// What it does not see: an object two stores share (the record a keyed input holds
+    /// and the join downstream of it holds too, on the node that read it from its
+    /// source) is counted in both; touched-entry maps and other scratch are not counted.
+    /// </para>
+    /// </summary>
+    public StateSizeEstimate EstimateSize()
+    {
+        lock (_lock)
+        {
+            // An entry kept as bytes: two arrays (24 bytes of header each, rounded) and a
+            // slot of a dictionary that keeps between one and two per entry.
+            var meanRecord = _byteRecords == 0 ? 0 : (double)_byteRecordBytes / _byteRecords;
+            var perByteEntry = meanRecord + 48 + 8 + Diagnostics.ObjectSize.DictionaryEntryBytes<byte[], byte[]>() * 1.5;
+
+            var stores = new List<StateStoreSize>(_stores.Count + _pending.Count);
+            long entries = 0, bytes = 0, asBytes = 0, twice = 0;
+            foreach (var (name, store) in _stores)
+            {
+                var count = store.EntryCount;
+                var mean = store.Sizes.Mean;
+                var estimated = (long)(count * mean) + store.StructureBytes;
+                stores.Add(new StateStoreSize(
+                    name, store.Kind, count, estimated, Math.Round(mean, 1),
+                    store.Records == 0 ? 0 : Math.Round((double)store.RecordBytes / store.Records, 1), store.Sizes.Sampled));
+                entries += count;
+                bytes += estimated;
+            }
+            foreach (var (name, pending) in _pending)
+            {
+                var estimated = (long)(pending.Count * perByteEntry);
+                stores.Add(new StateStoreSize(name, "bytes", pending.Count, estimated, 0, Math.Round(meanRecord, 1), 0));
+                entries += pending.Count;
+                asBytes += pending.Count;
+                bytes += estimated;
+            }
+            foreach (var origin in _origins.Values)
+                twice += origin.Count;
+            var twiceBytes = (long)(twice * perByteEntry);
+            return new StateSizeEstimate(entries, bytes + twiceBytes, asBytes, twice, twiceBytes, stores);
+        }
+    }
+
+    /// <summary>Whether bytes a store was created from are still kept beside it: true
+    /// from a circuit being built on restored state until the next commit.</summary>
+    public bool HoldsRestoredCopy
+    {
+        get
+        {
+            lock (_lock)
+                return _origins.Count != 0;
+        }
+    }
+
     /// <summary>The pipeline's durable identity; see <see cref="ChangelogStorage.Pipeline"/>.</summary>
     public string PipelineId { get; }
 
@@ -403,7 +509,11 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
                 try
                 {
                     foreach (var (entry, value) in pending)
+                    {
                         store.Apply(_serializer, entry, value, tombstone: false);
+                        store.Records++;
+                        store.RecordBytes += entry.Length + value.Length;
+                    }
                 }
                 // A value the declared types cannot take. A record this version cannot
                 // read at all (an unknown format byte) is not a mismatch of types.
@@ -493,7 +603,10 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
                     if (!store.HasChanges)
                         continue;
                     _encoder.Store(store.NameUtf8);
+                    var (records, bytes) = (_encoder.Records, _encoder.RecordBytes);
                     store.WriteChanges(_encoder);
+                    store.Records += _encoder.Records - records;
+                    store.RecordBytes += _encoder.RecordBytes - bytes;
                 }
                 _encoder.Commit(sequence, writer.Term, inputOffsets, _committedManifests, _stagedManifests);
                 layout = _layout;
@@ -678,6 +791,11 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
                     try
                     {
                         store.Apply(_serializer, entry, record.Value.Span, record.IsTombstone);
+                        if (!record.IsTombstone)
+                        {
+                            store.Records++;
+                            store.RecordBytes += entry.Length + record.Value.Length;
+                        }
 
                         // A typed store that is followed has moved on from the bytes it was made of.
                         if (_origins.Count != 0)
@@ -701,7 +819,11 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             if (record.IsTombstone)
                 _lastPending!.Remove(entry.ToArray());
             else
+            {
                 _lastPending![entry.ToArray()] = record.Value.ToArray();
+                _byteRecords++;
+                _byteRecordBytes += entry.Length + record.Value.Length;
+            }
         }
     }
 
@@ -970,6 +1092,19 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         /// <summary>The layout every value is written under; empty for none.</summary>
         public byte[] Tag { get; set; } = [];
 
+        /// <summary>Entry records appended since the encoder was made, tombstones aside,
+        /// and their bytes: the entry part of the key and the value.</summary>
+        public long Records { get; private set; }
+
+        /// <inheritdoc cref="Records"/>
+        public long RecordBytes { get; private set; }
+
+        private void Counted()
+        {
+            Records++;
+            RecordBytes += _key.Length - _storeLength + _value.Length;
+        }
+
         /// <summary>Starts a value: the format byte and, with a layout, its tag.</summary>
         private void Header()
         {
@@ -1036,6 +1171,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             Header();
             Utf8Formatter.TryFormat(weight, _value.GetSpan(20), out var written);
             _value.Advance(written);
+            Counted();
             _transaction.Append(_partition, _key.Written, _value.Written);
         }
 
@@ -1043,6 +1179,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         {
             Header();
             serializer.Write(_value, value);
+            Counted();
             _transaction.Append(_partition, _key.Written, _value.Written);
         }
 
@@ -1125,6 +1262,24 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         private int _slack;
 
         public byte[] NameUtf8 = [];
+
+        /// <summary>What an entry's key and value cost on the heap, from entries sized as
+        /// they were written to the log or read from it. The store's own: it goes with
+        /// the store, and the types it has learnt with it.</summary>
+        public readonly Diagnostics.SizeSampler Sizes = new();
+
+        /// <summary>Records written for this store or applied to it, tombstones aside,
+        /// and their bytes (the entry part of the key, and the value).</summary>
+        public long Records, RecordBytes;
+
+        /// <summary>"weight", "indexed", "value" or "deadline".</summary>
+        public abstract string Kind { get; }
+
+        /// <summary>An estimate of the bytes the store's own structures take on the heap —
+        /// its maps, with the keys and values that lie in their entries — beside the
+        /// objects those entries refer to. Read without the owning thread's leave: the
+        /// counts it is made of may be a moment old.</summary>
+        public abstract long StructureBytes { get; }
 
         /// <summary>Entries touched since the last commit.</summary>
         public abstract int TouchedCount { get; }
@@ -1232,14 +1387,19 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         public override int TouchedCapacity => _touched.EnsureCapacity(0);
         public override int HeldCount => _held.Count;
         public override long EntryCount => _live.Entries.Count;
+        public override string Kind => "weight";
+        public override long StructureBytes => (long)_live.Entries.EnsureCapacity(0) * Diagnostics.ObjectSize.DictionaryEntryBytes<T, long>();
 
         public override void WriteChanges(RecordEncoder encoder)
         {
             foreach (var (value, before) in _touched)
             {
                 var now = _live.WeightOf(value);
-                if (now != before)
-                    encoder.Entry().Part(value).Weight(now);
+                if (now == before)
+                    continue;
+                encoder.Entry().Part(value).Weight(now);
+                if (now != 0)
+                    Sizes.Offer(value);
             }
         }
 
@@ -1273,7 +1433,10 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             if (weight == 0)
                 _held.Release(read);
             else
+            {
                 _held.Hold(read);
+                Sizes.Offer(read);
+            }
         }
 
         public override void WriteTombstones(RecordEncoder encoder)
@@ -1359,13 +1522,34 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         public override int TouchedCount => _touched.Count;
         public override int TouchedCapacity => _touched.EnsureCapacity(0);
         public override int HeldCount => _held.Count;
-        public override long EntryCount => _live.Entries().LongCount();
+        public override long EntryCount => _live.EntryCount;
+        public override string Kind => "indexed";
+
+        public override long StructureBytes
+        {
+            get
+            {
+                // The group map with one value inline per group; a group of several values
+                // has a dictionary of its own: the object and its two arrays' headers
+                // (136 bytes), and slots for about twice its values — a small dictionary's
+                // capacity is the next prime, so it runs emptier than a large one.
+                var (groups, many, capacity) = _live.Shape;
+                var inGroups = Math.Max(0, _live.EntryCount - (groups - many));
+                return (long)capacity * Diagnostics.ObjectSize.DictionaryEntryBytes<TKey, (TValue Single, long Weight, object? Many)>()
+                    + many * 136 + inGroups * Diagnostics.ObjectSize.DictionaryEntryBytes<TValue, long>() * 2;
+            }
+        }
 
         public override void WriteChanges(RecordEncoder encoder)
         {
             foreach (var (entry, weights) in _touched)
-                if (weights.Now != weights.Before)
-                    encoder.Entry().Part(entry.Key).Separator().Part(entry.Value).Weight(weights.Now);
+            {
+                if (weights.Now == weights.Before)
+                    continue;
+                encoder.Entry().Part(entry.Key).Separator().Part(entry.Value).Weight(weights.Now);
+                if (weights.Now != 0)
+                    Sizes.Offer(entry.Key, entry.Value);
+            }
         }
 
         public override void Promote()
@@ -1400,7 +1584,10 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             if (weight == 0)
                 _held.Release(read);
             else
+            {
                 _held.Hold(read);
+                Sizes.Offer(read.Item1, read.Item2);
+            }
         }
 
         public override void WriteTombstones(RecordEncoder encoder)
@@ -1467,13 +1654,18 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         public override int TouchedCapacity => _touched.EnsureCapacity(0);
         public override int HeldCount => _held.Count;
         public override long EntryCount => _live.Entries.Count;
+        public override string Kind => "value";
+        public override long StructureBytes => (long)_live.Entries.EnsureCapacity(0) * Diagnostics.ObjectSize.DictionaryEntryBytes<TKey, TValue>();
 
         public override void WriteChanges(RecordEncoder encoder)
         {
             foreach (var (key, before) in _touched)
             {
                 if (_live.TryGet(key, out var now))
+                {
                     encoder.Entry().Part(key).Value(now);
+                    Sizes.Offer(key, now);
+                }
                 else if (before.Existed)
                     encoder.Entry().Part(key).Tombstone();
             }
@@ -1513,8 +1705,10 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             }
             else
             {
-                _live.Put(key, serializer.Read<TValue>(Payload(value)));
+                var read = serializer.Read<TValue>(Payload(value));
+                _live.Put(key, read);
                 _held.Hold(key);
+                Sizes.Offer(key, read);
             }
         }
 
@@ -1598,6 +1792,12 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         public override int TouchedCapacity => _touched.EnsureCapacity(0);
         public override int HeldCount => _held.Count;
         public override long EntryCount => _live.Entries.Count;
+        public override string Kind => "deadline";
+
+        // The map, and the queue that orders it: a key and a deadline per entry in each.
+        public override long StructureBytes =>
+            (long)_live.Entries.EnsureCapacity(0) * Diagnostics.ObjectSize.DictionaryEntryBytes<TKey, long>()
+            + _live.Entries.Count * (long)System.Runtime.CompilerServices.Unsafe.SizeOf<(TKey, long)>();
 
         public override void WriteChanges(RecordEncoder encoder)
         {
@@ -1606,7 +1806,10 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
                 if (_live.TryGet(key, out var now))
                 {
                     if (!before.Held || before.Deadline != now)
+                    {
                         encoder.Entry().Part(key).Value(now);
+                        Sizes.Offer(key);
+                    }
                 }
                 else if (before.Held)
                     encoder.Entry().Part(key).Tombstone();
@@ -1648,6 +1851,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             else
             {
                 _live.Set(_held.Hold(key), serializer.Read<long>(Payload(value)));
+                Sizes.Offer(key);
             }
         }
 

@@ -88,6 +88,18 @@ public sealed class InMemoryStorageProvider : IStorageProvider
 
         private readonly Dictionary<TKey, Group> _groups = new();
 
+        // Entries held, and groups that have outgrown their inline slot: this thread's
+        // counts, for whoever asks what the store holds without walking it.
+        private long _entryCount;
+        private long _manyGroups;
+
+        /// <summary>Entries held, across all groups.</summary>
+        internal long EntryCount => Volatile.Read(ref _entryCount);
+
+        /// <summary>Groups held, groups of more than one value, and the room the group map
+        /// has: what the store's own structures cost.</summary>
+        internal (int Groups, long ManyGroups, int Capacity) Shape => (_groups.Count, Volatile.Read(ref _manyGroups), _groups.EnsureCapacity(0));
+
         // Multi-valued groups appear and vanish too in a sliding workload. Their emptied
         // dictionaries are parked here (bounded, and empty, so this holds nothing but their
         // capacity) and handed back out to the next group that outgrows one value.
@@ -124,29 +136,42 @@ public sealed class InMemoryStorageProvider : IStorageProvider
                 many.Add(group.Single, group.Weight);
                 many.Add(value, delta);
                 group = new Group { Many = many };
+                _entryCount++;
+                _manyGroups++;
                 return delta;
             }
 
             // Written through the ref before any removal: removing the key clears the slot.
             group.Weight = updated;
             if (updated == 0)
+            {
                 _groups.Remove(key);
+                if (hadGroup)
+                    _entryCount--;
+            }
+            else if (!hadGroup)
+                _entryCount++;
             return updated;
         }
 
         private long UpdateMany(TKey key, Dictionary<TValue, long> group, TValue value, long delta, ref Dictionary<TValue, long>? reachable)
         {
-            ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(group, value, out _);
+            ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(group, value, out var had);
             var updated = slot + delta;
             if (updated != 0)
             {
                 slot = updated;
+                if (!had)
+                    _entryCount++;
                 return updated;
             }
 
             group.Remove(value);
+            if (had)
+                _entryCount--;
             if (group.Count == 0)
             {
+                _manyGroups--;
                 _groups.Remove(key);
                 if (_spare.Count < MaxSpare)
                     _spare.Push(group);
@@ -218,7 +243,18 @@ public sealed class InMemoryStorageProvider : IStorageProvider
             }
         }
 
-        public void RemoveGroup(TKey key) => _groups.Remove(key);
+        public void RemoveGroup(TKey key)
+        {
+            if (!_groups.Remove(key, out var group))
+                return;
+            if (group.Many is { } many)
+            {
+                _entryCount -= many.Count;
+                _manyGroups--;
+            }
+            else
+                _entryCount--;
+        }
 
         /// <summary>The weight of one value under <paramref name="key"/>, 0 if absent.</summary>
         internal long WeightOf(TKey key, TValue value)
@@ -272,7 +308,12 @@ public sealed class InMemoryStorageProvider : IStorageProvider
             }
         }
 
-        internal void Clear() => _groups.Clear();
+        internal void Clear()
+        {
+            _groups.Clear();
+            _entryCount = 0;
+            _manyGroups = 0;
+        }
     }
 
     internal sealed class ValueStore<TKey, TValue> : IValueStore<TKey, TValue> where TKey : notnull
