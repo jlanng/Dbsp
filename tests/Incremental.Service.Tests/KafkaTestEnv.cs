@@ -132,7 +132,19 @@ internal sealed class KafkaTestEnv : IAsyncDisposable
                 Configs = compacted ? new Dictionary<string, string> { ["cleanup.policy"] = "compact" } : [],
             },
         ]);
-        return topic;
+
+        // Created is the controller's word; a client asks a broker, whose copy of the
+        // metadata follows a moment later. Until then the topic "does not exist".
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        while (true)
+        {
+            var described = await Task.Run(() => admin.GetMetadata(topic, TimeSpan.FromSeconds(10)).Topics.FirstOrDefault(t => t.Topic == topic));
+            if (described is not null && !described.Error.IsError && described.Partitions.Count == partitions && described.Partitions.All(p => p.Leader >= 0))
+                return topic;
+            if (waited.Elapsed > Timeout)
+                Assert.Fail($"Topic '{topic}' was created and is still not known to the broker after {Timeout}.");
+            await Task.Delay(50);
+        }
     }
 
     public static async Task<bool> TopicExistsAsync(string topic)

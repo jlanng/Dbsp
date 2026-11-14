@@ -279,7 +279,14 @@ public class KafkaSinkTests(ITestOutputHelper output)
 
         await circuit.Handle(lines).InsertAsync(new Line(1, "fits"));
         await circuit.StepAsync().WaitAsync(Timeout);
-        await KafkaEnv.EventuallyAsync(() => Task.FromResult(handle.AcknowledgedSequence == 1), "the small record is acknowledged");
+        // A delivery that has failed here will never acknowledge: say why, not "timed out".
+        await KafkaEnv.EventuallyAsync(
+            async () =>
+            {
+                if (delivery.IsFaulted)
+                    await delivery;
+                return handle.AcknowledgedSequence == 1;
+            }, "the small record is acknowledged");
 
         await circuit.Handle(lines).InsertAsync(new Line(2, new string('x', 20_000)));
         await circuit.StepAsync().WaitAsync(Timeout);

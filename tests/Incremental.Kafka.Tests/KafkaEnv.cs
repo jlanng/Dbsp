@@ -161,7 +161,27 @@ internal sealed class KafkaEnv : IAsyncDisposable
         using var admin = new AdminClientBuilder(new AdminClientConfig { BootstrapServers = Bootstrap }).Build();
         await admin.CreateTopicsAsync(
             [new Confluent.Kafka.Admin.TopicSpecification { Name = topic, NumPartitions = partitions, ReplicationFactor = Replication, Configs = settings }]);
+        await TopicKnownAsync(admin, topic, partitions);
         return topic;
+    }
+
+    /// <summary>Waits until a topic that was just created is one a client can use. The
+    /// creation is the controller's; a client's question about the topic is answered by
+    /// a broker from its own copy of the metadata, which follows a moment later — longer
+    /// on a slow runner — and until then the topic "does not exist", which a sink that
+    /// does not create its topic takes at its word.</summary>
+    public static async Task TopicKnownAsync(IAdminClient admin, string topic, int partitions)
+    {
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        while (true)
+        {
+            var described = await Task.Run(() => admin.GetMetadata(topic, TimeSpan.FromSeconds(10)).Topics.FirstOrDefault(t => t.Topic == topic));
+            if (described is not null && !described.Error.IsError && described.Partitions.Count == partitions && described.Partitions.All(p => p.Leader >= 0))
+                return;
+            if (waited.Elapsed > Timeout)
+                Assert.Fail($"Topic '{topic}' was created and is still not known to the broker after {Timeout} ({described?.Error.Reason ?? "it is not in the answer"}).");
+            await Task.Delay(50);
+        }
     }
 
     public KafkaSourceOptions Source(string topic) => new() { BootstrapServers = Bootstrap, Topic = topic };

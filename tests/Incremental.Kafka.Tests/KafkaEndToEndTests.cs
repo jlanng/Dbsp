@@ -528,10 +528,16 @@ public class KafkaEndToEndTests(ITestOutputHelper output)
     {
         // Small segments and an eager cleaner, so that by the time the active is dropped
         // the state topic has been compacted under it: superseded records are gone, and
-        // the restore reads what the cleaner left.
+        // the restore reads what the cleaner left. The segments are very small because
+        // the cleaner never touches the one being written, and nothing is written while
+        // this test waits: what is in that segment stays, however long the wait. With
+        // 16 KB segments it was 47 offsets on a fast machine and 263 on a CI runner
+        // (a segment also rolls when its first record is a second old, so where the
+        // last one begins depends on the pace), which left 893 and 959 records against
+        // the 857 this test accepts: it skipped in about half of the runs there.
         var stateTopic = new Dictionary<string, string>
         {
-            ["segment.bytes"] = "16384",
+            ["segment.bytes"] = "4096",
             ["min.cleanable.dirty.ratio"] = "0.01",
             ["min.compaction.lag.ms"] = "0",
             ["max.compaction.lag.ms"] = "1000",
