@@ -358,9 +358,15 @@ public sealed class Smoke(ExampleOptions options)
     {
         Console.WriteLine();
         Console.WriteLine($"2. 2,000 trades are published over {_shape.TradeKeySpace:N0} trade ids, so a quarter of them reuse the id of an earlier, final trade.");
-        // Two halves, the second once the first is through: never two trades of one id in a step.
+        // Two halves, the second once the first is through: never two trades of one id in a
+        // step. Through both pipelines that key the trades by id, each of which cuts its
+        // own steps: on a slow runner large-trades was still on the first half when the
+        // second arrived, took a reused id's two trades for one trade amended, and never
+        // delivered the first of them (19 rows short of the model's 1,095).
         await PublishAsync(1000);
-        await EnrichedIs("the first 1,000 trades are through trade-enrichment");
+        await Claim("the first 1,000 trades are through trade-enrichment and large-trades", () => Task.Run(() =>
+            Model.Difference(_model.Enrichments["trade-enrichment"].Expected(), Sink("trade-enrichment"))
+            ?? Model.Difference(_model.Enrichments["large-trades"].Expected(), Sink("large-trades"))));
         await PublishAsync(1000);
         await EnrichedIs($"trade-enrichment delivered exactly the {_model.Enrichments["trade-enrichment"].Expected().Count:N0} live trades at or above its minimum notional, each joined to three tables");
         await EnrichedIs($"large-trades, the same definition with other settings and its own state, delivered its {_model.Enrichments["large-trades"].Expected().Count:N0}", "large-trades");

@@ -2045,6 +2045,14 @@ Each has a default this design is built on.
     or keeps it if the new trade is filtered out. *Alternative:* an id that must stay
     unique could be checked, but only against what the input still holds — the open
     trades — so it would catch nothing the watermark has passed.
+    Whether the earlier trade *is* final when the later one arrives depends on how the
+    input is cut into steps: a pipeline that reads both in one step — a backlog after a
+    restart, a pipeline that had fallen behind — takes them for one trade amended, and
+    the first is never delivered. Found in round four's CI work: the smoke test
+    published its trades in two halves and waited for `trade-enrichment` between them,
+    and on a runner `large-trades` was still on the first half (19 rows short of the
+    model). The smoke now waits for both; what a tenant's pipeline delivers for a
+    reused id after a replay is the question this item leaves.
 72. **The definition's `openSeconds` defaults to an hour; the example seeds two minutes
     and the smoke test thirty seconds** (S8). An hour is a guess at how late a booking
     correction comes. At 1,000 trades a second it is about 9 GB of state per node for
