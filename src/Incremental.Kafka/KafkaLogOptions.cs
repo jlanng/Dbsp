@@ -63,9 +63,31 @@ public sealed class KafkaLogOptions
     /// partition can miss a tombstone and keep a deleted entry.</summary>
     public TimeSpan DeleteRetention { get; init; } = TimeSpan.FromHours(24);
 
-    /// <summary><c>transaction.timeout.ms</c>: how long the broker lets one transaction stay
-    /// open before aborting it and fencing the producer.</summary>
-    public TimeSpan TransactionTimeout { get; init; } = TimeSpan.FromSeconds(60);
+    /// <summary>
+    /// <c>transaction.timeout.ms</c>: how long one transaction of the writer may stay open.
+    /// Two clocks run on it. The client gives a transaction's records this long to be
+    /// taken by the brokers and then fails the transaction; the transaction coordinator
+    /// aborts a transaction it has registered once it is this old and raises the
+    /// producer's epoch, which fences the writer. Either way a writer whose brokers cannot
+    /// commit for longer than this — a cluster without a quorum — usually ends
+    /// (<see cref="KafkaLogFencedException"/>; the process exits and comes back as the
+    /// standby), so this is how long an outage of the brokers a leader rides out, less
+    /// the time the brokers take to commit again once they are back.
+    /// <para>
+    /// What a long timeout costs is small here. A writer that dies inside a transaction
+    /// leaves it open until somebody initialises the <c>transactional.id</c> — which the
+    /// standby's takeover and the node's own restart both do, within seconds — or until
+    /// this timeout if nobody does; until then readers at <c>read_committed</c> see
+    /// nothing past the transaction's first record in the partitions it wrote, which
+    /// are this log's own topics and the topics of sinks that write through the log.
+    /// </para>
+    /// <para>
+    /// The brokers refuse a value above their <c>transaction.max.timeout.ms</c> (fifteen
+    /// minutes unless the cluster says otherwise) when the writer is acquired. Default
+    /// five minutes (the Kafka clients' own default is one).
+    /// </para>
+    /// </summary>
+    public TimeSpan TransactionTimeout { get; init; } = TimeSpan.FromMinutes(5);
 
     /// <summary>How long the log writer waits for more commits before it begins a
     /// transaction for the ones it has. Zero (the default) adds no latency: commits that

@@ -121,6 +121,7 @@ public sealed class KafkaServiceBackend : IServiceBackend
             ["heartbeatInterval"] = log.HeartbeatInterval.ToString(),
             ["takeoverAfter"] = _options.TakeoverAfter.ToString(),
             ["takeoverCeiling"] = _options.TakeoverCeiling.ToString(),
+            ["transactionTimeout"] = log.TransactionTimeout.ToString(),
             ["automaticTakeover"] = _options.AutomaticTakeover.ToString(),
             ["statePartitions"] = log.StatePartitions.ToString(CultureInfo.InvariantCulture),
             ["retainedHistoryVersions"] = RetainedHistoryVersions.ToString(CultureInfo.InvariantCulture),
@@ -392,7 +393,9 @@ internal sealed class KafkaBlobStore : IBlobStore, IDisposable
                     Name = Topic,
                     NumPartitions = 1,
                     ReplicationFactor = _log.ReplicationFactor,
-                    Configs = new Dictionary<string, string> { ["cleanup.policy"] = "compact" },
+                    // Unclean election off, as for every topic the log creates
+                    // (KafkaLog.EnsureTopicAsync): a blob is state too.
+                    Configs = new Dictionary<string, string> { ["cleanup.policy"] = "compact", [KafkaLog.UncleanElection] = "false" },
                 },
             ], new CreateTopicsOptions { RequestTimeout = Patience, OperationTimeout = Patience }).GetAwaiter().GetResult();
         }

@@ -121,6 +121,12 @@ try
                 ReplicationFactor = short.TryParse(Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_REPLICATION"), out var replication) ? replication : (short)1,
                 StatePartitions = 3,
                 TableRowPartitions = 2,
+                // The library's default unless a test says otherwise (seconds): the broker
+                // tests set it to put an outage on one side or the other of it.
+                TransactionTimeout = double.TryParse(
+                    Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_TRANSACTION_TIMEOUT_SECONDS"), CultureInfo.InvariantCulture, out var transactionTimeout)
+                    ? TimeSpan.FromSeconds(transactionTimeout)
+                    : new KafkaLogOptions { BootstrapServers = "unused" }.TransactionTimeout,
                 // Client settings a test wants to try: "name=value;name=value".
                 ClientConfig = (Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_CLIENT") ?? "")
                     .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)

@@ -68,9 +68,11 @@ internal sealed class KafkaEnv : IAsyncDisposable
         int fetchBufferKilobytes = 8 * 1024,
         IReadOnlyDictionary<string, string>? clientConfig = null,
         Action<ConsumerBuilder<byte[], byte[]>>? configureConsumer = null,
-        TimeSpan? operationTimeout = null) => new()
+        TimeSpan? operationTimeout = null,
+        TimeSpan? transactionTimeout = null) => new()
         {
             OperationTimeout = operationTimeout ?? TimeSpan.FromSeconds(30),
+            TransactionTimeout = transactionTimeout ?? new KafkaLogOptions { BootstrapServers = Bootstrap }.TransactionTimeout,
             MaxTransactionRecords = maxTransactionRecords,
             MaxAbortRetries = maxAbortRetries,
             FetchBufferKilobytes = fetchBufferKilobytes,

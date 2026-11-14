@@ -128,9 +128,13 @@ public sealed class KafkaLog : IAsyncDisposable
                 LogError("producer", error);
                 // A fence can arrive between transactions; say so at once instead of at the
                 // next commit. Not for a client this log has already replaced: its end is
-                // not this writer's.
-                if (error.IsFatal && generation == Volatile.Read(ref _producerGeneration))
-                    MarkFenced(new KafkaException(error));
+                // not this writer's — and which client is the log's is looked at under the
+                // lock that replaces it. This callback and the exception from the call that
+                // failed are raised by the same event on two threads; looked at out here,
+                // a client that was current a moment ago marked the log fenced after
+                // ResetWriter had put it back to reading.
+                if (error.IsFatal)
+                    MarkFenced(new KafkaException(error), ofGeneration: generation);
             });
         options.ConfigureProducer?.Invoke(producerBuilder);
         return producerBuilder.Build();
@@ -391,6 +395,16 @@ public sealed class KafkaLog : IAsyncDisposable
         {
             await AcquireCoreAsync(() => began = true, cancellationToken, whileFree).ConfigureAwait(false);
         }
+        catch (TransactionTimeoutRefusedException ex) when (Volatile.Read(ref _disposed) == 0)
+        {
+            // The brokers will not have this log's transaction timeout. The client calls
+            // that fatal and would answer every later call with it — as a fence, which it
+            // is not: nobody took anything. A new client, and the refusal by its name; the
+            // caller may try again and will be told the same until the setting or the
+            // brokers' limit has changed.
+            ResetWriter();
+            throw new KafkaLogException(ex.Message, ex.InnerException);
+        }
         catch (Exception ex) when (!_isWriter && began && Volatile.Read(ref _disposed) == 0
             && (ex is KafkaLogFencedException || (ex is OperationCanceledException && !_stop.IsCancellationRequested)))
         {
@@ -412,6 +426,11 @@ public sealed class KafkaLog : IAsyncDisposable
                 _acquiring = false;
         }
     }
+
+    /// <summary>The brokers answered <c>InitProducerId</c> with
+    /// <c>INVALID_TRANSACTION_TIMEOUT</c>; <see cref="AcquireAsync"/> turns it into a
+    /// plain <see cref="KafkaLogException"/> once the client has been replaced.</summary>
+    private sealed class TransactionTimeoutRefusedException(string message, Exception inner) : Exception(message, inner);
 
     /// <summary>Back to a reader after a lost acquisition: a new client, nothing marked.</summary>
     private void ResetWriter()
@@ -466,6 +485,14 @@ public sealed class KafkaLog : IAsyncDisposable
                 }
                 catch (KafkaRetriableException)
                 {
+                }
+                catch (KafkaException ex) when (ex.Error.Code == ErrorCode.InvalidTransactionTimeout)
+                {
+                    // Before the fence below: the client flags this one fatal too.
+                    throw new TransactionTimeoutRefusedException(
+                        $"The brokers refuse a transaction timeout of {_options.TransactionTimeout} for transactional.id " +
+                        $"'{_options.EffectiveTransactionalId}': it is above their transaction.max.timeout.ms. Lower " +
+                        "KafkaLogOptions.TransactionTimeout or raise the brokers' limit; until then this log cannot be the writer.", ex);
                 }
                 catch (KafkaException ex) when (IsFencing(ex))
                 {
@@ -1046,12 +1073,16 @@ public sealed class KafkaLog : IAsyncDisposable
         exception.Error.IsFatal
         || exception.Error.Code is ErrorCode.Local_Fenced or ErrorCode.ProducerFenced or ErrorCode.Local_Fatal;
 
-    private KafkaLogFencedException MarkFenced(Exception cause, string? message = null)
+    private KafkaLogFencedException MarkFenced(Exception cause, string? message = null, int? ofGeneration = null)
     {
         bool completes;
         KafkaLogFencedException fencedNow;
         lock (_gate)
         {
+            // News from a client this log has replaced since (ResetWriter) is not news
+            // about this log.
+            if (ofGeneration is { } generation && generation != _producerGeneration)
+                return new KafkaLogFencedException(cause.Message, cause);
             completes = _isWriter || !_acquiring;
             if (_fenced is null)
             {
@@ -1090,6 +1121,10 @@ public sealed class KafkaLog : IAsyncDisposable
         return text.Length > 0;
     }
 
+    /// <summary>The topic setting that lets a replica that is not in sync lead a
+    /// partition whose in-sync replicas are all gone — and lose what they had committed.</summary>
+    public const string UncleanElection = "unclean.leader.election.enable";
+
     internal static Dictionary<string, string> CompactedConfig(KafkaLogOptions options, IReadOnlyDictionary<string, string> extra)
     {
         var config = new Dictionary<string, string>
@@ -1108,6 +1143,13 @@ public sealed class KafkaLog : IAsyncDisposable
     internal async Task<int> EnsureTopicAsync(
         string topic, int partitions, Dictionary<string, string> config, bool fixedPartitions, CancellationToken cancellationToken)
     {
+        // Everything this log writes is committed state: a partition that has lost every
+        // replica in sync must wait for one of them, not go on from a replica that is
+        // behind. That is Kafka's own default and not every cluster's (Amazon MSK's
+        // default configuration turns unclean election on for clusters without tiered
+        // storage), so the topics say it themselves. A caller's own topic settings win.
+        config.TryAdd(UncleanElection, "false");
+
         // Asked again while the brokers cannot say: a cluster between controllers answers
         // nothing for some seconds, and a node that starts just then — one its supervisor
         // has restarted in the middle of a broker fault — must not end for it. A request
@@ -1496,7 +1538,16 @@ public sealed class KafkaLog : IAsyncDisposable
         RetryTransientAsync(call, _options.OperationTimeout, cancellationToken, () => RefreshMetadata(_admin, topics),
             _options.Logger is null ? null : (attempt, given, took, ex) => _options.Logger.LogDebug(
                 "Kafka log {Prefix}: an admin call for {Topics} failed on attempt {Attempt} after {Ms} ms of the {Given} ms it was given ({Code}: {Reason}); it is made again",
-                _options.TopicPrefix, string.Join(",", topics), attempt + 1, (long)took.TotalMilliseconds, (long)given.TotalMilliseconds, ex.Error.Code, ex.Error.Reason));
+                _options.TopicPrefix, string.Join(",", topics), attempt + 1, (long)took.TotalMilliseconds, (long)given.TotalMilliseconds, PartitionError(ex).Code, PartitionError(ex).Reason));
+
+    /// <summary>The error worth reading in an admin call's failure: for a
+    /// <c>ListOffsets</c> answer the client's own exception says only "check the
+    /// partitions", and what a partition's broker said is inside.</summary>
+    private static Error PartitionError(KafkaException exception) =>
+        exception is ListOffsetsException list
+        && list.Result.ResultInfos.Select(info => info.TopicPartitionOffsetError.Error).FirstOrDefault(error => error.IsError) is { } inner
+            ? inner
+            : exception.Error;
 
     /// <summary>Asks the cluster for the topics' metadata through <paramref name="admin"/>,
     /// which puts what it answers into that client's cache. Failures are the next
@@ -1720,12 +1771,20 @@ public sealed class KafkaLog : IAsyncDisposable
         }
     }
 
-    // Topics the current short reader has been told the leaders of, and the admin client
-    // that asks for them on its handle. Guarded by the gate.
-    private readonly HashSet<string> _shortReaderTopics = new(StringComparer.Ordinal);
+    // Topics the current short reader has been told the leaders of and when it was last
+    // told, and the admin client that asks for them on its handle. Guarded by the gate.
+    private readonly Dictionary<string, long> _shortReaderTopics = new(StringComparer.Ordinal);
     private IConsumer<byte[], byte[]>? _shortReaderOfTopics;
     private IAdminClient? _shortReaderAdmin;
     private int _shortReadAdminsCreated;
+    private long _shortReadLeadersAsked;
+
+    /// <summary>How old what the short reader knows of a topic's leaders may be before a
+    /// read asks again.</summary>
+    internal static readonly TimeSpan ShortReadLeadersFor = TimeSpan.FromSeconds(1);
+
+    /// <summary>How many times the short reads have asked for a topic's leaders. For tests.</summary>
+    internal long ShortReadLeadersAsked => Interlocked.Read(ref _shortReadLeadersAsked);
 
     /// <summary>How many admin clients the short reads have made to ask for a topic's
     /// metadata: at most one for each consumer they have had. For tests.</summary>
@@ -1740,6 +1799,17 @@ public sealed class KafkaLog : IAsyncDisposable
     /// had not seen took about a second: two per table when a node opens its tables, one
     /// after another. A new consumer's first assignment does not pay this, which is why
     /// followers and restores never showed it.
+    /// <para>
+    /// A topic it has seen is asked about again when the answer is more than a second
+    /// old (<see cref="ShortReadLeadersFor"/>). Between reads the consumer is assigned to
+    /// nothing, and what it knows of a topic then goes stale: a partition whose broker
+    /// died while the reader was idle is fetched from that broker first, and the client
+    /// pauses half a second (<c>fetch.error.backoff.ms</c>) before it looks the new
+    /// leader up. The reads this matters to are a takeover's, made the moment the
+    /// brokers have given a dead broker up: the catalog's head once took 0.9 s that way
+    /// (the service design, S8, <i>What a broker's loss costs</i>). This second question
+    /// is not waited on for long and its failure is not the read's.
+    /// </para>
     /// </summary>
     internal void AssignForShortRead(IConsumer<byte[], byte[]> consumer, TopicPartitionOffset position)
     {
@@ -1758,7 +1828,9 @@ public sealed class KafkaLog : IAsyncDisposable
             _shortReaderOfTopics = consumer;
             _shortReaderTopics.Clear();
         }
-        if (_shortReaderTopics.Add(position.Topic))
+        var now = Environment.TickCount64;
+        var met = _shortReaderTopics.TryGetValue(position.Topic, out var told);
+        if (!met || now - told > (long)ShortReadLeadersFor.TotalMilliseconds)
         {
             // One admin client for the consumer's whole life, never one per question:
             // disposing an admin client waits for its poll loop, which looks up every
@@ -1771,10 +1843,31 @@ public sealed class KafkaLog : IAsyncDisposable
                 _shortReaderAdmin = new DependentAdminClientBuilder(consumer.Handle).Build();
                 Interlocked.Increment(ref _shortReadAdminsCreated);
             }
-            _shortReaderAdmin.GetMetadata(position.Topic, _options.OperationTimeout);
+            Interlocked.Increment(ref _shortReadLeadersAsked);
+            if (!met)
+                _shortReaderAdmin.GetMetadata(position.Topic, _options.OperationTimeout);
+            else
+            {
+                try
+                {
+                    _shortReaderAdmin.GetMetadata(position.Topic, ShortReadRefreshPatience);
+                }
+                catch (KafkaException)
+                {
+                    // No answer in time: the read goes ahead on what the consumer knows,
+                    // as it did before this question existed, and the next read asks.
+                    now = told;
+                }
+            }
+            _shortReaderTopics[position.Topic] = now;
         }
         consumer.Assign(position);
     }
+
+    /// <summary>How long a read waits for the leaders of a topic its consumer has met
+    /// before. Longer than a round trip to a broker in another zone by two orders of
+    /// magnitude, and short beside the half second a stale leader costs.</summary>
+    private static readonly TimeSpan ShortReadRefreshPatience = TimeSpan.FromMilliseconds(500);
 
     /// <summary>Disposes the short reader and the admin client that asked on its handle,
     /// the admin client first: its poll loop reads a queue of the consumer's.</summary>

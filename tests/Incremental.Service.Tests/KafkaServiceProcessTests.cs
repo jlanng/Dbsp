@@ -1082,15 +1082,25 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         await Task.Delay(2000);
 
         // Two of three brokers: no controller quorum, no partition with two replicas in
-        // sync. Nothing can be written or elected — for longer than the transaction
-        // timeout (60 s), the heartbeat interval and the takeover ceiling put together.
-        // INCREMENTAL_KAFKA_OUTAGE_SECONDS makes it shorter: under the transaction timeout
-        // the leader's open transaction survives the outage, and so should the leader.
+        // sync. Nothing can be written or elected — for longer than the heartbeat
+        // interval and the takeover ceiling put together, and well under the writer's
+        // transaction timeout (KafkaLogOptions.TransactionTimeout, five minutes): the
+        // leader's open transaction outlives the outage, and so must the leader.
+        // INCREMENTAL_KAFKA_OUTAGE_SECONDS changes how long the brokers are away, and
+        // INCREMENTAL_KAFKA_TRANSACTION_TIMEOUT_SECONDS the nodes' transaction timeout:
+        // 60 with the default 70 s outage is an outage past the timeout, which ends the
+        // leader's writer more often than not (the node exits 3, the standby leads; what
+        // decides is in durability-and-standby.md, A leader does not outlive its
+        // transaction timeout) and is required only to lose nothing.
         // INCREMENTAL_KAFKA_FAULT=kill takes the two away in one command and without a
         // word to the controller; otherwise they are stopped one after the other, a
         // second each to shut down in (which the second of them may not manage).
         var seconds = int.TryParse(Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_OUTAGE_SECONDS"), out var asked) ? asked : 70;
         var fault = Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_FAULT") is "kill" ? "kill" : "stop";
+        var transactionTimeout = double.TryParse(
+            Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_TRANSACTION_TIMEOUT_SECONDS"), CultureInfo.InvariantCulture, out var given)
+            ? TimeSpan.FromSeconds(given)
+            : new Incremental.Kafka.KafkaLogOptions { BootstrapServers = "unused" }.TransactionTimeout;
         var outage = Stopwatch.StartNew();
         if (fault == "kill")
             await DockerAsync("kill", Brokers[0], Brokers[1]);
@@ -1128,14 +1138,27 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         // supervisor; which had to, and how, is what the measurement records.
         await Task.Delay(2000);
         var (trades, stall) = await load.StopAsync();
-        await ConcludeAsync(
+        var moved = await ConcludeAsync(
             "no-quorum", env, d, trades, stall, $"two of three brokers were down for {seconds} s",
             new()
             {
                 ["takeoversHeld"] = held, ["wholeToSettledMs"] = null, ["outageMs"] = outage.ElapsedMilliseconds, ["outageSeconds"] = seconds,
                 ["downForMs"] = downFor, ["fault"] = fault, ["statusDuringOutageMs"] = statusMs,
+                ["transactionTimeoutS"] = transactionTimeout.TotalSeconds,
             });
         Measured($"kafka3 no-quorum: one leader, a warm standby and a complete sink {back.ElapsedMilliseconds} ms after the cluster was whole");
+
+        // An outage the leader's transaction outlives — with half a minute for the
+        // brokers to commit again, which took them 15 to 17 s in every run here — moves
+        // nothing: the same node leads under the same term and no process ended. (With
+        // a 60 s timeout this outage ended the leader in ten runs of sixteen.)
+        if (TimeSpan.FromSeconds(seconds + 30) < transactionTimeout)
+        {
+            Assert.False(moved, $"the leadership moved over an outage of {seconds} s, which is under the transaction timeout of {transactionTimeout}");
+            Assert.True(
+                a.SupervisedExits().Count == 0 && b.SupervisedExits().Count == 0,
+                $"a node process ended over an outage under the transaction timeout: a [{string.Join(",", a.SupervisedExits())}] b [{string.Join(",", b.SupervisedExits())}]");
+        }
     }
 
     /// <summary>

@@ -62,6 +62,16 @@ public class KafkaLogTests(ITestOutputHelper output)
         Assert.Equal("compact", configs[0].Entries["cleanup.policy"].Value);
         Assert.Equal("86400000", configs[0].Entries["delete.retention.ms"].Value);
 
+        // Committed state never goes on from a replica that was behind, whatever the
+        // cluster's own default says (MSK's says it may): each topic says so itself, as
+        // a setting of the topic's and not one it inherits.
+        foreach (var topic in new[] { log.State.Topic, env.Prefix + ".leader" })
+        {
+            var own = (await admin.DescribeConfigsAsync([new ConfigResource { Type = ResourceType.Topic, Name = topic }]))[0].Entries[KafkaLog.UncleanElection];
+            Assert.Equal("false", own.Value);
+            Assert.Equal(ConfigSource.DynamicTopicConfig, own.Source);
+        }
+
         // Connecting again finds them as they are.
         var again = await env.ConnectAsync(env.Options(statePartitions: 5));
         Assert.Equal(5, again.State.PartitionCount);
@@ -76,6 +86,41 @@ public class KafkaLogTests(ITestOutputHelper output)
         var failure = await Assert.ThrowsAsync<KafkaLogException>(() => KafkaLog.ConnectAsync(env.Options(statePartitions: 4)));
         Assert.Contains("3 partition(s)", failure.Message);
         Assert.Contains("configured for 4", failure.Message);
+    }
+
+    /// <summary>
+    /// The transaction timeout is how long a leader rides out brokers that cannot commit
+    /// (durability-and-standby.md, <i>A leader does not outlive its transaction
+    /// timeout</i>), and the brokers cap it (<c>transaction.max.timeout.ms</c>, fifteen
+    /// minutes unless the cluster says otherwise). The default must be under that cap on
+    /// a cluster nobody configured, and a value over it must be refused as what it is.
+    /// The client reports the refusal as a fatal error, which this log would otherwise
+    /// read as a fence: "another process has taken the log over", from a cluster on
+    /// which no process can — and for every later attempt, since a client that has
+    /// failed fatally answers every call with its first error.
+    /// </summary>
+    [Fact]
+    public async Task A_transaction_timeout_the_brokers_refuse_is_said_by_name_and_is_not_a_fence()
+    {
+        await using var env = KafkaEnv.Create();
+        Assert.Equal(TimeSpan.FromMinutes(5), new KafkaLogOptions { BootstrapServers = KafkaEnv.Bootstrap }.TransactionTimeout);
+
+        var log = await env.ConnectAsync(env.Options(transactionTimeout: TimeSpan.FromHours(1)));
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            var failure = await Assert.ThrowsAsync<KafkaLogException>(() => log.AcquireWriterAsync().WaitAsync(Timeout));
+            Assert.Contains("transaction.max.timeout.ms", failure.Message);
+            Assert.Contains("01:00:00", failure.Message);
+            Assert.False(log.IsFenced, $"a refused setting was read as a fence on attempt {attempt + 1}: {log.FencedBy?.Message}");
+            Assert.False(log.IsWriter);
+        }
+        Assert.Equal(2, log.WriterResets);
+
+        // Nothing was taken: a log with a timeout the brokers allow acquires the id as
+        // its first writer, and the default is such a timeout.
+        var other = await env.ConnectWriterAsync(env.Options(nodeId: "other"));
+        Assert.Equal(1, other.Term);
+        await CommitAsync(await other.State.AcquireWriterAsync(), 0, ("k", (string?)"v"));
     }
 
     [Fact]
@@ -755,5 +800,48 @@ public class KafkaLogTests(ITestOutputHelper output)
         KafkaEnv.Measured(output,
             $"short reads of {Tables} tables whose topics are new to the reader: opened in {opening.ElapsedMilliseconds} ms, " +
             $"last versions after the reader was replaced in {reading.ElapsedMilliseconds} ms (a client per topic cost 100 ms a topic)");
+    }
+
+    /// <summary>
+    /// Between reads the short reader is assigned to nothing, and what it knows of a
+    /// topic's leaders ages. A takeover that follows the loss of a broker reads its
+    /// tables' heads the moment the brokers have moved that broker's partitions: a
+    /// reader that still believes in the old leader fetches from it first and then waits
+    /// out the client's pause after a fetch error (half a second) — the catalog's head
+    /// took 0.9 s that way in one takeover of nine with a broker killed beside the leader.
+    /// So a read of a topic the reader has met asks for its leaders again when its answer
+    /// is over a second old, and not when it is fresh: a takeover's two reads of one
+    /// table are one question, and so are a node's reads in the same second.
+    /// What moving leaders cost needs brokers that can be killed; this holds the rule.
+    /// </summary>
+    [Fact]
+    public async Task A_short_read_asks_for_a_topics_leaders_again_once_its_answer_is_a_second_old()
+    {
+        await using var env = KafkaEnv.Create();
+        var writer = await env.ConnectWriterAsync();
+        var written = await writer.OpenTableLogAsync<int, Row>("rows").WaitAsync(Timeout);
+        await written.AppendAsync(Version(1, new TableChange<int, Row>(1, null, new Row(1, "one"))));
+
+        var standby = await env.ConnectAsync();
+        var log = await standby.OpenTableLogAsync<int, Row>("rows").WaitAsync(Timeout);
+        Assert.Equal(1, await log.LastVersionAsync().AsTask().WaitAsync(Timeout));
+        var met = standby.ShortReadLeadersAsked;
+        Assert.True(met >= 1, "the reader was not told the leaders of a topic it had not met");
+
+        // At once: what it was told is fresh, and nothing is asked.
+        Assert.Equal(1, await log.LastVersionAsync().AsTask().WaitAsync(Timeout));
+        Assert.Equal(1, await log.LastVersionAsync().AsTask().WaitAsync(Timeout));
+        Assert.Equal(met, standby.ShortReadLeadersAsked);
+
+        // Past the age: each topic the read touches is asked about once, and the reads
+        // that follow in the same moment ask nothing.
+        await Task.Delay(KafkaLog.ShortReadLeadersFor + TimeSpan.FromMilliseconds(200));
+        Assert.Equal(1, await log.LastVersionAsync().AsTask().WaitAsync(Timeout));
+        var again = standby.ShortReadLeadersAsked;
+        Assert.InRange(again - met, 1, met);
+        Assert.Equal(1, await log.LastVersionAsync().AsTask().WaitAsync(Timeout));
+        Assert.Equal(again, standby.ShortReadLeadersAsked);
+        Assert.Equal(1, standby.ShortReadersCreated);
+        Assert.Equal(1, standby.ShortReadAdminsCreated);
     }
 }
