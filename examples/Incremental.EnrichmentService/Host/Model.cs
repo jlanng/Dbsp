@@ -55,7 +55,7 @@ public sealed class Model(WorldShape shape)
         Trades += count;
     }
 
-    /// <summary>A retroactive join: every row the instrument prices is emitted again.</summary>
+    /// <summary>A retroactive join: every open row the instrument prices is emitted again.</summary>
     public void Change(Instrument instrument)
     {
         var changed = !Instruments.TryGetValue(instrument.Id, out var old) || old.Multiplier != instrument.Multiplier || old.Symbol != instrument.Symbol;
@@ -63,16 +63,16 @@ public sealed class Model(WorldShape shape)
         if (changed)
         {
             foreach (var enrichment in Enrichments.Values)
-                enrichment.Reemit(row => row.Trade.InstrumentId == instrument.Id);
+                enrichment.Reemit(this, row => row.Trade.InstrumentId == instrument.Id);
         }
     }
 
-    /// <summary>A retroactive join, through the derived table: the trader's rows move desk.</summary>
+    /// <summary>A retroactive join, through the derived table: the trader's open rows move desk.</summary>
     public void Change(Trader trader)
     {
         Traders[trader.Id] = trader;
         foreach (var enrichment in Enrichments.Values)
-            enrichment.Reemit(row => row.Trade.TraderId == trader.Id);
+            enrichment.Reemit(this, row => row.Trade.TraderId == trader.Id);
     }
 
     /// <summary>A lookup: nothing already delivered changes.</summary>
@@ -144,60 +144,109 @@ public sealed class Model(WorldShape shape)
     }
 }
 
-/// <summary>One deployment of the trade-enrichment definition.</summary>
-public sealed class EnrichmentModel(decimal minNotional)
+/// <summary>
+/// One deployment of the trade-enrichment definition. A trade is open while its execution
+/// time is at or after the pipeline's watermark — the newest execution time it has read,
+/// less <c>openSeconds</c> — and final after: a change of reference data re-emits only the
+/// open trades, a final trade's row stays as it was last emitted, and a trade that arrives
+/// behind the watermark (a straggler) is dropped. The smoke test changes reference data
+/// only once the pipeline has read everything published, so the watermark is the model's.
+/// <para>
+/// The sink is an upsert by trade id, and it is modelled as one: a later trade under an id
+/// whose trade is final retracts nothing, so if the new trade is filtered out the old row
+/// stays. (The smoke test never publishes two trades of one id within one step: it
+/// publishes fewer than the 1,500 ids at a time and waits.)
+/// </para>
+/// </summary>
+public sealed class EnrichmentModel(decimal minNotional, TimeSpan open)
 {
-    /// <summary>What the pipeline holds per trade id: the trade, the counterparty it met on
-    /// arrival, and which version of the definition last emitted its row.</summary>
-    public sealed record Row(Trade Trade, Counterparty? AtArrival, bool EmittedByV2);
+    /// <summary>What the pipeline last emitted per trade id: the trade, the counterparty it
+    /// met on arrival, the instrument and the trader's desk it was last joined to, and which
+    /// version of the definition emitted it.</summary>
+    public sealed record Row(Trade Trade, Counterparty? AtArrival, bool EmittedByV2, Instrument Instrument, TraderDesk Desk);
 
     private readonly Dictionary<long, Row> _rows = [];
+    private readonly Dictionary<string, JsonObject> _sink = new(StringComparer.Ordinal);
+    private long _newest = long.MinValue;
 
     /// <summary>Whether version 2 of the definition is running.</summary>
     public bool V2 { get; set; }
 
-    public void Arrive(Model model, Trade trade) =>
-        _rows[trade.Id] = new Row(trade, model.Counterparties.GetValueOrDefault(trade.CounterpartyId), V2);
+    /// <summary>The watermark: trades executed before it are final.</summary>
+    public DateTimeOffset? Watermark => _newest == long.MinValue ? null : new DateTimeOffset(_newest, TimeSpan.Zero) - open;
 
-    public void Reemit(Func<Row, bool> where)
+    public bool IsOpen(Row row) => Watermark is not { } watermark || row.Trade.ExecutedAt >= watermark;
+
+    public void Arrive(Model model, Trade trade)
     {
-        foreach (var (id, row) in _rows.Where(r => where(r.Value)).ToList())
-            _rows[id] = row with { EmittedByV2 = V2 };
+        if (Watermark is { } watermark && trade.ExecutedAt < watermark)
+            return;                                                     // late: dropped, and a final trade under its id stays
+        // An open trade amended: its row is taken back — if the filter let it through.
+        var amends = _rows.TryGetValue(trade.Id, out var before) && IsOpen(before) && Json(before) is not null;
+        var row = _rows[trade.Id] = new Row(trade, model.Counterparties.GetValueOrDefault(trade.CounterpartyId), V2,
+            model.Instruments[trade.InstrumentId], model.TraderDesk(trade.TraderId));
+        Emit(row, retracts: amends);
+        _newest = Math.Max(_newest, trade.ExecutedAt.UtcTicks);
     }
 
-    public void Reset(Model model)
+    /// <summary>A retroactive join: the open rows <paramref name="where"/> selects are
+    /// emitted again from the tables as they are now.</summary>
+    public void Reemit(Model model, Func<Row, bool> where)
     {
-        _rows.Clear();
-        foreach (var trade in model.Replay())
-            Arrive(model, trade);
-    }
-
-    public Dictionary<string, JsonObject> Expected(Model model)
-    {
-        var expected = new Dictionary<string, JsonObject>(StringComparer.Ordinal);
-        foreach (var (id, row) in _rows)
-        {
-            var instrument = model.Instruments[row.Trade.InstrumentId];
-            var notional = row.Trade.Quantity * row.Trade.Price * instrument.Multiplier;
-            if (notional < minNotional)
-                continue;                                               // the filter
-            var desk = model.TraderDesk(row.Trade.TraderId);
-            var json = new JsonObject
+        foreach (var (id, row) in _rows.Where(r => where(r.Value) && IsOpen(r.Value)).ToList())
+            Emit(_rows[id] = row with
             {
-                ["tradeId"] = id,
-                ["symbol"] = instrument.Symbol,
-                ["counterparty"] = row.AtArrival?.Name ?? "(unknown)",
-                ["rating"] = row.AtArrival?.Rating ?? "NR",
-                ["trader"] = desk.Trader,
-                ["desk"] = desk.Desk,
-                ["region"] = desk.Region,
-                ["notional"] = notional,
-            };
-            if (row.EmittedByV2)
-                json["size"] = notional >= 1_000_000m ? "block" : "regular";
-            expected[id.ToString()] = json;
-        }
-        return expected;
+                EmittedByV2 = V2, Instrument = model.Instruments[row.Trade.InstrumentId], Desk = model.TraderDesk(row.Trade.TraderId),
+            }, retracts: Json(row) is not null);
+    }
+
+    /// <summary>What the sink does with a row the pipeline emits: holds it under its id if
+    /// it passes the filter; if it does not, deletes the id only when the row it replaces
+    /// was delivered and is taken back (an open trade amended or corrected).</summary>
+    private void Emit(Row row, bool retracts)
+    {
+        var key = row.Trade.Id.ToString();
+        if (Json(row) is { } json)
+            _sink[key] = json;
+        else if (retracts)
+            _sink.Remove(key);
+    }
+
+    /// <summary>The rows <paramref name="where"/> selects that would be delivered, open and final.</summary>
+    public (int Open, int Final) Count(Func<Row, bool> where)
+    {
+        var rows = _rows.Values.Where(r => where(r) && r.Trade.Quantity * r.Trade.Price * r.Instrument.Multiplier >= minNotional).ToList();
+        return (rows.Count(IsOpen), rows.Count(r => !IsOpen(r)));
+    }
+
+    /// <summary>The instrument of the newest trade: one with an open trade in it.</summary>
+    public int OpenInstrument() => _rows.Values.MaxBy(r => r.Trade.ExecutedAt)!.Trade.InstrumentId;
+
+    /// <summary>Trades the pipeline holds state for: those still open.</summary>
+    public int OpenTrades => _rows.Values.Count(IsOpen);
+
+    public Dictionary<string, JsonObject> Expected() => new(_sink, StringComparer.Ordinal);
+
+    /// <summary>The row the pipeline emits for a trade, or null when the filter drops it.</summary>
+    private JsonObject? Json(Row row)
+    {
+        var notional = row.Trade.Quantity * row.Trade.Price * row.Instrument.Multiplier;
+        if (notional < minNotional)
+            return null;                                                // the filter
+        var json = new JsonObject
+        {
+            ["tradeId"] = row.Trade.Id,
+            ["symbol"] = row.Instrument.Symbol,
+            ["counterparty"] = row.AtArrival?.Name ?? "(unknown)",
+            ["rating"] = row.AtArrival?.Rating ?? "NR",
+            ["trader"] = row.Desk.Trader,
+            ["desk"] = row.Desk.Desk,
+            ["region"] = row.Desk.Region,
+            ["notional"] = notional,
+        };
+        if (row.EmittedByV2)
+            json["size"] = notional >= 1_000_000m ? "block" : "regular";
+        return json;
     }
 }
 

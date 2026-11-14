@@ -321,6 +321,30 @@ same operator on a grouping you control — or, for a stream that only ever inse
 events, log lines), use `LookupAppendOnly`, which keeps nothing and faults the circuit if a
 retraction ever reaches it.
 
+**Facts whose key never closes.** A trade's instrument, trader and counterparty are keys
+that live for ever, so `EvictWhen` has nothing to hang on: a retroactive join or a
+remembered lookup over a feed of trades keeps every trade. What does end is each trade's
+own openness to correction. On an event-time grouping, `EvictWhenFinal()` forgets each
+record once the watermark has passed its event time — once nothing can retract or amend
+it, since a later version would be dropped as late — and a change to the table corrects
+only the records still open. A keyed input does the same for its rows with
+`WithEventTime(sel, lateness, evictWhenFinal: true)`, and `WithEventTime(sel)` (no
+lateness) re-declares event time after a reshape without giving the clock another source:
+
+```csharp
+var enriched = builder.KeyedInput<long, Trade>("trades", t => t.Id)
+    .WithEventTime(t => t.At, lateness: TimeSpan.FromHours(1), evictWhenFinal: true)
+    .GroupBy(t => t.InstrumentId).EvictWhenFinal()
+    .Join(inst, (_, trade, instrument) => new Priced(trade, instrument.Multiplier))
+    .WithEventTime(p => p.Trade.At)
+    .GroupBy(p => p.Trade.CounterpartyId).EvictWhenFinal()
+    .Lookup(counterparties, (_, p, c) => new EnrichedTrade(p, c.Name));
+```
+
+The lateness is how long a trade stays open, and the state is that many hours of trades.
+`EvictWhenFinal()` offers only the table `Join`, `LeftJoin` and `Lookup`, the operators
+that honour it.
+
 **Other columns.** To join on something that is not the table's key, ask the table for an
 index. It is maintained with the rows, shared by every circuit that asks for the same name,
 and may hold several rows per value — a join then yields one result per row, and a left
@@ -1492,6 +1516,9 @@ for the cases the paved road doesn't cover:
   window shapes. You then own eviction, via the next item.
 - **`EvictWhen(key => closesAt)`** on any grouping: declare when a key's state can be
   dropped, for keyed state with a lifecycle that isn't window-derived.
+- **`EvictWhenFinal()`** on an event-time grouping: forget each record, rather than each
+  key, once the watermark is past its event time — for a table join or lookup over facts
+  whose key never closes (*Facts whose key never closes*, above).
 - **`GroupBy(selector, stableHash: …)`**: custom routing hash for exotic key types.
 - **`Minus` / `Negate`**: pointwise weighted subtraction and negation of streams
   (deliberately not called `Except` — results can carry negative weights, which is exactly

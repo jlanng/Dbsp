@@ -2021,6 +2021,37 @@ Each has a default this design is built on.
     *Alternative:* the last lag that was measured, with its age; it would be a figure
     on a page that is wrong exactly while it matters.
 
+69. **A keyed input with no event time has no expiry** (S8). Its rows go when the
+    source deletes them, and a retroactive join over it keeps every record; the way to
+    bound either is event time (`WithEventTime(…, evictWhenFinal: true)`,
+    `EvictWhenFinal()`). *Alternatives:* an expiry by processing time — the age of the
+    row on the node — which a restart would apply differently from the run it replaces
+    (the replayed steps expire other rows), so the sink could differ from an
+    uninterrupted run; or a limit on the number of keys, evicting the oldest, which has
+    the same problem and an arbitrary order besides. Both are a day's work; neither was
+    built, because each gives up the property every other operator has, that a
+    restored circuit does what the uninterrupted one would.
+70. **A pipeline whose state only grows is flagged, and nothing more** (S8): after
+    `ServiceOptions.StateGrowthAlarmAfter` (30 min) with no fall and a rise at twelve of
+    fifteen samples it is marked, an event is raised and the gauge
+    `pipeline.state_growing` is 1. It is not a health reason and stops nothing.
+    *Alternatives:* make it `Degraded` (a node with one leaky tenant pipeline would
+    then always be degraded, and the readiness probe is not the place); a per-spec
+    limit on state entries (`circuit.maxStateEntries`) that faults the pipeline when
+    passed — a tenant's choice, cheap to add on the same counts, not built for want of
+    a number anybody has asked for.
+71. **A trade id reused after its trade is final is a new trade** (S8): nothing is
+    retracted for the old one, so an upsert sink keyed by the id overwrites the old row,
+    or keeps it if the new trade is filtered out. *Alternative:* an id that must stay
+    unique could be checked, but only against what the input still holds — the open
+    trades — so it would catch nothing the watermark has passed.
+72. **The definition's `openSeconds` defaults to an hour; the example seeds two minutes
+    and the smoke test thirty seconds** (S8). An hour is a guess at how late a booking
+    correction comes. At 1,000 trades a second it is about 9 GB of state per node for
+    `trade-enrichment` alone (the guide's arithmetic). *Alternative:* no default, so
+    that every spec has to say — the dry run would then refuse the template the admin
+    offers, which today is valid as it stands.
+
 ## Not verified
 
 - That a collectible context unloads once state, connectors and settings use
@@ -5591,3 +5622,130 @@ directories (`mutations.txt`, `core.py`, `svc.py` and the second session's
   in a standby's build that a slow machine reaches and this step did not find.
 - None of the twelve findings was in the admin UI, so nothing was verified in a
   browser in this step.
+
+### S8 — round four
+
+#### Bounded state for a join over a stream of facts (J1)
+
+The critic's J1: the guide's reference pipeline, `trade-enrichment`, kept every trade.
+Its key is the trade id, every trade is a new id, and its retroactive joins are keyed
+by instrument and trader, which never close, so `EvictWhen` had nothing to hang on. The
+example hid it: the generator's trade ids came round at 20,000, so the state stopped at
+four entries per id.
+
+**Every definition, measured.** In memory, one node, 50 trades a second, the seeded
+specs, state entries from `GET /admin/api/pipelines` at one, two, five and ten
+minutes. *Before* is the tree at a0cbd57 with the new `--trade-ids` option (0: ids
+never repeat; 20,000: the old default); *after* is this step's tree. Records:
+`docs/design/runs/2026-11-14-j1-state.tsv`.
+
+| pipeline | definition | state keyed by | before, ids never repeat (1 / 2 / 5 / 10 min) | before, ids repeat at 20,000 | after, ids never repeat |
+|---|---|---|---|---|---|
+| trade-enrichment | trade-enrichment, `minNotional` 0 | input: trade id; lookup: (counterparty, trade); joins: instrument and trader, a trade each | 11,900 / 23,940 / 60,040 / 120,200 — growing | 11,940 / 23,980 / 60,080 / 80,000 — stopped at 4 × 20,000 | 23,882 / 47,980 / 48,059 / 48,061 — level |
+| large-trades | trade-enrichment, `minNotional` 20,000,000 | the same; the last join only for the trades that pass | 9,534 / 19,223 / 48,226 / 96,543 — growing | 9,564 / 19,255 / 48,257 / 64,240 | 19,130 / 38,513 / 38,582 / 38,477 — level |
+| execution-quality | execution-quality | the join: (instrument, minute), closed at the minute's end (`EvictWhen`); windows: asset class and window | 12,764 / 25,588 / 18,860 / 19,006 | 12,784 / 25,608 / 18,884 / 19,020 | 12,784 / 25,608 / 18,870 / 19,020 |
+| desk-exposure | desk-exposure | desk and window, closed at the window's end; the lookup keeps nothing | 16 / 16 / 26 / 28 | 16 / 16 / 28 / 28 | 16 / 16 / 26 / 28 |
+| trader-desks | trader-desks | the traders table's rows, under their desk | 24 throughout | 24 | 24 |
+| sanctions-alerts, credit-alerts | watchlist-alerts | nothing: an append-only lookup | 0 | 0 | 0 |
+
+Only the two deployments of `trade-enrichment` grew. After the change they stop at the
+open window: two minutes of trades (the seeded `openSeconds`, 120), eight entries each —
+2 × 4 × 50 × 120 = 48,000 — at about 310 bytes an entry, 14.9 MB. Twice the entries per
+trade of before, because every operator keeps a deadline beside each record; level
+from the second minute on, where before was 120,200 at ten minutes and gaining 12,000 a
+minute. `examples/Incremental.TradeEnrichment` is not a service and runs a fixed
+narrative: its state is the live book (7,688 entries for 1,920 live trades at its
+end), bounded by the source's deletes — a cancellation, a settlement — which its new
+seventh act shows by settling the book and finding the state empty. It keeps its
+"every trade they ever did" semantics on purpose and says, at its top, that a feed of
+trades that are never deleted needs `EvictWhenFinal`.
+
+**The engine** (`src/Incremental`):
+
+- `GroupedEventTimeStream.EvictWhenFinal()` returns `FinalizingGroupedStream`, a staging
+  type that offers only what honours it: the table `Join` and `LeftJoin` (primary key
+  and index views) and the remembered `Lookup`. Each record gets a deadline one tick
+  after its own event time, in an `EvictionTracker` keyed by (key, record) — the
+  existing checkpointed deadline store, `{node}.deadlines.w{n}` — and the joins remove
+  final records one entry at a time with a new `IIndexedWeightStore.RemoveEntries`
+  (a default member that reads the group; the in-memory, checkpoint and changelog
+  stores override it with a point read, the changelog writing a tombstone per entry).
+  Sound because the watermark operator upstream drops every record behind the
+  watermark, a final record's retraction and its amendments included.
+- A table change corrects only open records. The joins apply table changes before
+  they drain their deadlines, so in the step that first sees a new watermark a change
+  would still reach records that are final but not yet evicted; they are skipped
+  (`RecordEviction.IsFinal`), so the outcome does not depend on how the steps fall.
+- `KeyedInputStream.WithEventTime(eventTime, lateness, evictWhenFinal)`: the upsert
+  operator keeps a deadline per key (`Set` with the row, `Remove` with a delete, so an
+  amendment to a later time moves it) and forgets rows the watermark has passed. That
+  changes nothing downstream — the retraction such a row would owe is behind the
+  watermark and dropped by the declaration — and `Build()` refuses a circuit that also
+  reads the input without going through that declaration.
+- `ZStream.WithEventTime(eventTime)`, no lateness: re-declares event time after a
+  reshape, dropping what is behind the watermark, without registering a clock source.
+  After `trade-enrichment`'s filter a second source would have held the watermark at
+  the newest trade the filter passed.
+
+**The service:** `ServiceOptions.StateGrowthAlarmAfter` (30 min) and `StateGrowth`, a
+ring of sixteen samples per pipeline fed once a second by the sampler with the entry
+count it already reads for the gauges. Flagged when, across the period, no sample fell
+and at least twelve of fifteen rose; a fall clears it. `PipelineStatus.StateGrowingSince`,
+the event (`state growing: … without falling once …`, and `state no longer growing`),
+the gauge `incremental.service.pipeline.state_growing`, `stateGrowingSince` in the admin
+API, a *growing* badge in the pipelines list, a notice on the pipeline's state card and
+an entry on the overview's attention list.
+
+**The harness:** `PipelineTestHarness.StateSize` (`HarnessStateSize`: entries in all and
+by store), from the checkpoint store's committed counts
+(`InMemoryCheckpointStorageProvider.CommittedEntriesByStore`, new and public).
+
+**The example:** `trade-enrichment` has `openSeconds` (default 3,600; the seeds 120; the
+smoke test 30) and the shape the guide tells tenants to copy. The generator's trade ids
+no longer repeat unless `--trade-ids N` says so. The smoke test's model now knows a
+trade's openness and models the sink as an upsert by id; its reference-data claims say
+how many open trades were corrected and how many final ones were not; act 2 publishes
+its 2,000 trades in two halves so that no step holds two trades of one id; and act 5
+has a new claim that the state levels off — four batches of 125 trades, each reading at
+most eight entries per open trade and per trade of the batch (1,976), against the 6,000
+that keeping every one of the 1,500 ids would hold. Every definition has a bounded-state
+test on `StateSize` in `Pipelines.Tests`, `trader-desks` in a new file.
+
+**Tests and mutations.** New: `EvictWhenFinalTests` (11, core), a `final` scenario in
+`EventTimeRestartTests` (the lookup, join and left join under `EvictWhenFinal`, killed
+and restored at random steps on all four backings at one and four workers),
+`StateGrowthTests` (5, service), six tests in `Pipelines.Tests`. Mutations, all killed
+in the end: 16 in the engine (the final-record skip in both joins, eviction a no-op,
+the deadline at the event time instead of a tick after, `IsFinal` with `<=`, the upsert's
+deadlines never set or never taken on an empty step, the lookup ignoring the policy,
+the index join never tracking, the build check, the re-declaration feeding the clock or
+not dropping, the changelog's removal writing no tombstone, the checkpoint store's
+removal ignoring a staged weight, and two in the definition), seven in the service and
+the harness, and one in the smoke test: eviction a minute late — still sound, the sinks
+all agreed — failed the levelling claim at 3,834 entries against 1,976. Two engine
+mutants and one service mutant survived the first run and were killed by a test added
+for them (a re-declared time of its own, a staged weight over a committed one, a quiet
+sample after the flag).
+
+**Deviations.**
+
+- The interactive example's trade ids no longer come round at 20,000 by default: the
+  bound is now the event-time window, and a feed whose ids repeat was what hid the leak.
+- `EvictWhenFinal` is a separate staging type rather than a policy on `GroupedZStream`,
+  so that an operator that does not honour it cannot be reached with it.
+- A deadline whose record was retracted is not forgotten early by the joins (they do
+  not read the weights they write); it falls due at the record's own time. The rule in
+  CLAUDE.md about `EvictionTracker.Forget` is for a key's tracked records outliving the
+  key; here the deadline is bounded by the same window as the records.
+- `trade-enrichment` drops a trade that arrives behind its watermark (a straggler),
+  which it used to carry; the smoke test's model and claims say so.
+- With `EvictWhenFinal` a pipeline holds twice the entries per open record (the record
+  and its deadline); per byte the deadline is about a sixth of a join's record.
+
+**Not verified.** Nothing ran longer than ten minutes; the growth flag's thirty minutes
+were exercised with a clock the test drives, not waited out. `EvictWhenFinal` under a
+changing table across a restart is covered by the directed tests only: the restart
+scenario's table does not change mid-run. No Kafka run measured the bound beyond the
+smoke test's four batches. The admin UI's new badge, notice and attention entry were
+not looked at in a browser in this step.
+

@@ -73,6 +73,52 @@ public class TradeEnrichmentTests
     }
 
     [Fact]
+    public async Task A_trade_is_corrected_while_it_is_open_and_left_alone_once_it_is_final()
+    {
+        await using var pipeline = await StartAsync("""{ "minNotional": 1000, "openSeconds": 60 }""");
+        var trades = pipeline.KeyedInput<long, Trade>("trades");
+        await trades.UpsertAsync(Trade(1, quantity: 100));                                   // at T0
+        await pipeline.StepAsync();
+        await trades.UpsertAsync(Trade(2, quantity: 100) with { ExecutedAt = T0.AddMinutes(2) });
+        await pipeline.StepAsync();                                                          // the watermark: T0 + 1 min
+
+        await pipeline.Table(Reference.Instruments).UpsertAsync(Abc with { Multiplier = 3m });
+        await pipeline.StepAsync();
+        var rows = pipeline.UpsertSink<long, EnrichedTrade>("enriched").Rows;
+        Assert.Equal(2000m, rows[1].Notional);                  // final: as it was emitted
+        Assert.Equal(3000m, rows[2].Notional);                  // open: repriced
+
+        // An amendment of a final trade is behind the watermark: dropped as late.
+        await trades.UpsertAsync(Trade(1, quantity: 500));
+        await pipeline.StepAsync();
+        Assert.Equal(2000m, rows[1].Notional);
+    }
+
+    [Fact]
+    public async Task The_state_holds_the_open_trades_and_no_more_however_long_the_feed()
+    {
+        await using var pipeline = await StartAsync("""{ "minNotional": 0, "openSeconds": 60 }""");
+        var trades = pipeline.KeyedInput<long, Trade>("trades");
+        var entries = new List<long>();
+        for (var second = 0; second < 1200; second++)       // a trade a second, each a new id
+        {
+            await trades.UpsertAsync(Trade(second, quantity: 100) with { ExecutedAt = T0.AddSeconds(second) });
+            if (second % 10 == 9)
+            {
+                await pipeline.StepAsync();
+                entries.Add(pipeline.StateSize.Entries);
+            }
+        }
+        // Per open trade: its row in the input, what the lookup emitted for it, its fact in
+        // each join, and a deadline in each of the four. Open: the 61 seconds from the
+        // watermark (60 behind the newest trade) on, and the step's own 10 until the next
+        // step evicts what this one made final.
+        Assert.InRange(entries.Max(), 1, 8 * (61 + 10));
+        Assert.Equal(entries[^1], entries[^50]);                 // level: it stopped growing
+        Assert.Equal(1200, pipeline.UpsertSink<long, EnrichedTrade>("enriched").Rows.Count);
+    }
+
+    [Fact]
     public async Task Settings_an_operator_could_not_deploy_are_refused_here_too()
     {
         var refused = await Assert.ThrowsAsync<ServiceException>(() => StartAsync("""{ "minNotional": -1 }"""));

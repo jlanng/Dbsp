@@ -77,4 +77,19 @@ public class WatchlistAlertsTests
         await sanctions.StepAsync();
         Assert.Equal([1L, 4L], sanctions.AppendSink<Alert>("alerts").Records.Select(a => a.TradeId));
     }
+
+    [Fact]
+    public async Task It_keeps_no_state_at_all()
+    {
+        await using var pipeline = await PipelineTestHarness.For<WatchlistAlerts>()
+            .Table(Reference.Watchlist, [new WatchlistEntry("CP0001", "sanctioned")])
+            .StartAsync();
+        for (var id = 1; id <= 1000; id++)
+            await pipeline.InsertAsync("executions", [Execution(id, id % 2 == 0 ? "CP0001" : "CP0002")]);
+        await pipeline.StepAsync();
+        Assert.Equal(500, pipeline.AppendSink<Alert>("alerts").Records.Count);
+        // Every operator is append-only: the lookup on arrival keeps nothing, so neither
+        // does the pipeline.
+        Assert.Equal(0, pipeline.StateSize.Entries);
+    }
 }

@@ -31,10 +31,13 @@ public class StateGrowthTests
         Assert.Equal(T0, growth.Since);
         Assert.Equal(1000, growth.OldestEntries);
 
-        // Still growing: flagged once, not again.
+        // Still growing: flagged once, not again. Gone quiet: still flagged, since what it
+        // holds has not gone anywhere.
         Assert.Equal(0, growth.Observe(T0.AddMinutes(16), 17_000, Period));
+        Assert.Equal(0, growth.Observe(T0.AddMinutes(17), 17_000, Period));
+        Assert.Equal(T0, growth.Since);
         // It falls: the flag clears.
-        Assert.Equal(-1, growth.Observe(T0.AddMinutes(17), 16_500, Period));
+        Assert.Equal(-1, growth.Observe(T0.AddMinutes(18), 16_500, Period));
         Assert.Null(growth.Since);
     }
 

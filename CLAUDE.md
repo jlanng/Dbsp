@@ -49,12 +49,14 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   run the built binary and stop it with SIGTERM (a backgrounded `dotnet run` ignores SIGINT).
   Its build copies the plugin (`Pipelines/`) to `plugins/` beside the host and zips
   version 2 (`Pipelines.V2/`, the same sources with `V2` defined) to `plugin-packages/`.
-  `--poison N` sets how many generated trades have no quantity (the dead letters; 200).
+  `--poison N` sets how many generated trades have no quantity (the dead letters; 200);
+  `--trade-ids N` makes trade ids come round after N (default 0: never — the pipelines'
+  state is bounded by event time, not by the generator).
   The definitions' own tests are `dotnet test --project
   examples/Incremental.EnrichmentService/Pipelines.Tests` (xunit v3 on
   `PipelineTestHarness`; under a second, and CI runs them).
 - Trade enrichment on shared tables: `dotnet run --project examples/Incremental.TradeEnrichment`
-  prints a narrative of twelve checked claims and exits 1 if one is wrong (`-- --trades N`).
+  prints a narrative of thirteen checked claims and exits 1 if one is wrong (`-- --trades N`).
 - Service guide: `docs/enrichment-service.md`. Its C# blocks are regions of the example's
   sources (`// <snippet:name>` … `// </snippet:name>`, quoted under
   `<!-- snippet: path#name -->`); `DocSnippetTests` in `tests/Incremental.Service.Tests`
@@ -306,6 +308,18 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   not only when `TakeDue` drains it (`DeadlineStoreTests`). `EventTimeRestartTests` is the
   check: killed and restored at any step, a circuit's outputs and final state equal the
   uninterrupted run's.
+- Per-record eviction (`EvictWhenFinal()` → `FinalizingGroupedStream`; docs/design/shared-tables.md,
+  *Per fact*). A record's deadline is one tick after its own event time (the watermark
+  keeps ticks ≥ it, `TakeDue` takes ≤ it), tracked by (key, record) in an
+  `EvictionTracker`, removed with `IIndexedWeightStore.RemoveEntries`. It is offered only
+  on an event-time grouping and only by operators that honour it — the table `Join`,
+  `LeftJoin` (both views) and `Lookup`; do not hang it on an aggregate or a stream join.
+  An operator that applies table changes before it drains must skip final records
+  (`RecordEviction.IsFinal`), or a change corrects them in the step that first sees the
+  watermark. A keyed input that forgets final rows (`WithEventTime(…, evictWhenFinal:
+  true)`) owes no retraction for them only because its declaration drops it: `Build()`
+  refuses any other reader of the input; keep it so. `WithEventTime(sel)` without a
+  lateness re-declares time and registers no clock source.
 - Checkpointed state identity is covered by the state manifest (committed with every
   checkpoint, validated at `Start()`); store names are positional unless pinned with
   `.Named()` — changing store naming or the manifest format needs a format-version bump.
@@ -411,7 +425,12 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     faults the pipeline — never drop to the ring and carry on.
   - `PipelineTestHarness` builds a definition through the same `DefinitionBinding` and
     `PipelineBuilder` as the supervisor; keep it so, or its tests stop meaning what a
-    deploy would do.
+    deploy would do. Its `StateSize` is the checkpoint store's committed count, by store;
+    every example definition has a test that its state returns to a bound under a long feed.
+  - A pipeline whose state only grows is flagged (`StateGrowth`,
+    `ServiceOptions.StateGrowthAlarmAfter`): from the entry count the sampler already
+    reads, a fixed ring per pipeline — never by walking a store. It flags; it does not
+    change health or stop anything (Open for James 70).
   - A table, plugin or pipeline that fails is that thing's failure: shown, retried, never
     thrown out of a takeover callback. Only the catalog and the storage may fail a node.
   - Nothing waits without a bound, and nothing holds another pipeline's queue: teardown is

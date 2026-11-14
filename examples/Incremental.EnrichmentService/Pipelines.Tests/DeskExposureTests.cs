@@ -30,4 +30,29 @@ public class DeskExposureTests
         Assert.Equal(100m, exposure[("Macro", T0.AddMinutes(1))]);
         Assert.Equal(10m, exposure[("Rates", T0.AddMinutes(1))]);
     }
+
+    [Fact]
+    public async Task Its_state_is_the_open_windows_and_no_more_however_long_the_feed()
+    {
+        await using var pipeline = await PipelineTestHarness.For<DeskExposure>()
+            .Settings("""{ "windowSeconds": 60, "latenessSeconds": 5 }""")
+            .Table(Reference.TraderDesks, [new TraderDesk(7, "Ada A.", 3, "Macro", "EMEA"), new TraderDesk(8, "Alan B.", 4, "Rates", "APAC")])
+            .StartAsync();
+        var executions = pipeline.Input<Trade>("executions");
+        var entries = new List<long>();
+        for (var second = 0; second < 1800; second++)        // half an hour, two executions a second
+        {
+            await executions.InsertAsync(new Trade(2 * second, 1, 7, "CP0001", 100, 10m, T0.AddSeconds(second)));
+            await executions.InsertAsync(new Trade(2 * second + 1, 1, 8, "CP0001", 100, 10m, T0.AddSeconds(second)));
+            if (second % 10 == 9)
+            {
+                await pipeline.StepAsync();
+                entries.Add(pipeline.StateSize.Entries);
+            }
+        }
+        // A window's total and its deadline per desk, for the one or two windows open: the
+        // lookup on arrival keeps nothing, and a window goes when the watermark passes its end.
+        Assert.InRange(entries.Max(), 1, 2 * 2 * 2);
+        Assert.Equal(30, pipeline.UpsertSink<string, Exposure>("exposure").Rows.Count / 2);
+    }
 }

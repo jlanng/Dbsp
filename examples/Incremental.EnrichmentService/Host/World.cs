@@ -20,6 +20,11 @@ public sealed class ExampleOptions
     public int PeerProbePort { get; init; } = 5191;
     public int Rate { get; init; } = 50;
 
+    /// <summary>How many trade ids the generated feed runs over before it comes round
+    /// again; a later trade under an id amends the earlier one. 0: every trade has an id
+    /// of its own, as a real feed does.</summary>
+    public long TradeIds { get; init; }
+
     /// <summary>One generated trade in this many has no quantity, which one definition
     /// refuses: it is what fills the dead-letter page. 0: none.</summary>
     public int Poison { get; init; } = 200;
@@ -69,6 +74,7 @@ public sealed class ExampleOptions
         ("--clean", null, "With --kafka: remove the connector, the Postgres tables and the topics of the prefix, and exit."),
         ("--port", "N", "The admin port (5180; 5181 for node b)."),
         ("--rate", "N", "Generated trades per second (50)."),
+        ("--trade-ids", "N", "Trade ids the generated feed runs over before it repeats one, amending that trade (0: never repeats)."),
         ("--poison", "N", "One trade in N has no quantity, which one definition refuses (200; 0 for none)."),
         ("--prefix", "name", "With --kafka: the prefix of the topics and Postgres tables (enrich)."),
         ("--data", "dir", "Where the files live (a temporary directory)."),
@@ -150,6 +156,7 @@ public sealed class ExampleOptions
             ProbePort = Number("--probe-port", node == "b" ? "5191" : "5190"),
             PeerProbePort = Number("--peer-probe-port", node == "b" ? "5190" : "5191"),
             Rate = Number("--rate", "50"),
+            TradeIds = Number("--trade-ids", "0"),
             Poison = Number("--poison", "200"),
             Prefix = Value("--prefix") ?? defaults.Prefix,
             Bootstrap = Value("--bootstrap") ?? defaults.Bootstrap,
@@ -308,13 +315,15 @@ public sealed class Specs(KafkaStack? kafka, TimeSpan? fileSpacing = null, int? 
         Definition = "trader-desks",
     };
 
-    public PipelineSpec TradeEnrichment(string id, decimal minNotional, string version = "") => new()
+    // A trade stays open to corrections for two minutes of event time: short, so that the
+    // example shows its state levelling off within minutes (the definition's default is an hour).
+    public PipelineSpec TradeEnrichment(string id, decimal minNotional, string version = "", int openSeconds = 120) => new()
     {
         Id = id,
         Plugin = Plugin,
         Version = version,
         Definition = "trade-enrichment",
-        Settings = Json($$"""{ "minNotional": {{minNotional.ToString(System.Globalization.CultureInfo.InvariantCulture)}}, "label": "{{id}}" }"""),
+        Settings = Json($$"""{ "minNotional": {{minNotional.ToString(System.Globalization.CultureInfo.InvariantCulture)}}, "openSeconds": {{openSeconds}}, "label": "{{id}}" }"""),
         Inputs = new Dictionary<string, JsonElement> { ["trades"] = Trades },
         Sinks = new Dictionary<string, JsonElement> { ["enriched"] = Sink(id) },
     };

@@ -33,7 +33,7 @@ Read them in this order; each adds one thing to the one before.
 
 | Definition (file in `Pipelines/`) | Deployed as | Shape |
 |---|---|---|
-| `trade-enrichment` (`TradeEnrichment.cs`) | `trade-enrichment`, and again as `large-trades` with a higher `minNotional` | **Start here.** Keyed trades → `Lookup` counterparties (on arrival) → `Join` instruments (retroactive; notional computed) → filter → `Join` trader-desks (retroactive) → upsert sink |
+| `trade-enrichment` (`TradeEnrichment.cs`) | `trade-enrichment`, and again as `large-trades` with a higher `minNotional` | **Start here.** Keyed trades with event time → `Lookup` counterparties (on arrival) → `Join` instruments (retroactive; notional computed) → filter → `Join` trader-desks (retroactive) → upsert sink. A trade is open to corrections for `openSeconds`, then final and forgotten by every operator (`EvictWhenFinal`): the state is the open window, not the feed |
 | `trader-desks` (`TraderDesks.cs`) | `trader-desks` | `traders.Changes() ⋈ desks → ToTable(trader-desks)`: a derived table, no input, no sink |
 | `desk-exposure` (`DeskExposure.cs`) | `desk-exposure` | Trades as append-only executions → `LookupAppendOnly` trader-desks → event time → per desk, one-minute tumbling windows, `Sum` → upsert sink |
 | `execution-quality` (`ExecutionQuality.cs`) | `execution-quality` | **Two inputs.** Executions `LookupAppendOnly` instruments (their asset class, with no state), then `LeftJoin` reference quotes on (instrument, minute), evicted by the watermark → per asset class, five-minute windows sliding by a minute, a custom linear aggregate → upsert sink. The quotes are read from files |
@@ -172,6 +172,7 @@ node's memory comes to; the cluster page of the admin UI shows this process's.
 | `--prefix name` | Kafka topic prefix and Postgres table prefix (lower-case letters and digits) |
 | `--port N`, `--probe-port N`, `--peer-probe-port N` | |
 | `--rate N` | trades per second (50) |
+| `--trade-ids N` | trade ids come round after N, a later trade amending the earlier one (0, the default: never; the pipelines' state is bounded by event time, not by the ids) |
 | `--poison N` | one trade in N has no quantity (200); 0 for none |
 | `--ui-dir DIR` | serve the admin UI's files from DIR (`src/Incremental.Service.Admin/wwwroot`) instead of the embedded copies |
 | `--otlp` | export the meters `Incremental.Service` and `Incremental` over OTLP; the endpoint is `OTEL_EXPORTER_OTLP_ENDPOINT` (the guide's *Operating it: monitoring*) |

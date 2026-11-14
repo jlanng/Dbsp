@@ -34,6 +34,14 @@ public sealed class Smoke(ExampleOptions options)
         Instruments = 400, Counterparties = 120, TradeKeySpace = 1500, TradeInterval = TimeSpan.FromMilliseconds(250),
         PoisonEvery = 97,                   // about one execution in a hundred has no quantity
     };
+    // How long a trade stays open to corrections in trade-enrichment's deployments: 120
+    // trades of event time, so that most of the 4,000 the run publishes become final and
+    // the state's bound is far below the 1,500 trade ids.
+    private static readonly TimeSpan Open = TimeSpan.FromSeconds(30);
+
+    private PipelineSpec Enrichment(string id, decimal minNotional, string version = "") =>
+        _specs.TradeEnrichment(id, minNotional, version, (int)Open.TotalSeconds);
+
     private readonly List<ExampleNode> _nodes = [];
     private readonly TimeSpan _patience = options.Kafka ? TimeSpan.FromSeconds(120) : TimeSpan.FromSeconds(45);
     private World _world = null!;
@@ -127,7 +135,7 @@ public sealed class Smoke(ExampleOptions options)
         Claim(text, () => Task.Run(() => Model.Difference(expected(), Sink(name))));
 
     private Task EnrichedIs(string text, string id = "trade-enrichment") =>
-        SinkIs(text, id, () => _model.Enrichments[id].Expected(_model));
+        SinkIs(text, id, () => _model.Enrichments[id].Expected());
 
     private Task QualityIs(string text) => SinkIs(text, "execution-quality", () => _model.Quality!.Expected(_model));
 
@@ -280,21 +288,21 @@ public sealed class Smoke(ExampleOptions options)
         Console.WriteLine();
         Console.WriteLine("1. Seven pipelines are deployed through the admin API from the stored plugin, version 1.");
 
-        var refused = await _admin.PutAsync("pipelines/trade-enrichment", _specs.TradeEnrichment("trade-enrichment", -1));
+        var refused = await _admin.PutAsync("pipelines/trade-enrichment", Enrichment("trade-enrichment", -1));
         await Claim("a spec whose settings fail validation (minNotional −1) is refused, and nothing is deployed",
             async () => Unless(refused.Status == 400 && (await _admin.SendAsync(HttpMethod.Get, "/admin/api/pipelines/trade-enrichment")).Status == 404,
                 $"the deploy answered {refused.Status} {refused.Body?.ToJsonString()}"));
 
-        _model.Enrichments["trade-enrichment"] = new EnrichmentModel(250_000m);
-        _model.Enrichments["large-trades"] = new EnrichmentModel(5_000_000m);
+        _model.Enrichments["trade-enrichment"] = new EnrichmentModel(250_000m, Open);
+        _model.Enrichments["large-trades"] = new EnrichmentModel(5_000_000m, Open);
         _model.Exposure = new ExposureModel(TimeSpan.FromSeconds(60));
         _model.Quality = new QualityModel(TimeSpan.FromSeconds(300), TimeSpan.FromSeconds(60));
         _model.Alerts["sanctions-alerts"] = new AlertsModel(new(_world.Sanctions.Rows), 0, "block");
         _model.Alerts["credit-alerts"] = new AlertsModel(new(_world.CreditWatch.Rows), 1_000_000m, "review");
         foreach (var spec in new[]
                  {
-                     _specs.TraderDesks(), _specs.TradeEnrichment("trade-enrichment", 250_000m),
-                     _specs.TradeEnrichment("large-trades", 5_000_000m), _specs.DeskExposure(),
+                     _specs.TraderDesks(), Enrichment("trade-enrichment", 250_000m),
+                     Enrichment("large-trades", 5_000_000m), _specs.DeskExposure(),
                      _specs.ExecutionQuality(), _specs.SanctionsAlerts(), _specs.CreditAlerts(),
                  })
         {
@@ -349,10 +357,13 @@ public sealed class Smoke(ExampleOptions options)
     private async Task TradesAsync()
     {
         Console.WriteLine();
-        Console.WriteLine($"2. 2,000 trades are published over {_shape.TradeKeySpace:N0} trade ids, so a quarter of them amend an earlier trade.");
-        await PublishAsync(2000);
-        await EnrichedIs($"trade-enrichment delivered exactly the {_model.Enrichments["trade-enrichment"].Expected(_model).Count:N0} live trades at or above its minimum notional, each joined to three tables");
-        await EnrichedIs($"large-trades, the same definition with other settings and its own state, delivered its {_model.Enrichments["large-trades"].Expected(_model).Count:N0}", "large-trades");
+        Console.WriteLine($"2. 2,000 trades are published over {_shape.TradeKeySpace:N0} trade ids, so a quarter of them reuse the id of an earlier, final trade.");
+        // Two halves, the second once the first is through: never two trades of one id in a step.
+        await PublishAsync(1000);
+        await EnrichedIs("the first 1,000 trades are through trade-enrichment");
+        await PublishAsync(1000);
+        await EnrichedIs($"trade-enrichment delivered exactly the {_model.Enrichments["trade-enrichment"].Expected().Count:N0} live trades at or above its minimum notional, each joined to three tables");
+        await EnrichedIs($"large-trades, the same definition with other settings and its own state, delivered its {_model.Enrichments["large-trades"].Expected().Count:N0}", "large-trades");
         await SinkIs($"desk-exposure delivered {_model.Exposure!.Expected().Count} window totals — every execution counted once, in the minute of its execution time",
             "desk-exposure", _model.Exposure.Expected);
 
@@ -400,16 +411,17 @@ public sealed class Smoke(ExampleOptions options)
             _world.Traders.Upsert(moved);
         _model.Change(moved);
         var desk = _model.Desks[moved.DeskId].Name;
-        var theirs = _model.Enrichments["trade-enrichment"].Expected(_model).Values.Count(r => r["trader"]!.GetValue<string>() == moved.Name);
+        var (open, final) = _model.Enrichments["trade-enrichment"].Count(r => r.Trade.TraderId == moved.Id);
         await Claim($"{moved.Name} moves to {desk}: the change reaches the derived table through the trader-desks pipeline",
             async () => Model.Difference(
                 new() { [moved.Id.ToString()] = _model.ExpectedTraderDesks()[moved.Id.ToString()] }, await TableRowsAsync("trader-desks", moved.Id.ToString())));
-        await EnrichedIs($"all {theirs} of their delivered trades now say {desk} (a retroactive join)");
+        await EnrichedIs($"their {open} open trades now say {desk} (a retroactive join); their {final} final ones, executed more than {Open.TotalSeconds:N0} s before the newest trade, still say {_model.Desks[trader.DeskId].Name}");
         await SinkIs("desk-exposure is unchanged: those executions were done on the old desk (a lookup on arrival)", "desk-exposure", () => exposureBefore);
 
         // An instrument's multiplier is corrected.
-        var instrument = await ChangeInstrumentAsync(first.InstrumentId);
-        await EnrichedIs($"{instrument.Symbol}'s multiplier becomes {instrument.Multiplier}: every trade in it is repriced, and the filter applied again");
+        var instrument = await ChangeInstrumentAsync(_model.Enrichments["trade-enrichment"].OpenInstrument());
+        var (repriced, kept) = _model.Enrichments["trade-enrichment"].Count(r => r.Trade.InstrumentId == instrument.Id);
+        await EnrichedIs($"{instrument.Symbol}'s multiplier becomes {instrument.Multiplier}: its open trades are repriced and the filter applied again ({repriced} delivered), its final ones are not ({kept})");
         await EnrichedIs("large-trades took the same correction", "large-trades");
         if (_kafka is null)
         {
@@ -469,13 +481,15 @@ public sealed class Smoke(ExampleOptions options)
         }
         // In memory the instrument feed decides what changes next; take its records until
         // one of them really changes a multiplier.
+        // An instrument with an open trade, so that the change has something to correct.
+        var enrichment = _model.Enrichments["trade-enrichment"];
         while (true)
         {
             var next = _shape.InstrumentChangeAt(_world.Instruments.Published);
             var changes = _model.Instruments[next.Id].Multiplier != next.Multiplier;
             _world.Instruments.Publish();
             _model.Change(next);
-            if (changes)
+            if (changes && enrichment.Count(r => r.Trade.InstrumentId == next.Id).Open > 0)
                 return next;
         }
     }
@@ -495,7 +509,7 @@ public sealed class Smoke(ExampleOptions options)
             () => Unless(uploaded.Status == 201 && uploaded.Body!["plugin"]!["definitions"]!.AsArray().Count == 5, $"the upload answered {uploaded.Status} {uploaded.Body?.ToJsonString()}"));
 
         // trade-enrichment: version 2 adds a computed column and changes nothing stored.
-        var enrichment = _specs.TradeEnrichment("trade-enrichment", 250_000m, v2);
+        var enrichment = Enrichment("trade-enrichment", 250_000m, v2);
         var undecided = await _admin.PutAsync("pipelines/trade-enrichment", enrichment);
         await Claim("replacing trade-enrichment without saying what happens to its state is refused (409 state-choice-required)",
             () => Unless(undecided.Status == 409 && undecided.Body?["error"]?["code"]?.GetValue<string>() == "state-choice-required",
@@ -507,7 +521,7 @@ public sealed class Smoke(ExampleOptions options)
                     && !details.Any(d => d.Contains("EnrichedTrade") || d.Contains("keep is not possible")),
                 $"the details were: {string.Join(" | ", details)}");
         });
-        var before = _model.Enrichments["trade-enrichment"].Expected(_model).Count;
+        var before = _model.Enrichments["trade-enrichment"].Expected().Count;
         var kept = await _admin.PutAsync("pipelines/trade-enrichment?state=keep", enrichment);
         _model.Enrichments["trade-enrichment"].V2 = true;
         await Claim("with state=keep it is replaced and runs version 2",
@@ -622,12 +636,39 @@ public sealed class Smoke(ExampleOptions options)
         await EnrichedIs("500 more trades: trade-enrichment never stopped");
         await SinkIs("neither did desk-exposure", "desk-exposure", ExpectedExposure);
         await QualityIs("nor execution-quality");
+        await StateLevelsOffAsync();
         await Claim("the audit log has every change made here, newest first", async () =>
         {
             var actions = (await _admin.GetAsync("audit?limit=50"))["items"]!.AsArray().Select(a => a!["action"]!.GetValue<string>()).ToList();
             return Unless(actions.Contains("pipeline.remove") && actions.Contains("plugin.import") && actions.Count(a => a.StartsWith("pipeline.", StringComparison.Ordinal)) >= 7,
                 "the audit log holds " + string.Join(", ", actions));
         });
+    }
+
+    /// <summary>
+    /// The feed goes on, a batch at a time, and trade-enrichment's state does not follow it:
+    /// it holds the open trades — the last <see cref="Open"/> of event time — and the batch
+    /// just read, until the next step forgets what that batch made final. Per open trade at
+    /// most eight entries: its row and deadline in the input, what the lookup emitted and its
+    /// deadline, and its fact and deadline in each join. Before EvictWhenFinal it held an
+    /// entry in each of four stores for every one of the 1,500 trade ids.
+    /// </summary>
+    private async Task StateLevelsOffAsync()
+    {
+        const int batch = 125;
+        var readings = new List<long>();
+        for (var round = 0; round < 4; round++)
+        {
+            await PublishAsync(batch);
+            await EnrichedIs($"{batch} more trades ({round + 1} of 4): the sink equals the model");
+            readings.Add((await _admin.GetAsync("pipelines/trade-enrichment"))["pipeline"]!["stateSize"]?["entries"]?.GetValue<long>() ?? -1);
+        }
+        var open = _model.Enrichments["trade-enrichment"].OpenTrades;
+        var bound = 8L * (open + batch + 1);
+        await Claim($"trade-enrichment's state levels off as the feed goes on: {string.Join(", ", readings.Select(r => r.ToString("N0")))} entries after the four batches, " +
+                    $"at most 8 per open trade and per trade of the last batch ({bound:N0}), where keeping every trade would be four per trade id ({4 * _shape.TradeKeySpace:N0})",
+            () => Unless(readings.All(r => r > 0 && r <= bound) && readings.Skip(2).Max() <= readings.Take(2).Max() * 11 / 10,
+                $"the readings were {string.Join(", ", readings)}"));
     }
 
     // ── act 6: leadership moves ────────────────────────────────────────────────────────
@@ -645,7 +686,7 @@ public sealed class Smoke(ExampleOptions options)
             return Unless(status["leadership"]!["role"]!.GetValue<string>() == "Standby" && status["standby"]?["takeoverWouldBeWarm"]?.GetValue<bool>() == true,
                 $"b is {status["leadership"]!["role"]}, not warm because {status["standby"]?["notWarmBecause"]?.ToJsonString()}");
         });
-        var refused = await standby.PutAsync("pipelines/trade-enrichment?state=keep", _specs.TradeEnrichment("trade-enrichment", 250_000m));
+        var refused = await standby.PutAsync("pipelines/trade-enrichment?state=keep", Enrichment("trade-enrichment", 250_000m));
         await Claim("a change sent to the standby is refused, with the leader's address",
             () => Unless(refused.Status is 409 or 421 or 503 && refused.Body?["error"]?["leader"] is not null, $"the standby answered {refused.Status} {refused.Body?.ToJsonString()}"));
 

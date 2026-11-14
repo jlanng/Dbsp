@@ -110,14 +110,29 @@ with `Incremental.`: it collides with `Incremental.Tables`.
 /// Trades enriched from three shared tables, each join of the kind its column needs: the
 /// counterparty is looked up when the trade arrives and then left alone; the instrument
 /// and the trader's desk are joined, so a change to either corrects every trade it touches.
+/// <para>
+/// Every trade is a new key, so nothing would ever close one: a retroactive join keeps
+/// every fact it has joined, and a keyed input every row it has had. What bounds them is
+/// the trade's own time. A trade is <em>open</em> for <c>OpenSeconds</c> of event time —
+/// the watermark runs that far behind the newest trade seen — and while it is open an
+/// amendment replaces it and a change of reference data corrects it. Then it is
+/// <em>final</em>: an amendment that arrives later is dropped as late, its row in the sink
+/// stays as last emitted, and every operator below forgets it (<c>evictWhenFinal</c> on
+/// the input, <c>EvictWhenFinal()</c> on each grouping). The state is about
+/// <c>OpenSeconds × trades per second</c> trades, whatever the feed's length. Copy this
+/// shape for any retroactive join over a stream of facts.
+/// </para>
 /// </summary>
-[Pipeline("trade-enrichment", Description = "Trades with counterparty (on arrival), instrument and desk (retroactive), filtered by notional.")]
+[Pipeline("trade-enrichment", Description = "Trades with counterparty (on arrival), instrument and desk (retroactive while open), filtered by notional.")]
 public sealed class TradeEnrichment : IPipelineDefinition<TradeEnrichment.Settings>
 {
     public sealed record Settings
     {
         [Range(0, 1e12), Description("Trades with a notional below this are dropped.")]
         public decimal MinNotional { get; init; }
+
+        [Range(1, 30 * 86_400), Description("How long, in seconds of event time behind the newest trade, a trade stays open to amendments and reference-data corrections. Then it is final and its state goes.")]
+        public int OpenSeconds { get; init; } = 3600;
 
         [StateNeutral, Description("A label for operators; it changes no stored row.")]
         public string? Label { get; init; }
@@ -130,16 +145,22 @@ public sealed class TradeEnrichment : IPipelineDefinition<TradeEnrichment.Settin
         var traderDesks = p.Table(Reference.TraderDesks);
 
         var enriched = p.KeyedInput<long, Trade>("trades", t => t.Id)
+            // The trade's time, and how long it stays open: the input forgets a trade's row
+            // once it is final.
+            .WithEventTime(t => t.ExecutedAt, TimeSpan.FromSeconds(s.OpenSeconds), evictWhenFinal: true)
             // Enrich on arrival: who the counterparty was when the trade was booked.
-            .Lookup(counterparties, t => t.CounterpartyId,
-                (t, c) => new Booked(t, c.Name, c.Rating),
-                t => new Booked(t, "(unknown)", "NR")).Named("booked")
-            // Retroactive: a corrected multiplier reprices every trade in the instrument.
-            .GroupBy(b => b.Trade.InstrumentId)
+            .GroupBy(t => t.CounterpartyId).EvictWhenFinal()
+            .Lookup(counterparties,
+                (_, t, c) => new Booked(t, c.Name, c.Rating),
+                (_, t) => new Booked(t, "(unknown)", "NR")).Named("booked")
+            // Retroactive while open: a corrected multiplier reprices the instrument's open trades.
+            .WithEventTime(b => b.Trade.ExecutedAt)
+            .GroupBy(b => b.Trade.InstrumentId).EvictWhenFinal()
             .Join(instruments, (_, b, i) => new Priced(b, i.Symbol, b.Trade.Quantity * b.Trade.Price * i.Multiplier)).Named("priced")
             .Where(x => x.Notional >= s.MinNotional)
-            // Retroactive: a trader who moves desk takes their trades with them.
-            .GroupBy(x => x.Booked.Trade.TraderId)
+            // Retroactive while open: a trader who moves desk takes their open trades with them.
+            .WithEventTime(x => x.Booked.Trade.ExecutedAt)
+            .GroupBy(x => x.Booked.Trade.TraderId).EvictWhenFinal()
             .Join(traderDesks, (_, x, td) => Row(x, td)).Named("with-desk");
 
         p.UpsertSink("enriched", enriched, e => e.TradeId);
@@ -177,16 +198,19 @@ What is going on:
 - **The join kind is chosen per join.** `Join` is retroactive: change the table row and
   every fact joined to it is corrected. `Lookup` enriches a record as it arrives and
   leaves it alone. In the definition above a renamed counterparty affects only trades
-  booked afterwards, while a corrected multiplier reprices every trade in the instrument.
+  booked afterwards, while a corrected multiplier reprices every open trade in the
+  instrument.
   Put the lookup *before* the retroactive joins if "as it arrived" is to mean the trade's
   arrival: a lookup downstream of a join looks again whenever the join re-emits.
-- **A `Lookup` remembers what it emitted for every record it has seen**, so that it can
-  take exactly that back when the record is retracted. On a keyed input that is one
-  entry per key, like the input's own state. On a stream of records that only ever
-  arrive it is one entry per record, for ever: use `LookupAppendOnly` there, which
-  keeps nothing and faults on a retraction. Where a lookup must sit behind something
-  that retracts and the records never end, group by the lookup key and give the
-  grouping `EvictWhen`.
+- **A retroactive join keeps every record it has joined, and a `Lookup` what it
+  emitted for every record**, so that each can correct or take back exactly that. Over
+  a stream of trades, where every trade is a new key, that is one entry per trade for
+  ever — unless something closes it. Here it is the trade's own time: a trade is open
+  for `openSeconds` of event time, then final, and `EvictWhenFinal()` on each grouping
+  (with `evictWhenFinal: true` on the input) forgets it. On a stream that only ever
+  arrives and needs no retroactivity, `LookupAppendOnly` keeps nothing at all.
+  [Bounding a join over a stream of facts](#bounding-a-join-over-a-stream-of-facts) is
+  the whole story, with the arithmetic.
 - Settings are one type per definition, bound from the spec's `settings` with
   `System.Text.Json` (camelCase, unknown members refused, string enums) and then
   validated with DataAnnotations — before anything is deployed.
@@ -609,13 +633,15 @@ public PipelineSpec TraderDesks(string version = "") => new()
     Definition = "trader-desks",
 };
 
-public PipelineSpec TradeEnrichment(string id, decimal minNotional, string version = "") => new()
+// A trade stays open to corrections for two minutes of event time: short, so that the
+// example shows its state levelling off within minutes (the definition's default is an hour).
+public PipelineSpec TradeEnrichment(string id, decimal minNotional, string version = "", int openSeconds = 120) => new()
 {
     Id = id,
     Plugin = Plugin,
     Version = version,
     Definition = "trade-enrichment",
-    Settings = Json($$"""{ "minNotional": {{minNotional.ToString(System.Globalization.CultureInfo.InvariantCulture)}}, "label": "{{id}}" }"""),
+    Settings = Json($$"""{ "minNotional": {{minNotional.ToString(System.Globalization.CultureInfo.InvariantCulture)}}, "openSeconds": {{openSeconds}}, "label": "{{id}}" }"""),
     Inputs = new Dictionary<string, JsonElement> { ["trades"] = Trades },
     Sinks = new Dictionary<string, JsonElement> { ["enriched"] = Sink(id) },
 };
@@ -779,6 +805,52 @@ public class TradeEnrichmentTests
     }
 
     [Fact]
+    public async Task A_trade_is_corrected_while_it_is_open_and_left_alone_once_it_is_final()
+    {
+        await using var pipeline = await StartAsync("""{ "minNotional": 1000, "openSeconds": 60 }""");
+        var trades = pipeline.KeyedInput<long, Trade>("trades");
+        await trades.UpsertAsync(Trade(1, quantity: 100));                                   // at T0
+        await pipeline.StepAsync();
+        await trades.UpsertAsync(Trade(2, quantity: 100) with { ExecutedAt = T0.AddMinutes(2) });
+        await pipeline.StepAsync();                                                          // the watermark: T0 + 1 min
+
+        await pipeline.Table(Reference.Instruments).UpsertAsync(Abc with { Multiplier = 3m });
+        await pipeline.StepAsync();
+        var rows = pipeline.UpsertSink<long, EnrichedTrade>("enriched").Rows;
+        Assert.Equal(2000m, rows[1].Notional);                  // final: as it was emitted
+        Assert.Equal(3000m, rows[2].Notional);                  // open: repriced
+
+        // An amendment of a final trade is behind the watermark: dropped as late.
+        await trades.UpsertAsync(Trade(1, quantity: 500));
+        await pipeline.StepAsync();
+        Assert.Equal(2000m, rows[1].Notional);
+    }
+
+    [Fact]
+    public async Task The_state_holds_the_open_trades_and_no_more_however_long_the_feed()
+    {
+        await using var pipeline = await StartAsync("""{ "minNotional": 0, "openSeconds": 60 }""");
+        var trades = pipeline.KeyedInput<long, Trade>("trades");
+        var entries = new List<long>();
+        for (var second = 0; second < 1200; second++)       // a trade a second, each a new id
+        {
+            await trades.UpsertAsync(Trade(second, quantity: 100) with { ExecutedAt = T0.AddSeconds(second) });
+            if (second % 10 == 9)
+            {
+                await pipeline.StepAsync();
+                entries.Add(pipeline.StateSize.Entries);
+            }
+        }
+        // Per open trade: its row in the input, what the lookup emitted for it, its fact in
+        // each join, and a deadline in each of the four. Open: the 61 seconds from the
+        // watermark (60 behind the newest trade) on, and the step's own 10 until the next
+        // step evicts what this one made final.
+        Assert.InRange(entries.Max(), 1, 8 * (61 + 10));
+        Assert.Equal(entries[^1], entries[^50]);                 // level: it stopped growing
+        Assert.Equal(1200, pipeline.UpsertSink<long, EnrichedTrade>("enriched").Rows.Count);
+    }
+
+    [Fact]
     public async Task Settings_an_operator_could_not_deploy_are_refused_here_too()
     {
         var refused = await Assert.ThrowsAsync<ServiceException>(() => StartAsync("""{ "minNotional": -1 }"""));
@@ -795,6 +867,7 @@ public class TradeEnrichmentTests
 | `StepAsync()` | one step over everything sent and changed since the last. A record that faults the circuit is thrown from here. |
 | `UpsertSink<TKey, TRow>(slot).Rows`, `AppendSink<T>(slot).Records` | what the slot's sink holds |
 | `DeadLetters`, `Watermark`, `Shape` | the records dropped so far; the event-time watermark; the slots and tables `Build` declared |
+| `StateSize` | `Entries` and `Stores` (entries by store name) as of the last step: assert that a definition's state returns to a bound under a long feed, as `The_state_holds_the_open_trades_…` above does |
 
 Settings that would be refused at a deploy are refused by `StartAsync` with the same
 `ServiceException`, and a slot asked for under the wrong name or type says what the
@@ -1460,10 +1533,14 @@ directory the program prints as `files:`.
 | `--otlp` | export the meters over OTLP ([monitoring](#operating-it-monitoring)) |
 | `--poison N` | one generated trade in N has no quantity, which `watchlist-alerts` refuses: the dead letters. Default 200; 0 for none |
 | `--ui-dir src/Incremental.Service.Admin/wwwroot` | serve the admin UI's files from the checkout: an edit is a browser reload away |
+| `--trade-ids N` | the generated feed's trade ids come round again after N, a later trade amending the earlier one; 0, the default, gives every trade an id of its own, as a real feed does |
 | `--port N`, `--rate N`, `--prefix name`, `--no-generate`, `--no-pipelines`, `--verbose` | |
 
-It can be left running. Trade ids come round again after 20,000 and what is keyed by
-time closes with the watermark, so the pipelines' state is bounded; the in-memory
+It can be left running. Every trade has an id of its own, and the pipelines' state is
+bounded by time all the same: the seeded trade-enrichment and large-trades keep a trade
+open for two minutes of event time and then forget it, and what is keyed by a window or
+an interval closes with the watermark (*Bounding a join over a stream of facts* has the
+numbers); the in-memory
 backend compacts its state log as it goes (`InMemoryBackendOptions.StateCompactAbove`);
 and its two files sinks keep the newest 200 objects each (`"retain": 200`), because a
 directory has no lifecycle rule.
@@ -1474,7 +1551,9 @@ in its files directory. At `--rate 5000` event time runs a hundred times faster 
 minute of it is 300,000 executions held by the join until it closes: about a million
 state records and 1.8 to 2.7 GB, with no trend over nine minutes. The numbers, and
 what they were before a lookup in `execution-quality` was moved, are under *As built*,
-S6 (*The second review's findings*), in the design document.
+S6 (*The second review's findings*), in the design document. Those runs were made with
+trade ids coming round at 20,000, before trade-enrichment forgot its final trades;
+with ids that never repeat its state is now bounded by its open window instead (S8).
 
 Things to try in the UI, in the default mode:
 
@@ -1642,7 +1721,10 @@ delivered; per table the version the pipeline's checkpoint has committed beside 
 table's current one; and its state, store by store — entries, counted, and the bytes
 of this node's heap they take, estimated, with the size of one entry and of one record
 in the state log. A definition whose state grows without end shows there first; the
-list of pipelines has the same two figures as a column. The buttons are the actions: each shows its plan first, and reset
+list of pipelines has the same two figures as a column, and a pipeline whose state has
+grown without a pause for half an hour is marked *growing* there, on its page and on
+the overview's attention list
+([Bounding a join over a stream of facts](#bounding-a-join-over-a-stream-of-facts)). The buttons are the actions: each shows its plan first, and reset
 and remove want the id typed. *Generation* is the generation of the pipeline's spec
 everywhere — the header, the timeline, the audit, `If-Match`; a fault also says which
 *run* it was, since a restart builds the same generation again.
@@ -2118,6 +2200,7 @@ Gauges are read from a snapshot each node refreshes once a second (tables every 
 | `incremental.service.table.memory` (bytes) | node, table, part | the table on this node's heap, estimated, by part: `rows` (with the key map), `indexes`, `history` (superseded rows kept for readers) |
 | `incremental.service.pipeline.state_entries` | node, pipeline | entries its state holds on this node, counted — on a standby too |
 | `incremental.service.pipeline.state_memory` (bytes) | node, pipeline | the same state on this node's heap, estimated |
+| `incremental.service.pipeline.state_growing` | node, pipeline | 1 while its state entries have grown without a pause for `ServiceOptions.StateGrowthAlarmAfter` (30 min): not one fall, and a rise at twelve of the fifteen samples |
 | `incremental.service.process.working_set` (bytes) | node | what the operating system counts for the process: the figure to set against a container's limit |
 | `incremental.service.process.gc.live`, `.gc.committed` (bytes) | node | what the managed heap held at its last collection, and what the collector has committed for it |
 | `incremental.service.process.other` (bytes) | node | resident memory that is not the collector's: the Kafka client, the runtime, stacks (Linux) |
@@ -2147,7 +2230,7 @@ commit every step; a pipeline with `checkpointMaxDelay` or slow sinks needs its 
 | Loader stuck | `tables{state="LoaderFaulted"} > 0` for 5 min, or `table.loader_lag` rising | Readers keep the last version; the data is going stale. |
 | Table faulted | `tables{state="Faulted"} + tables{state="Failed"} > 0` | Pipelines that read it are `Blocked`. |
 | Node near its memory | `process.working_set` above 85 % of the container's limit for 10 min | The next bulk load or restore may not fit (*Sizing a node*). Which table or pipeline grew is in `table.memory` and `pipeline.state_memory`. |
-| State growing without end | `pipeline.state_entries` rising for a day in a pipeline whose keys should be bounded | A join or a lookup that never evicts keeps every key it has seen: the definition wants `EvictWhen`, a window, or `LookupAppendOnly`. |
+| State growing without end | `pipeline.state_growing == 1` (ticket) | Something kept per record is never closed: a retroactive join, a remembered lookup or a keyed input over a stream of facts. The definition wants `EvictWhenFinal`, `EvictWhen`, a window or `LookupAppendOnly` (*Bounding a join over a stream of facts*). The node raises it itself after `StateGrowthAlarmAfter` (30 min) of growth with no fall; the same is an event and an entry on the overview's attention list. |
 | Collector busy | `process.gc.pause_ratio > 0.1` for 10 min | The node is short of memory for what it allocates, or its collector is not set as *Sizing a node* says. |
 | Takeover slow | on Kafka, `takeover.duration{stage="total"}` above about 3 s, and `{stage="silence"}` above your failover budget | `total` is the takeover from the decision to leading: `fence`, `storage`, `catalog`, `tables`, then `start_leading` (the leader record, seeds, `pipelines`, loaders). It is about a second locally, half of it the `fence`, and does not grow with state when the standby was warm — so a long one is a slow fence (the brokers), or a `pipelines` stage that had to build circuits the standby had not (`standby.pipelines_to_build` was not 0). `silence` is how long the leader had been quiet when the standby went: 3 s for a dead leader, 30 s for one that still answered its probe. `start_leading` alone leaves out the fence and the wait, which is where a slow takeover is slow. |
 
@@ -2313,6 +2396,124 @@ will have other figures, and the two that matter to set against them are
 and `KafkaLogOptions.TransactionTimeout` (60 s: how long a leader survives brokers that
 cannot commit).
 
+## Bounding a join over a stream of facts
+
+A pipeline's state is whatever its operators keep between steps, and for an enrichment
+pipeline most of it is kept per record. Over a stream of facts — trades, executions,
+orders, where every record is a new key — that is state that grows with the feed unless
+something closes it. Measured on the example before round four (S8 in the design
+document), the reference pipeline `trade-enrichment` with trade ids that never repeat
+held 11,900 entries after one minute at 50 trades a second, 60,000 after five and
+120,200 after ten: four entries per trade, for ever, about 340 bytes each.
+
+**What is kept per fact.**
+
+| operator | kept | closed by |
+|---|---|---|
+| `KeyedInput` | the current row per key: what an upsert or a delete must take back | a delete from the source; `WithEventTime(…, evictWhenFinal: true)` |
+| table `Join`, `LeftJoin` (retroactive) | every record joined, under its join key: what a change of the row must correct | the key closing (`EvictWhen`); the record becoming final (`EvictWhenFinal`) |
+| `Lookup` (on arrival, remembered) | per record, the row it emitted: what a retraction must take back | the same two |
+| stream `Join` | both sides, per key | `EvictWhen` on a key that has a time in it (`execution-quality`'s instrument and minute) |
+| an aggregate (`Sum`, `Count`, windows) | one total per key or window | the window's end; nothing, if the key is a reference key — but then it is one per reference key, not per record |
+| `LookupAppendOnly`, `Select`, `Where` | nothing | — |
+
+**What closes it.** Four things, and a definition should be able to say which one bounds
+each operator:
+
+1. *The source deletes.* A book of positions or live orders, where a settlement or a
+   cancellation is a delete, is bounded by what is live. `examples/Incremental.TradeEnrichment`
+   is one: its last act settles the book and the state goes with it.
+2. *The key closes.* When the join key carries a time — an instrument and a quote
+   interval — `EvictWhen` drops a key's state when the watermark passes it.
+3. *The record becomes final.* When the key is a reference key (an instrument, a
+   trader, a counterparty) it never closes, but each fact does stop changing. Give the
+   input event time with a lateness that says how long a fact stays open, and
+   `EvictWhenFinal()` on each grouping: a record is forgotten once the watermark has
+   passed its own event time.
+4. *Nothing is kept.* If nothing needs to be corrected after arrival and the input only
+   ever inserts, `LookupAppendOnly` keeps nothing at all (`desk-exposure`,
+   `watchlist-alerts`).
+
+`trade-enrichment` is the third kind, and its shape is the one to copy (the definition
+is under *2. A definition*):
+
+```text
+KeyedInput("trades").WithEventTime(t => t.ExecutedAt, open, evictWhenFinal: true)   the input forgets final rows
+  .GroupBy(counterparty).EvictWhenFinal().Lookup(counterparties)                     on arrival, forgotten when final
+  .WithEventTime(b => b.Trade.ExecutedAt)                                            the time again, no new clock source
+  .GroupBy(instrument).EvictWhenFinal().Join(instruments)                            retroactive while open
+  .Where(notional ≥ minimum)
+  .WithEventTime(x => x.Booked.Trade.ExecutedAt)
+  .GroupBy(trader).EvictWhenFinal().Join(trader-desks)                               retroactive while open
+```
+
+What it means for a trade, with `openSeconds` as the lateness:
+
+- The watermark runs `openSeconds` behind the newest execution time read. A trade is
+  *open* while its execution time is at or after the watermark: an amendment (an upsert
+  of its id) replaces it, and a change to its instrument or its trader's desk corrects
+  it in the sink.
+- Then it is *final*. Every operator forgets it; its row stays in the sink as last
+  emitted; an amendment that arrives later is behind the watermark and dropped as late.
+  A later trade under the same id is a new trade: nothing is retracted for the old one,
+  so an upsert sink overwrites the row — or keeps the old row, if the filter drops the
+  new trade.
+- A change of reference data corrects exactly the trades at or after the watermark,
+  however the steps fall: a final trade not yet evicted is left alone too.
+- `WithEventTime(selector)` without a lateness re-declares the time after a lookup or
+  a join has reshaped the record. It drops what is behind the watermark, as the first
+  declaration does, and adds no source to the clock: after the filter, a second source
+  would hold the watermark back to the newest trade the filter let through.
+
+Choose `openSeconds` as how late a correction may come and still count: a trade booked
+in error and amended within the hour, a desk move that should still carry the morning's
+trades. It is a setting, so an operator changes it with a replace (the state's shape is
+unchanged; the watermark simply moves).
+
+**The arithmetic.** With `EvictWhenFinal` every operator that keeps a record also keeps
+a deadline for it, so an open trade costs two entries per stateful operator —
+`trade-enrichment` has four, eight entries — and the state is
+
+```
+entries ≈ 2 × stateful operators × trades per second × (openSeconds + one step)
+bytes   ≈ entries × about 310           (trade-enrichment's entries, measured)
+```
+
+Measured on the example after the change, at 50 trades a second with the seeded
+`openSeconds` of 120: 23,882 entries after one minute, 47,980 after two, 48,059 after
+five and the same after ten, about 14.9 MB — 2 × 4 × 50 × 120 = 48,000. Before, the same
+run held 120,200 at ten minutes and was growing by 12,000 a minute. An hour open at a
+thousand trades a second would be 3.6 million open trades, 29 million entries and about
+9 GB on each node, leader and standby alike: the window is a sizing decision, and
+*Sizing a node* is where its bytes go.
+
+**Seeing it.** A pipeline's page has its state store by store: `input.trades.upsert.rows`
+and `.deadlines`, `named.booked.tableLookup.remembered`, `named.priced.tableJoin.facts`
+and so on, each with entries and bytes. The list of pipelines has the total as a column,
+and the meter has it as `pipeline.state_entries` and `pipeline.state_memory`. A state
+that is bounded rises to its bound and then rises and falls with the feed. One that is
+not is flagged by the node itself: when the entries, sampled every fifteenth of
+`ServiceOptions.StateGrowthAlarmAfter` (30 min), have not fallen once in that time and
+rose at no fewer than twelve of the fifteen samples, the pipeline is marked *growing* on
+its page, in the list and on the overview's attention list, an event says so (`state
+growing: … entries in 30 min without falling once`), and the gauge
+`pipeline.state_growing` is 1. It is read from the counts the node already keeps; a
+state that filled and then went quiet with its input is not flagged, and one flagged
+stays flagged until its entries fall.
+
+**Testing it.** `PipelineTestHarness.StateSize` is the same count, by store and in all,
+after each step. Feed the definition far more event time than it keeps open and assert
+that the state comes back to the bound the arithmetic gives — the example's tests do
+that for every definition (`The_state_holds_the_open_trades_and_no_more_however_long_the_feed`
+above, and one per definition in `Pipelines.Tests`).
+
+**What it does not cover.** `EvictWhenFinal` is offered on an event-time grouping and
+only for the table `Join`, `LeftJoin` and `Lookup`; an aggregate over facts keeps a
+total per key, which is bounded by the keys. A keyed input with no event time has no
+expiry: its rows go only when the source deletes them (*Open for James* 69 in the
+design document has the options). Nothing limits a pipeline's state by count: the flag
+says it grows, and stops nothing.
+
 ## Sizing a node
 
 A node needs its **working set**: what the operating system counts for the process, and
@@ -2352,7 +2553,7 @@ and an entry costs its key and value as objects plus a slot in the store's map:
 | a join's side: the same record under its join key (`Join`, `LeftJoin`: one per record) | 359 |
 | a running total or count per key (`Sum`, `Count`) | 61 |
 | a count per string key | 87 |
-| a deadline (`EvictWhen`, a window: one per open key) | 56 |
+| a deadline (`EvictWhen`, a window: one per open key; `EvictWhenFinal`: one per open record, in each operator) | 56 |
 
 A join over a keyed input keeps each record twice, once in each of the first two rows.
 `Lookup` remembers what it emitted per record; `LookupAppendOnly` and everything

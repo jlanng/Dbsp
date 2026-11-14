@@ -15,6 +15,13 @@ using Incremental.Tables;
 // moves desk takes every trade they ever did with them. Both sinks are fed through the
 // acknowledged-output path (DeliverToAsync), as a database or a topic would be.
 //
+// The trade circuit's state is the live book: every trade not yet cancelled is held by both
+// joins and the lookup, so it is bounded by what the source deletes — a cancellation, a
+// settlement — and by nothing else. That suits a book of positions. A feed of trades that
+// are never deleted needs event time and EvictWhenFinal instead (the enrichment service's
+// trade-enrichment definition, and docs/enrichment-service.md, "Bounding a join over a
+// stream of facts"). Act 7 settles the whole book and the state goes with it.
+//
 // The program narrates what it does and checks every claim against a model kept beside the
 // circuits; a claim that does not hold ends the run with exit code 1.
 //
@@ -80,7 +87,9 @@ derivingCircuit.Start();
 
 // ── the trade circuit: it stores trades, and no reference row ───────────────────────────
 
-var builder = new CircuitBuilder(new CircuitOptions { Workers = 1 });
+// A checkpointing store, for one reason: it can say how many entries the state holds.
+var storage = new Incremental.Storage.InMemoryCheckpointStorageProvider();
+var builder = new CircuitBuilder(new CircuitOptions { Workers = 1, Storage = storage });
 var tradeStream = builder.KeyedInput<long, Trade>("trades", t => t.Id);
 
 var enriched = tradeStream
@@ -275,19 +284,35 @@ await Claim($"every one of its {book.Values.Count(t => t.CounterpartyId == rerat
     () => BlotterMatches() && blotter.Rows.Values.Where(e => e.Counterparty == rerated.Name).All(e => e.Rating == newRating));
 await Claim($"trade {gone} is gone from the blotter and from its desk's total", () => !blotter.Rows.ContainsKey(gone) && BlotterMatches() && DeskTotalsMatch());
 
+// ── act 7: the book is settled ──────────────────────────────────────────────────────────
+
+long StateEntries() => storage.CommittedEntriesByStore().Values.Sum();
+var held = StateEntries();
+var live = book.Count;
+foreach (var id in book.Keys.ToList())
+{
+    book.Remove(id);
+    arrival.Remove(id);
+    await trades.DeleteAsync(id);
+}
+Console.WriteLine();
+Console.WriteLine($"7. Every one of the {live:N0} live trades is settled: deleted at the source.");
+await Claim($"the circuit's state, {held:N0} entries for {live:N0} live trades, returns to nothing with the book: what bounds it is the source's deletes",
+    () => StateEntries() == 0 && blotter.Rows.Count == 0 && DeskTotalsMatch());
+
 // ── the end: drain, and look once more ──────────────────────────────────────────────────
 
 await circuit.DisposeAsync();
 await Task.WhenAll(blotterDelivery, deskDelivery);
 await derivingCircuit.DisposeAsync();
 Console.WriteLine();
-Console.WriteLine("7. Both circuits are drained and disposed.");
+Console.WriteLine("8. Both circuits are drained and disposed.");
 await Claim("the sinks, read after the last acknowledgement, still equal the model", () => BlotterMatches() && DeskTotalsMatch());
 await Claim("no batch was delivered twice", () => blotter.Redeliveries == 0 && deskTotals.Redeliveries == 0);
 
 Console.WriteLine();
 Console.WriteLine(failures == 0
-    ? $"{claims} claims checked, all hold. The trade circuit kept {book.Count:N0} trades and not one reference row."
+    ? $"{claims} claims checked, all hold. The trade circuit kept {live:N0} trades at most and not one reference row."
     : $"{failures} of {claims} claims did NOT hold.");
 return failures == 0 ? 0 : 1;
 

@@ -88,4 +88,31 @@ public class ExecutionQualityTests
         await pipeline.StepAsync();
         Assert.Equal((1, 0, 50m), Windows(pipeline)[("Equity", T0)]);
     }
+
+    [Fact]
+    public async Task Its_state_is_the_open_intervals_and_windows_and_no_more_however_long_the_feed()
+    {
+        await using var pipeline = await StartAsync();
+        var executions = pipeline.Input<Trade>("executions");
+        var quotes = pipeline.Input<Quote>("quotes");
+        var entries = new List<long>();
+        for (var second = 0; second < 1800; second++)        // half an hour of both feeds
+        {
+            if (second % 60 == 0)
+                foreach (var instrument in new[] { 1, 2 })
+                    await quotes.InsertAsync(new Quote(instrument, T0.AddSeconds(second), 100m));
+            await executions.InsertAsync(Execution(second, instrument: 1 + second % 2, second: second, price: 100.1m));
+            if (second % 10 == 9)
+            {
+                await pipeline.StepAsync();
+                entries.Add(pipeline.StateSize.Entries);
+            }
+        }
+        // The join holds an interval's executions and quote until the interval ends; the
+        // windows hold a total per asset class until theirs do. So the state rises through
+        // each minute and falls back: its peak in the last ten minutes is no higher than in
+        // the first ten.
+        Assert.True(entries.TakeLast(60).Max() <= entries.Take(60).Max(), $"peaks {entries.Take(60).Max()} then {entries.TakeLast(60).Max()}");
+        Assert.InRange(entries.Max(), 1, 400);
+    }
 }

@@ -66,3 +66,10 @@ and the series was written up from these records by another session on 2026-11-1
 `KafkaServiceProcessTests` once each with their defaults (`run.sh check-all '*broker*'`),
 on the tree as committed (`7dd9d9e`) and the `kafka3` containers removed and started
 again a minute before. 7 min 34 s, all passed.
+
+`2026-11-14-j1-state.tsv`: state entries and estimated bytes per pipeline, read from
+`GET /admin/api/pipelines` at one, two, five and ten minutes of the in-memory example
+(one node, 50 trades a second, the seeded specs), for S8. `before` is the tree at
+`a0cbd57` with the `--trade-ids` option added; `after` is S8's tree. `unique`
+ran with `--trade-ids 0`, `wrap` with `--trade-ids 20000` (the old default). Two
+processes of a Debug build ran side by side.

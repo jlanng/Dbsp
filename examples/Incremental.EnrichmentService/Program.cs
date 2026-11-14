@@ -67,7 +67,11 @@ if (args.Contains("--clean"))
 var dataDirectory = options.DataDirectory
     ?? Path.Combine(Path.GetTempPath(), "incremental-enrichment-service", options.Kafka ? options.Prefix : "memory-" + Environment.ProcessId);
 // Event time moves at the pace trades are generated, so a one-minute window takes a minute.
-var shape = new WorldShape { TradeInterval = TimeSpan.FromSeconds(1.0 / Math.Max(1, options.Rate)), PoisonEvery = Math.Max(0, options.Poison) };
+var shape = new WorldShape
+{
+    TradeInterval = TimeSpan.FromSeconds(1.0 / Math.Max(1, options.Rate)), PoisonEvery = Math.Max(0, options.Poison),
+    TradeKeySpace = options.TradeIds > 0 ? options.TradeIds : long.MaxValue,
+};
 
 KafkaStack? kafka = null;
 var nodes = new List<ExampleNode>();

@@ -146,6 +146,24 @@ Eviction is unchanged: `EvictWhen` on the grouping drops closed keys' fact state
 facts are tracked for it; a table change creates no state, so a change to a key with no
 facts here (most of them, in most pipelines) costs one empty group read and nothing else.
 
+**Per fact, as built later (`EvictWhenFinal`).** A join key that is a reference key (an
+instrument, a trader) never closes, so over a feed of facts `EvictWhen` bounds nothing.
+`GroupedEventTimeStream.EvictWhenFinal()` hands the join (and `LeftJoin`, the index join
+and `Lookup`) a `RecordEviction`: each fact gets a deadline one tick after its own event
+time, tracked in an `EvictionTracker` keyed by (key, fact) — so checkpointed like any
+other deadline — and removed from the fact store one entry at a time
+(`IIndexedWeightStore.RemoveEntries`, a new member with a default that reads the group;
+the in-memory, checkpoint and changelog stores override it with a point read). Sound
+because the watermark operator upstream drops every record behind the watermark, a
+final fact's retraction and its amendments included. One ordering detail matters: the
+join applies table changes before it drains its deadlines, so a change in the step that
+first sees a new watermark would still reach facts that are final but not yet evicted.
+It skips them (`RecordEviction.IsFinal`): a change corrects exactly the facts at or
+after the watermark, whichever step evicts the others. A deadline whose fact was
+retracted is not forgotten early (the join does not read the weights it writes); it
+falls due at the fact's time like the rest, which bounds the deadlines by the same
+window as the facts.
+
 As built (`Operators/TableJoinOperator.cs`), three things the sketch above leaves open:
 
 - **"The same exchange" is a second exchange with the same hash.** The fact side's
@@ -793,7 +811,8 @@ rules as an adapter.
   position. A different retention rule, the same view structure.
 - **Wait-for-reference in lookup.** Parking facts whose reference row has not arrived yet.
   Today that is what the retroactive join does.
-- **Processing-time expiry of fact state.** Still watermark-only via `EvictWhen`.
+- **Processing-time expiry of fact state.** Still watermark-only, via `EvictWhen` or
+  `EvictWhenFinal` (below).
 
 ## Tests
 

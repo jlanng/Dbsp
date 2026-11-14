@@ -14,7 +14,8 @@ public sealed record WorldShape
     public int Traders { get; init; } = 24;
 
     /// <summary>Trade ids run over this many values and then come round again: the feed's
-    /// later records for an id amend the trade, so a host left running holds bounded state.</summary>
+    /// later record for an id amends the trade. <see cref="long.MaxValue"/>: every trade
+    /// has an id of its own.</summary>
     public long TradeKeySpace { get; init; } = 20_000;
 
     /// <summary>Event time between one trade and the next.</summary>

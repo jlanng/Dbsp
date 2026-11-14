@@ -89,7 +89,10 @@ views.WithEventTime(v => v.At, lateness: TimeSpan.FromSeconds(2))
 ```
 
 For keyed state whose lifecycle isn't window-derived, the escape hatch is
-`.EvictWhen(key => closesAt)` on any grouping.
+`.EvictWhen(key => closesAt)` on any grouping. For a table join or lookup over facts whose
+key never closes (trades by instrument), `.EvictWhenFinal()` on an event-time grouping
+forgets each fact once the watermark is past its own time, and a keyed input does the same
+with `WithEventTime(sel, lateness, evictWhenFinal: true)`.
 
 The watermark and the deadlines of everything still open are checkpointed with the state
 they bound, so they hold across a restart and a failover: a restored circuit has the

@@ -135,8 +135,21 @@ public class EventTimeRestartTests
         Add(taps, "join", grouped.Join(table, (_, e, rate) => (e.Id, rate.Tier)).ToOutput());
     }
 
+    /// <summary>The same table operators under <c>EvictWhenFinal</c>: each fact goes on
+    /// its own once the watermark passes its time, whatever its key, and a table change
+    /// corrects only the facts still open.</summary>
+    private static void FinalTableJoins(CircuitBuilder builder, InputStream<Ev> a, InputStream<Ev> b, SharedTable<int, Rate> rates, List<ITap> taps)
+    {
+        var table = builder.Table(rates);
+        var grouped = a.WithEventTime(e => e.At, Lateness).GroupBy(e => e.Key).EvictWhenFinal();
+        Add(taps, "lookup", grouped.Lookup(table, (_, e, rate) => (e.Id, rate.Tier), (_, e) => (e.Id, "none")).ToOutput());
+        Add(taps, "join", grouped.Join(table, (_, e, rate) => (e.Id, rate.Tier)).ToOutput());
+        Add(taps, "left", grouped.LeftJoin(table, (_, e, rate) => (e.Id, rate.Tier), (_, e) => (e.Id, "none")).ToOutput());
+    }
+
     private static readonly Dictionary<string, Scenario> Scenarios = new()
     {
+        ["final"] = FinalTableJoins,
         ["tumbling"] = Tumbling,
         ["hopping"] = Hopping,
         ["session"] = Session,
