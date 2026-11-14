@@ -576,6 +576,83 @@ public class KafkaLogTests(ITestOutputHelper output)
         Assert.Equal(new Dictionary<int, Row> { [1] = new(1, "one"), [3] = new(3, "three") }, rows);
     }
 
+    /// <summary>
+    /// A follower that has read every committed record stands in front of whatever an
+    /// aborted transaction left behind them, and has to learn that this is the end: a
+    /// takeover waits for its followers to reach the end of the state before it promotes
+    /// it. The client tells an application so with an end-of-partition event — after a
+    /// fetch that came back empty, which the broker holds for <c>fetch.wait.max.ms</c>,
+    /// half a second by default. A leader killed inside a transaction that had written
+    /// state cost every takeover that wait: fence and storage stage took 507 to 510 ms
+    /// together in six of six, however quick the fence. The reader now also reports
+    /// where the client itself stands when nothing arrives, which is behind the aborted
+    /// records and their marker as soon as it has read them. Here the empty fetch is
+    /// held for four seconds, so that only the position can bring the reader to the end
+    /// in the two the test allows.
+    /// </summary>
+    [Fact]
+    public async Task A_follower_reaches_the_end_behind_an_aborted_transaction_without_waiting_for_an_empty_fetch()
+    {
+        await using var env = KafkaEnv.Create();
+        var log = await env.ConnectWriterAsync();
+        var writer = await log.State.AcquireWriterAsync();
+        await CommitAsync(writer, 0, ("kept", "1"));
+
+        var held = TimeSpan.FromSeconds(4);
+        var follower = await env.ConnectAsync(env.Options(
+            clientConfig: new Dictionary<string, string> { ["fetch.wait.max.ms"] = ((int)held.TotalMilliseconds).ToString() }));
+        using var stop = new CancellationTokenSource(Timeout);
+        var position = 0L;
+        var fell = false;
+        var seen = new List<string>();
+        var following = Task.Run(async () =>
+        {
+            await foreach (var batch in follower.State.ReadAsync(0, 0, stop.Token))
+            {
+                lock (seen)
+                    seen.AddRange(batch.Records.Select(r => Text(r.Key)));
+                fell |= batch.NextOffset < Volatile.Read(ref position);
+                Volatile.Write(ref position, batch.NextOffset);
+            }
+        });
+        var committed = 0L;
+        await KafkaEnv.EventuallyAsync(async () => (committed = await log.State.EndOffsetAsync(0)) > 0 && Volatile.Read(ref position) >= committed, "the follower at the end of what is committed");
+
+        // Three records that reach the broker and are aborted, behind the follower.
+        using (var other = new ProducerBuilder<byte[], byte[]>(new ProducerConfig
+        {
+            BootstrapServers = KafkaEnv.Bootstrap, TransactionalId = env.Prefix + ".other",
+        }).Build())
+        {
+            other.InitTransactions(Timeout);
+            other.BeginTransaction();
+            for (var i = 0; i < 3; i++)
+                other.Produce(new TopicPartition(log.State.Topic, 0), new Message<byte[], byte[]> { Key = Bytes($"aborted{i}"), Value = Bytes("x") });
+            other.Flush(Timeout);
+            other.AbortTransaction(Timeout);
+        }
+        var end = 0L;
+        await KafkaEnv.EventuallyAsync(async () => (end = await log.State.EndOffsetAsync(0)) == committed + 4, "the end of committed data past the aborted records and their marker");
+
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        while (Volatile.Read(ref position) < end && clock.Elapsed < held)
+            await Task.Delay(10);
+        clock.Stop();
+        Assert.True(Volatile.Read(ref position) >= end && clock.Elapsed < held / 2,
+            $"the follower stood at {Volatile.Read(ref position)} of {end} after {clock.ElapsedMilliseconds} ms; an empty fetch is held for {held.TotalMilliseconds:F0} ms here, and the follower must not need one");
+        lock (seen)
+            Assert.Equal(["kept"], seen);
+
+        // And it stands at the end, not past it — a position is a promise about every
+        // offset below it — and has never gone back.
+        await Task.Delay(300);
+        Assert.Equal(end, Volatile.Read(ref position));
+        Assert.False(fell, "a position the follower reported was below one it had reported before");
+        KafkaEnv.Measured(output, $"follower behind an aborted transaction: at the end {clock.ElapsedMilliseconds} ms after the end had moved (an empty fetch is held {held.TotalMilliseconds:F0} ms)");
+        stop.Cancel();
+        await following.ContinueWith(_ => { });
+    }
+
     private static TableVersion<int, Row> Version(long version, params TableChange<int, Row>[] changes) =>
         new(version, changes, new Dictionary<int, long>());
 

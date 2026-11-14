@@ -2078,6 +2078,24 @@ table stage is inside `Prepare`; `ServiceTakeoverTimings` splits it out.
   last versions on a reader just replaced 1,299 ms and 84 ms. The takeover of
   `KafkaEndToEndTests` (two tables): 120–140 ms of fence and 8, 110 or 215 ms of tables
   before, 15–22 ms and 7–24 ms after. See enrichment-service.md, S8, *CI*.
+- *A reader reports where the client stands when nothing arrives* (2026-11-14). A
+  follower that has read every committed record stands in front of whatever an aborted
+  transaction left behind them. The client passes those records and their marker over
+  without handing anything on, and tells an application that it is at the end with an
+  end-of-partition event — after a fetch that came back empty, which the broker holds
+  for `fetch.wait.max.ms`, half a second. A takeover waits for its followers to reach
+  the end of the state topic before it promotes the state, so after a leader killed
+  inside a transaction that had written state the storage stage waited out what was
+  left of that half second: fence and storage took 507 to 510 ms together in six
+  takeovers of six, however quick the fence (166 and 326 ms in a scale-rig run, 95 and
+  418 on a runner). The reader loop now asks the consumer for its position whenever a
+  poll returns nothing, and reports it if it is past what it last reported: the
+  client's position stands behind an abort marker as soon as it has read it. The same
+  six takeovers: storage 1 to 13 ms, where it was 33 to 126. What remains after such a
+  leader is the fence's own wait — the client asking the broker again while the
+  transaction is aborted, 380 to 490 ms there.
+  `KafkaLogTests.A_follower_reaches_the_end_behind_an_aborted_transaction…` holds an
+  empty fetch for four seconds and gives the follower two.
 
 **Measured with the service** (two processes, 21 tables, two plugin pipelines, kill -9
 mid-stream, local broker): see enrichment-service.md, *As built*, S2 — detection is

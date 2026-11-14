@@ -1912,7 +1912,22 @@ public sealed class KafkaLog : IAsyncDisposable
             {
                 var result = consumer.ConsumeAssigned(TimeSpan.FromMilliseconds(100));
                 if (result is null)
+                {
+                    // Nothing to hand on, but the client may have read on all the same:
+                    // the records of an aborted transaction and its marker are passed
+                    // over inside it, and its position then stands behind them. The
+                    // end-of-partition event would say so too, one empty fetch later —
+                    // fetch.wait.max.ms, half a second — and a takeover that follows a
+                    // leader killed inside a transaction waited for exactly that before
+                    // it could promote the state.
+                    var at = consumer.Position(partition);
+                    if (at != Offset.Unset && at.Value > reported)
+                    {
+                        reported = at.Value;
+                        output.WriteAsync(new LogBatch([], reported), token).AsTask().GetAwaiter().GetResult();
+                    }
                     continue;
+                }
 
                 var records = new List<ConsumeResult<byte[], byte[]>>();
                 var next = -1L;

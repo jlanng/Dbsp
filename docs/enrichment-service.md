@@ -2279,6 +2279,9 @@ its first record 4.4 s after the kill.
 Of the takeover's second, half is the Kafka client waiting to retry while the broker
 aborts the dead writer's open transaction; the rest is reading the last term, promoting
 the tables (a few milliseconds for all of them), and starting twenty sources and sinks.
+That half second is there only when the leader died inside a transaction and the
+client has to ask twice; after a leader that died between transactions the fence and
+the storage stage took 24 to 56 ms together.
 The three seconds before it are yours to set: a shorter `TakeoverAfter` mistakes a slow
 broker for a dead leader sooner.
 

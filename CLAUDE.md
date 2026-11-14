@@ -216,6 +216,12 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   one too) waits out its poll loop's 100 ms, so one made and disposed per question is
   a tenth of a second per topic — it was, in every takeover's fence stage and once per
   table when the reader was new. Never dispose an admin client on a path that is timed.
+  A reader (`KafkaLog.ReadLoop`) reports the client's own position when nothing arrives:
+  the records of an aborted transaction are passed over inside the client, and the
+  end-of-partition event that would say so comes one empty fetch later
+  (`fetch.wait.max.ms`, half a second) — which a takeover's storage stage waited for
+  after a leader killed inside a transaction. A position reported is a promise about
+  every offset below it and never falls.
   A short read its caller calls off (a status that gives a table's lag two seconds)
   keeps that consumer and what it knows of the topics; only a read that failed
   replaces it (`KafkaLogTests`, the short reader's test).
