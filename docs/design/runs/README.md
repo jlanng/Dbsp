@@ -59,3 +59,10 @@ brokers had been started again at 07:50 and its last lines were written at 19:02
 durations in it are the machine's running time. The session that made the series was
 cut off there; the ten runs that follow were made by its script when the machine woke,
 and the series was written up from these records by another session on 2026-11-14.
+
+## 2026-11-14, a check of the same step on a cluster just started
+
+`2026-11-14-broker-failures-check.jsonl` and `….measurements.log`: the broker tests of
+`KafkaServiceProcessTests` once each with their defaults (`run.sh check-all '*broker*'`),
+on the tree as committed (`7dd9d9e`) and the `kafka3` containers removed and started
+again a minute before. 7 min 34 s, all passed.

@@ -5356,6 +5356,22 @@ seconds and `InitTransactions` waited eleven for a new controller and then a new
 coordinator. That last is the review's 13.4 to 16.3 s. Four runs; a first lead with a
 plugin import pending (the review's 25.8 s) was not run again.
 
+**A check on a cluster started a minute before** (2026-11-14, the tree as committed,
+the profile's containers removed and started again; records:
+`docs/design/runs/2026-11-14-broker-failures-check.jsonl`). The broker tests of
+`KafkaServiceProcessTests`, once each with their defaults, passed in 7 min 34 s. The
+70 s outage, brokers stopped: the standby held 90 times and answered its status in
+20 ms; the leader's transaction timed out at sixty seconds and its abort was refused
+(`INVALID_TXN_STATE`) sixteen seconds after the brokers had been started again; the
+standby took over three seconds later — its reason `silence`: it had heard the
+leader once more in between, and the leader then stopped answering its probe — and
+the old leader came back as the standby (a: 3); sink silent 88.8 s. That is three of
+four 70 s outages that moved the leadership, the same way each time. One broker
+killed for 20 s, every broker killed in turn and every broker shut down in turn
+moved nothing (sink silent 9.9 s, 14.2 s, 0.6 s); broker 3 away for 81 s with the
+leader killed half way: the standby led 3.4 s after the kill; a takeover with broker
+2 shut down 1.5 s before: 3.9 s.
+
 **Files and tables.**
 
 - **A `files` source on a compacting upsert sink's prefix lost deletes**, read
