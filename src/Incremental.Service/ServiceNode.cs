@@ -227,6 +227,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
     private (TimeSpan Catalog, TimeSpan Tables, int TableCount) _prepared;
     private DateTimeOffset _catalogReopenedAt = DateTimeOffset.MinValue;
     private int _cannotLead;
+    private readonly TaskCompletionSource<int> _ended = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private volatile bool _started;
     private int _disposed;
 
@@ -709,12 +710,24 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         _logger.LogCritical("Service node {Node} cannot lead ({Why}) and no ready standby answers; exiting with code 5", NodeId, why);
         _context.Events.Publish("node", NodeId, $"cannot lead ({why}); no ready standby answers");
         CannotLead?.Invoke(why);
+        _ended.TrySetResult(5);
         if (_lifetime is not null && _context.Options.ExitOnLeadershipLoss)
         {
             Environment.ExitCode = 5;
             _lifetime.StopApplication();
         }
     }
+
+    /// <summary>
+    /// Completes when this node will not lead again in this process, with what its process
+    /// would exit with (<see cref="ServiceOptions.ExitOnLeadershipLoss"/>): 3 when another
+    /// node replaced it, 4 when it stepped down, 5 when it could not lead. By then its
+    /// circuits are abandoned. A host that runs nodes in one process and does not let them
+    /// end it (the in-memory backend's two nodes) starts a node again on this, through
+    /// <see cref="NodeSupervisor.RunInProcessAsync{THost}"/>; a node that is stopped and never
+    /// lost the leadership leaves it incomplete.
+    /// </summary>
+    public Task<int> Ended => _ended.Task;
 
     /// <summary>Raised when this node finds it cannot lead and no ready standby answers,
     /// just before it stops the host with exit code 5.</summary>
@@ -1049,6 +1062,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         {
             _logger.LogError(ex, "Service node {Node}: abandoning its circuits failed", NodeId);
         }
+        _ended.TrySetResult(ExitCodeFor(finished));
         if (_lifetime is not null && _context.Options.ExitOnLeadershipLoss && Volatile.Read(ref _disposed) == 0 && !_stopping.IsCancellationRequested)
         {
             Environment.ExitCode = ExitCodeFor(finished);

@@ -75,6 +75,7 @@ var shape = new WorldShape
 
 KafkaStack? kafka = null;
 var nodes = new List<ExampleNode>();
+var supervisors = new List<Task>();
 using var stop = new CancellationTokenSource();
 try
 {
@@ -104,6 +105,26 @@ try
             while (i == 0 && !node.Node.IsLeader)
                 await Task.Delay(20);
         }
+        if (nodes.Count == 2)
+        {
+            // <snippet:in-process-supervisor>
+            // Two nodes in one process: a node that lost the leadership cannot end the
+            // process, so it is started again in it, on the same cluster, port and name, and
+            // comes back as the standby — the contract NodeSupervisor keeps for a process.
+            for (var i = 0; i < nodes.Count; i++)
+            {
+                var index = i;
+                ExampleNode? running = nodes[i];
+                supervisors.Add(NodeSupervisor.RunInProcessAsync(
+                    _ => Interlocked.Exchange(ref running, null) is { } first
+                        ? Task.FromResult(first)
+                        : ExampleNode.StartAsync(world, options, index == 0 ? "a" : "b", options.Port + index, cluster, exitOnLeadershipLoss: false),
+                    n => n.Node,
+                    n => nodes[index] = n,
+                    stop: stop.Token));
+            }
+            // </snippet:in-process-supervisor>
+        }
     }
 
     foreach (var node in nodes)
@@ -121,11 +142,15 @@ try
         e.Cancel = true;
         interrupted.TrySetResult();
     };
+    using var terminated = System.Runtime.InteropServices.PosixSignalRegistration.Create(
+        System.Runtime.InteropServices.PosixSignal.SIGTERM, _ => interrupted.TrySetResult());
     // A node that loses leadership stops its host (exit code 3 fenced, 4 resigned, 5 cannot
-    // lead); a process supervisor starts it again and it comes back as the standby.
-    await Task.WhenAny(nodes.Select(n => n.App.WaitForShutdownAsync()).Append(interrupted.Task));
+    // lead); a process supervisor starts it again and it comes back as the standby. Two
+    // nodes in memory are supervised in this process instead, and only a stop request ends it.
+    await (supervisors.Count > 0 ? interrupted.Task : Task.WhenAny(nodes.Select(n => n.App.WaitForShutdownAsync()).Append(interrupted.Task)));
     stop.Cancel();
     await generator;
+    await Task.WhenAll(supervisors);
 }
 finally
 {

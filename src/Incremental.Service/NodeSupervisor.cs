@@ -172,6 +172,84 @@ public static class NodeSupervisor
         }
     }
 
+    /// <summary>
+    /// The same contract for nodes that share a process, where a node that lost the
+    /// leadership cannot end the process without ending the others: the in-memory
+    /// backend's two nodes, as the example and the admin test host run them. Starts a host
+    /// with <paramref name="start"/>, waits for its node's <see cref="ServiceNode.Ended"/>,
+    /// disposes the host, and starts another the same way after the delay
+    /// <see cref="RunAsync"/> would give the exit code — 3 and 4 at once, anything else
+    /// doubling while it keeps ending within <see cref="NodeSupervisorOptions.StableAfter"/>.
+    /// The node's <see cref="ServiceOptions.ExitOnLeadershipLoss"/> must be off.
+    /// <paramref name="started"/> is told of each host as it is started; the one running
+    /// when <paramref name="stop"/> is cancelled is the caller's to dispose, in whatever
+    /// order its other nodes need, after this task has completed.
+    /// <see cref="NodeSupervisorOptions.ShouldRestart"/> and <see cref="NodeSupervisorOptions.StopTimeout"/>
+    /// do not apply.
+    /// </summary>
+    public static async Task RunInProcessAsync<THost>(
+        Func<CancellationToken, Task<THost>> start, Func<THost, ServiceNode> node, Action<THost>? started = null,
+        NodeSupervisorOptions? options = null, CancellationToken stop = default)
+        where THost : IAsyncDisposable
+    {
+        ArgumentNullException.ThrowIfNull(start);
+        ArgumentNullException.ThrowIfNull(node);
+        options ??= new NodeSupervisorOptions();
+        var log = options.Log ?? (line => Console.Error.WriteLine(line));
+        var delay = options.RestartDelay;
+        while (!stop.IsCancellationRequested)
+        {
+            THost host;
+            try
+            {
+                host = await start(stop).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (stop.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                // A start that fails is a node that ended early: slowed down, never given up.
+                delay = TimeSpan.FromTicks(Math.Min(options.MaxRestartDelay.Ticks, Math.Max(options.RestartDelay.Ticks, delay.Ticks * 2)));
+                log($"node supervisor: a node did not start ({ex.GetType().Name}: {ex.Message}); trying again in {delay.TotalMilliseconds:F0} ms");
+                try
+                {
+                    await Task.Delay(delay, stop).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                continue;
+            }
+            started?.Invoke(host);
+            var serviceNode = node(host);
+            var ran = Stopwatch.StartNew();
+            int code;
+            try
+            {
+                code = await serviceNode.Ended.WaitAsync(stop).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (stop.IsCancellationRequested)
+            {
+                return;
+            }
+            var healthy = code is 3 or 4 || ran.Elapsed >= options.StableAfter;
+            delay = healthy ? options.RestartDelay : TimeSpan.FromTicks(Math.Min(options.MaxRestartDelay.Ticks, Math.Max(options.RestartDelay.Ticks, delay.Ticks * 2)));
+            log($"node supervisor: node {serviceNode.NodeId} ended with exit code {code} ({Meaning(code)}) after {ran.Elapsed.TotalSeconds:F1} s; starting it again in {delay.TotalMilliseconds:F0} ms");
+            await host.DisposeAsync().ConfigureAwait(false);
+            try
+            {
+                await Task.Delay(delay, stop).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+        }
+    }
+
     private static string Meaning(int code) => code switch
     {
         3 => "fenced: another node leads",

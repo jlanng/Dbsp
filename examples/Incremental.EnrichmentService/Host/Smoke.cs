@@ -51,6 +51,9 @@ public sealed class Smoke(ExampleOptions options)
     private Process? _child;                // node a's supervisor, which starts node a
     private AdminClient? _first;            // node a's own admin API, whoever leads
     private readonly List<int> _nodeProcesses = [];   // node a's process ids, as its supervisor reports them
+    private readonly List<Task> _supervisors = [];    // in memory, two nodes: each node's supervisor in this process
+    private readonly CancellationTokenSource _stopSupervisors = new();
+    private int _restarts;                            // in memory: nodes started again by their supervisor
     private AdminClient _admin = null!;     // the leader's
     private int _claims;
 
@@ -231,7 +234,32 @@ public sealed class Smoke(ExampleOptions options)
             _admin = new AdminClient(_nodes[0].Url);
             await Claim("node a leads and is ready", async () => await RoleAsync(_admin) is "Leader" ? null : "not the leader yet");
             if (options.Nodes >= 2)
+            {
                 _nodes.Add(await ExampleNode.StartAsync(_world, nodeOptions, "b", ports[1], cluster, exitOnLeadershipLoss: false));
+                // As the program runs them: a node that loses the leadership is started again in
+                // this process and is the standby.
+                for (var i = 0; i < 2; i++)
+                {
+                    var index = i;
+                    ExampleNode? running = _nodes[i];
+                    _supervisors.Add(NodeSupervisor.RunInProcessAsync(
+                        _ => Interlocked.Exchange(ref running, null) is { } first
+                            ? Task.FromResult(first)
+                            : ExampleNode.StartAsync(_world, nodeOptions, index == 0 ? "a" : "b", ports[index], cluster, exitOnLeadershipLoss: false),
+                        n => n.Node,
+                        n =>
+                        {
+                            lock (_nodes)
+                            {
+                                if (_nodes[index] != n)
+                                    _restarts++;
+                                _nodes[index] = n;
+                            }
+                        },
+                        new NodeSupervisorOptions { Log = line => { if (options.Verbose) Console.WriteLine("        " + line); } },
+                        _stopSupervisors.Token));
+                }
+            }
         }
 
         _model = new Model(_shape);
@@ -775,6 +803,24 @@ public sealed class Smoke(ExampleOptions options)
             }
             return await ResumedAsync("execution-quality");
         });
+        if (_kafka is null)
+        {
+            // Two nodes again, in this process: the same contract.
+            var first = new AdminClient(_nodes[0].Url);
+            await Claim("node a is back: started again in this process under the same name and address, it stands by behind b, warm — nobody restarted it by hand", async () =>
+            {
+                int restarts;
+                lock (_nodes)
+                    restarts = _restarts;
+                if (restarts < 1)
+                    return "a's supervisor has not started it again";
+                var status = (await first.GetAsync("node"))["status"]!;
+                return Unless(
+                    status["leadership"]!["role"]!.GetValue<string>() == "Standby" && status["leadership"]!["leaderNodeId"]?.GetValue<string>() == "b"
+                    && status["standby"]?["takeoverWouldBeWarm"]?.GetValue<bool>() == true,
+                    $"a is {status["leadership"]!["role"]} behind {status["leadership"]!["leaderNodeId"]}, not warm because {status["standby"]?["notWarmBecause"]?.ToJsonString()}");
+            });
+        }
         if (_kafka is not null)
         {
             // Two nodes again, without anybody's help: the supervisor contract.
@@ -844,6 +890,8 @@ public sealed class Smoke(ExampleOptions options)
 
     private async Task StopAsync(string dataDirectory)
     {
+        _stopSupervisors.Cancel();
+        await Task.WhenAll(_supervisors);
         foreach (var node in Enumerable.Reverse(_nodes))
         {
             try

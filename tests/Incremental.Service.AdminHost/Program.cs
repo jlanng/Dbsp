@@ -34,6 +34,8 @@ var options = new DemoOptions
     AllowPluginUpload = !args.Contains("--no-upload"),
     UiDirectory = Arg("--ui-dir"),
     LogLevel = args.Contains("--verbose") ? LogLevel.Information : LogLevel.Warning,
+    // Two nodes: one that loses the leadership comes back as the standby, in this process.
+    SuperviseNodes = true,
 };
 
 await using var host = await DemoHost.StartAsync(options);
@@ -48,5 +50,7 @@ Console.CancelKeyPress += (_, e) =>
     stopped.TrySetResult();
 };
 AppDomain.CurrentDomain.ProcessExit += (_, _) => stopped.TrySetResult();
-await Task.WhenAny(stopped.Task, Task.WhenAny(host.Nodes.Select(n => n.App.WaitForShutdownAsync())));
+// A node of two that is replaced or resigns is started again by the host; one node alone
+// that stops ends the program.
+await (host.Nodes.Count > 1 ? stopped.Task : Task.WhenAny(stopped.Task, Task.WhenAny(host.Nodes.Select(n => n.App.WaitForShutdownAsync()))));
 return 0;

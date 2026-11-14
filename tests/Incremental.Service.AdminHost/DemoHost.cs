@@ -32,9 +32,15 @@ public sealed class DemoOptions
     public Action<WebApplicationBuilder>? Builder { get; set; }
     public Action<WebApplication>? App { get; set; }
     public LogLevel LogLevel { get; set; } = LogLevel.Warning;
+
+    /// <summary>With two nodes: a node that loses the leadership is started again in this
+    /// process, on the same port, and comes back as the standby
+    /// (<see cref="NodeSupervisor.RunInProcessAsync{THost}"/>). The AdminHost program sets
+    /// it; tests that look at a fenced node leave it off.</summary>
+    public bool SuperviseNodes { get; set; }
 }
 
-public sealed class DemoNode
+public sealed class DemoNode : IAsyncDisposable
 {
     public required WebApplication App { get; init; }
     public required ServiceNode Node { get; init; }
@@ -42,6 +48,19 @@ public sealed class DemoNode
 
     /// <summary>The admin UI's address: <c>{Url}/admin/</c>.</summary>
     public string Admin => Url + "/admin/";
+
+    public async ValueTask DisposeAsync()
+    {
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            await App.StopAsync(timeout.Token);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        await App.DisposeAsync();
+    }
 }
 
 /// <summary>
@@ -61,6 +80,7 @@ public sealed class DemoHost : IAsyncDisposable
     private readonly CancellationTokenSource _stop = new();
     private readonly string _work;
     private Task _generator = Task.CompletedTask;
+    private readonly List<Task> _supervisors = [];
 
     private DemoHost(string work) => _work = work;
 
@@ -115,6 +135,24 @@ public sealed class DemoHost : IAsyncDisposable
                 if (n == 0)
                     await host.LoadInstrumentsAsync(node.Node, options.Instruments);
             }
+            if (options.SuperviseNodes && host.Nodes.Count > 1)
+            {
+                for (var n = 0; n < host.Nodes.Count; n++)
+                {
+                    var index = n;
+                    DemoNode? running = host.Nodes[n];
+                    var port = new Uri(running.Url).Port;
+                    host._supervisors.Add(NodeSupervisor.RunInProcessAsync(
+                        _ => Interlocked.Exchange(ref running, null) is { } first ? Task.FromResult(first) : host.StartNodeAsync(cluster, index, options, port),
+                        node => node.Node,
+                        node =>
+                        {
+                            lock (host.Nodes)
+                                host.Nodes[index] = node;
+                        },
+                        stop: host._stop.Token));
+                }
+            }
             if (options.Rate > 0)
                 host._generator = Task.Run(() => host.GenerateAsync(options.Rate, host._stop.Token));
             return host;
@@ -161,16 +199,16 @@ public sealed class DemoHost : IAsyncDisposable
             File.Copy(file, Path.Combine(to, Path.GetFileName(file)), overwrite: true);
     }
 
-    private async Task<DemoNode> StartNodeAsync(InMemoryServiceCluster cluster, int index, DemoOptions options)
+    private async Task<DemoNode> StartNodeAsync(InMemoryServiceCluster cluster, int index, DemoOptions options, int? port = null)
     {
         var nodeId = index == 0 ? "node-a" : $"node-{(char)('a' + index)}";
         var builder = WebApplication.CreateBuilder();
         builder.Logging.SetMinimumLevel(options.LogLevel);
         if (options.LogLevel == LogLevel.None)
             builder.Logging.ClearProviders();
-        builder.WebHost.UseUrls($"http://127.0.0.1:{(options.Port == 0 ? 0 : options.Port + index)}");
+        builder.WebHost.UseUrls($"http://127.0.0.1:{port ?? (options.Port == 0 ? 0 : options.Port + index)}");
         builder.Services.AddSingleton(Memory);
-        var advertised = options.Port == 0 ? null : $"http://127.0.0.1:{options.Port + index}/admin/";
+        var advertised = options.Port == 0 ? null : $"http://127.0.0.1:{port ?? options.Port + index}/admin/";
         var service = builder.Services.AddIncrementalService(o =>
             {
                 o.CacheDirectory = Path.Combine(_work, "cache-" + nodeId);
@@ -271,7 +309,10 @@ public sealed class DemoHost : IAsyncDisposable
                 checkedOrders.Upsert(Order(sequence, random, Options.Instruments, negative: tick == 150));
                 lenient.Upsert(Order(sequence, random, Options.Instruments, negative: tick % 70 == 35));
 
-                if (tick % 20 == 0 && Nodes.FirstOrDefault(n => n.Node.IsLeader) is { } leader)
+                DemoNode[] nodes;
+                lock (Nodes)
+                    nodes = [.. Nodes];
+                if (tick % 20 == 0 && nodes.FirstOrDefault(n => n.Node.IsLeader) is { } leader)
                 {
                     try
                     {
@@ -301,6 +342,7 @@ public sealed class DemoHost : IAsyncDisposable
         try
         {
             await _generator;
+            await Task.WhenAll(_supervisors);
         }
         catch
         {
