@@ -73,3 +73,21 @@ again a minute before. 7 min 34 s, all passed.
 `a0cbd57` with the `--trade-ids` option added; `after` is S8's tree. `unique`
 ran with `--trade-ids 0`, `wrap` with `--trade-ids 20000` (the old default). Two
 processes of a Debug build ran side by side.
+
+## 2026-11-14, CI that can be trusted — round four, J3
+
+`docs/design/enrichment-service.md`, *As built*, S8, *CI that can be trusted*.
+
+- `2026-11-14-j3-ci-runs.tsv` — every run of the workflow on the branch from the
+  step's first commit (71521ba) to its last that changed code or tests (53d8c83), one
+  line per job: run id, commit, what started it, the run's and the job's conclusion,
+  when the job started and how many seconds it took. Made with `gh run list` and
+  `gh run view --json jobs`.
+- `2026-11-14-j3-local.txt` — what ran here: the six loops of the whole service test
+  project pinned to two processors (`taskset -c 0,1`, the node processes with it), run
+  by run; the broker-free classes under busy loops; the scratch experiments' own
+  output (the end of committed data after a commit, a topic asked about after its
+  creation, the cost of the first short read of a topic, a leader stopped inside a
+  transaction); each node's processor time while one broker of three was down; and
+  the two runs of the scale rig. The scripts and the logs behind it were the
+  session's scratch directory and are not kept.

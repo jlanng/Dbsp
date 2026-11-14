@@ -1,0 +1,160 @@
+# Round four, J3 — the service test project and the experiments, run locally (2026-11-14)
+# A 13th-gen i7-13700H (20 threads), podman, one local broker (apache/kafka 3.9.0), Release build.
+
+## The whole of tests/Incremental.Service.Tests pinned to two processors (taskset -c 0,1): run, exit code, seconds, summary
+
+### loop 1 — 71521ba plus the workflow change (the first two fixes)
+run 1 rc=0 152 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 151.902s
+run 2 rc=0 151 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 150.109s
+run 3 rc=0 152 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 152.631s
+run 4 rc=0 148 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 148.561s
+run 5 rc=0 152 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 151.072s
+run 6 rc=0 150 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 149.905s
+run 7 rc=0 153 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 153.019s
+run 8 rc=0 155 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 154.743s
+run 9 rc=0 153 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 152.521s
+run 10 rc=0 150 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 149.688s
+run 11 rc=0 149 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 149.457s
+run 12 rc=0 153 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 152.097s
+run 13 rc=0 150 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 149.734s
+run 14 rc=0 150 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 149.817s
+run 15 rc=0 157 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 157.208s
+run 16 rc=0 151 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 150.615s
+run 17 rc=0 153 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 152.931s
+run 18 rc=0 152 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 151.519s
+run 19 rc=0 150 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 150.198s
+run 20 rc=1 150 s  Total: 251, Errors: 0, Failed: 1, Skipped: 6, Not Run: 0, Time: 149.514s
+
+### loop 2 — db23011, stopped after five
+run 1 rc=0 151 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 150.228s
+run 2 rc=0 150 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 149.590s
+run 3 rc=0 152 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 152.137s
+run 4 rc=0 153 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 152.191s
+run 5 rc=0 152 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 152.167s
+
+### loop 3 — 6f15177, stopped after two
+run 1 rc=0 152 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 151.602s
+run 2 rc=0 154 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 153.625s
+
+### loop 4 — 78af0b5, stopped after five
+run 1 rc=0 152 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 151.681s
+run 2 rc=0 153 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 151.927s
+run 3 rc=0 151 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 151.327s
+run 4 rc=0 154 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 153.714s
+run 5 rc=1 150 s  Total: 251, Errors: 0, Failed: 1, Skipped: 6, Not Run: 0, Time: 150.068s
+
+### loop 5 — f2e5ceb, stopped after seven
+run 1 rc=0 154 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 153.198s
+run 2 rc=0 150 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 150.384s
+run 3 rc=0 150 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 149.817s
+run 4 rc=0 152 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 151.161s
+run 5 rc=1 148 s  Total: 251, Errors: 0, Failed: 1, Skipped: 6, Not Run: 0, Time: 148.147s
+run 6 rc=0 150 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 149.300s
+run 7 rc=1 150 s  Total: 251, Errors: 0, Failed: 1, Skipped: 6, Not Run: 0, Time: 150.179s
+
+### loop 6 — 53d8c83, the final build
+run 1 rc=0 149 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 148.583s
+run 2 rc=0 149 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 149.081s
+run 3 rc=0 152 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 151.870s
+run 4 rc=0 153 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 152.066s
+run 5 rc=0 151 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 151.040s
+run 6 rc=0 151 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 150.546s
+run 7 rc=0 153 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 152.980s
+run 8 rc=0 150 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 149.906s
+run 9 rc=0 152 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 151.513s
+run 10 rc=0 154 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 154.094s
+run 11 rc=0 151 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 150.727s
+run 12 rc=0 154 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 153.483s
+run 13 rc=0 156 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 155.540s
+run 14 rc=0 150 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 150.051s
+run 15 rc=0 152 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 152.098s
+run 16 rc=0 151 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 150.322s
+run 17 rc=0 152 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 151.640s
+run 18 rc=0 153 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 152.811s
+run 19 rc=0 152 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 152.265s
+run 20 rc=0 153 s  Total: 251, Errors: 0, Failed: 0, Skipped: 6, Not Run: 0, Time: 152.557s
+
+## The broker-free classes on two other processors with three busy loops beside them (f2e5ceb, stopped after fifteen)
+run 1 rc=0 62 s Total: 228, Errors: 0, Failed: 0, Skipped: 0, Not Run: 0, Time: 60.818s
+run 2 rc=0 61 s Total: 228, Errors: 0, Failed: 0, Skipped: 0, Not Run: 0, Time: 60.685s
+run 3 rc=0 61 s Total: 228, Errors: 0, Failed: 0, Skipped: 0, Not Run: 0, Time: 60.923s
+run 4 rc=0 63 s Total: 228, Errors: 0, Failed: 0, Skipped: 0, Not Run: 0, Time: 62.115s
+run 5 rc=0 65 s Total: 228, Errors: 0, Failed: 0, Skipped: 0, Not Run: 0, Time: 63.939s
+run 6 rc=0 63 s Total: 228, Errors: 0, Failed: 0, Skipped: 0, Not Run: 0, Time: 62.483s
+run 7 rc=0 63 s Total: 228, Errors: 0, Failed: 0, Skipped: 0, Not Run: 0, Time: 62.204s
+run 8 rc=0 64 s Total: 228, Errors: 0, Failed: 0, Skipped: 0, Not Run: 0, Time: 63.770s
+run 9 rc=0 62 s Total: 228, Errors: 0, Failed: 0, Skipped: 0, Not Run: 0, Time: 61.609s
+run 10 rc=0 64 s Total: 228, Errors: 0, Failed: 0, Skipped: 0, Not Run: 0, Time: 63.574s
+run 11 rc=0 62 s Total: 228, Errors: 0, Failed: 0, Skipped: 0, Not Run: 0, Time: 61.151s
+run 12 rc=0 63 s Total: 228, Errors: 0, Failed: 0, Skipped: 0, Not Run: 0, Time: 62.243s
+run 13 rc=0 62 s Total: 228, Errors: 0, Failed: 0, Skipped: 0, Not Run: 0, Time: 61.469s
+run 14 rc=0 65 s Total: 228, Errors: 0, Failed: 0, Skipped: 0, Not Run: 0, Time: 64.682s
+run 15 rc=0 65 s Total: 228, Errors: 0, Failed: 0, Skipped: 0, Not Run: 0, Time: 63.954s
+
+## WarmStandbyTests on two processors with three busy loops beside it
+before the in-memory fencing: 2 of 8, 2 of 12 and 2 of 14 runs failed (6 of 34), each time A_table_opened_again_while_the_standby_builds_on_it…
+after: 0 of 34
+
+## Experiments (scratch tests, not in the repository)
+the end of committed data right after a commit that returned, unlimited broker: end 0 right after acquire: 0 of 40; end behind right after a commit: 33 of 400
+the same with the broker held to 0.3 of a processor: end 0 right after acquire: 5 of 40; end behind right after a commit: 98 of 400
+a topic asked about straight after its creation, by another client (five runs; the last three with the broker held to 0.08 of a processor):
+unknown right after creation: 0 of 60
+unknown right after creation: 0 of 60
+unknown right after creation: 2 of 60
+unknown right after creation: 19 of 60
+unknown right after creation: 1 of 60
+the first short read of a topic, 90 of them: admin client build 0.2 ms, GetMetadata 0.3 ms, Dispose 99.9 ms (most frequent values)
+twelve tables (KafkaLogTests.A_short_reader_that_meets_many_topics…, Debug): opened 2,691 ms before / 217 ms after; last versions on a replaced reader 1,299 ms / 84 ms
+a leader stopped inside a transaction of 2,048 state records, and between transactions, before the reader reported the client's position:
+inside a transaction True, round 0: fence 393 ms, storage 115 ms, total 508 ms (silence)
+inside a transaction True, round 1: fence 401 ms, storage 109 ms, total 510 ms (silence)
+inside a transaction True, round 2: fence 416 ms, storage 91 ms, total 507 ms (silence)
+inside a transaction True, round 3: fence 396 ms, storage 113 ms, total 509 ms (silence)
+inside a transaction True, round 4: fence 474 ms, storage 33 ms, total 507 ms (silence)
+inside a transaction True, round 5: fence 383 ms, storage 126 ms, total 509 ms (silence)
+inside a transaction False, round 0: fence 27 ms, storage 3 ms, total 30 ms (silence)
+inside a transaction False, round 1: fence 24 ms, storage 2 ms, total 26 ms (silence)
+inside a transaction False, round 2: fence 22 ms, storage 3 ms, total 24 ms (silence)
+inside a transaction False, round 3: fence 54 ms, storage 2 ms, total 56 ms (silence)
+inside a transaction False, round 4: fence 44 ms, storage 1 ms, total 45 ms (silence)
+inside a transaction False, round 5: fence 35 ms, storage 1 ms, total 35 ms (silence)
+the same, inside a transaction, with the reader reporting the client's position:
+round 0: fence 380 ms, storage 13 ms, total 393 ms (silence)
+round 1: fence 484 ms, storage 2 ms, total 485 ms (silence)
+round 2: fence 384 ms, storage 3 ms, total 387 ms (silence)
+round 3: fence 416 ms, storage 1 ms, total 417 ms (silence)
+round 4: fence 491 ms, storage 2 ms, total 493 ms (silence)
+round 5: fence 391 ms, storage 1 ms, total 392 ms (silence)
+
+## One broker of three killed for 20 s (kafka3 profile): each node's processor time, ticks per second (100 = one processor)
+node a: 56 27 15 19 42 5 30 47 30 46 5 25 52 32 38 16 6 5 4 3 5 2 6 5 3 3 4 6 11 14 10 9 9 9 12 12 11 14 9 8 13 4
+node b: 78 41 41 45 21 22 9 39 136 139 140 138 135 135 141 139 138 142 138 100 4 2 7 7 6 6 4 4 11 8 2 9 10
+
+## The scale rig, 500,000 rows and 500,000 orders of state (run A: with the short reader's fix; run B: with the reader's position too)
+### scale-500k
+first-lead.from-process-start: 4549 ms
+standby.cold-to-warm: 7328 ms
+kill.detection: 3004 ms
+kill.to-leader: 3685 ms
+kill.first-sink-write.last-pipeline: 3769 ms
+kill.stages: fence 166 + waiting for tables being restored 1 + catalog 9 + tables 10 + storage 326 + leader record 36 + plugin directory 1 + pipelines 125 + finish 1 = 680 ms (reason silence)
+standby.cold-to-warm.with-state: 6081 ms
+manual.to-leader: 1609 ms
+manual.sink-silence.longest-pipeline: 1646 ms
+manual.stages: fence 554 + waiting for tables being restored 1 + catalog 8 + tables 11 + storage 7 + leader record 125 + plugin directory 727 + pipelines 134 + finish 1 = 1571 ms (reason manual)
+cold-start.to-leader: 7634 ms
+cold-start.stages: fence 37 + waiting for tables being restored 2040 + catalog 132 + tables 11 + storage 7 + leader record 29 + plugin directory 1 + pipelines 1928 + finish 6 = 4198 ms (reason silence)
+### scale-500k-b
+first-lead.from-process-start: 4524 ms
+standby.cold-to-warm: 7625 ms
+kill.detection: 3003 ms
+kill.to-leader: 3806 ms
+kill.first-sink-write.last-pipeline: 3892 ms
+kill.stages: fence 544 + waiting for tables being restored 1 + catalog 7 + tables 10 + storage 7 + leader record 91 + plugin directory 1 + pipelines 130 + finish 1 = 802 ms (reason silence)
+standby.cold-to-warm.with-state: 6306 ms
+manual.to-leader: 1590 ms
+manual.sink-silence.longest-pipeline: 1574 ms
+manual.stages: fence 553 + waiting for tables being restored 1 + catalog 8 + tables 17 + storage 8 + leader record 37 + plugin directory 725 + pipelines 130 + finish 1 = 1484 ms (reason manual)
+cold-start.to-leader: 8095 ms
+cold-start.stages: fence 562 + waiting for tables being restored 2080 + catalog 176 + tables 15 + storage 6 + leader record 26 + plugin directory 2 + pipelines 1857 + finish 1 = 4729 ms (reason silence)

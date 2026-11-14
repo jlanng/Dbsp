@@ -12,6 +12,13 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   `gh workflow run CI --ref <branch> -f broker_tests=true`.
   A test that reads "the end" of a Kafka partition right after its own commit must wait
   for it (`KafkaEnv.EventuallyAsync`): the marker is written after the commit returns.
+  A service test that has seen an output and goes on to something that reads the
+  checkpoint (a takeover or restart counted as resumed, a replace that keeps state, a
+  figure taken at a commit) waits for `TestService.Settled()` in between: the output is
+  in the sink before its step is committed. One that counts a files sink's objects
+  waits until the sink's write has returned (`SinkAtRestAsync`). One that reads the
+  whole process's heap goes in the `measured alone` collection. A hook sets what the
+  test reads before the count the test waits on.
 - Kafka tests: `dotnet test --project tests/Incremental.Kafka.Tests` — integration tests of
   `Incremental.Kafka` against the connector stack (start it first, below): the logs,
   leadership, sources, sinks, and CDC from Postgres through Debezium. Tests skip, not fail,

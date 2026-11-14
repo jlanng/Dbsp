@@ -2075,6 +2075,23 @@ Each has a default this design is built on.
     fails the build for a reason that is not the push's), or on a schedule (a nightly
     run on the default branch — cheap to add once the branch is merged: `schedule`
     only fires there).
+75. **A standby takes more than one processor for as long as a dead broker is still
+    listed as a partition's leader** (S8, *CI*): about ten seconds per broker lost,
+    1.35 to 1.42 processors measured here, 27,000 refused connections a second on a
+    runner. Its lag questions (`KafkaLeadership.MeasureLagAsync`, once a second from
+    the node's loop and again from the leadership's sampler) and its look at the
+    leader topic's end while the leader is quiet (`NoteProgressAsync`) are admin
+    requests that wait for a broker that refuses connections, and the Kafka client
+    connects again without a pause while one waits. Two nodes on hosts of their own
+    lose nothing by it but the processor; on one small host it starved the leader
+    once in the broker job's runs. *Alternatives:* give the state's lag question the
+    patience and the pause a table's has (two seconds, then nobody asks for five:
+    about a third of the time instead of all of it) and stop asking for progress
+    while the brokers themselves say a partition has no leader; or ask only brokers
+    the client holds a connection to. Either is a change to what a standby knows of
+    its lag during an outage, with the broker tests as its check; neither was built
+    in this step, which found it in its last hour. The node's loop also waits on that
+    lag question — a standby applies no catalog change while it is out.
 
 ## Not verified
 
@@ -5773,3 +5790,409 @@ scenario's table does not change mid-run. No Kafka run measured the bound beyond
 smoke test's four batches. The admin UI's new badge, notice and attention entry were
 not looked at in a browser in this step.
 
+#### CI that can be trusted (J3)
+
+The critic's J3: six of the last eight runs on the branch had failed in the
+`connector-stack` job, and two service tests had failed on a runner for reasons nobody
+had found. This step read every failed run on the branch, found the cause of each
+failure that was still open, and proved each one — by forcing it, or by measuring the
+mechanism with the broker held back — before changing anything. Then it ran one commit
+ten times, and the suite twenty times here on two cores, and did the same with what
+those found. Four were defects of the product: three are fixed, two of them in the
+path a takeover takes, and the fourth was found in the step's last hour and is an open
+item. The rest were tests that looked a moment too early.
+
+**Every failure on the branch.** Twelve runs failed between the first push to the
+branch's workflow (d459e8c, 11 November) and this step, all in `connector-stack`; seven
+more failed among the 59 runs this step made, and four of the suite's 59 runs here. By
+what failed:
+
+| what failed | runs | cause | state |
+|---|---|---|---|
+| the job's own check that nothing was skipped | 43079381475 | the summary's colour codes hid `skipped: 0` from the `grep` | fixed in fdd5d9b (round three) |
+| `KafkaLeadershipTests.A_probe_query_returns_the_whole_answer…` | 43128441300 | the test's listener was stopped while it accepted | fixed in 96055e9 (round three) |
+| `KafkaSourcePositionTests.ALoader_RecordsThePosition…` | 43135482953 | the test asserted a position the loader had not recorded yet | fixed in ceb4c5e (round three) |
+| `KafkaEndToEndTests.Cold_start_from_a_compacted_state_topic…` skipped, which fails the step | 43135482953, 43176457481, 43598420364, 43599691061, 43600575363, 43600582106 | the test waited for the cleaner to compact the segment being written, which it never touches | fixed in f52a991 (round three); not skipped in any run since |
+| `FileConnectorTests.A_line_that_is_not_a_record_is_a_dead_letter…` | 43162497577 | the dead letter reaches the node's ring through a reader of its own, a moment after the sink has the last count; the test asserted it at once | fixed in 0ca9037 (round three); read again here, and the counter it asserts next is raised before the record is rejected, so nothing else in it races |
+| `KafkaSinkTests.ABatchTheBrokerRefuses…`, one minute without an acknowledgement | 43599691061 | a topic created a moment before was unknown to the broker the sink asked, so the sink's delivery had failed and the test waited for an acknowledgement that could not come | round three's reading, proved here (below); its fix stands |
+| `KafkaServiceProcessTests.Killing_the_leader_process_mid_stream…`, table stage 2,164 ms against 2 s | 43602050386 | **product:** every topic new to the log's short reader cost 100 ms | found and fixed here |
+| `WarmStandbyTests.A_table_opened_again_while_the_standby_builds_on_it…`, 30 s | 43602055418 | **product:** a deposed in-memory leader's rows landing over its successor's | found and fixed here |
+| `KafkaLogTests.A_short_read_its_caller_calls_off…`, "the writer's term is in the leader topic" | 43612148168 | the test read the end of the leader topic right after the commit; the marker is written after the commit returns | test fixed here |
+| `FileConnectorTests.An_upsert_sink_told_to_compact_folds…`, two snapshots where one was expected | none on a runner; run 20 of this step's first loop of twenty here | the test listed the sink's directory while the sink was inside the write that folds | test fixed here |
+| the Kafka smoke test, "large-trades … delivered its 1,095": 1,076 rows | 43625822629 (one of ten runs of db23011) | the smoke published its trades in two halves and waited between them for one of the two pipelines that key them by id | smoke fixed here |
+| `SupervisorTests.Many_pipelines_share_one_large_table…`, "the table is only 10,229,144 bytes" | 43625839461 (another of the ten; the only failure ever in `build-and-test`) | the test reads the whole process's heap, in a class that ran beside the others | test moved to run alone, here |
+| the Kafka smoke test, "trade-enrichment's state levels off": 1,602, 1,738, 1,954, 1,952 | 43627490271 (one of ten runs of 6f15177); 43628127621 (one of ten of 78af0b5, the in-memory smoke: 1,070, 1,462, 1,954, 1,952) | the claim compared its four readings with each other; every one was inside its bound | smoke fixed here |
+| `WarmStandbyTests.A_spec_replaced_while_the_standby_fetches…`, a layout expected and null read | none on a runner; once here in the suite's fourth loop, and once in round three under load, unexplained then | the test's hook counted the build and then noted the layout; the test waits on the count | test fixed here |
+| `ReplaceTests.Keep_that_the_checkpoint_cannot_follow…`, "No exception was thrown" | 43629484693 (one of ten runs of f2e5ceb); twice in seven runs of the suite's fifth loop here | the test asked for a replace that keeps state before the first checkpoint was committed | fixed here, with eight tests of the same kind |
+| `KafkaServiceTests.A_standby_on_kafka_sees_what_the_leader_deploys…`, state lag 322 where 0 was expected | 43629500952 (another of the ten) | a figure sampled once a second, read once, while the leader's last commit was on its way | test fixed here |
+| `KafkaServiceProcessTests.Losing_one_broker_of_three…`, "the loss of one broker of three moved the leadership", and the test after it | 43629495626, in the `broker-failures` job only | the standby's process took most of a two-core runner for as long as the dead broker was still listed as a leader | **product**, found and not fixed (Open for James 75) |
+
+**A deposed in-memory leader delivered over its successor.** The in-memory backend's
+`Leased(sink)` returned the sink as it was ("there is no heartbeat to miss"). A leader
+that is replaced is told at once — its role is `Fenced` before the takeover prepares
+anything — but what tears its circuits down is its own node, on a thread-pool thread,
+a moment later. In that moment a circuit of the old leader's is whole: it reads the
+input both nodes share, joins against its own copy of a table, which no longer follows
+anything, and delivers. Its commit is then refused, but the rows are in the sink — and
+when they land after the new leader's rows for the same keys, they stay. The test that
+timed out on the runner appends twenty trades and changes an instrument straight after
+a takeover; in the failed runs the new leader had delivered its twenty-eight rows in
+one batch, and four of them had then been overwritten by the old leader's, joined to
+the instrument as it had been (`SYM4` where the model has `AGAIN`); the old leader's
+circuit had run three steps and committed two. Reproduced on two cores with three
+busy loops beside it: 6 of 34 runs of `WarmStandbyTests` failed, every one this test
+with these four rows.
+
+Fixed in the backend (`InMemoryBackend.cs`): a leased sink begins a write only if its
+node is the one the cluster calls leader, decided under the cluster's gate where a
+takeover names the new one; and the takeover, having named itself, waits for the
+deposed leader's writes in flight before `PrepareAsync`, for at most
+`InMemoryBackendOptions.DeposedWriteTimeout` (5 s, new). So a write either began
+before the takeover, and is in the sink before anything of the new leader's, or does
+not reach the sink. A refused write is a `ChangelogFencedException`, which the
+supervisor already reports as "this node no longer leads". `InMemoryFencingTests`
+forces both halves with a sink that holds a write inside itself: the takeover does
+not prepare while the write is held, the fenced node's next write is refused, a bound
+that is reached lets the takeover go on; and through two service nodes, where the
+leader is held in the sink with a row, the instrument is renamed, the standby takes
+over, and the sink must end with the new leader's row. After the fix: 0 of 34 runs of
+`WarmStandbyTests` under the same load.
+
+On Kafka the same gap is narrower and was already measured: the service's Kafka sinks
+write through the log's transactional producer, which the takeover fences; a sink
+outside Kafka has the lease, which a leader replaced by hand holds until it reads the
+new term (`KafkaFailoverProcessTests`: "0 sink record(s) from the deposed leader after
+its successor's first").
+
+**Every topic new to the short reader cost a tenth of a second.** The log has one
+consumer for short reads — a table's head, the last term. Before it is assigned to a
+topic it has not met, the topic's metadata is asked for on its handle (round two: a
+running consumer otherwise waits a second). That question went through an admin client
+made for it and disposed at once, and disposing an admin client waits for its poll
+loop, which looks up every 100 ms: build 0.2 ms, the request 0.3 ms, the disposal
+99.9 ms (traced on 90 first reads). Reads take turns on that consumer, so it added up:
+
+- 100 ms in the fence stage of every takeover, because the read of the last term is the
+  reader's first sight of the leader topic;
+- 200 ms per table when a node opens its tables (the rows topic, then the changes
+  topic), which is most of what a standby's start took;
+- 100 ms per table in a takeover whose reader had not met the tables' topics — a reader
+  replaced after a read that failed, or, before a0cbd57, after a statistics question
+  that was called off at its two seconds. That is the 2,164 ms: the same run's catalog
+  stage was 122 ms where it is otherwise 9 to 36, and its Kafka tests' two-table
+  takeovers took 8, 110 and 215 ms by turns — none, one or two tables at 100 ms each.
+  The clusters are in every `measurements.log` kept here: 7–30, 106–129 and 205–249 ms.
+
+The admin client is now made once for the consumer and disposed with it
+(`KafkaLog.AssignForShortRead`); a sink without the log's producer puts its own away
+off the path of its first batch. `KafkaLogTests.A_short_reader_that_meets_many_topics…`
+holds it by count, not by the clock: twelve tables opened, the reader replaced, twelve
+heads read, and two admin clients made in all — one for each consumer. Measured in that
+test, one local broker, Debug:
+
+| twelve tables | before | after |
+|---|---|---|
+| opened by a reader that has met none of them | 2,691 ms | 217 ms |
+| their last versions, read on a reader just replaced | 1,299 ms | 84 ms |
+
+On the runners, the service's process tests (21 tables, two processes) before and
+after, from the runs' own `measurements.log` (kill to leader: 3,469 to 5,587 ms before,
+3,319 to 3,983 since):
+
+| | eleven runs before | the 59 runs since |
+|---|---|---|
+| kill -9 failover, fence stage | 129–162 ms (638 once) | 26–120 ms in 52 runs, 535–550 ms in 7 |
+| kill -9 failover, table stage, 21 tables | 109–185 ms (2,164 once) | 86–253 ms, median 121 |
+| a standby warm, from process start | 7.1–8.4 s | 2.2–5.7 s, median 3.6 |
+| step-down: resignation to the standby leading | 236–475 ms | 110–480 ms, median 199 |
+| the Kafka tests' takeover, two tables | 8–13, 110 or 213–217 ms | 5–61 ms in 351 of 354; three above 100 (126, 220, 843) |
+
+**After a leader killed inside a transaction the storage stage waited for an empty
+fetch.** Found on the way, not by a failed run. A scratch test stopped a leader inside a
+transaction of 2,048 state records, six times, and between transactions, six times:
+
+| the leader stopped | fence | storage | fence and storage |
+|---|---|---|---|
+| between transactions | 22–54 ms | 1–3 ms | 24–56 ms |
+| inside a transaction that had written state | 383–474 ms | 33–126 ms | 507–510 ms, every time |
+| the same, with the reader's change below | 380–491 ms | 1–13 ms | 387–493 ms |
+
+Two waits ended together, half a second after the takeover began. The fence waits
+while the broker aborts the transaction; the guide's account of it — the client asks
+again after a pause of its own — was not traced again here (in the service's runs it
+was a fence of 638 to 692 ms against 130 to 220 before this step's first fix, in 2 of
+14 takeovers in a loop here and 1 of 11 on the runners; 535 to 550 ms against 26 to
+120 in 7 of 59 since). The storage stage waited for
+the standby's follower to reach the end of the state topic: the follower has read every
+committed record, and that the aborted ones behind them are the end the client tells
+an application with an end-of-partition event — after a fetch that came back empty,
+which the broker holds for the consumer's `fetch.wait.max.ms`, 500 ms. So when the
+fence was quick the storage stage was slow by what was left of the half second: 326 ms
+beside a fence of 166 in a scale-rig run, 418 ms beside 95 once on a runner in the
+Kafka tests' takeover between two processes (3 or 4 ms otherwise).
+
+The client itself passes the aborted records and their marker as soon as it has read
+them, and its position says so. The reader loop (`KafkaLog.ReadLoop`, which every
+follower and restore runs) now asks the consumer for its position whenever a poll
+returns nothing and reports it if it is past what it last reported — an empty batch
+with a position, which the loop's callers already took from the end-of-partition
+event. `KafkaLogTests.A_follower_reaches_the_end_behind_an_aborted_transaction…` holds
+the empty fetch for four seconds and gives the follower two; it also holds the position
+to the end exactly, and never falling. What is left after such a leader is the fence's
+own wait, which is the half second the guide names.
+
+**The scale rig**, 500,000 rows, 500,000 orders of state, twenty pipelines, one local
+broker, beside the critic's run of the same on a0cbd57 (3,938 ms from the kill to the
+leader, 4,123 to the last sink, a cold standby warm in 7.1 s, a takeover by hand
+1,635 ms, one node from nothing leading after 7.8 s):
+
+| | with the short reader's fix | with the reader's position too |
+|---|---|---|
+| kill to leader, to the last sink | 3,685, 3,769 ms | 3,806, 3,892 ms |
+| the takeover's stages after the kill | 680 ms: fence 166, storage 326, pipelines 125 | 802 ms: fence 544, storage 7, pipelines 130 |
+| a cold standby warm, with the state | 6.1 s | 6.3 s |
+| a takeover by hand, to leader | 1,609 ms | 1,590 ms |
+| one node from nothing, to leader | 7.6 s | 8.1 s |
+
+One run each. The stages are the two cases of the table above — the client's pause in
+the second run, the follower's wait in the first — and the rig has not yet shown a run
+with neither. The Kafka smoke test: 3.1, 3.1, 2.8 and 3.1 s from the kill to the new
+leader in four runs here (`TakeoverAfter` is 3 s of it), 3.1 to 3.3 before.
+
+**A commit returns before its marker is written.** `KafkaStateChangelog.EndOffsetAsync`
+says so, and round three's short-read test asked for the end of the leader topic
+straight after the writer's first commit. With nothing else running here the end was
+behind a commit that had returned in 33 of 400 tries, and never 0 after an acquisition
+(0 of 40); with the broker held to 0.3 of a processor, 98 of 400 and 5 of 40. The test
+now waits for the end to pass the term. The other reads of an end in
+`tests/Incremental.Kafka.Tests` were read through: each is behind a new writer's
+`InitTransactions`, which waits for the markers, or already waits.
+
+**A topic made a moment ago can be unknown.** Sixty topics created and asked about at
+once by another client: known every time on an idle broker (0 of 60, twice), and
+unknown 2, 19 and 1 times of 60 with the broker held to 0.08 of a processor. That is
+what round three read from the code for `ABatchTheBrokerRefuses…`; its helper now waits
+until the topic is known, and the test reports a failed delivery as that. In
+production a sink whose topic was created that instant fails its first delivery and
+the pipeline is started again, which is the rule for any sink failure.
+
+**The smoke test waited for one pipeline of two.** Its second act publishes 2,000
+trades over 1,500 ids in two halves, "the second once the first is through: never two
+trades of one id in a step" — and waited for `trade-enrichment` alone. `large-trades` is
+the same definition with its own state and its own steps; on a runner it was still on
+the first half when the second arrived, took a reused id's two trades for one trade
+amended, and never delivered the first: 1,076 rows of the model's 1,095. Forced here by
+stopping `large-trades` until both halves were published: 980 of 1,095, the same claim
+failing the same way. The smoke now waits for both between the halves. What it says
+about the product is under Open for James 71: whether a reused id's earlier trade is
+final when the later one arrives depends on how the input is cut into steps.
+
+**The smoke test compared four readings that are not comparable.** J1's claim that
+`trade-enrichment`'s state levels off holds each of four readings, a batch of 125
+trades apart, to a bound computed from the trades still open (1,976 entries) — and
+asked besides that the last two be within a tenth of the first two. A reading is taken
+when the sink has the batch, which is before the step that delivered it is committed
+and counted, so it lies anywhere between the state without the batch and with it:
+984 to 1,954 in runs here, in no order. On a runner they came as 1,602, 1,738, 1,954,
+1,952. The bound is what the claim is: a state that kept the feed would be a thousand
+entries past it after one batch, and J1's mutant that evicted a minute late read
+3,834. The second clause is gone.
+
+**Tests went on from an output to something that reads the checkpoint.** A step's
+output is in the sink before the step is committed — commit after delivery — so "the
+sink has it" says nothing yet about the checkpoint. `Keep_that_the_checkpoint_cannot_follow…`
+waited for the first output and at once asked for a replace that keeps state with two
+workers, which is refused by reading the checkpoint; asked before there was one, keep
+is open, and the test failed with "No exception was thrown". (Nothing is wrong in the
+service there: a replace that turns out not to fit is found when its generation
+starts and rolled back, which another test holds.) That is one test; the rule it
+broke is broken wherever a test does the same, and waiting for each to fail in one
+run of a hundred is no way to find them. So every sink's acknowledgement was held back
+half a second after its rows were visible, and the broker-free classes run: eight
+more tests failed — a takeover and a restart that count what the new leader read
+against a checkpoint not yet written (`NodeTests`, twice; `TwoInputTests`;
+`WarmStandbyTests`), a state mismatch that needs a checkpoint to mismatch
+(`ReplaceTests`), figures that exist once a commit has happened (`MeterTests`,
+`MemoryFiguresTests`), and one that the hold itself breaks (a shutdown that drains
+5,000 records through a sink now half a second slow per batch, past its budget).
+`TestService.Settled()` waits until every running pipeline has committed what its
+sources have handed it and no sink is inside a write; the seven that were real wait
+on it, as does the first. With the hold still in place the broker-free classes then
+passed but for the shutdown test, three runs of three, and the Kafka-backed in-process
+classes passed (14 of 14). On Kafka the same rule gave the other failure of that
+round: a standby's state lag is sampled once a second, and the test read it once.
+
+**A hook counted before it noted.** `A_spec_replaced_while_the_standby_fetches…` is
+the test round three saw fail once under three busy loops and could not explain. Its
+hook after the standby's build incremented a counter and, on the next line, stored the
+layout the stores were bound under; the test waits for the counter and then reads the
+layout. With the hook's thread taken off the processor between the two lines the test
+read null — once in about 130 runs of the test here on two cores. Forced with a delay
+between the lines: the same message. The hook now stores the layout first. Nothing in
+the product: the standby's build was right each time.
+
+**A test that reads the process's heap ran beside others.**
+`Many_pipelines_share_one_large_table_with_one_copy_of_its_rows` takes the collector's
+total before it loads 200,000 rows, after, and again with twelve circuits on the table.
+On a runner the table measured 10.2 MB; run alone it measures 89.6 MB, three times to
+within a kilobyte. Another class had let go of the difference between two readings. It
+is now a class of its own (`SharedTableMemoryTests`) in a collection that runs with
+nothing beside it, as the Kafka-backed classes do.
+
+**A files sink tidies up inside its write.** The first twenty runs of the service
+tests on two cores (below) ended with a failure in the twentieth:
+`An_upsert_sink_told_to_compact_folds…` found two snapshot objects. A fold writes its
+snapshot whole and then deletes what it stands for, the snapshot before it included,
+inside the write of the step that set it off; a reader of the sink takes the newer of
+two and is right at every moment (`A_reader_that_listed_before_a_fold…` holds that).
+The test waited for the last round's rows, which are readable as soon as that round's
+step object is written, and listed the directory at once — which, when the last round
+is one that folds, is the moment between the snapshot and the deletes. The listing it
+failed on is exactly that state: the old snapshot, the three objects it was folded
+with, the new snapshot, and the step that set the fold off. Alone the test did not
+fail in 40 runs on two busy cores; with the fold's deletes held back 300 ms and the
+test ended on a round in which a fold was in flight it failed with the same message,
+and with the listing taken once the sink's write has returned
+(`SinkSlotStatus.WriteInFlightSince` is null) it passed on that round and nine
+others. `An_append_sink_told_to_retain…` counted the objects of a sink that deletes the
+one too many in the same way; it has not been seen to fail and waits the same way now.
+Nothing was changed in the sinks.
+
+**Clocks in assertions.** The table stage of the kill -9 failover was held to two
+seconds in all. It is now held to 100 ms a table (2.1 s for the 21): the unit in which
+every wait that has crept into that stage has come — a second, half a second, a tenth
+— and the measured stage is 86 to 253 ms for all of them on the runners since. The
+other wall-clock bounds
+in the two test projects (a step-down's hand-over under half its timeout, a leader
+stopped inside a transaction replaced within three timeouts, a deploy and a takeover
+under ten seconds) were left: none has failed in any run but one with the broker
+starved (below), and each is several times what it measures.
+
+**What was added to see by.** Debug lines, none on a hot path: an admin call that is
+made again (attempt, how long it was given, the error); a short read that waited more
+than a quarter of a second for its turn; a table's last version, or its promotion,
+that took as long. None of them existed when the 2,164 ms happened, which is why it
+took a trace to find.
+
+**The broker tests in CI.** `gh workflow run CI --ref <branch> -f broker_tests=true`
+adds a job, `broker-failures`, that starts the `kafka3` profile and runs the tests
+whose names contain "broker" (the six that stop, kill and freeze brokers, and one that
+needs none stopped), failing on a skip and keeping the node logs on a failure. It does
+not run on a push. Ten runs of it so far, on six commits: nine green,
+the job taking 11 min 45 s to 17 min 21 s of a runner (the seven tests 9 to 12½
+minutes of that; the rest is the build and the brokers' start), and one red, for the
+reason in the next paragraph.
+
+**A standby takes more than a core while a dead broker is still listed as a leader.**
+What the one red broker run had: the standby's log, 192 MB of it, with 522,625
+refused connections from the log's admin client in three broker losses — up to 27,000
+a second. A standby asks where the state topic ends once a second (its lag), and
+where the leader topic ends while the leader is quiet; the questions go to the
+partition's leader, which for the nine seconds or so before the controller drops a
+dead broker is the dead one, and while a request waits for a broker that refuses
+connections the Kafka client connects again without a pause. Here, one broker of
+three killed for 20 s, each node's processor time read every second: the standby
+between 1.35 and 1.42 processors for eleven seconds and under 0.1 after, the leader
+never above 0.6. (The log does not show it here: one address for `localhost`, and
+the client folds identical errors; on the runner there are two.) On a runner's two
+processors, with three brokers beside it, that is most of the machine, and once the
+leader's heartbeat was late enough for the standby to take over — which is what the
+test is there to catch, and in a deployment the two nodes do not share processors.
+Not fixed: Open for James 75.
+
+**With the broker starved.** The whole of `tests/Incremental.Kafka.Tests` with the
+broker held to 0.3 of a processor, far below a runner: 131 of 134 passed in 6 min
+40 s, and the three that failed each read a clock — a leader stopped inside a
+transaction replaced in 2,408 ms against a bound of three takeover timeouts
+(2,400 ms; 1.3 s on a runner), a leader that commits again once the brokers are back
+replaced all the same within twice a two-second ceiling, and the source-resumption
+test's own check that most of its crashes landed after a checkpoint. None has failed
+on a runner in any run. Left as they are, and named here so that the next one to fail
+is recognised.
+
+**Ten runs of one commit.** Ten runs of 53d8c83, the last commit that changed code
+or tests: the push's own and nine started by hand straight after it, the last with the
+broker tests. All ten green.
+
+| run | started by | build-and-test | connector-stack | perf-contracts | broker-failures | result |
+|---|---|---|---|---|---|---|
+| 43632984819 | the push | 4 min 37 s | 10 min 50 s | 1 min 02 s | not asked for | success |
+| 43632999415 | by hand | 4 min 50 s | 11 min 26 s | 0 min 39 s | not asked for | success |
+| 43633005112 | by hand | 6 min 00 s | 11 min 34 s | 0 min 38 s | not asked for | success |
+| 43633010192 | by hand | 5 min 41 s | 11 min 37 s | 0 min 52 s | not asked for | success |
+| 43633015440 | by hand | 4 min 47 s | 11 min 46 s | 0 min 58 s | not asked for | success |
+| 43633020393 | by hand | 4 min 27 s | 10 min 42 s | 0 min 55 s | not asked for | success |
+| 43633025557 | by hand | 4 min 38 s | 10 min 41 s | 0 min 47 s | not asked for | success |
+| 43633030602 | by hand | 4 min 35 s | 10 min 06 s | 0 min 45 s | not asked for | success |
+| 43633035565 | by hand | 4 min 54 s | 10 min 35 s | 0 min 52 s | not asked for | success |
+| 43633040370 | by hand | 5 min 53 s | 9 min 54 s | 0 min 55 s | 11 min 45 s | success |
+
+It took seven commits to get there, and most sets of runs before it found something:
+
+| commit | runs | green | what the red ones were |
+|---|---|---|---|
+| 71521ba, 23fcecb (the first two fixes; the broker job) | 3 | 3 | |
+| db23011 | 10 | 8 | the smoke's two halves; the heap test beside others |
+| 6f15177 (the reader's position) | 10 | 9 | the smoke's four readings |
+| 78af0b5 | 10 | 9 | the smoke's four readings again, in memory this time |
+| fa307a8 | 6, and 4 called off unstarted | 6 | |
+| f2e5ceb | 10 | 7 | a replace before the first checkpoint; a sampled state lag read once; the broker job |
+| 53d8c83 | 10 | 10 | |
+
+Every job of every run, with its duration: `docs/design/runs/2026-11-14-j3-ci-runs.tsv`.
+`connector-stack` took 9½ to 12 minutes where it passed (55 runs), `build-and-test`
+4 to 6.
+
+**Twenty runs here on two cores.** The service test project — 251 tests, of which
+the six that need three brokers skip — pinned to two processors with `taskset`, and
+with it the node processes it starts; the one local broker was not limited. Twenty runs of
+the last build, 53d8c83: twenty green, 149 to 156 s each.
+
+It took six goes at twenty. The first, on the build with the first two fixes, passed
+nineteen and failed the twentieth on the fold. The next three were stopped when a run
+here or on a runner had shown the next thing: 5 of 5, 2 of 2, and 4 of 5 (the hook).
+The fifth was 5 of 7 (the checkpoint, twice) when it was stopped. 59 runs of the
+suite in all, four of them red, each in the table above. Besides those: the
+broker-free classes on two other processors with three busy loops beside them, 15 of
+15 on f2e5ceb before that loop was stopped; `WarmStandbyTests` under the same load,
+28 of 34 before its fix and 34 of 34 after; the two-node in-memory smoke under it, 25
+of 25. On the final tree, once each: `tests/Incremental.Tests` 709 of 710 (one opt-in
+skip), `tests/Incremental.Kafka.Tests` 134 of 134, the example's `Pipelines.Tests` 17
+of 17, the four smokes (55, 69 and 69 claims, and the narrative's 13). Records:
+`docs/design/runs/2026-11-14-j3-local.txt`.
+
+**Deviations.**
+
+- **The in-memory backend's takeover can now wait**: up to `DeposedWriteTimeout` (5 s)
+  for a write the old leader is inside. It waited for nothing before, and a sink that
+  hangs makes an in-memory takeover five seconds longer (Open for James 73).
+- **A fenced in-memory leader's sink write throws**, where it used to go through. Its
+  pipeline ends as "this node no longer leads", as on Kafka.
+- **The broker tests are a job started by hand**, not part of every run (Open for
+  James 74), and not stable on a two-core runner until Open for James 75 is.
+- **Every follower's reader asks the client for its position ten times a second while
+  nothing arrives**, and reports it when it has moved. A local call; not measured as a
+  cost.
+- **The table-stage assertion still reads a clock.** A count holds the defect that was
+  found (`ShortReadAdminsCreated`); the stage's bound stays as the net for the next
+  wait of that kind, with the reason for its size beside it.
+
+**Left undone.**
+
+- `KafkaConnection.TopicMissingAsync` (a dry run's question whether a topic exists)
+  still makes and disposes an admin client: a tenth of a second per Kafka slot at a dry
+  run, on no path that is timed.
+- The fence's wait after a leader killed inside a transaction (380 to 690 ms where it
+  is otherwise 20 to 220) was not traced further than the guide's account of it and
+  was not worked around.
+- The core's Redis tests skip when Redis does not answer their first connection in
+  time, and two did in one run of `tests/Incremental.Tests` pinned to sixteen cores
+  beside other work here (3 skipped instead of 1). The `build-and-test` job does not
+  count skips; it was not looked into.
+- **Not explained.** Three of the Kafka tests' 354 two-table takeovers on the runners
+  since the fix took over 100 ms (126, 220, 843); nothing asserts on them and they
+  were not looked into. Why `Keep_that_the_checkpoint_cannot_follow…` raced its
+  checkpoint in no run of some forty and then in two of seven once the heap test had
+  been moved out of the classes that run side by side is put down to what then ran
+  beside it, and was not shown. Every failure of a test in this step's runs, here and
+  on the runners, has its cause in the table above.
