@@ -415,16 +415,25 @@ internal sealed class TableHandle<TKey, TRow>(TableRegistry registry, TableDefin
             _rateSample = (now, version);
         }
 
+        // A follower's lag is asked of the log, and a log whose broker has gone answers
+        // after its own patience (the Kafka log's operation timeout, half a minute):
+        // far too long for a figure on a page, and for a status that is asked while
+        // brokers are down. So the question gets two seconds (LagPatience) — the wait
+        // is given up, whether or not the log's call honours the token — and when it
+        // had no answer nobody asks again for five (LagAskAgainAfter), for any table:
+        // twenty tables do not wait in turn. The lag is then not known, and says so.
         long? lag = null;
-        if (table is { IsFollowing: true } && log is not null)
+        if (table is { IsFollowing: true } && log is not null && Environment.TickCount64 >= Volatile.Read(ref registry.LagUnknownUntil))
         {
+            using var patience = new CancellationTokenSource(registry.LagPatience);
             try
             {
-                lag = Math.Max(0, await log.LastVersionAsync().ConfigureAwait(false) - version);
+                lag = Math.Max(0, await log.LastVersionAsync(patience.Token).AsTask().WaitAsync(patience.Token).ConfigureAwait(false) - version);
             }
             catch
             {
                 // Unknown is an honest answer.
+                Volatile.Write(ref registry.LagUnknownUntil, Environment.TickCount64 + (long)registry.LagAskAgainAfter.TotalMilliseconds);
             }
         }
 
@@ -602,6 +611,18 @@ internal sealed class TableRegistry(ServiceContext context) : ITableRegistry
     private readonly ConcurrentDictionary<string, ITableHandle> _tables = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _declare = new(1, 1);
     private readonly ILogger _logger = context.LoggerFactory.CreateLogger("Incremental.Service.Tables");
+
+    /// <summary>Until when (<see cref="Environment.TickCount64"/>) no table's statistics
+    /// ask a log how far its follower is behind: one question that got no answer in
+    /// <see cref="LagPatience"/> stands for them all for <see cref="LagAskAgainAfter"/>
+    /// (<c>TableHandle.StatsAsync</c>).</summary>
+    internal long LagUnknownUntil;
+
+    /// <summary>How long a table's statistics wait for its log to say where it ends.</summary>
+    internal TimeSpan LagPatience { get; set; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>How long nobody asks again after a question that had no answer.</summary>
+    internal TimeSpan LagAskAgainAfter { get; set; } = TimeSpan.FromSeconds(5);
 
     public ServiceContext Context => context;
 

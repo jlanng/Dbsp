@@ -1091,18 +1091,27 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
             await DockerAsync("stop", "-t", "1", Brokers[0]);
             await DockerAsync("stop", "-t", "1", Brokers[1]);
         }
-        await Task.Delay(TimeSpan.FromSeconds(seconds));
+        // Near the end of the outage the standby is asked for its status, as an operator
+        // would ask: it must answer in seconds with the brokers gone. (It once took
+        // thirty: a following table's lag was asked of a log whose broker was dead.)
+        await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, seconds - 8)));
+        var answering = Stopwatch.StartNew();
+        await b.StatusAsync();
+        var statusMs = answering.ElapsedMilliseconds;
+        if (outage.Elapsed < TimeSpan.FromSeconds(seconds))
+            await Task.Delay(TimeSpan.FromSeconds(seconds) - outage.Elapsed);
 
         // The brokers first, in one command, and the time taken from before and after
         // it: the outage is as long as it was asked to be, whatever the counter costs
-        // to read. (Asked first, the standby's status once took thirty seconds to come.)
+        // to read.
         var downFor = outage.ElapsedMilliseconds;
         await DockerAsync("start", Brokers[0], Brokers[1]);
         var startedAfter = outage.ElapsedMilliseconds;
         var held = (await b.StatusAsync()).GetProperty("counters").GetProperty("takeoversHeld").GetInt64();
         Measured(
             $"kafka3: two of three brokers {(fault == "kill" ? "killed" : "stopped")} and down for {downFor} ms (started again by {startedAfter} ms); " +
-            $"the standby held its takeover back {held} time(s) at the ceiling");
+            $"the standby held its takeover back {held} time(s) at the ceiling and answered a status request in {statusMs} ms during the outage");
+        Assert.True(statusMs < 10_000, $"the standby took {statusMs} ms to answer a status request with two brokers down");
         await ClusterWholeAsync(env.Prefix);
         var back = Stopwatch.StartNew();
 
@@ -1113,7 +1122,11 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         var (trades, stall) = await load.StopAsync();
         await ConcludeAsync(
             "no-quorum", env, d, trades, stall, $"two of three brokers were down for {seconds} s",
-            new() { ["takeoversHeld"] = held, ["wholeToSettledMs"] = null, ["outageMs"] = outage.ElapsedMilliseconds, ["outageSeconds"] = seconds, ["fault"] = fault });
+            new()
+            {
+                ["takeoversHeld"] = held, ["wholeToSettledMs"] = null, ["outageMs"] = outage.ElapsedMilliseconds, ["outageSeconds"] = seconds,
+                ["downForMs"] = downFor, ["fault"] = fault, ["statusDuringOutageMs"] = statusMs,
+            });
         Measured($"kafka3 no-quorum: one leader, a warm standby and a complete sink {back.ElapsedMilliseconds} ms after the cluster was whole");
     }
 

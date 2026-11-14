@@ -488,6 +488,98 @@ public class TableTests
         Assert.True(service.Tables.Stats("instruments") is { Rows: 3, Loader.State: TableSourceState.Idle });
     }
 
+    /// <summary>A backend whose table logs can stop saying where they end, as a Kafka
+    /// log's does while the partition's broker is gone: the question is not refused, it
+    /// is not answered, and the token given with it is not looked at (the client's call
+    /// blocks for its own timeout).</summary>
+    private sealed class SilentLagBackend(IServiceBackend inner) : IServiceBackend
+    {
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public volatile bool Silent;
+        public int Asked;
+
+        public string NodeId => inner.NodeId;
+        public Task ConnectAsync(CancellationToken cancellationToken) => inner.ConnectAsync(cancellationToken);
+        public Incremental.Storage.IStateChangelog State => inner.State;
+        public int RetainedHistoryVersions => inner.RetainedHistoryVersions;
+        public IBlobStore Blobs => inner.Blobs;
+        public INodeLeadership Leadership => inner.Leadership;
+        public BackendInfo Describe() => inner.Describe();
+
+        public async Task<Incremental.Tables.ITableLog<TKey, TRow>> OpenTableLogAsync<TKey, TRow>(string name, CancellationToken cancellationToken)
+            where TKey : notnull
+            where TRow : class =>
+            new Log<TKey, TRow>(this, await inner.OpenTableLogAsync<TKey, TRow>(name, cancellationToken));
+
+        public ValueTask DisposeAsync()
+        {
+            _release.TrySetResult();
+            return inner.DisposeAsync();
+        }
+
+        private sealed class Log<TKey, TRow>(SilentLagBackend owner, Incremental.Tables.ITableLog<TKey, TRow> log) : Incremental.Tables.ITableLog<TKey, TRow>
+            where TKey : notnull
+            where TRow : class
+        {
+            public string Epoch => log.Epoch;
+            public long OldestRetainedVersion => log.OldestRetainedVersion;
+
+            public async ValueTask<long> LastVersionAsync(CancellationToken cancellationToken = default)
+            {
+                if (owner.Silent)
+                {
+                    Interlocked.Increment(ref owner.Asked);
+                    await Task.WhenAny(owner._release.Task, Task.Delay(TimeSpan.FromSeconds(20), CancellationToken.None));
+                }
+                return await log.LastVersionAsync(cancellationToken);
+            }
+
+            public ValueTask AppendAsync(Incremental.Tables.TableVersion<TKey, TRow> version, CancellationToken cancellationToken = default) => log.AppendAsync(version, cancellationToken);
+            public IAsyncEnumerable<Incremental.Tables.TableVersion<TKey, TRow>> ReadAsync(long fromExclusive, long toInclusive, CancellationToken cancellationToken = default) => log.ReadAsync(fromExclusive, toInclusive, cancellationToken);
+            public IAsyncEnumerable<Incremental.Tables.TableVersion<TKey, TRow>> FollowAsync(long fromExclusive, CancellationToken cancellationToken = default) => log.FollowAsync(fromExclusive, cancellationToken);
+            public ValueTask<Incremental.Tables.TableHead> RestoreAsync(Action<TKey, TRow> row, CancellationToken cancellationToken = default) => log.RestoreAsync(row, cancellationToken);
+            public ValueTask TrimBeforeAsync(long version, CancellationToken cancellationToken = default) => log.TrimBeforeAsync(version, cancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task A_standby_s_table_statistics_do_not_wait_out_a_log_that_does_not_answer()
+    {
+        // What a status request, the admin API's tables and the gauges all ask. With two
+        // of three brokers gone a standby once took thirty seconds to answer: each
+        // following table asked its log where it ends and waited out the log's own
+        // timeout. The question now has a bound, and one that had no answer stands for
+        // every table for a while — the lag is then unknown, which is what it is.
+        var cluster = new InMemoryServiceCluster();
+        SilentLagBackend? backend = null;
+        await using var a = await StartAsync(cluster, "a");
+        await using var b = await StartAsync(cluster, "b", configure: builder => builder.UseBackend(_ => backend = new SilentLagBackend(cluster.Node("b"))));
+        string[] names = ["one", "two", "three"];
+        foreach (var name in names)
+            await a.Tables.DeclareAsync(new TableSpec { Name = name, Definition = typeof(InstrumentsTable).FullName! }, default);
+        await Eventually(() => names.All(name => b.Tables.Tables.Any(t => t.Name == name && t.State == TableState.Open)), "the tables followed by b");
+        Assert.NotNull(backend);
+        var registry = b.Node.Context.Tables;
+        registry.LagPatience = TimeSpan.FromSeconds(1);
+        registry.LagAskAgainAfter = TimeSpan.FromSeconds(3);
+        foreach (var name in names)
+            Assert.True(await b.Tables.StatsAsync(name) is { Following: true, LagVersions: 0 });
+
+        backend.Silent = true;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        foreach (var name in names)
+            Assert.Null((await b.Tables.StatsAsync(name)).LagVersions);
+
+        // One wait, not one per table, and not the log's twenty seconds. (At most two
+        // questions: the node's own refresh of its gauges may have asked beside this.)
+        Assert.InRange(clock.Elapsed.TotalSeconds, 0, 2.5);
+        Assert.InRange(Volatile.Read(ref backend.Asked), 1, 2);
+
+        // And it is asked again once the while has passed: the lag is known when the log answers.
+        backend.Silent = false;
+        await Eventually(() => names.All(name => b.Tables.Stats(name).LagVersions == 0), "the lag known again");
+    }
+
     [Fact]
     public async Task A_loaded_table_whose_file_has_since_been_removed_is_not_waiting_after_a_takeover_or_a_restart()
     {
