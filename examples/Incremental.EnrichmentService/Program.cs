@@ -143,7 +143,11 @@ try
         interrupted.TrySetResult();
     };
     using var terminated = System.Runtime.InteropServices.PosixSignalRegistration.Create(
-        System.Runtime.InteropServices.PosixSignal.SIGTERM, _ => interrupted.TrySetResult());
+        System.Runtime.InteropServices.PosixSignal.SIGTERM, context =>
+        {
+            context.Cancel = true;
+            interrupted.TrySetResult();
+        });
     // A node that loses leadership stops its host (exit code 3 fenced, 4 resigned, 5 cannot
     // lead); a process supervisor starts it again and it comes back as the standby. Two
     // nodes in memory are supervised in this process instead, and only a stop request ends it.

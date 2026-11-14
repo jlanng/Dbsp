@@ -50,6 +50,11 @@ Console.CancelKeyPress += (_, e) =>
     stopped.TrySetResult();
 };
 AppDomain.CurrentDomain.ProcessExit += (_, _) => stopped.TrySetResult();
+using var terminated = System.Runtime.InteropServices.PosixSignalRegistration.Create(System.Runtime.InteropServices.PosixSignal.SIGTERM, context =>
+{
+    context.Cancel = true;
+    stopped.TrySetResult();
+});
 // A node of two that is replaced or resigns is started again by the host; one node alone
 // that stops ends the program.
 await (host.Nodes.Count > 1 ? stopped.Task : Task.WhenAny(stopped.Task, Task.WhenAny(host.Nodes.Select(n => n.App.WaitForShutdownAsync()))));
