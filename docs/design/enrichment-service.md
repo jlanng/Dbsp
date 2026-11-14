@@ -4804,6 +4804,43 @@ broker's one cleaner thread, looking every 15 s, had not reached its topic in 90
 behind the other tests' compacted topics (the compose broker now has two cleaner
 threads and a 1 s back-off; that test compacted in 2 s here afterwards).
 
+That last reading was wrong, and the skip came back: six of the next ten runs of the
+job. The third review's step printed the broker's `log-cleaner.log` from the job (it is
+a file in the container and was in no output) and the counts in the skip's message, and
+both kinds of run show the cleaner at work within a second of every roll. What differed
+was the segment being written when the test starts to wait: the cleaner never cleans
+it, nothing is written while the test waits, and where it begins depends on the pace
+of the run, because a segment also rolls when its first record is older than
+`max.compaction.lag.ms`. 47 offsets were left in it on this machine; 186 and 263 on the
+runner, which made 893 and 959 records where the test accepts 857 of 3,428 offsets. No
+wait would have changed that. The test's state topic now has 4 KB segments in place of
+16 KB, so what cannot be cleaned is a quarter of what it was at most. The same job
+failed once on `ABatchTheBrokerRefuses_FailsTheWrite…`, sixty seconds without the
+acknowledgement of a first record on a topic created a moment before: a sink does not
+create its topic and believes a broker that says it is unknown, and a broker answers
+from its own copy of the metadata, which follows the controller's. The tests' topic
+helpers now wait until the broker knows the topic and its leaders, and the test reports
+a failed delivery as that. This one is read from the code and was not reproduced.
+
+After those two changes the job's Kafka step passed in three runs of three (774
+records left, 2 s). Two of the three — runs started by hand on the same commit beside
+the push's own, which was green — then failed in the service step, each on a test
+that had not failed on a runner before, and neither is explained:
+`Killing_the_leader_process_mid_stream…` on its wall-clock target (the takeover's
+table stage took 2,164 ms for 21 tables against "under 2 s"; 118 to 185 ms in the
+five other runs of the job that reached it and 108 to 140 ms on this machine, and
+the catalog stage of the same takeover took 122 ms where it takes 9 to 28), and
+`A_table_opened_again_while_the_standby_builds_on_it…` (in memory: thirty seconds
+without the new leader's sink following the table it writes). Neither came back
+here: the second in 25 runs alone on two cores, 6 runs of the in-memory classes on
+four, and 30 runs of its class on two cores with three busy loops beside it (one of
+which failed another test of the class, `A_spec_replaced_while_the_standby_fetches…`,
+once, in 0.3 s); the first not with a table's statistics asked without pause
+through four takeovers of twenty tables (table stage 108 to 132 ms, as without). The
+service tests start their Kafka classes while some two hundred in-memory tests run
+beside them on a runner's four cores; that both failures fell in that stretch is
+all that is known.
+
 **The front door (H12).** The example, AdminHost, the scale rig and both failover apps
 print their usage for `--help` and exit 2 on an option they do not have
 (`tests/Shared/CommandLine.cs`, linked into the four; the example's own table in
@@ -5451,7 +5488,8 @@ A following table's `LagVersions` is null while its log does not say where it en
   node's own that fails on the Kafka backend is told as such and is exit code 5; a
   standby's table statistics over three tables whose logs stop answering come back
   after one wait, not three, with the lag not known, and know it again when the logs
-  answer.
+  answer. Kafka, one more: a short read its caller calls off keeps the log's shared
+  consumer, which then reads as before, and one that fails gets a new one.
 
 **Mutations.** Core: 13, all killed by `DeadlineStoreTests`, `EventTimeRestartTests`
 and `MemoryEstimateTests` — the queue not swept at a removal, never rebuilt, not
@@ -5479,9 +5517,10 @@ reaches neither branch (an id no broker has comes back as a plain client error).
 judgement is now a function of its own (`KafkaLog.AnsweredWith`) with a test of each
 kind of failure, and five mutations of it are killed. Three more for the bounded lag
 question, all killed: the wait not given up, a question without an answer not
-standing for the other tables, the lag never asked again. In all: 13 core and 39
-Kafka and service; every one killed at the end, nine of them only after a test or a
-change was made for it. The lists and results were in the sessions' scratch
+standing for the other tables, the lag never asked again; and two for the short
+reader (a read called off costing the consumer, a failed read keeping it). In all:
+13 core and 41 Kafka and service; every one killed at the end, nine of them only
+after a test or a change was made for it. The lists and results were in the sessions' scratch
 directories (`mutations.txt`, `core.py`, `svc.py` and the second session's
 `svc2.py`, `kafka2.py`, `kafka3.py`), not the repository.
 
@@ -5506,9 +5545,15 @@ directories (`mutations.txt`, `core.py`, `svc.py` and the second session's
   in the status and the admin API, no value on the `table.lag` gauge. The test asks
   for the status eight seconds before the end of the outage and fails above ten
   seconds; series 2 has what it took (20 ms, and 2.0 s with the brokers killed). The
-  log's own call is not cut short — it ends at its own timeout with nobody waiting
-  for it — so a few of them are in flight on a standby during an outage, one more
-  for each question that is asked (Open for James 68).
+  log's call is given the same two seconds as its token and stops where it next
+  looks at it; a call blocked inside the client ends at the client's timeout with
+  nobody waiting for it (Open for James 68). One thing had to follow from that: a
+  table's head is read on the log's one shared short-read consumer, which a
+  takeover reads every table's head with, and a read that threw — a cancellation
+  included — had its consumer thrown away, so that a lag question called off after
+  two seconds on a slow machine would have left the next takeover a consumer that
+  knows no topic. A read its caller calls off now keeps the consumer
+  (`KafkaLog.ShortReadAsync`); a read that failed still does not.
 - **`A_takeover_with_one_broker_down…` takes `INCREMENTAL_KAFKA_FAULT` and
   `INCREMENTAL_KAFKA_BROKER`** and records the broker's roles; its default is what it
   did before (broker 2 shut down 1.5 s before the kill).
@@ -5538,5 +5583,11 @@ directories (`mutations.txt`, `core.py`, `svc.py` and the second session's
   the records and the node logs afterwards. Nothing in them was rerun.
 - The log's call behind a lag question that got no answer is left to end by itself
   (Open for James 68).
+- Two service tests failed once each on a CI runner and are not explained (above,
+  *CI*): a takeover's table stage over its two-second target, and the warm
+  standby's reopened-table test timing out. A third,
+  `A_spec_replaced_while_the_standby_fetches…`, failed once here under three busy
+  loops on two cores. None was reproduced on demand; the second and third are races
+  in a standby's build that a slow machine reaches and this step did not find.
 - None of the twelve findings was in the admin UI, so nothing was verified in a
   browser in this step.

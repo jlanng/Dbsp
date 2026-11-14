@@ -578,4 +578,49 @@ public class KafkaLogTests(ITestOutputHelper output)
 
     private static TableVersion<int, Row> Version(long version, params TableChange<int, Row>[] changes) =>
         new(version, changes, new Dictionary<int, long>());
+
+    /// <summary>The log's one consumer for short reads is what a takeover reads each
+    /// table's head with, and what it has learnt of the topics keeps those reads short.
+    /// A read whose caller stops waiting — a status that gives a table's lag two seconds
+    /// — must not cost the next reads that: the consumer is kept. One that failed is not.</summary>
+    [Fact]
+    public async Task A_short_read_its_caller_calls_off_keeps_the_shared_reader_and_one_that_fails_does_not()
+    {
+        await using var env = KafkaEnv.Create();
+        var log = await env.ConnectWriterAsync();
+        var end = await log.EndOffsetAsync(log.LeaderPartition, default);
+        Assert.True(end > 0, "the writer's term is in the leader topic");
+
+        int Records(IConsumer<byte[], byte[]> consumer, CancellationToken token)
+        {
+            var seen = 0;
+            log.AssignForShortRead(consumer, new TopicPartitionOffset(log.LeaderPartition, 0));
+            log.ReadTo(consumer, end, _ => { seen++; }, token);
+            return seen;
+        }
+
+        var all = await log.ShortReadAsync(consumer => Records(consumer, default), default).WaitAsync(Timeout);
+        Assert.True(all > 0);
+        Assert.Equal(1, log.ShortReadersCreated);
+
+        // Called off in the middle: assigned, and stopped at the read's first look.
+        using var off = new CancellationTokenSource();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => log.ShortReadAsync(consumer =>
+        {
+            log.AssignForShortRead(consumer, new TopicPartitionOffset(log.LeaderPartition, 0));
+            off.Cancel();
+            log.ReadTo(consumer, end, _ => { }, off.Token);
+            return 0;
+        }, off.Token)).WaitAsync(Timeout);
+
+        // The same consumer serves the next read, and reads what the first one read.
+        Assert.Equal(all, await log.ShortReadAsync(consumer => Records(consumer, default), default).WaitAsync(Timeout));
+        Assert.Equal(1, log.ShortReadersCreated);
+
+        // A read that failed leaves a consumer in a state nobody knows: the next gets a new one.
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => log.ShortReadAsync<int>(_ => throw new InvalidOperationException("the read broke"), default)).WaitAsync(Timeout);
+        Assert.Equal(all, await log.ShortReadAsync(consumer => Records(consumer, default), default).WaitAsync(Timeout));
+        Assert.Equal(2, log.ShortReadersCreated);
+    }
 }

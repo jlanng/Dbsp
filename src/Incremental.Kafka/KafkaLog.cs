@@ -1640,6 +1640,11 @@ public sealed class KafkaLog : IAsyncDisposable
     // IAM handshake — per table, per lag sample. Guarded by the gate; rebuilt after a failure.
     private readonly SemaphoreSlim _shortReadGate = new(1, 1);
     private IConsumer<byte[], byte[]>? _shortReader;
+    private int _shortReadersCreated;
+
+    /// <summary>How many consumers the short reads have had: one, unless a read failed.
+    /// For tests.</summary>
+    internal int ShortReadersCreated => Volatile.Read(ref _shortReadersCreated);
 
     /// <summary>Runs <paramref name="read"/> on a thread-pool thread with the log's shared
     /// short-read consumer, which <paramref name="read"/> assigns itself. One at a time.</summary>
@@ -1651,7 +1656,12 @@ public sealed class KafkaLog : IAsyncDisposable
             return await Task.Run(() =>
             {
                 ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-                var consumer = _shortReader ??= CreateConsumer(forShortReads: true);
+                var consumer = _shortReader;
+                if (consumer is null)
+                {
+                    consumer = _shortReader = CreateConsumer(forShortReads: true);
+                    Interlocked.Increment(ref _shortReadersCreated);
+                }
                 try
                 {
                     // It is polled only while a read runs, and a read may begin with a
@@ -1661,16 +1671,36 @@ public sealed class KafkaLog : IAsyncDisposable
                     consumer.Unassign();
                     return result;
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // Whatever state the read left it in, the next one starts clean.
-                    _shortReader = null;
-                    try
+                    // A read its caller called off (a status that stopped waiting for a
+                    // table's lag) leaves the consumer as a read that ended early does:
+                    // nothing is wrong with it, and it is kept — what it has learnt of
+                    // the topics is what keeps the next reads short, and the next reads
+                    // may be a takeover's, one per table. After anything else the next
+                    // one starts clean, whatever state this one left it in.
+                    var keep = ex is OperationCanceledException && cancellationToken.IsCancellationRequested && !_stop.IsCancellationRequested;
+                    if (keep)
                     {
-                        consumer.Dispose();
+                        try
+                        {
+                            consumer.Unassign();
+                        }
+                        catch (KafkaException)
+                        {
+                            keep = false;
+                        }
                     }
-                    catch (KafkaException)
+                    if (!keep)
                     {
+                        _shortReader = null;
+                        try
+                        {
+                            consumer.Dispose();
+                        }
+                        catch (KafkaException)
+                        {
+                        }
                     }
                     throw;
                 }

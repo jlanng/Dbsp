@@ -204,6 +204,9 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   topic it has not seen waits a second for the client to look the leader up, and that
   consumer keeps `fetch.wait.max.ms` at 5 so one read does not wait out the last one's
   long poll. Both cost a takeover or a start-up a second or half a second per table.
+  A short read its caller calls off (a status that gives a table's lag two seconds)
+  keeps that consumer and what it knows of the topics; only a read that failed
+  replaces it (`KafkaLogTests`, the short reader's test).
   Every Kafka client starts from `KafkaClientDefaults` (reconnect delay at most 1 s,
   socket timeout 6 s, a metadata refresh every 2 s), applied before the caller's own
   settings: librdkafka's defaults leave a healthy leader silent for 10 to 60 s after a
