@@ -811,4 +811,25 @@ public class KafkaServiceTests(ITestOutputHelper output)
         Assert.True(left < open, $"{left} entries now, {open} with five windows open");
         output.WriteLine($"state entries: {open} with five windows open at the takeover, {left} once they closed (a pipeline that saw only the last window: {alone})");
     }
+
+    [Fact]
+    public async Task A_takeover_of_the_nodes_own_that_fails_on_kafka_is_told_apart_and_exits_5()
+    {
+        // The Kafka leadership tells a takeover that failed by the node's own doing from
+        // one that another node ended, and the backend must hand that on: without it the
+        // node exits 3, which a supervisor answers at once and for ever.
+        await using var env = KafkaTestEnv.Create();
+        await using var backend = new KafkaServiceBackend(env.Backend("a", automaticTakeover: true));
+        await backend.ConnectAsync(default);
+        var callbacks = new LeadershipCallbacks(
+            _ => Task.CompletedTask, (_, _) => throw new InvalidOperationException("no pipelines today"), _ => Task.CompletedTask,
+            () => throw new NotSupportedException());
+        await backend.Leadership.StartAsync(callbacks, default);
+        await backend.Leadership.WhenFinished.WaitAsync(Timeout);
+        var status = backend.Leadership.Status;
+        Assert.Equal(NodeRole.Fenced, status.Role);
+        Assert.Contains("no pipelines today", status.Kafka!.Fault);
+        Assert.True(status.TakeoverFailed);
+        Assert.Equal(5, ServiceNode.ExitCodeFor(status));
+    }
 }

@@ -1452,19 +1452,23 @@ public sealed class KafkaLog : IAsyncDisposable
                 .WaitAsync(timeout * 2, cancellationToken).ConfigureAwait(false);
             return true;
         }
-        catch (DescribeConfigsException ex)
+        catch (Exception ex) when (ex is KafkaException or TimeoutException)
         {
-            return ex.Results.Any(result => result.Error.IsBrokerError);
-        }
-        catch (KafkaException ex)
-        {
-            return ex.Error.IsBrokerError;
-        }
-        catch (TimeoutException)
-        {
-            return false;
+            return AnsweredWith(ex);
         }
     }
+
+    /// <summary>Whether a question that failed was all the same answered by the broker
+    /// it was put to: an error the broker sent (it refuses, it does not know the
+    /// resource) is the broker speaking; an error the client made up for it (a
+    /// transport failure, a request that timed out in the client) and a wait that
+    /// ran out are silence.</summary>
+    internal static bool AnsweredWith(Exception failure) => failure switch
+    {
+        DescribeConfigsException described => described.Results.Any(result => result.Error.IsBrokerError),
+        KafkaException kafka => kafka.Error.IsBrokerError,
+        _ => false,
+    };
 
     /// <summary><c>String.hashCode</c> as Java computes it: what the brokers place a
     /// transactional id by.</summary>

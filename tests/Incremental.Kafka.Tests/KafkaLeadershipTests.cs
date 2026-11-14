@@ -1032,6 +1032,20 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         var silent = Stopwatch.StartNew();
         Assert.False(await log.BrokerAnswersAsync(9_999, default).WaitAsync(Timeout));
         Assert.InRange(silent.Elapsed.TotalSeconds, 1, 6);
+
+        // What counts as an answer when the question fails: an error the broker sent —
+        // a node that may not describe brokers is refused, and the broker is there to
+        // refuse it — and nothing the client made up in its place, and no wait that ran out.
+        static Confluent.Kafka.Admin.DescribeConfigsException Described(ErrorCode code) => new(
+            [new Confluent.Kafka.Admin.DescribeConfigsReport { ConfigResource = new Confluent.Kafka.Admin.ConfigResource { Type = Confluent.Kafka.Admin.ResourceType.Broker, Name = "1" }, Error = new Error(code) }]);
+        Assert.True(KafkaLog.AnsweredWith(Described(ErrorCode.ClusterAuthorizationFailed)));
+        Assert.True(KafkaLog.AnsweredWith(new KafkaException(new Error(ErrorCode.ClusterAuthorizationFailed))));
+        Assert.False(KafkaLog.AnsweredWith(Described(ErrorCode.Local_TimedOut)));
+        Assert.False(KafkaLog.AnsweredWith(Described(ErrorCode.Local_Transport)));
+        Assert.False(KafkaLog.AnsweredWith(new KafkaException(new Error(ErrorCode.Local_Transport))));
+        Assert.False(KafkaLog.AnsweredWith(new KafkaException(new Error(ErrorCode.Local_TimedOut))));
+        Assert.False(KafkaLog.AnsweredWith(new TimeoutException()));
+
         var asked = new List<int>();
         log.BrokerAnswersOverride = broker =>
         {

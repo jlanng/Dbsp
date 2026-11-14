@@ -1047,6 +1047,34 @@ public class FileConnectorTests : IDisposable
         await Eventually(() => input.Count == 4 + 39, "and the newest once it has settled");
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-3600)]
+    public async Task A_backlog_that_is_old_by_the_stores_own_stamps_is_read_at_once_by_a_reader_that_has_only_just_seen_it(int skewSeconds)
+    {
+        // A reader that starts on a prefix has seen nothing for any time at all. What
+        // was written a minute before the newest object is old by the store's own
+        // account, and is not made to wait out a settle time of this reader's: with
+        // only the reader's own sightings to go by, a backlog would wait once per
+        // listing of it.
+        for (var i = 1; i <= 3; i++)
+        {
+            await PutAsync($"in/{i:D4}.jsonl", Numbered($"{i:D4}", 1));
+            File.SetLastWriteTimeUtc(Path.Combine(_root, "in", $"{i:D4}.jsonl"), DateTime.UtcNow.AddMinutes(-1));
+        }
+        await PutAsync("in/0004.jsonl", Numbered("0004", 1));
+        var input = new FakeInput();
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        await using var reader = Read(new SkewedStore(_store, TimeSpan.FromSeconds(skewSeconds)), input, "in/", ", \"settle\": \"00:00:03\"");
+        await Eventually(() => input.Count == 3, "the backlog read");
+        Assert.InRange(clock.Elapsed.TotalSeconds, 0, 1.5);                     // not after the three seconds
+        await Task.Delay(300);
+        Assert.Equal(3, input.Count);                                           // the newest waits out its own
+        await Eventually(() => input.Count == 4, "the newest once it has settled");
+        Assert.InRange(clock.Elapsed.TotalSeconds, 3, 9);
+        Assert.Equal(Enumerable.Range(1, 4).SelectMany(i => Numbered($"{i:D4}", 1)), input.Lines);
+    }
+
     [Fact]
     public async Task An_object_that_changes_while_it_settles_waits_from_the_change()
     {
