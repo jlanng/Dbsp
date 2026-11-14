@@ -2051,6 +2051,22 @@ Each has a default this design is built on.
     `trade-enrichment` alone (the guide's arithmetic). *Alternative:* no default, so
     that every spec has to say — the dry run would then refuse the template the admin
     offers, which today is valid as it stands.
+73. **An in-memory takeover waits up to five seconds for a sink write the replaced
+    leader is inside** (S8, *CI*; `InMemoryBackendOptions.DeposedWriteTimeout`). The
+    wait is what keeps the old leader's last rows from landing over the new leader's;
+    a sink that hangs makes the takeover that much longer, and a write that outlasts
+    the wait can still land late. *Alternatives:* no bound (a hung sink then holds an
+    in-memory takeover for ever, against "nothing waits without a bound"), or a shorter
+    one; the in-memory backend is for tests and for trying things out, where five
+    seconds is long enough for any sink that is not broken.
+74. **The broker-failure tests run in CI only when asked**
+    (`gh workflow run CI --ref <branch> -f broker_tests=true`; S8, *CI*). They take a
+    whole runner for a quarter of an hour, and on two shared cores what they assert
+    rests on three JVMs and two node processes keeping their heartbeats.
+    *Alternatives:* on every push (every push then waits for them, and a slow runner
+    fails the build for a reason that is not the push's), or on a schedule (a nightly
+    run on the default branch — cheap to add once the branch is merged: `schedule`
+    only fires there).
 
 ## Not verified
 

@@ -1696,12 +1696,13 @@ model that leaves it out. The alert files and the dead letters are read back
 with `FileSinkFormat` and compared too: every alert once, every dropped record there.
 On Kafka the first node runs under its supervisor, the kill is of the node alone, and
 the last claim is that it came back as a warm standby without anybody starting it.
-A claim that does not hold exits 1 (48 claims in memory, 62 with two nodes, 62 on
+A claim that does not hold exits 1 (55 claims in memory, 69 with two nodes, 69 on
 Kafka). CI runs the two in-memory ones on every build, and the Kafka one in a job of its
 own that starts the connector stack from `docker-compose.yml` and also runs the Kafka
 and Kafka-backed service tests, failing if any of them was skipped
-(`.github/workflows/ci.yml`, job `connector-stack`). That job was written and its
-commands run here against the local stack; it has not yet run on GitHub.
+(`.github/workflows/ci.yml`, job `connector-stack`). The tests that stop, kill and
+freeze brokers need three of them and run in a fourth job, started by hand:
+`gh workflow run CI --ref <branch> -f broker_tests=true`.
 
 ## The admin UI
 
@@ -1860,6 +1861,16 @@ does not get there: the sink is silent for 8 to 15 s and the leader carries on
 
 Delivery is at least once: whatever the old leader had delivered but not committed is
 delivered again. An upsert sink converges; an append sink sees duplicates.
+
+What matters to an upsert sink is the order: a row of the replaced leader's must not
+land after its successor's row for the same key, or the stale one stays. A Kafka sink
+writes through the log's own producer, which the takeover fences. A sink outside Kafka
+writes only while its node holds the lease, which a leader that has gone quiet has lost
+before anyone replaces it, and which a leader replaced by hand gives up when it reads
+the new term. Two in-memory nodes (`--nodes 2`) keep the order too: the replaced node
+begins no sink write once the other leads, and the takeover waits for the write it was
+in the middle of — five seconds at most (`InMemoryBackendOptions.DeposedWriteTimeout`),
+after which it goes on without it.
 
 **A node that stops leading exits, and must be started again.** Exit code 3: fenced by
 a takeover. 4: resigned (stepped down). 5: it could not lead — its catalog writer

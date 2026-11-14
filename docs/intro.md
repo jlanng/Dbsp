@@ -1398,7 +1398,9 @@ What to know:
 - **The in-memory backend is bounded.** Its state log compacts itself
   (`InMemoryBackendOptions.StateCompactAbove`) and its table logs cap history by row
   changes as well as by versions, so a node left running holds what is live. It is still
-  one process's memory: Kafka is the backend to run on.
+  one process's memory: Kafka is the backend to run on. Two in-memory nodes fence each
+  other's sinks as well as their logs: a replaced leader begins no sink write, and the
+  takeover waits for the one in flight (`InMemoryBackendOptions.DeposedWriteTimeout`).
 
 #### Looking at it: the admin API and UI
 

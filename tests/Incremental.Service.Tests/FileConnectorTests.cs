@@ -1209,6 +1209,14 @@ public class FileConnectorTests : IDisposable
 
     // ── sinks: retention, snapshots, and the object of a leader that was replaced ──────
 
+    /// <summary>Waits until the pipeline's sink is not inside a write. A files sink tidies
+    /// up after it has written a step's object — deletes the object that is one too many,
+    /// folds and deletes what a snapshot replaces — in the same write, so what the step
+    /// wrote can be read a moment before the directory is as the sink leaves it. A test
+    /// that has seen the rows and then counts the objects waits for this first.</summary>
+    private static Task SinkAtRestAsync(TestService service, string pipeline) =>
+        Eventually(() => service.Pipelines.Get(pipeline).Sinks.Single().WriteInFlightSince is null, $"the sink of '{pipeline}' to return from its write");
+
     [Fact]
     public async Task An_append_sink_told_to_retain_keeps_that_many_of_its_newest_objects_across_a_restart()
     {
@@ -1228,6 +1236,9 @@ public class FileConnectorTests : IDisposable
             var seen = i + 1;
             await EventuallyAsync(async () => (await AppendsAsync<Trade>("out/kept-")).LastOrDefault() == trades[seen - 1], $"record {seen} written");
         }
+        // The record is readable once its object is written; the object that makes one
+        // too many is deleted after that, in the same write.
+        await SinkAtRestAsync(service, "big");
         var before = await StepsAsync();
         Assert.Equal(3, before.Count);
         Assert.Equal(trades.Skip(5).Take(3), await AppendsAsync<Trade>("out/kept-"));
@@ -1238,6 +1249,7 @@ public class FileConnectorTests : IDisposable
         await service.Running("big");
         log.Append(trades[8]);
         await EventuallyAsync(async () => (await AppendsAsync<Trade>("out/kept-")).LastOrDefault() == trades[8], "a record after the restart");
+        await SinkAtRestAsync(service, "big");
         Assert.Equal(trades.Skip(6).Take(3), await AppendsAsync<Trade>("out/kept-"));
         Assert.Equal(3, Directory.GetFiles(Path.Combine(_root, "out")).Length);
     }
@@ -1287,6 +1299,13 @@ public class FileConnectorTests : IDisposable
             // step that set the fold off (it is above the checkpoint while it is written).
             Assert.InRange(Names().Length, 1, 4 + 2);
         }
+
+        // A fold writes its snapshot whole and then deletes what it stands for, the
+        // snapshot before it included, all inside the write of the step that set it off:
+        // for that moment there are two, and a reader takes the newer. The last round's
+        // rows are readable as soon as its step object is there, which can be that
+        // moment — so the listing is taken once the sink's write has returned.
+        await SinkAtRestAsync(service, "latest");
         var names = Names();
         Assert.Single(names, n => n.EndsWith(".snapshot.jsonl"));
         // The snapshot holds each live key once and no deleted one.
