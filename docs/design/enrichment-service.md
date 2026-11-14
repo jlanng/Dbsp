@@ -1608,7 +1608,79 @@ Everything else they raised is in the text above.
 
 Each has a default this design is built on.
 
-1. **Warm circuits on the standby** (default; built in S6 after S1 had taken the
+### Decide before production
+
+Chosen from the numbered items below by what a wrong default costs once something is deployed:
+persisted formats, upgrade rules, availability and data-loss trade-offs, exposure, and
+claims only AWS can check. Each was checked against the code in round four (S8); the
+numbers are the items' own, from the runs they cite.
+
+1. **Upgrades are in lockstep** (31). Every state-log value carries format byte 2
+   (`ChangelogStorageProvider.FormatTagged`), and a node built before a format change
+   cannot follow a leader built after it, so both nodes are replaced together. To allow
+   rolling upgrades later, every format byte shipped by then needs a reader kept for
+   ever; decide whether the first deployment must support them.
+2. **The `files` connector's formats are persisted** (22, 54, 63). Object names
+   (`{step:D19}-{term:D6}-{base:D19}.jsonl`) and the source's position packed into the
+   checkpoint's partition → offset map are what deployed pipelines resume from; changing
+   either later means a new connector name and moving every spec to it. A `files` input
+   on a `files` sink's prefix is refused, so pipelines are chained through Kafka or a
+   table until the sink gets a commit marker.
+3. **The writer's transaction timeout is 60 s** (67; `KafkaLogOptions.TransactionTimeout`).
+   A quorum outage longer than that moved the leadership in 3 of 4 runs (nothing lost,
+   the sink silent for about 86–89 s); a longer timeout keeps the leader but leaves the
+   partitions blocked that long when a writer dies holding a transaction. It is a
+   setting, cheap to change; what to set needs a zone loss on MSK, which has not been run.
+4. **Failover timing: `TakeoverAfter` 3 s, the ceiling 30 s** (32, 61, 64, 75). A bulk
+   load of five million rows stops a leader for about 2 s (61), close to the 3 s; a
+   takeover called off between one-second `InitTransactions` slices can still fence the
+   leader a takeover timeout later (64); a standby takes more than a processor for about
+   ten seconds per broker lost (75, found and not fixed). Decide the two timeouts for the
+   production cluster, and whether 75 must be fixed first.
+5. **Something must restart a node after exit codes 3, 4 and 5** (50). Without it a
+   deployment is one node after its first takeover; `NodeSupervisor` does it for a
+   process and, since S8, `NodeSupervisor.RunInProcessAsync` for the in-memory backend's
+   two nodes. Decide what does it in production (ECS, Kubernetes, systemd) with "start
+   again at once after 3 and 4, with a growing delay after 5".
+6. **The admin surface's exposure** (4, 5, 25, 30). With no authorization policy the API
+   answers loopback only; rows and exception messages are off; upload and rescan are
+   off; but a caller nobody authenticated may name itself (`AcceptOperatorHeader` is on),
+   and the audit then records `name (self-declared)`. Audit entries written under that
+   rule cannot be re-attributed later: decide the authorization policy, and whether the
+   header stays on, before the first operator uses it. Plugin code runs on both nodes
+   (warm standby builds).
+7. **What only AWS can verify** (33, 47, 48, 51, 59; the critic's J5). `UseMsk` is example
+   code that nothing calls; the IAM action table is translated from the ACLs tested on
+   `kafka-sasl`; the probe's broker question behind ACLs, token refresh over hours, a
+   zone loss and separate controllers have not been run; there is no S3 `IObjectStore`.
+   Decide who runs that check, on what cluster, and what has to pass.
+8. **Bounded state per tenant** (69, 70, 72). A keyed input without event time never
+   expires a row; a state that only grows is flagged and nothing more; the reference
+   definition's `openSeconds` defaults to an hour, about 9 GB of state per node at 1,000
+   trades a second. A per-spec limit on state entries is cheap to add on the existing
+   counts; decide whether production needs one, and the default window.
+9. **Event-time state from before manifest format 7 is refused, not migrated** (36).
+   *Moot for a first deployment:* only state committed by a build before format 7
+   (round three) is affected, and it needs `state=reset`. What remains is the precedent
+   for the next format change: refuse and reset, or migrate.
+
+**Decide before a second tenant:** a failing pipeline never moves the leadership and
+`Failed` is not durable (6, 7); plugins compile against `Incremental.Service` rather
+than an abstractions package (11), and the harness ships inside it (20); a `kafka` sink
+claims no topic, so two pipelines can overwrite each other's keys (40); a per-pipeline
+state limit (70); keep-or-reset asked for every change (9).
+
+**Can wait:** 2, 3, 8, 12–19, 23, 24, 26, 27, 29, 35, 38, 41–45, 49, 52, 53, 55–58,
+60, 62, 65, 66, 68, 71, 73, 74.
+
+**Made moot by later rounds:** 1 (warm standbys built, S6; 30 is the decision as it now stands), 10 (roll-back
+built, S6), 21 (closed by 53 once the successor writes), 28 and 46 (estimates and
+counts built, S7), 34 (the broker tests are a CI job started by hand, 74; the SASL run
+is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by 52).
+
+### The items
+
+1. *Moot (built, S6).* **Warm circuits on the standby** (default; built in S6 after S1 had taken the
    alternative — see item 30) — the standby loads plugin code and builds
    every confirmed circuit, as durability-and-standby.md specifies. It is what C1's
    layout marker and follower halves exist for. *Alternative:* the standby holds pipeline
@@ -1648,7 +1720,7 @@ Each has a default this design is built on.
    edit. *Alternative:* keep silently when only settings change — one request fewer for
    the commonest action, and silently wrong output whenever the setting feeds a filter
    or a key. `[StateNeutral]` is the escape for settings that truly do not.
-10. **An incompatible `keep` rolls back and reports.** *Alternative:* leave the pipeline
+10. *Moot (built, S6).* **An incompatible `keep` rolls back and reports.** *Alternative:* leave the pipeline
     stopped in `NeedsReset` — simpler, and a tenant's mistaken deploy takes their
     pipeline down until someone chooses. (Built in S6.)
 11. **Plugin authors reference `Incremental.Service`** (compile time only).
@@ -1696,7 +1768,7 @@ Each has a default this design is built on.
     out of the service's assembly, at the cost of one more package to version and of
     `InternalsVisibleTo` for it; the harness references no test framework, so the
     service gains no dependency by carrying it.
-21. **The files sink's reader rule is "highest term per step"** (S6), which a late
+21. *Moot once the successor writes (53).* **The files sink's reader rule is "highest term per step"** (S6), which a late
     write by a replaced leader can defeat when the new leader writes nothing for that
     step. *Alternative:* a marker object per term, written when a generation starts and
     naming the step it starts at, so that a reader discards older terms' objects at or
@@ -1732,7 +1804,7 @@ Each has a default this design is built on.
 27. **A long circuit is drawn in bands, at a readable size** (S6), rather than scaled
     down until it fits one row. *Alternative:* one row, scaled; the whole shape is
     visible at once and nothing can be read past a dozen operators.
-28. **A table's size is an estimate of its data, not of its memory** (S6: the mean JSON
+28. *Moot (the alternative built, S7).* **A table's size is an estimate of its data, not of its memory** (S6: the mean JSON
     size of a sample times the row count). *Alternative:* account for bytes as rows are
     written — a counter in `SharedTable`'s write path and a size function per row type,
     which is core work on the hot path of every table writer for a number that the
@@ -1769,7 +1841,7 @@ Each has a default this design is built on.
     (`{prefix}.reader`, `{prefix}.svc.blobs.{node}`, `incremental.source`): a quiet
     log, one more permission to get wrong, and `incremental.source` is not under the
     deployment's prefix.
-34. **The broker-stopping tests and the SASL run are not in CI.** They need three
+34. *Moot for the broker tests (a CI job started by hand, 74); the SASL run is still not in CI.* **The broker-stopping tests and the SASL run are not in CI.** They need three
     brokers whose containers the test may kill, take about ten minutes, and have run
     only here. *Alternative:* a nightly job on the `kafka3` and `kafka-sasl` profiles.
     What S7 moved into every run instead: the lost takeover, the stale request that
@@ -1793,7 +1865,7 @@ Each has a default this design is built on.
     from the keys of its state. The deadlines can be rebuilt; the watermark cannot, so
     the first late record after such a start would still reopen a window — once per
     pipeline, at the upgrade. It would also want an enumeration on every store.
-37. **State bytes are kept beside the typed stores until the first commit after a
+37. *Moot (the alternative is what happens, S7).* **State bytes are kept beside the typed stores until the first commit after a
     start** (S6), so a leader's idle pipeline holds its state twice for as long as it is
     idle. *Alternative:* commit once as soon as a circuit has started on existing state,
     without a step. The copy goes at once; it costs a transaction per start, and it
@@ -1813,7 +1885,7 @@ Each has a default this design is built on.
     *Alternative:* keep `OpenWriteAsync` and return a stream type with a `CommitAsync`;
     it leaves the old call compiling and every implementer with a stream class to write.
     Nothing has been published, so the break costs the hosts in this repository only.
-39. **A files source lists again at most once per `pollInterval` while it has names to
+39. *Moot (superseded by 52).* **A files source lists again at most once per `pollInterval` while it has names to
     read** (S6, second review); the rule a producer must keep is "names increase".
     *Alternative:* list before every object, which makes "an object whose name sorts
     after the position is read" exact up to the moment of the listing, at one listing
@@ -1852,7 +1924,7 @@ Each has a default this design is built on.
     New stores start empty, as ever, and a deadline store is a store. *Alternative:*
     refuse a `keep` that adds a deadline store beside a non-empty state store of the
     same operator.
-46. **A pipeline's state size is readable but not shown** (S7):
+46. *Moot (built, S7).* **A pipeline's state size is readable but not shown** (S7):
     `ChangelogStorageProvider.CountEntries()` walks the state, so it is not in the
     status the UI polls. *Alternative:* keep a running count per store and show it per
     pipeline; it is what would let an operator see a definition whose state grows for
@@ -2092,6 +2164,18 @@ Each has a default this design is built on.
     its lag during an outage, with the broker tests as its check; neither was built
     in this step, which found it in its last hour. The node's loop also waits on that
     lag question — a standby applies no catalog change while it is out.
+76. **Two in-memory nodes in one process start a node again when it loses the
+    leadership** (S8, J7; `NodeSupervisor.RunInProcessAsync`, `ServiceNode.Ended`), in
+    the example's `--nodes 2`, its two-node smoke and the AdminHost: the same name, the
+    same address, back as the standby. *Alternative:* leave the replaced node `Fenced`
+    for good, as before, and say in the UI that the in-memory mode does not restart
+    nodes; the leader then shows *no ready standby* until the program is restarted. The
+    in-memory cluster takes a node that leaves and one that joins, so nothing was found
+    that makes the restart unsound; it was not tried with a sink that hangs across it.
+77. **A node that does not lead shows no rates** (S8, J7): its overview tiles, and the
+    pipelines list's rate, lag and dead-letter columns, say the figures are on the
+    leader instead of showing zeroes. *Alternative:* show the columns with a dash, so
+    that the list keeps one shape on both nodes.
 
 ## Not verified
 
@@ -3862,10 +3946,12 @@ produced throughout, and ends by comparing the sink topic with the model.
 
 | | what happened |
 |---|---|
-| a rolling restart: each broker shut down (`docker stop -t 30`), five seconds, started, until every partition has all its replicas in sync | 21 runs (twelve as built, six with `request.timeout.ms` 5 s, three back at the default). In 16 the leader kept leading under term 1, the pipeline did not restart and the sink was complete. In 5 the leader lost the leadership (three of the twelve, two of the six), at the third broker — by then the leader of most partitions and the coordinator of the service's transactions: the leader's open transaction waited 10 to 30 s for the brokers to take its records (the writer logs it: `Kafka transaction has been waiting 30 s for the brokers to take its records`) and the standby saw no heartbeat for `TakeoverCeiling` and began a takeover. In 4 of those it completed and the old leader exited with 3; the test as it then was failed there ("the leader did not stay the leader", or a broken pipe to the node that had exited), **so the sink was not compared in any rolling run in which the leadership moved**. In 1 (`k3-rt5-2`) both nodes ended `Fenced` and exited with 3, and the test timed out with the sink at 7,930 rows of 10,660. The three rolling runs made after the test was corrected had no move |
-| each broker killed in turn (`docker kill`), eight seconds, started | nothing lost in 3 runs. In one nobody took over; in two the standby took over at the ceiling after the third broker's kill (the cluster took 43–48 s to be whole again that time, 8–17 s otherwise), and the old leader exited with 3 |
-| one broker shut down (`docker stop`, which is a controlled shutdown and not a kill, as this row first said), the leader `kill -9`ed 1.5 s later, the broker started under the new leader | the standby led 3.5–5.3 s after the kill (3 s of that is `TakeoverAfter`); the sink complete; the killed node back as a warm standby. Three runs. A broker lost in the same moment as the leader, without a word to the controller, costs more: S7, *The third review's findings*. |
-| two of three brokers killed for 70 s — no controller quorum, nothing writable — then started | the standby had started its takeover at the ceiling and completed it 0.6–3.8 s after the cluster was whole again, at term 2 (four runs); the old leader was fenced and exited with 3; the sink complete, the pipeline not restarted. (Before fix 3 below, that takeover failed and both nodes had exited.) |
+| a rolling restart: each broker shut down (`docker stop -t 30`), five seconds, started, until every partition has all its replicas in sync † | 21 runs (twelve as built, six with `request.timeout.ms` 5 s, three back at the default). In 16 the leader kept leading under term 1, the pipeline did not restart and the sink was complete. In 5 the leader lost the leadership (three of the twelve, two of the six), at the third broker — by then the leader of most partitions and the coordinator of the service's transactions: the leader's open transaction waited 10 to 30 s for the brokers to take its records (the writer logs it: `Kafka transaction has been waiting 30 s for the brokers to take its records`) and the standby saw no heartbeat for `TakeoverCeiling` and began a takeover. In 4 of those it completed and the old leader exited with 3; the test as it then was failed there ("the leader did not stay the leader", or a broken pipe to the node that had exited), **so the sink was not compared in any rolling run in which the leadership moved**. In 1 (`k3-rt5-2`) both nodes ended `Fenced` and exited with 3, and the test timed out with the sink at 7,930 rows of 10,660. The three rolling runs made after the test was corrected had no move |
+| each broker killed in turn (`docker kill`), eight seconds, started † | nothing lost in 3 runs. In one nobody took over; in two the standby took over at the ceiling after the third broker's kill (the cluster took 43–48 s to be whole again that time, 8–17 s otherwise), and the old leader exited with 3 |
+| one broker shut down (`docker stop`, which is a controlled shutdown and not a kill, as this row first said), the leader `kill -9`ed 1.5 s later, the broker started under the new leader † | the standby led 3.5–5.3 s after the kill (3 s of that is `TakeoverAfter`); the sink complete; the killed node back as a warm standby. Three runs. A broker lost in the same moment as the leader, without a word to the controller, costs more: S7, *The third review's findings*. |
+| two of three brokers killed for 70 s — no controller quorum, nothing writable — then started † | the standby had started its takeover at the ceiling and completed it 0.6–3.8 s after the cluster was whole again, at term 2 (four runs); the old leader was fenced and exited with 3; the sink complete, the pipeline not restarted. (Before fix 3 below, that takeover failed and both nodes had exited.) |
+
+† *No record of this run is in the repository (round four's check): the runs were kept in a session's scratch directory, which no longer exists. The row is the account written at the time; `docs/design/runs/` holds every run made since.*
 
 **A broker restart can move the leadership.** That is the finding of the two rows
 above, and it is not fully explained. While the partitions a broker led and the
@@ -4510,16 +4596,18 @@ input's acknowledgement to its row, who led, and every exit a supervisor saw.
 
 | scenario | runs | sink = model, one leader, one warm standby | leadership moved | node processes ended | sink silent: min / median / max |
 |---|---|---|---|---|---|
-| one broker killed, 20 s away — it was **not** the active controller | 10 | 10 | 0 | 0 | 7.7 / 9.9 / 10.8 s |
-| one broker killed, 20 s away — it **was** the active controller | 20 | 20 | 0 | 0 | 12.6 / 13.6 / 15.1 s, and once 26.0 s |
-| the active controller killed, 45 s away, the node's client log at debug | 20 | 20 | 0 | 0 | 12.4 / 13.6 / 15.0 s |
-| rolling restart: each of the three brokers shut down, 5 s, started | 30 | 30 | 0 | 0 | 0.6 / 1.1 / 1.8 s |
-| one broker frozen (`docker pause`) for 20 s | 6 | 6 | 0 | 0 | 10.6 / 14.7 / 15.7 s |
-| one broker frozen for 60 s | 3 | 3 | 0 | 0 | 12.6 / 13.4 / 14.4 s |
-| the same, the Kafka client's default settings (two sets of three) | 6 | 6 | **3**, at the ceiling | 3 (exit 3, started again) | 8.3 / 35.3 / 60.6 s |
-| every broker killed in turn, 15 s each, the next when every broker calls the cluster whole | 2 | 2 | 0 | 0 | 13.1 and 13.9 s |
+| one broker killed, 20 s away — it was **not** the active controller † | 10 | 10 | 0 | 0 | 7.7 / 9.9 / 10.8 s |
+| one broker killed, 20 s away — it **was** the active controller † | 20 | 20 | 0 | 0 | 12.6 / 13.6 / 15.1 s, and once 26.0 s |
+| the active controller killed, 45 s away, the node's client log at debug † | 20 | 20 | 0 | 0 | 12.4 / 13.6 / 15.0 s |
+| rolling restart: each of the three brokers shut down, 5 s, started † | 30 | 30 | 0 | 0 | 0.6 / 1.1 / 1.8 s |
+| one broker frozen (`docker pause`) for 20 s † | 6 | 6 | 0 | 0 | 10.6 / 14.7 / 15.7 s |
+| one broker frozen for 60 s † | 3 | 3 | 0 | 0 | 12.6 / 13.4 / 14.4 s |
+| the same, the Kafka client's default settings (two sets of three) † | 6 | 6 | **3**, at the ceiling | 3 (exit 3, started again) | 8.3 / 35.3 / 60.6 s |
+| every broker killed in turn, 15 s each, the next when every broker calls the cluster whole † | 2 | 2 | 0 | 0 | 13.1 and 13.9 s |
 | two of three brokers away for 40 s or 70 s | | | | | see *The third review's findings*: the rows that stood here (0 moves in 3 runs at 40 s; 4 in 4 at 70 s) were not reproduced by the review — in three of its four 40 s outages the standby did not hold — and are measured again there |
-| one broker killed and away for 10 min 10 s, the leader's process killed after 5 min | 1 | 1 | 1, which is the test: the standby led 3.5 s after the kill, on two brokers | 1 (the killed leader; started again, a warm standby on two brokers) | 10.8 s, at the broker's loss |
+| one broker killed and away for 10 min 10 s, the leader's process killed after 5 min † | 1 | 1 | 1, which is the test: the standby led 3.5 s after the kill, on two brokers | 1 (the killed leader; started again, a warm standby on two brokers) | 10.8 s, at the broker's loss |
+
+† *No record of this row's runs is in the repository: see the paragraph above the table. The two-broker rows were measured again, with records, in* The third review's findings*.*
 
 One thing the 70-second runs of that step showed stands, though their row does not:
 a node started by its supervisor while the brokers were still down could not create
@@ -4563,7 +4651,7 @@ leadership stays.
 controller, the transaction coordinator of the deployment's writer, leader of the
 leader topic's partition, of a state partition, of an input partition, of the sink's):
 
-| run | broker killed (what it was) | sink silent, s | slowest trade, s | leads afterwards | leadership moved |
+| run † | broker killed (what it was) | sink silent, s | slowest trade, s | leads afterwards | leadership moved |
 |---|---|---|---|---|---|
 | 1 | 1 (coordinator, state, sink) | 9.6 | 9.6 | a, term 1 | no |
 | 2 | 2 (controller, coordinator, state, input) | 13.1 | 1.3 | a, term 1 | no |
@@ -4596,16 +4684,20 @@ leader topic's partition, of a state partition, of an input partition, of the si
 | 29 | 2 (controller, coordinator, leader-topic, state, input) | 15.1 | 2.4 | a, term 1 | no |
 | 30 | 3 (controller, leader-topic, state, input) | 14.2 | 1.7 | a, term 1 | no |
 
+† *These thirty runs' records were in the same scratch directory and are gone; the table is the account written at the time.*
+
 **Every rolling restart** (all thirty: the sink equal to the model, node a leading at
 term 1 afterwards, node b standing by, no node process ended):
 
-| run: silent s / slowest trade s | | | | | |
+| run † : silent s / slowest trade s | | | | | |
 |---|---|---|---|---|---|
 | 1: 1.2 / 0.9 | 2: 1.4 / 1.3 | 3: 1.2 / 1.1 | 4: 1.2 / 1.2 | 5: 1.6 / 0.7 | 6: 0.7 / 0.7 |
 | 7: 1.4 / 1.1 | 8: 1.3 / 1.3 | 9: 1.0 / 1.0 | 10: 1.1 / 1.5 | 11: 0.6 / 0.6 | 12: 1.0 / 1.5 |
 | 13: 1.2 / 1.1 | 14: 0.7 / 0.7 | 15: 1.1 / 1.4 | 16: 1.0 / 1.5 | 17: 0.8 / 0.7 | 18: 1.1 / 1.1 |
 | 19: 1.1 / 1.1 | 20: 1.1 / 1.2 | 21: 1.7 / 1.3 | 22: 1.4 / 1.4 | 23: 1.3 / 1.4 | 24: 0.7 / 0.7 |
 | 25: 1.8 / 1.8 | 26: 1.1 / 0.7 | 27: 1.3 / 1.3 | 28: 1.2 / 1.1 | 29: 1.2 / 1.2 | 30: 0.9 / 0.9 |
+
+† *The same: these runs' records are gone with the scratch directory.*
 
 **Before and after.** The same two tests as they stood at the start of this step —
 stock client settings, containers at changing addresses, the next broker killed 2 s
@@ -6196,3 +6288,153 @@ of 17, the four smokes (55, 69 and 69 claims, and the narrative's 13). Records:
   been moved out of the classes that run side by side is put down to what then ran
   beside it, and was not shown. Every failure of a test in this step's runs, here and
   on the runners, has its cause in the table above.
+
+#### The admin UI read as an operator reads it, and the decision list (J2, J7, J8)
+
+**The shifted columns (J2).** The overview's Tables card had a Memory header and no
+Memory cell, so a table's version showed under Memory and its readers under Version;
+the tables list had the cell and not the header, so every column after Rows was under
+its neighbour's name. Both came from building the header row and the cells separately.
+Every table with a header row in the UI's scripts is now drawn by one helper, `grid`
+(`wwwroot/app.js`), from a list of columns given once: a column's label is the header's
+text and every cell's `data-label`, which the phone layout prints beside the value. A
+column left out (a standby's, or a button nobody may press) is left out of both.
+Sixteen of the seventeen tables with a header row were moved to it; the plugin diff (grouped rows with
+a cell spanning four columns) is the one still built by hand. Going through them found
+no third mismatch in count; it found labels that differed from their header only in
+the pipelines list's spark column (header "Records in, last minute", cell "Last
+minute"; now "In, last minute" for both).
+
+The check is `AdminUiTablesTests`: a two-node AdminHost with the generator running, the
+UI's own files plus `Ui/tables-check.js`, and headless Chrome with `--dump-dom`, as the
+morph test. The script visits every page that lists something — overview, pipelines,
+one pipeline's overview, topology and faults, tables, one table, plugins, dead letters,
+cluster, audit — on the leader and then on the standby, and for every table with a
+header row checks each body row: cells (a `colspan` counted for what it spans) against
+headers, and each `data-label` against its header's text. A page that should list
+something and shows no row fails, as does a view that failed to draw or anything on the
+console. The live feed is an `EventSource` that never ends, which stops a headless
+browser's virtual clock for good; `Ui/tables-stub.js`, loaded first, replaces it, and
+the UI then loads each page by itself. About 9 s for both nodes. CI's runners have
+Chrome (the morph test is not among the skips of `build-and-test`), so it runs on every
+push. Mutations: a `grid` that drops the Memory cell (the J2 shape) and one that labels
+Rows "Row count": both killed, on the overview, the tables list and the state table.
+
+**What read wrong (J7).** Used with the example's two in-memory nodes and its generator
+for about fifteen minutes, on the leader and the standby, at 1440 and 390 px, light and
+dark, before and after a takeover:
+
+- *A standby's builds shown as starts.* "Last start of each pipeline" listed a
+  standby's warm builds as starts, "built at start", with Start and Edges at 0 µs. A
+  standby build is the record with run 0: it is now "standby build", Start and Edges
+  are a dash ("not started"), and on a node whose every row is one the card is called
+  *Standby build of each pipeline*. A takeover's starts read "warm start" or "built at
+  start". The first version of the dash was one DOM node placed in every row, and a node
+  can be in one place: it showed in the last row only. Seen in the browser, fixed, and
+  written into CLAUDE.md's UI rules.
+- *Two notations for one position.* A source read `0:10,209 / trades#p0:10,209`. It is
+  now one line per partition, `p0 10,209 / 10,209` (or `10,209 / 10,209` for a source
+  with one), read / committed, under the header *Position: read / committed* with a
+  tooltip. A connector that keeps more in the checkpoint than the partitions it reads by
+  — the `files` source's name banks — had them printed as offsets in the hundreds of
+  millions; they are counted ("and 13 more checkpoint entries") instead.
+- *A fenced in-memory node never came back* — see below.
+- *A standby's zeroes.* The standby's overview showed Records in 0/s, Records out 0/s
+  and Step latency "–, no steps in the last second", and its pipelines list In /s 0,
+  Out /s 0, a flat spark and Dead letters 0 for every pipeline — figures it does not
+  measure. The tiles now say the rates are on the leader; the list leaves out the rate,
+  lag and dead-letter columns on a node that does not lead and says so in its lede
+  (Open for James 77).
+- *The peer standby's term* read 0 for a standby that has never led; it says so.
+- *The growth flag* (J1's): the overview's attention entry read "grown without a pause
+  since 32 min ago"; it reads "for 32 min". The list's badge had an ISO timestamp as its
+  tooltip; a local time now. The flag itself was not seen raised in the browser: no
+  example pipeline grows any more, and the thirty-minute period was not waited out.
+- *State entries* ("One entry") read "0 B" for a store whose key and value have no
+  objects of their own (a deadline store keyed by a long); "none", with a tooltip saying
+  the Memory column is the map.
+- *The phone layout.* At 390 px a store's name in the state table broke a letter per
+  line. Sources, sinks, state stores, a pipeline's tables, definitions and the cluster's
+  table lag now use the card layout that the lists already had. No page scrolls
+  sideways at 375 px of content.
+- *The pipeline tile's text* "upserts, deletes and appe…" was cut at 1440 px; it is
+  "upserts, deletes, appends".
+
+Console: no message on the pages visited after the fixes, in light and dark, at 1440 and
+390 px; the
+content security policy is the one served, unchanged (no inline style or script was
+added: the meter widths go through the CSSOM as before). Retaken: `docs/images/admin/`
+overview, pipeline and cluster-standby (AdminHost), `docs/images/enrichment-service/`
+overview and pipeline (the example). The guide's *takeover* screenshot is of the Kafka
+mode and still shows the old "warm" label; it was not retaken.
+
+**A fenced in-memory node comes back (J7).** In the example's and the AdminHost's
+`--nodes 2` the node a takeover replaced stayed `Fenced`, and the new leader showed
+*Degraded: no ready standby* until the program was restarted. The in-memory cluster
+takes a node that leaves (`DisposeAsync` removes it) and one that joins (it is the
+standby if a leader exists), so the same supervisor contract as on Kafka was built in
+the process instead of saying the mode cannot do it:
+
+- `ServiceNode.Ended` (`Task<int>`) completes with what the process would exit with — 3
+  replaced, 4 resigned, 5 could not lead — once the node's circuits are abandoned.
+- `NodeSupervisor.RunInProcessAsync<THost>(start, node, started, options, stop)` waits
+  for it, disposes the host, and starts it again under the same name and address: at
+  once after 3 and 4, with the doubling delay of `RunAsync` otherwise, and a start that
+  throws is retried the same way. The host it holds when `stop` is cancelled is the
+  caller's to dispose, in the order its nodes need.
+- The example's `--nodes 2`, its two-node smoke (a seventieth claim: a is back, warm,
+  behind b) and the AdminHost (`DemoOptions.SuperviseNodes`, on in its program and off
+  in the tests that look at a fenced node) use it. Both programs now take SIGTERM as the
+  stop request: with nodes that come back, a node's host stopping no longer ends the
+  program, and the AdminHost, which waited for Ctrl+C alone, ignored a SIGTERM.
+- `InProcessSupervisorTests`: a takeover (a ends with 3 and is the warm standby behind b
+  under the same name and URL, and b's health loses *no-ready-standby*), then a step-down
+  (b ends with 4, a leads, b comes back). Mutations: `Ended` not completed, the
+  supervisor not starting again, the old host not disposed (its port still taken): all
+  three killed. Measured once in the example: the replaced node was a warm standby again
+  within the six seconds before the first look.
+
+**The decision list (J8).** *Open for James* now begins with *Decide before production*:
+nine items (lockstep upgrades; the `files` formats; the transaction timeout; failover
+timing with 61, 64 and 75; the restart contract; the admin surface's exposure; what
+needs AWS; bounded state per tenant; and event-time state before format 7, which is moot
+for a first deployment), a line for *before a second tenant*, one for *can wait*, and
+the items later rounds made moot, which are also marked in place. Each was checked
+against the code as it is now: the 60 s `TransactionTimeout`, `TakeoverAfter` 3 s and
+`TakeoverCeiling` 30 s, `FormatTagged = 2`, manifest format 7 with the 6 → 7 refusal
+for event-time circuits, `AcceptOperatorHeader` on and `ExposeRowData`,
+`AllowPluginUpload` and `AllowPluginRescan` off, `UseMsk` called by nothing, no S3
+store, `OpenSeconds` 3,600. Nothing was renumbered or deleted. The rows of S6's and
+S7's broker tables whose run records were in a scratch directory that is gone carry a
+dagger and a footnote: S6's four three-broker rows, S7's summary rows other than the
+two-broker ones, its thirty kills and its thirty rolling restarts.
+
+**Public API added.** `ServiceNode.Ended`; `NodeSupervisor.RunInProcessAsync<THost>`.
+Test host: `DemoOptions.SuperviseNodes`, `DemoNode : IAsyncDisposable`. UI: `grid` on
+`window.__admin`.
+
+**Deviations.**
+
+- The pipelines list has fewer columns on a node that does not lead (Open for James 77).
+- The plugin diff table is not drawn by `grid`; the check covers it (its rows span).
+- `--dump-dom` with a stubbed `EventSource` checks the pages as loaded by polling, not as
+  updated by the live feed; a view that redraws differently on a feed tick is not
+  covered.
+- A graceful stop of the two-node in-memory program still steps the leader down to the
+  standby on the way out (each node's host hears the signal); with the supervisor
+  watching, the resigned node could be started again in the moment before the program
+  ends. It is disposed with the others; nothing was seen go wrong in the runs made.
+
+**Numbers.** On the final tree: build 0 warnings; `tests/Incremental.Tests` 710, 709
+passed, 1 skipped; `tests/Incremental.Kafka.Tests` 134/134; `tests/Incremental.Service.Tests`
+253, 247 passed, 6 skipped (the kafka3 broker tests); `Pipelines.Tests` 17/17. Smokes:
+`--headless` 55 claims, `--headless --nodes 2` 70, `--headless --kafka` 69 (2.8 s from
+the kill to b leading), `TradeEnrichment` 13; all exit 0. `benchmarks -- --assert` was
+not run: `src/Incremental` was not touched.
+
+**Left undone.**
+
+- The growth flag and its notice were read in the code and not seen raised in a browser.
+- The guide's takeover screenshot (Kafka) was not retaken.
+- The in-process restart was not tried with a sink that hangs across it, nor with
+  `DeposedWriteTimeout` running out.

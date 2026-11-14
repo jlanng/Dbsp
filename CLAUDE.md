@@ -44,7 +44,8 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   standby on 5181; `--read-only`, `--no-rows`, `--port`;
   `--ui-dir src/Incremental.Service.Admin/wwwroot` serves the UI's files from the checkout,
   so an edit is a browser reload away). The admin API's tests (`AdminApiTests`) run that
-  host on a free port.
+  host on a free port. With two nodes a node that loses the leadership is started again
+  in the process (`DemoOptions.SuperviseNodes`), as in the example's `--nodes 2`.
 - Enrichment service example: `dotnet run --project examples/Incremental.EnrichmentService`
   serves one in-memory node with the admin UI at http://127.0.0.1:5180/admin/ and its sinks
   at `/views` (`-- --nodes 2`: a standby on 5181). `-- --kafka --node a` and
@@ -306,7 +307,9 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   (replaced, resigned) and are answered at once; 5 is a node that could not lead —
   including a takeover of its own that failed after it had taken the log
   (`LeadershipStatus.TakeoverFailed`) — and is answered with a growing delay. Do not
-  map a failure of the node's own to 3.
+  map a failure of the node's own to 3. Nodes that share a process (the in-memory
+  backend's two) cannot exit for it: their `ExitOnLeadershipLoss` is off and
+  `NodeSupervisor.RunInProcessAsync` starts one again on `ServiceNode.Ended`.
   The ceiling's question to the brokers (`KafkaLog.ProbeWritePathAsync`) does not
   believe the metadata's lists of leaders and replicas in sync by themselves: with no
   controller quorum they never change. It asks any broker for the metadata and each
@@ -564,6 +567,13 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     `morph` sets form controls' properties (selection, `checked`, an unfocused
     field's `value`) from the new tree: `AdminUiMorphTests` runs `Ui/morph-tests.js`
     in a headless Chrome and is the check.
+    Every table with a header row is drawn by `grid` (`app.js`), which takes each column
+    once: its label is the header's text and every cell's `data-label` (the phone
+    layout's label), so the two cannot disagree. Do not build a `thead` by hand.
+    `AdminUiTablesTests` runs `Ui/tables-check.js` in headless Chrome against a two-node
+    AdminHost with data and fails on a row whose cells do not match its headers in
+    number or name, on the leader and on the standby. A DOM node made once and placed
+    in many cells lands in the last one only: make it per cell.
     A field whose text may not be a value yet (JSON for an array or object setting)
     keeps the text as a draft, and a form with a draft on screen is not sent; a dialog
     is closed when the route moves to another page.

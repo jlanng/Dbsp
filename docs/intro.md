@@ -1292,7 +1292,9 @@ What to know before relying on it:
 
 `InMemoryServiceCluster` gives several nodes in one process — `cluster.Node("a")`,
 `cluster.Node("b")` — with real fencing, which is how the takeover order is tested without
-a broker.
+a broker. Two such nodes cannot end the process when one stops leading;
+`NodeSupervisor.RunInProcessAsync` starts that one again on `ServiceNode.Ended`, under the
+same name and address, as the standby.
 
 **On Kafka, for availability.** The load fits one node; the second process exists so that
 losing the first costs seconds. Both are configured alike except for their names:

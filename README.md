@@ -493,7 +493,8 @@ so implementations never see cross-thread access to one store.
 
   `dotnet run --project tests/Incremental.Service.AdminHost` runs it against three tables
   and eight pipelines on the in-memory backend (`-- --nodes 2` for a leader and a standby
-  on ports 5180 and 5181; `--read-only`, `--no-rows`).
+  on ports 5180 and 5181, a replaced node started again in the process as the standby;
+  `--read-only`, `--no-rows`).
 
   How it behaves at size is measured by `benchmarks/Incremental.Service.Scale`: two node
   processes on Kafka, a table of millions of wide rows shared by twenty pipelines, large

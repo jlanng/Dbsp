@@ -73,9 +73,12 @@ is what the two alert pipelines drop.
 
 With `--nodes 2`, take over from the standby's *Cluster* page (or
 `curl -X POST 'http://127.0.0.1:5181/admin/api/node/takeover?confirm=b' -H 'X-Incremental-Admin: 1'`).
-The terminal then shows one warning — `Service node a is Fenced; it will not lead again
-in this process` — and b's page shows every pipeline Running; a's page says it is fenced
-and links to b.
+The terminal then shows `Service node a is Fenced; it will not lead again in this
+process` and `node supervisor: node a ended with exit code 3 (fenced: another node
+leads) … starting it again in 200 ms`: b's page shows every pipeline Running, and
+within a few seconds a is the standby again, behind b and ready to take over — two
+nodes in one process are supervised in that process (`NodeSupervisor.RunInProcessAsync`;
+the guide, *A node that stops leading exits*).
 
 ### Two nodes on Kafka
 

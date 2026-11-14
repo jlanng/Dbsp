@@ -1695,8 +1695,9 @@ is many minutes of event time behind the watermark: the windowed sinks must equa
 model that leaves it out. The alert files and the dead letters are read back
 with `FileSinkFormat` and compared too: every alert once, every dropped record there.
 On Kafka the first node runs under its supervisor, the kill is of the node alone, and
-the last claim is that it came back as a warm standby without anybody starting it.
-A claim that does not hold exits 1 (55 claims in memory, 69 with two nodes, 69 on
+the last claim is that it came back as a warm standby without anybody starting it; with
+two nodes in memory the last claim is the same, of the supervisor in the process.
+A claim that does not hold exits 1 (55 claims in memory, 70 with two nodes, 69 on
 Kafka). CI runs the two in-memory ones on every build, and the Kafka one in a job of its
 own that starts the connector stack from `docker-compose.yml` and also runs the Kafka
 and Kafka-backed service tests, failing if any of them was skipped
@@ -1717,7 +1718,8 @@ is cut short with *show all*.
 ![Overview](images/enrichment-service/overview.png)
 
 **A pipeline.** Rates, step latency, how long commits wait for sinks, checkpoint age and
-input lag; per source the position read and the position committed; per sink what was
+input lag; per source, partition by partition, the offset it has read to and the
+offset its last checkpoint covers (where a restart resumes); per sink what was
 delivered; per table the version the pipeline's checkpoint has committed beside the
 table's current one; and its state, store by store — entries, counted, and the bytes
 of this node's heap they take, estimated, with the size of one entry and of one record
@@ -1810,8 +1812,11 @@ what the collector has committed and is not using, and what is not the collector
 and says what the node has given back to the operating system since it started
 (*Sizing a node*). On a standby, how ready it is to lead, and why not if it is not,
 with how many pipelines it has built, is still building and leaves to be built at a
-takeover. Below, each pipeline's last start on this node: warm (built while standing by)
-or built at the start, and what the plugin, the build, the start and the sources took.
+takeover. Below, each pipeline's last start on this node: a warm start (built while
+standing by) or built at the start, and what the plugin, the build, the start and the
+sources took. On a standby that has not led, the same card is its standby builds: the
+plugin and the build, and no start, since a takeover does that. A node that does not lead
+shows no rates — its overview and pipelines list say they are on the leader.
 
 ![A standby](images/enrichment-service/standby.png)
 
@@ -1897,6 +1902,33 @@ minutes, which is long: a `Deployment` of one replica per node id, or a `Statefu
 and an alert on `node.role`); in ECS a service. Where there is no platform — a terminal,
 a container whose entry point is the node — `NodeSupervisor.RunAsync(args)` is the same
 contract in the process itself, as the example uses it (*On Kafka, with a standby*).
+
+Two nodes that share a process — the in-memory backend's two nodes, as the example's
+`--nodes 2` and the admin test host run them — cannot end the process when one of them
+stops leading. `ServiceNode.Ended` completes with the code the process would have exited
+with, and `NodeSupervisor.RunInProcessAsync` keeps the same contract for such a node: it
+disposes the node's host and starts it again under the same name and address, at once
+after 3 and 4 and with the growing delay otherwise. The node's `ExitOnLeadershipLoss`
+must be off. The example:
+
+<!-- snippet: examples/Incremental.EnrichmentService/Program.cs#in-process-supervisor -->
+```csharp
+// Two nodes in one process: a node that lost the leadership cannot end the
+// process, so it is started again in it, on the same cluster, port and name, and
+// comes back as the standby — the contract NodeSupervisor keeps for a process.
+for (var i = 0; i < nodes.Count; i++)
+{
+    var index = i;
+    ExampleNode? running = nodes[i];
+    supervisors.Add(NodeSupervisor.RunInProcessAsync(
+        _ => Interlocked.Exchange(ref running, null) is { } first
+            ? Task.FromResult(first)
+            : ExampleNode.StartAsync(world, options, index == 0 ? "a" : "b", options.Port + index, cluster, exitOnLeadershipLoss: false),
+        n => n.Node,
+        n => nodes[index] = n,
+        stop: stop.Token));
+}
+```
 
 One takeover does not end the node: one that is lost before the node has become the
 log's writer — the leader was heard again while the standby was on its way, or another
