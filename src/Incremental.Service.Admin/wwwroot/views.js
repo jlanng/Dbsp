@@ -80,7 +80,7 @@
         if (p.stateGrowingSince)
           attention.push(h('li', { key: 'g' + p.id }, h('span', { class: 'badge warn' }, 'Growing'),
             h('div', { class: 'text' }, pipelineLink(p.id), h('span', { class: 'sub' },
-              `its state has grown without a pause since ${ago(p.stateGrowingSince)}, to ${plural(p.stateSize ? p.stateSize.entries : 0, 'entry', 'entries')}: something kept per record is never closed`))));
+              `its state has grown without a pause for ${fmtMs(Date.now() - new Date(p.stateGrowingSince).getTime())}, to ${plural(p.stateSize ? p.stateSize.entries : 0, 'entry', 'entries')}: something kept per record is never closed`))));
       }
       for (const p of pipelines.items) {
         if (!lastKnown() && p.waiting)
@@ -106,12 +106,17 @@
           h('div', { class: 'facts' }, nodeFacts(node))),
 
         h('div', { class: 'tiles' },
-          tile('Records in', rate(total.in), '/s', `${fmtInt(total.steps || 0)} steps in the last second`, spark(seriesOf('', 'in'), { label: 'Records in per second', unit: '/s' })),
-          tile('Records out', rate(total.out), '/s', 'delivered to sinks', spark(seriesOf('', 'out'), { cls: 'out', label: 'Records out per second', unit: '/s' })),
+          role !== 'Leader'
+            ? tile('Records in', '–', '', 'this node runs no pipeline: rates are on the leader', null)
+            : tile('Records in', rate(total.in), '/s', `${fmtInt(total.steps || 0)} steps in the last second`, spark(seriesOf('', 'in'), { label: 'Records in per second', unit: '/s' })),
+          role !== 'Leader'
+            ? tile('Records out', '–', '', 'nothing is delivered from here', null)
+            : tile('Records out', rate(total.out), '/s', 'delivered to sinks', spark(seriesOf('', 'out'), { cls: 'out', label: 'Records out per second', unit: '/s' })),
           standby
             ? tile('State lag', fmtNum(live.stateLag ?? (st.standby && st.standby.stateLagRecords)), 'records', 'behind the state log', null)
             : tile('Input lag', total.lag == null ? '–' : fmtNum(total.lag), total.lag == null ? '' : 'records', total.lag == null ? 'no source reports lag' : 'across every source', spark(seriesOf('', 'lag'), { cls: 'neutral', label: 'Input lag in records' })),
-          tile('Step latency', total.stepMs == null ? '–' : fmtMs(total.stepMs), '', total.stepMaxMs == null ? 'no steps in the last second' : `slowest ${fmtMs(total.stepMaxMs)}`, spark(seriesOf('', 'stepMs'), { cls: 'neutral', label: 'Mean step latency', unit: ' ms' }))),
+          role !== 'Leader' ? tile('Step latency', '–', '', 'steps run on the leader', null)
+            : tile('Step latency', total.stepMs == null ? '–' : fmtMs(total.stepMs), '', total.stepMaxMs == null ? 'no steps in the last second' : `slowest ${fmtMs(total.stepMaxMs)}`, spark(seriesOf('', 'stepMs'), { cls: 'neutral', label: 'Mean step latency', unit: ' ms' }))),
 
         h('div', { class: 'split' },
           h('div', { class: 'stack' },
@@ -205,6 +210,8 @@
           return (x < y ? -1 : x > y ? 1 : a.id.localeCompare(b.id)) * dir;
         });
       const set = patch => ctx.setQuery({ ...Object.fromEntries(ctx.query), ...patch });
+      // A node that does not lead runs no pipeline: its rates are zeroes, not measurements.
+      const runsNothing = !!store.node && store.node.role !== 'Leader';
       const toggle = state => {
         const next = new Set(chosen);
         next.has(state) ? next.delete(state) : next.add(state);
@@ -213,7 +220,8 @@
 
       return h('div', { class: 'stack' },
         pageHead({
-          title: 'Pipelines', lede: 'One circuit each. Deployed, replaced and restarted one at a time while the others run.',
+          title: 'Pipelines', lede: runsNothing ? ['One circuit each. This node runs none of them, so their rates, lag and dead letters are on the leader', leaderLink(' (', ')'), '; here is what it holds of each.']
+            : 'One circuit each. Deployed, replaced and restarted one at a time while the others run.',
           actions: canAct() && h('button', { class: 'btn primary', type: 'button', on: { click: () => A.deployDialog({ after: ctx.reload }) } }, icon('plus', 14), 'Deploy'),
         }),
         lastKnown() && notice('warn', h('strong', null, 'These states are the last this node saw. '),
@@ -231,16 +239,16 @@
               { label: 'Pipeline', sort: 'id', cellCls: 'id', cell: p => pipelineLink(p.id) },
               { label: 'State', sort: 'state', cell: p => [pipelineBadge(p.state), p.blockedOn && h('span', { class: 'sub' }, blockedText(p.blockedOn)), p.pending && h('span', { class: 'sub' }, `unfinished ${p.pending}`)] },
               { label: 'Definition', sort: 'definition', cell: p => [p.definition, h('span', { class: 'sub mono' }, `${p.plugin}@${short(p.version)}`)] },
-              { label: 'In /s', sort: 'in', cls: 'r', cell: p => rate(rowRates(p).in) },
-              { label: 'In, last minute', sr: true, cellCls: 'spark', cell: p => spark(seriesOf(p.id, 'in'), { label: `${p.id}: records in per second`, unit: '/s' }) },
-              { label: 'Out /s', sort: 'out', cls: 'r', cell: p => rate(rowRates(p).out) },
-              { label: 'Step', sort: 'step', cls: 'r', cell: p => { const r = rowRates(p); return r.batchedEveryS ? h('span', { title: `It has stepped about every ${r.batchedEveryS} s lately — a sink’s minimum interval, or an input that is quiet; rates are over the last ${r.rateOverS} s` }, `every ${r.batchedEveryS} s`)
+              !runsNothing && { label: 'In /s', sort: 'in', cls: 'r', cell: p => rate(rowRates(p).in) },
+              !runsNothing && { label: 'In, last minute', sr: true, cellCls: 'spark', cell: p => spark(seriesOf(p.id, 'in'), { label: `${p.id}: records in per second`, unit: '/s' }) },
+              !runsNothing && { label: 'Out /s', sort: 'out', cls: 'r', cell: p => rate(rowRates(p).out) },
+              !runsNothing && { label: 'Step', sort: 'step', cls: 'r', cell: p => { const r = rowRates(p); return r.batchedEveryS ? h('span', { title: `It has stepped about every ${r.batchedEveryS} s lately — a sink’s minimum interval, or an input that is quiet; rates are over the last ${r.rateOverS} s` }, `every ${r.batchedEveryS} s`)
                 : r.stepMs == null ? '–' : fmtMs(r.stepMs); } },
-              { label: 'Lag', sort: 'lag', cls: 'r', cell: p => { const r = rowRates(p); return r.lag == null ? '–' : fmtNum(r.lag); } },
+              !runsNothing && { label: 'Lag', sort: 'lag', cls: 'r', cell: p => { const r = rowRates(p); return r.lag == null ? '–' : fmtNum(r.lag); } },
               { label: 'State size', sort: 'state-size', cls: 'r', cell: p => (!p.stateSize || !p.stateSize.entries ? h('span', { class: 'muted' }, 'none')
                 : [fmtNum(p.stateSize.entries), h('span', { class: 'sub' }, '≈ ' + fmtBytes(p.stateSize.bytes)),
-                  p.stateGrowingSince && h('span', { class: 'badge warn', title: `Grown without a pause since ${p.stateGrowingSince}` }, 'growing')]) },
-              { label: 'Dead letters', sort: 'dead', cls: 'r', cell: p => (p.deadLetters ? h('a', { href: '#/pipelines/' + enc(p.id) + '/dead-letters' }, fmtNum(p.deadLetters)) : '0') },
+                  p.stateGrowingSince && h('span', { class: 'badge warn', title: `Grown without a pause since ${stamp(p.stateGrowingSince)}` }, 'growing')]) },
+              !runsNothing && { label: 'Dead letters', sort: 'dead', cls: 'r', cell: p => (p.deadLetters ? h('a', { href: '#/pipelines/' + enc(p.id) + '/dead-letters' }, fmtNum(p.deadLetters)) : '0') },
               { label: 'In state', sort: 'since', cls: 'r', cell: p => timeEl(p.since) },
             ], shown, { key: p => p.id, cls: 'data cards', sort: (key, label, cls) => sortHeader(ctx, key, label, cls) })),
           pipelines.capped && h('div', { class: 'pager' }, h('span', { class: 'info' }, `Showing the first ${fmtInt(pipelines.items.length)} of ${fmtInt(pipelines.total)}. Filter on the server with the API's q and state parameters.`))));
@@ -349,7 +357,7 @@
 
       h('div', { class: 'tiles' },
         tile([h('span', { class: 'swatch in' }), 'Records in'], rate(r.in), '/s', r.batchedEveryS ? `a step every ${r.batchedEveryS} s · rate over the last ${r.rateOverS} s` : `${fmtInt(r.steps || 0)} steps in the last second`, spark(seriesOf(id, 'in'), { label: 'Records in per second', unit: '/s' })),
-        tile([h('span', { class: 'swatch out' }), 'Records out'], rate(r.out), '/s', 'upserts, deletes and appends', spark(seriesOf(id, 'out'), { cls: 'out', label: 'Records out per second', unit: '/s' })),
+        tile([h('span', { class: 'swatch out' }), 'Records out'], rate(r.out), '/s', 'upserts, deletes, appends', spark(seriesOf(id, 'out'), { cls: 'out', label: 'Records out per second', unit: '/s' })),
         tile('Step latency', r.stepMs == null ? '–' : fmtMs(r.stepMs), '', r.batchedEveryS ? `a step every ${r.batchedEveryS} s; a sink’s minimum interval is part of its step` : r.stepMaxMs == null ? 'no steps in the last second' : `slowest ${fmtMs(r.stepMaxMs)}`, spark(seriesOf(id, 'stepMs'), { cls: 'neutral', label: 'Mean step latency', unit: ' ms' })),
         tile('Sink-ack wait', r.ackMs == null ? '–' : fmtMs(r.ackMs), '', 'per commit, waiting for sinks', spark(seriesOf(id, 'ackMs'), { cls: 'neutral', label: 'Sink acknowledgement wait', unit: ' ms' })),
         tile('Checkpoint age', r.checkpointAgeS == null ? '–' : r.checkpointAgeS < 1 ? '< 1 s' : fmtMs(r.checkpointAgeS * 1000), '', p.committedStep == null ? 'no committed step' : `committed step ${fmtInt(p.committedStep)}`, spark(seriesOf(id, 'checkpointAgeS'), { cls: 'neutral', label: 'Checkpoint age', unit: ' s' })),
@@ -375,7 +383,7 @@
               { label: 'Lag', cls: 'r', cell: src => (src.lag == null ? '–' : fmtNum(src.lag)) },
               { label: 'Unreadable', cls: 'r', cell: src => fmtNum(src.unreadable) },
               { label: 'Position: read / committed', title: 'Per partition of the input: the offset of the last record read, and the one the last committed checkpoint covers — where a restart resumes', cellCls: 'mono wrap', cell: src => positionsCell(src) },
-            ], detail.sources, { key: src => src.slot }))),
+            ], detail.sources, { key: src => src.slot, cls: 'data cards' }))),
         card('Sinks', 'delivered since this generation started',
           detail.sinks.length === 0
             ? empty(p.sinks && p.sinks.length ? 'Not delivering' : 'No sinks', p.sinks && p.sinks.length ? 'Deliveries run only while the pipeline does.' : 'This definition declares no sink slot; it writes a table.')
@@ -386,7 +394,7 @@
               { label: 'Deletes', cls: 'r', cell: sink => fmtNum(sink.deletes) },
               { label: 'Appends', cls: 'r', cell: sink => fmtNum(sink.appends) },
               { label: 'Write', cell: sink => (sink.writeInFlightSince ? ['in flight since ', timeEl(sink.writeInFlightSince)] : h('span', { class: 'muted' }, 'idle')) },
-            ], detail.sinks, { key: sink => sink.slot })))),
+            ], detail.sinks, { key: sink => sink.slot, cls: 'data cards' })))),
 
       stateCard(detail),
 
@@ -399,7 +407,7 @@
               { label: 'Committed', cls: 'r', cell: t => (t.committedVersion == null ? '–' : fmtInt(t.committedVersion)) },
               { label: 'Current', cls: 'r', cell: t => (t.currentVersion == null ? '–' : fmtInt(t.currentVersion)) },
               { label: 'Behind', cls: 'r', cell: t => (t.versionsBehind == null ? '–' : fmtInt(t.versionsBehind)) },
-            ], detail.tables, { key: t => t.name }))),
+            ], detail.tables, { key: t => t.name, cls: 'data cards' }))),
         card('State timeline', 'on this node, newest first',
           !detail.history || detail.history.length === 0 ? empty('No transitions yet', 'State changes on this node appear here.')
             : h('ul', { class: 'timeline scroll' }, detail.history.slice().reverse().map((t, i) => h('li', { key: t.time + i },
@@ -416,10 +424,15 @@
     const read = src.positions || {}, done = {};
     for (const [k, v] of Object.entries(src.committed || {}))
       done[k === src.slot ? '0' : k.startsWith(src.slot + '#p') ? k.slice(src.slot.length + 2) : k.slice(src.slot.length + 1)] = v;
-    const parts = [...new Set([...Object.keys(read), ...Object.keys(done)])].sort((a, b) => (Number(a) - Number(b)) || a.localeCompare(b));
+    // The partitions the source reports; a connector may keep more in the checkpoint than
+    // it reads by (the files source words an object's name into partitions of its own).
+    const order = (a, b) => (Number(a) - Number(b)) || a.localeCompare(b);
+    const parts = (Object.keys(read).length ? Object.keys(read) : Object.keys(done)).sort(order);
     if (!parts.length) return '–';
+    const more = Object.keys(done).filter(k => !(k in read)).length;
     const at = v => (v == null ? '–' : fmtInt(v));
-    return parts.map(k => h('div', { key: k }, parts.length > 1 || k !== '0' ? `p${k} ` : '', at(read[k]), ' / ', at(done[k])));
+    return [parts.map(k => h('div', { key: k }, parts.length > 1 || k !== '0' ? `p${k} ` : '', at(read[k]), ' / ', at(done[k]))),
+      Object.keys(read).length > 0 && more > 0 && h('div', { key: 'more', class: 'muted', title: 'Positions this connector keeps in the checkpoint beyond the partitions it reads by, in its own encoding' }, `and ${plural(more, 'more checkpoint entry', 'more checkpoint entries')}`)];
   };
 
   function configTab(ctx) {
@@ -960,9 +973,10 @@
           { label: 'Kind', cell: st => h('span', { class: 'tag', title: STORE_KINDS[st.kind] || '' }, st.kind) },
           { label: 'Entries', cls: 'r', cell: st => fmtInt(st.entries) },
           { label: 'Memory', cls: 'r', cell: st => '≈ ' + fmtBytes(st.estimatedBytes) },
-          { label: 'One entry', cls: 'r', title: 'The objects of one entry’s key and value, from entries sized as they were written or read', cell: st => (st.sampledEntries ? fmtNum(st.meanEntryBytes) + ' B' : '–') },
+          { label: 'One entry', cls: 'r', title: 'The objects of one entry’s key and value, from entries sized as they were written or read', cell: st => (!st.sampledEntries ? '–' : st.meanEntryBytes > 0 ? fmtNum(st.meanEntryBytes) + ' B'
+            : h('span', { class: 'muted', title: 'Its key and value are held in the store’s own map and have no objects of their own: the Memory column is the map' }, 'none')) },
           { label: 'One record', cls: 'r', title: 'Mean size of the store’s records in the state changelog, before compression', cell: st => (st.meanRecordBytes ? fmtNum(st.meanRecordBytes) + ' B' : '–') },
-        ], stores, { key: st => st.name })),
+        ], stores, { key: st => st.name, cls: 'data cards' })),
         z.stores > stores.length && h('p', { class: 'help' }, `The ${fmtInt(stores.length)} largest of ${fmtInt(z.stores)} stores.`),
         h('p', { class: 'help' },
           'Entries are counted. Memory is estimated: the objects of an entry — sized as entries are written to the changelog or read from it, each of a store’s first 256 and then one in 512 — times the entries, plus the store’s own maps. ',
@@ -1051,7 +1065,7 @@
       { label: 'Definition', cellCls: 'id', cell: d => d.name },
       { label: 'Description', cellCls: 'wrap', cell: d => d.description || h('span', { class: 'muted' }, 'none') },
       { label: 'Settings', cellCls: 'wrap', cell: settings },
-    ], p.definitions, { key: d => d.name }));
+    ], p.definitions, { key: d => d.name, cls: 'data cards' }));
   }
 
   const diffMark = { added: ['good', '+ added'], removed: ['crit', '− removed'], changed: ['warn', '~ changed'], unchanged: ['idle', 'unchanged'] };
@@ -1313,7 +1327,7 @@
       const other = peer ? h('section', { class: 'card nodecard', 'aria-label': 'The other node' },
           h('div', { class: 'who' }, roleBadge(peer.role, true), h('span', { class: 'node-name' }, peer.nodeId), h('span', { class: 'tag' }, 'peer, as it last answered')),
           kv([
-            ['Term', fmtInt(peer.term)],
+            ['Term', peer.role !== 'Standby' ? fmtInt(peer.term) : peer.term > 0 ? `${fmtInt(peer.term)} (the term it last led)` : h('span', { class: 'muted' }, 'none: a standby that has not led since it started')],
             ['Ready', peer.role === 'Standby' ? (peer.ready ? h('span', { class: 'badge good' }, icon('check', 12), 'ready to take over') : h('span', { class: 'badge warn' }, icon('alert', 12), 'not ready')) : peer.ready ? 'yes' : 'no'],
             peer.notReadyReason && ['Because', reasonText(peer.notReadyReason)],
             peer.adminUrl ? ['Admin address', h('a', { href: peerHref(peer.adminUrl) }, peer.adminUrl)]
@@ -1365,7 +1379,7 @@
             ? ['Standby build of each pipeline', 'on this node · built on the state it follows, not started: a takeover starts them · slowest first']
             : builds > 0 ? ['Last start or standby build of each pipeline', 'on this node · slowest first']
             : ['Last start of each pipeline', 'on this node · slowest first'];
-          const notRun = h('span', { class: 'muted', title: 'Not started: a standby builds the circuit and starts it only if it takes over' }, '–');
+          const notRun = () => h('span', { class: 'muted', title: 'Not started: a standby builds the circuit and starts it only if it takes over' }, '–');
           return card(title, sub,
             h('div', { class: 'table-wrap' }, grid([
               { label: 'Pipeline', cellCls: 'id', cell: p => pipelineLink(p.id) },
@@ -1375,8 +1389,8 @@
                 : h('span', { class: 'badge info', title: 'Built when it was started' }, 'built at start')) },
               { label: 'Plugin', cls: 'r', title: 'Getting the plugin version', cell: p => fmtMs(p.lastStart.plugin) },
               { label: 'Build', cls: 'r', title: 'Running the definition and building the circuit on the pipeline’s state', cell: p => fmtMs(p.lastStart.build) },
-              { label: 'Start', cls: 'r', title: 'The circuit’s own start: the manifest check, recovery, the workers', cell: p => (built(p.lastStart) ? notRun : fmtMs(p.lastStart.start)) },
-              { label: 'Edges', cls: 'r', title: 'Creating the sinks and starting the sources at their committed positions', cell: p => (built(p.lastStart) ? notRun : fmtMs(p.lastStart.edges)) },
+              { label: 'Start', cls: 'r', title: 'The circuit’s own start: the manifest check, recovery, the workers', cell: p => (built(p.lastStart) ? notRun() : fmtMs(p.lastStart.start)) },
+              { label: 'Edges', cls: 'r', title: 'Creating the sinks and starting the sources at their committed positions', cell: p => (built(p.lastStart) ? notRun() : fmtMs(p.lastStart.edges)) },
               { label: 'Total', cls: 'r', cell: p => fmtMs(p.lastStart.total) },
             ], started, { key: p => p.id, cls: 'data cards' })),
             { flush: true });
@@ -1397,7 +1411,7 @@
                 { label: 'State', cell: t => tableBadge(t.state) },
                 { label: 'Version', cls: 'r', cell: t => fmtInt(t.version) },
                 { label: 'Behind', cls: 'r', cell: t => (t.lagVersions == null ? h('span', { class: 'muted', title: 'The writer is never behind its own log' }, t.following ? '–' : 'writer') : fmtInt(t.lagVersions)) },
-              ], tables.items, { key: t => t.name }))),
+              ], tables.items, { key: t => t.name, cls: 'data cards' }))),
 
         h('div', { class: 'grid two' },
           card('Last takeover', take ? `term ${take.term}, ${ago(take.at)} · ${fmtMs(stageTotal)} in the service` : null,
