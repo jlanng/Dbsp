@@ -547,6 +547,26 @@
 
   const td = (label, cls, ...kids) => h('td', { class: cls, 'data-label': label }, ...kids);
 
+  /** A data table drawn from one list of columns, so that a header and the cells under it
+      cannot disagree in number or in name: every list in the UI is built here. A column is
+      { label, cls, title, cell(row, i) } and optionally `cellCls` (the cells' class, when it
+      is not the header's), `cellTitle(row)` (a cell's tooltip), `sr` (the header is for screen readers only) and `sort` (a key
+      for `opts.sort(key, label, cls)`, which draws a sorting header). `label` is the
+      header's text and every cell's `data-label`, which the phone layout shows beside the
+      value. A falsy column is left out, header and cells alike. Options: `key(row, i)`
+      (required), `cls` (the table's classes; `data` by default), `row(row)` (more
+      attributes for a row). */
+  function grid(columns, rows, opts) {
+    const cols = columns.filter(Boolean);
+    const { key, cls = 'data', row, sort } = opts;
+    const head = c => c.sort && sort ? sort(c.sort, c.label, c.cls)
+      : h('th', { class: c.cls, title: c.title || null }, c.sr ? h('span', { class: 'sr' }, c.label) : c.label);
+    return h('table', { class: cls },
+      h('thead', null, h('tr', null, cols.map(head))),
+      h('tbody', null, rows.map((r, i) => h('tr', { key: key(r, i), ...(row ? row(r) : null) },
+        cols.map(c => h('td', { class: c.cellCls !== undefined ? c.cellCls : c.cls, 'data-label': c.label, title: c.cellTitle ? c.cellTitle(r) : null }, c.cell(r, i)))))));
+  }
+
   function toast(text, kind) {
     const el = h('div', { class: ['toast', kind] }, text);
     $('toasts').append(el);
@@ -568,5 +588,5 @@
 
   window.__admin = { h, s, morph, icon, api, all, store, fmtNum, fmtInt, fmtMs, fmtBytes, ago, clock, stamp, timeEl, plural, short, pretty,
     pipelineBadge, lastKnown, peerHref, clamped, tableBadge, roleBadge, healthBadge, reasonText, spark, lineChart, chartWidth, card, empty, notice, errorNotice, skeleton,
-    tile, kv, td, toast, can, canAct, isLeader, pageHead, seriesOf, ratesOf, seedSeries, pushSeries, ApiError, STATE_ORDER, PIPELINE_STATES, SLOTS, $ };
+    tile, kv, td, grid, toast, can, canAct, isLeader, pageHead, seriesOf, ratesOf, seedSeries, pushSeries, ApiError, STATE_ORDER, PIPELINE_STATES, SLOTS, $ };
 })();

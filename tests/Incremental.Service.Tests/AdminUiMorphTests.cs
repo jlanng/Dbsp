@@ -49,7 +49,7 @@ public partial class AdminUiMorphTests
         }
     }
 
-    private static async Task<string> DumpDomAsync(string chrome, string page, string profile)
+    internal static async Task<string> DumpDomAsync(string chrome, string page, string profile, int virtualMilliseconds = 5000)
     {
         var start = new ProcessStartInfo(chrome)
         {
@@ -60,8 +60,8 @@ public partial class AdminUiMorphTests
         foreach (var argument in new[]
                  {
                      "--headless=new", "--disable-gpu", "--no-sandbox", "--no-first-run", "--no-default-browser-check",
-                     "--disable-extensions", $"--user-data-dir={profile}", "--virtual-time-budget=5000",
-                     "--dump-dom", new Uri(page).AbsoluteUri,
+                     "--disable-extensions", $"--user-data-dir={profile}", $"--virtual-time-budget={virtualMilliseconds}",
+                     "--dump-dom", page.Contains("://", StringComparison.Ordinal) ? page : new Uri(page).AbsoluteUri,
                  })
             start.ArgumentList.Add(argument);
         using var process = Process.Start(start)!;
@@ -80,7 +80,7 @@ public partial class AdminUiMorphTests
         return await output;
     }
 
-    private static string? FindChrome()
+    internal static string? FindChrome()
     {
         if (Environment.GetEnvironmentVariable("INCREMENTAL_CHROME") is { Length: > 0 } chosen)
             return chosen;
@@ -107,7 +107,7 @@ public partial class AdminUiMorphTests
         return null;
     }
 
-    private static string Root()
+    internal static string Root()
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
         while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "Incremental.slnx")))

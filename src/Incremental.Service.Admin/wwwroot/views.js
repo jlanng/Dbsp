@@ -5,7 +5,7 @@
   const A = window.__admin;
   const { h, s, icon, api, all, store, fmtNum, fmtInt, fmtMs, fmtBytes, ago, clock, stamp, timeEl, plural, short, pretty,
     pipelineBadge, lastKnown, peerHref, clamped, tableBadge, roleBadge, healthBadge, reasonText, spark, lineChart, chartWidth, card, empty, notice, errorNotice,
-    tile, kv, td, toast, canAct, pageHead, seriesOf, ratesOf, seedSeries, STATE_ORDER, PIPELINE_STATES } = A;
+    tile, kv, grid, toast, canAct, pageHead, seriesOf, ratesOf, seedSeries, STATE_ORDER, PIPELINE_STATES } = A;
 
   const views = A.views = {};
   const enc = encodeURIComponent;
@@ -126,14 +126,15 @@
 
             card('Tables', plural(tables.total, 'table'),
               tables.items.length === 0 ? empty('No tables are declared', 'Shared tables appear here once the host or the API declares them.')
-                : h('div', { class: 'table-wrap' }, h('table', { class: 'data cards' },
-                  h('thead', null, h('tr', null, h('th', null, 'Table'), h('th', null, 'State'), h('th', { class: 'r' }, 'Rows'), h('th', { class: 'r', title: 'Managed heap on this node, estimated: rows, indexes and retained history' }, 'Memory'), h('th', { class: 'r' }, 'Version'), h('th', { class: 'r' }, standby ? 'Behind' : 'Readers'))),
-                  h('tbody', null, tables.items.map(t => h('tr', { key: t.name },
-                    td('Table', 'id', tableLink(t.name)),
-                    td('State', null, tableBadge(t.state)),
-                    td('Rows', 'r', fmtNum(t.rows)),
-                    td('Version', 'r', fmtInt(t.version)),
-                    td(standby ? 'Behind' : 'Readers', 'r', standby ? (t.lagVersions == null ? '–' : plural(t.lagVersions, 'version')) : fmtInt(t.readers))))))),
+                : h('div', { class: 'table-wrap' }, grid([
+                  { label: 'Table', cls: 'id', cell: t => tableLink(t.name) },
+                  { label: 'State', cell: t => tableBadge(t.state) },
+                  { label: 'Rows', cls: 'r', cell: t => fmtNum(t.rows) },
+                  { label: 'Memory', cls: 'r', title: 'Managed heap on this node, estimated: rows, indexes and retained history', cell: t => (t.memory ? '≈ ' + fmtBytes(t.memory.totalBytes) : '–') },
+                  { label: 'Version', cls: 'r', cell: t => fmtInt(t.version) },
+                  standby ? { label: 'Behind', cls: 'r', cell: t => (t.lagVersions == null ? '–' : plural(t.lagVersions, 'version')) }
+                    : { label: 'Readers', cls: 'r', cell: t => fmtInt(t.readers) },
+                ], tables.items, { key: t => t.name, cls: 'data cards' })),
               { extra: h('a', { href: '#/tables' }, 'All tables') })),
 
           h('div', { class: 'stack' },
@@ -168,6 +169,8 @@
     dead: p => p.deadLetters, since: p => -new Date(p.since || 0).getTime(),
     'state-size': p => (p.stateSize ? p.stateSize.bytes : -1),
   };
+
+  const rowRates = p => ratesOf(p.id) || p.rates || {};
 
   function sortHeader(ctx, key, label, cls) {
     const asked = ctx.query.get('sort');
@@ -224,29 +227,22 @@
           pipelines.items.length === 0
             ? empty('No pipelines are deployed', canAct() ? 'Use Deploy to add the first one.' : 'Nothing has been deployed to this service yet.')
             : shown.length === 0 ? empty('No pipeline matches', 'Clear the filter to see all ' + pipelines.items.length + '.')
-            : h('div', { class: 'table-wrap' }, h('table', { class: 'data cards' },
-              h('thead', null, h('tr', null,
-                sortHeader(ctx, 'id', 'Pipeline'), sortHeader(ctx, 'state', 'State'), sortHeader(ctx, 'definition', 'Definition'),
-                sortHeader(ctx, 'in', 'In /s', 'r'), h('th', null, h('span', { class: 'sr' }, 'Records in, last minute')), sortHeader(ctx, 'out', 'Out /s', 'r'),
-                sortHeader(ctx, 'step', 'Step', 'r'), sortHeader(ctx, 'lag', 'Lag', 'r'), sortHeader(ctx, 'state-size', 'State size', 'r'), sortHeader(ctx, 'dead', 'Dead letters', 'r'), sortHeader(ctx, 'since', 'In state', 'r'))),
-              h('tbody', null, shown.map(p => {
-                const r = ratesOf(p.id) || p.rates || {};
-                return h('tr', { key: p.id },
-                  td('Pipeline', 'id', pipelineLink(p.id)),
-                  td('State', null, pipelineBadge(p.state), p.blockedOn && h('span', { class: 'sub' }, blockedText(p.blockedOn)), p.pending && h('span', { class: 'sub' }, `unfinished ${p.pending}`)),
-                  td('Definition', null, p.definition, h('span', { class: 'sub mono' }, `${p.plugin}@${short(p.version)}`)),
-                  td('In /s', 'r', rate(r.in)),
-                  td('Last minute', 'spark', spark(seriesOf(p.id, 'in'), { label: `${p.id}: records in per second`, unit: '/s' })),
-                  td('Out /s', 'r', rate(r.out)),
-                  td('Step', 'r', r.batchedEveryS ? h('span', { title: `It has stepped about every ${r.batchedEveryS} s lately — a sink’s minimum interval, or an input that is quiet; rates are over the last ${r.rateOverS} s` }, `every ${r.batchedEveryS} s`)
-                    : r.stepMs == null ? '–' : fmtMs(r.stepMs)),
-                  td('Lag', 'r', r.lag == null ? '–' : fmtNum(r.lag)),
-                  td('State size', 'r', !p.stateSize || !p.stateSize.entries ? h('span', { class: 'muted' }, 'none')
-                    : [fmtNum(p.stateSize.entries), h('span', { class: 'sub' }, '≈ ' + fmtBytes(p.stateSize.bytes)),
-                      p.stateGrowingSince && h('span', { class: 'badge warn', title: `Grown without a pause since ${p.stateGrowingSince}` }, 'growing')]),
-                  td('Dead letters', 'r', p.deadLetters ? h('a', { href: '#/pipelines/' + enc(p.id) + '/dead-letters' }, fmtNum(p.deadLetters)) : '0'),
-                  td('In state', 'r', timeEl(p.since)));
-              })))),
+            : h('div', { class: 'table-wrap' }, grid([
+              { label: 'Pipeline', sort: 'id', cellCls: 'id', cell: p => pipelineLink(p.id) },
+              { label: 'State', sort: 'state', cell: p => [pipelineBadge(p.state), p.blockedOn && h('span', { class: 'sub' }, blockedText(p.blockedOn)), p.pending && h('span', { class: 'sub' }, `unfinished ${p.pending}`)] },
+              { label: 'Definition', sort: 'definition', cell: p => [p.definition, h('span', { class: 'sub mono' }, `${p.plugin}@${short(p.version)}`)] },
+              { label: 'In /s', sort: 'in', cls: 'r', cell: p => rate(rowRates(p).in) },
+              { label: 'In, last minute', sr: true, cellCls: 'spark', cell: p => spark(seriesOf(p.id, 'in'), { label: `${p.id}: records in per second`, unit: '/s' }) },
+              { label: 'Out /s', sort: 'out', cls: 'r', cell: p => rate(rowRates(p).out) },
+              { label: 'Step', sort: 'step', cls: 'r', cell: p => { const r = rowRates(p); return r.batchedEveryS ? h('span', { title: `It has stepped about every ${r.batchedEveryS} s lately — a sink’s minimum interval, or an input that is quiet; rates are over the last ${r.rateOverS} s` }, `every ${r.batchedEveryS} s`)
+                : r.stepMs == null ? '–' : fmtMs(r.stepMs); } },
+              { label: 'Lag', sort: 'lag', cls: 'r', cell: p => { const r = rowRates(p); return r.lag == null ? '–' : fmtNum(r.lag); } },
+              { label: 'State size', sort: 'state-size', cls: 'r', cell: p => (!p.stateSize || !p.stateSize.entries ? h('span', { class: 'muted' }, 'none')
+                : [fmtNum(p.stateSize.entries), h('span', { class: 'sub' }, '≈ ' + fmtBytes(p.stateSize.bytes)),
+                  p.stateGrowingSince && h('span', { class: 'badge warn', title: `Grown without a pause since ${p.stateGrowingSince}` }, 'growing')]) },
+              { label: 'Dead letters', sort: 'dead', cls: 'r', cell: p => (p.deadLetters ? h('a', { href: '#/pipelines/' + enc(p.id) + '/dead-letters' }, fmtNum(p.deadLetters)) : '0') },
+              { label: 'In state', sort: 'since', cls: 'r', cell: p => timeEl(p.since) },
+            ], shown, { key: p => p.id, cls: 'data cards', sort: (key, label, cls) => sortHeader(ctx, key, label, cls) })),
           pipelines.capped && h('div', { class: 'pager' }, h('span', { class: 'info' }, `Showing the first ${fmtInt(pipelines.items.length)} of ${fmtInt(pipelines.total)}. Filter on the server with the API's q and state parameters.`))));
     },
   };
@@ -373,37 +369,37 @@
         card('Sources', 'input lag and positions per slot',
           detail.sources.length === 0
             ? empty(p.inputs && p.inputs.length ? 'Not reading' : 'No inputs', p.inputs && p.inputs.length ? 'Sources run only while the pipeline does.' : 'This definition declares no input slot; it reads tables.')
-            : h('div', { class: 'table-wrap' }, h('table', { class: 'data' },
-              h('thead', null, h('tr', null, h('th', null, 'Slot'), h('th', { class: 'r' }, 'Records'), h('th', { class: 'r' }, 'Lag'), h('th', { class: 'r' }, 'Unreadable'), h('th', null, 'Read to / committed'))),
-              h('tbody', null, detail.sources.map(src => h('tr', { key: src.slot },
-                h('td', { class: 'id' }, src.slot, src.pausedSince && h('span', { class: 'sub' }, 'paused ', timeEl(src.pausedSince))),
-                h('td', { class: 'r' }, fmtNum(src.records)),
-                h('td', { class: 'r' }, src.lag == null ? '–' : fmtNum(src.lag)),
-                h('td', { class: 'r' }, fmtNum(src.unreadable)),
-                h('td', { class: 'mono wrap' }, offsets(src.positions), ' / ', offsets(src.committed)))))))),
+            : h('div', { class: 'table-wrap' }, grid([
+              { label: 'Slot', cellCls: 'id', cell: src => [src.slot, src.pausedSince && h('span', { class: 'sub' }, 'paused ', timeEl(src.pausedSince))] },
+              { label: 'Records', cls: 'r', cell: src => fmtNum(src.records) },
+              { label: 'Lag', cls: 'r', cell: src => (src.lag == null ? '–' : fmtNum(src.lag)) },
+              { label: 'Unreadable', cls: 'r', cell: src => fmtNum(src.unreadable) },
+              { label: 'Position: read / committed', title: 'Per partition of the input: the offset of the last record read, and the one the last committed checkpoint covers — where a restart resumes', cellCls: 'mono wrap', cell: src => positionsCell(src) },
+            ], detail.sources, { key: src => src.slot }))),
         card('Sinks', 'delivered since this generation started',
           detail.sinks.length === 0
             ? empty(p.sinks && p.sinks.length ? 'Not delivering' : 'No sinks', p.sinks && p.sinks.length ? 'Deliveries run only while the pipeline does.' : 'This definition declares no sink slot; it writes a table.')
-            : h('div', { class: 'table-wrap' }, h('table', { class: 'data' },
-              h('thead', null, h('tr', null, h('th', null, 'Slot'), h('th', { class: 'r' }, 'Batches'), h('th', { class: 'r' }, 'Upserts'), h('th', { class: 'r' }, 'Deletes'), h('th', { class: 'r' }, 'Appends'), h('th', null, 'Write'))),
-              h('tbody', null, detail.sinks.map(sink => h('tr', { key: sink.slot },
-                h('td', { class: 'id' }, sink.slot), h('td', { class: 'r' }, fmtNum(sink.batches)), h('td', { class: 'r' }, fmtNum(sink.upserts)),
-                h('td', { class: 'r' }, fmtNum(sink.deletes)), h('td', { class: 'r' }, fmtNum(sink.appends)),
-                h('td', null, sink.writeInFlightSince ? ['in flight since ', timeEl(sink.writeInFlightSince)] : h('span', { class: 'muted' }, 'idle'))))))))),
+            : h('div', { class: 'table-wrap' }, grid([
+              { label: 'Slot', cellCls: 'id', cell: sink => sink.slot },
+              { label: 'Batches', cls: 'r', cell: sink => fmtNum(sink.batches) },
+              { label: 'Upserts', cls: 'r', cell: sink => fmtNum(sink.upserts) },
+              { label: 'Deletes', cls: 'r', cell: sink => fmtNum(sink.deletes) },
+              { label: 'Appends', cls: 'r', cell: sink => fmtNum(sink.appends) },
+              { label: 'Write', cell: sink => (sink.writeInFlightSince ? ['in flight since ', timeEl(sink.writeInFlightSince)] : h('span', { class: 'muted' }, 'idle')) },
+            ], detail.sinks, { key: sink => sink.slot })))),
 
       stateCard(detail),
 
       h('div', { class: 'grid two' },
         card('Tables', 'the version its checkpoint has committed, beside the table’s',
           detail.tables.length === 0 ? empty('No tables', 'This pipeline reads and writes no shared table.')
-            : h('div', { class: 'table-wrap' }, h('table', { class: 'data' },
-              h('thead', null, h('tr', null, h('th', null, 'Table'), h('th', null, 'Use'), h('th', { class: 'r' }, 'Committed'), h('th', { class: 'r' }, 'Current'), h('th', { class: 'r' }, 'Behind'))),
-              h('tbody', null, detail.tables.map(t => h('tr', { key: t.name },
-                h('td', { class: 'id' }, tableLink(t.name), t.holdsFloor && h('span', { class: 'sub' }, 'holds the retention floor')),
-                h('td', null, h('span', { class: 'tag' }, t.writes ? 'writes' : 'reads')),
-                h('td', { class: 'r' }, t.committedVersion == null ? '–' : fmtInt(t.committedVersion)),
-                h('td', { class: 'r' }, t.currentVersion == null ? '–' : fmtInt(t.currentVersion)),
-                h('td', { class: 'r' }, t.versionsBehind == null ? '–' : fmtInt(t.versionsBehind)))))))),
+            : h('div', { class: 'table-wrap' }, grid([
+              { label: 'Table', cellCls: 'id', cell: t => [tableLink(t.name), t.holdsFloor && h('span', { class: 'sub' }, 'holds the retention floor')] },
+              { label: 'Use', cell: t => h('span', { class: 'tag' }, t.writes ? 'writes' : 'reads') },
+              { label: 'Committed', cls: 'r', cell: t => (t.committedVersion == null ? '–' : fmtInt(t.committedVersion)) },
+              { label: 'Current', cls: 'r', cell: t => (t.currentVersion == null ? '–' : fmtInt(t.currentVersion)) },
+              { label: 'Behind', cls: 'r', cell: t => (t.versionsBehind == null ? '–' : fmtInt(t.versionsBehind)) },
+            ], detail.tables, { key: t => t.name }))),
         card('State timeline', 'on this node, newest first',
           !detail.history || detail.history.length === 0 ? empty('No transitions yet', 'State changes on this node appear here.')
             : h('ul', { class: 'timeline scroll' }, detail.history.slice().reverse().map((t, i) => h('li', { key: t.time + i },
@@ -412,10 +408,18 @@
               h('span', { class: 'what' }, h('strong', null, t.state), h('span', { class: 'muted' }, ` · generation ${t.generation}`), t.why && h('span', { class: 'why' }, t.why))))))));
   }
 
-  const offsets = map => {
-    const entries = Object.entries(map || {});
-    if (!entries.length) return '–';
-    return entries.map(([k, v]) => `${k}:${fmtInt(v)}`).join(' ');
+  /** A source's positions, one line per partition: read to / committed. The source says
+      where it has read by partition; the checkpoint keys the same positions by the input
+      (`{slot}#p{partition}`, or the slot alone for a count with no partitions), and both
+      are shown under the partition's number. */
+  const positionsCell = src => {
+    const read = src.positions || {}, done = {};
+    for (const [k, v] of Object.entries(src.committed || {}))
+      done[k === src.slot ? '0' : k.startsWith(src.slot + '#p') ? k.slice(src.slot.length + 2) : k.slice(src.slot.length + 1)] = v;
+    const parts = [...new Set([...Object.keys(read), ...Object.keys(done)])].sort((a, b) => (Number(a) - Number(b)) || a.localeCompare(b));
+    if (!parts.length) return '–';
+    const at = v => (v == null ? '–' : fmtInt(v));
+    return parts.map(k => h('div', { key: k }, parts.length > 1 || k !== '0' ? `p${k} ` : '', at(read[k]), ' / ', at(done[k])));
   };
 
   function configTab(ctx) {
@@ -808,21 +812,20 @@
         }),
         h('section', { class: 'card' },
           tables.items.length === 0 ? empty('No tables are declared', canAct() ? 'Use Declare to add the first one; a host can also seed them.' : 'Tables are declared on the leader, or seeded by the host.')
-            : h('div', { class: 'table-wrap' }, h('table', { class: 'data cards' },
-              h('thead', null, h('tr', null, h('th', null, 'Table'), h('th', null, 'State'), h('th', { class: 'r' }, 'Rows'), h('th', { class: 'r' }, 'Version'),
-                h('th', { class: 'r' }, standby ? 'Behind' : 'Versions /s'), h('th', null, 'Written by'), h('th', null, 'Loader'), h('th', { class: 'r' }, 'Readers'), h('th', null, 'Floor held by'))),
-              h('tbody', null, tables.items.map(t => h('tr', { key: t.name },
-                td('Table', 'id', tableLink(t.name), h('span', { class: 'sub' }, `${t.keyType} → ${t.rowType}`)),
-                td('State', null, tableBadge(t.state)),
-                td('Rows', 'r', fmtNum(t.rows)),
-                td('Memory', 'r', t.memory ? '≈ ' + fmtBytes(t.memory.totalBytes) : '–'),
-                td('Version', 'r', fmtInt(t.version)),
-                td(standby ? 'Behind' : 'Versions /s', 'r', standby ? (t.lagVersions == null ? '–' : fmtInt(t.lagVersions)) : fmtNum(t.versionsPerSecond)),
-                td('Written by', null, t.writer ? writerText(t.writer) : '–'),
-                td('Loader', null, t.loader ? [h('span', { class: 'tag' }, t.loader.kind), ' ', t.loader.state,
-                  t.loader.waitingFor && h('span', { class: 'sub' }, `for ${t.loader.waitingFor}`), t.loader.unreadable > 0 && h('span', { class: 'sub' }, plural(t.loader.unreadable, 'unreadable record'))] : h('span', { class: 'muted' }, 'none')),
-                td('Readers', 'r', fmtInt(t.readers)),
-                td('Floor held by', null, t.floorHeldBy ? pipelineLink(t.floorHeldBy) : h('span', { class: 'muted' }, 'nobody')))))))));
+            : h('div', { class: 'table-wrap' }, grid([
+              { label: 'Table', cellCls: 'id', cell: t => [tableLink(t.name), h('span', { class: 'sub' }, `${t.keyType} → ${t.rowType}`)] },
+              { label: 'State', cell: t => tableBadge(t.state) },
+              { label: 'Rows', cls: 'r', cell: t => fmtNum(t.rows) },
+              { label: 'Memory', cls: 'r', title: 'Managed heap on this node, estimated: rows, indexes and retained history', cell: t => (t.memory ? '≈ ' + fmtBytes(t.memory.totalBytes) : '–') },
+              { label: 'Version', cls: 'r', cell: t => fmtInt(t.version) },
+              standby ? { label: 'Behind', cls: 'r', title: 'Versions of the table this node has yet to apply', cell: t => (t.lagVersions == null ? '–' : fmtInt(t.lagVersions)) }
+                : { label: 'Versions /s', cls: 'r', cell: t => fmtNum(t.versionsPerSecond) },
+              { label: 'Written by', cell: t => (t.writer ? writerText(t.writer) : '–') },
+              { label: 'Loader', cell: t => (t.loader ? [h('span', { class: 'tag' }, t.loader.kind), ' ', t.loader.state,
+                t.loader.waitingFor && h('span', { class: 'sub' }, `for ${t.loader.waitingFor}`), t.loader.unreadable > 0 && h('span', { class: 'sub' }, plural(t.loader.unreadable, 'unreadable record'))] : h('span', { class: 'muted' }, 'none')) },
+              { label: 'Readers', cls: 'r', cell: t => fmtInt(t.readers) },
+              { label: 'Floor held by', cell: t => (t.floorHeldBy ? pipelineLink(t.floorHeldBy) : h('span', { class: 'muted' }, 'nobody')) },
+            ], tables.items, { key: t => t.name, cls: 'data cards' }))));
     },
   };
 
@@ -840,6 +843,7 @@
       const standby = t.following;
       const acting = canAct();
       const exposing = store.info && store.info.exposeRowData;
+      const readerOf = p => detail.readers.find(r => r.pipeline === p.id);
       return h('div', { class: 'stack' },
         pageHead({
           crumbs: h('a', { href: '#/tables' }, 'Tables'),
@@ -878,31 +882,32 @@
             : empty('No loader', t.writer.startsWith('pipeline:') ? ['Pipeline ', pipelineLink(t.writer.slice(9)), ' writes this table.'] : 'The host writes this table itself.'), { flush: !t.loader }),
           card('Indexes', plural(t.indexes.length, 'index', 'indexes'),
             t.indexes.length === 0 ? empty('No secondary index', 'Rows are found by key only.')
-              : h('table', { class: 'data' }, h('thead', null, h('tr', null, h('th', null, 'Index'), h('th', null, 'Key type'), h('th', null))),
-                h('tbody', null, t.indexes.map(i => h('tr', { key: i.name }, h('td', { class: 'id' }, i.name), h('td', { class: 'mono' }, i.keyType || '–'),
-                  h('td', { class: 'r' }, exposing && h('button', { class: 'btn small ghost', type: 'button', on: { click: () => { ui.mode = 'index:' + i.name; ui.key = ''; ctx.render(); document.getElementById('row-key')?.focus(); } } }, 'Look up')))))))),
+              : grid([
+                { label: 'Index', cellCls: 'id', cell: i => i.name },
+                { label: 'Key type', cellCls: 'mono', cell: i => i.keyType || '–' },
+                exposing && { label: 'Look up', sr: true, cellCls: 'r', cell: i => h('button', { class: 'btn small ghost', type: 'button', on: { click: () => { ui.mode = 'index:' + i.name; ui.key = ''; ctx.render(); document.getElementById('row-key')?.focus(); } } }, 'Look up') },
+              ], t.indexes, { key: i => i.name }))),
 
         sizeCard(detail),
 
         card('Readers and writers', 'the version each pipeline’s checkpoint has committed; the furthest behind holds the retention floor',
           detail.pipelines.length === 0 ? empty('No pipeline names this table', 'It can be removed, or read by the next pipeline deployed.')
-            : h('div', { class: 'table-wrap' }, h('table', { class: 'data cards' },
-              h('thead', null, h('tr', null, h('th', null, 'Pipeline'), h('th', null, 'Use'), h('th', { class: 'r' }, 'Committed version'), h('th', { class: 'r' }, 'Behind'), h('th', null, 'Until cut loose'), h('th', null, 'Retention'))),
-              h('tbody', null, detail.pipelines.map(p => {
-                const reader = detail.readers.find(r => r.pipeline === p.id);
-                const cap = detail.retainedHistoryVersions || 1;
-                const left = reader ? reader.versionsUntilCutLoose : null;
+            : h('div', { class: 'table-wrap' }, grid([
+              { label: 'Pipeline', cellCls: 'id', cell: p => pipelineLink(p.id) },
+              { label: 'Use', cell: p => h('span', { class: 'tag' }, p.writes ? 'writes' : 'reads') },
+              { label: 'Committed version', cls: 'r', cell: p => (p.committedVersion == null ? h('span', { class: 'muted', title: 'It has not committed a checkpoint that reads this table' }, 'none') : fmtInt(p.committedVersion)) },
+              { label: 'Behind', cls: 'r', cell: p => { const reader = readerOf(p); return reader ? fmtInt(reader.versionsBehind) : '–'; } },
+              { label: 'Until cut loose', cell: p => {
+                const reader = readerOf(p);
+                if (!reader) return '–';
+                const cap = detail.retainedHistoryVersions || 1, left = reader.versionsUntilCutLoose;
                 const meter = h('span');
-                if (reader) meter.style.width = Math.round(100 * (1 - left / cap)) + '%';
-                return h('tr', { key: p.id },
-                  td('Pipeline', 'id', pipelineLink(p.id)),
-                  td('Use', null, h('span', { class: 'tag' }, p.writes ? 'writes' : 'reads')),
-                  td('Committed version', 'r', p.committedVersion == null ? h('span', { class: 'muted', title: 'It has not committed a checkpoint that reads this table' }, 'none') : fmtInt(p.committedVersion)),
-                  td('Behind', 'r', reader ? fmtInt(reader.versionsBehind) : '–'),
-                  td('Until cut loose', null, reader ? h('div', null, h('div', { class: 'meter', role: 'img', 'aria-label': `${fmtInt(left)} of ${fmtInt(cap)} versions of history left` }, meter),
-                    h('span', { class: 'sub' }, `${fmtInt(left)} versions${reader.timeUntilCutLoose != null ? ' · about ' + fmtMs(reader.timeUntilCutLoose) + ' at this rate' : ''}`)) : '–'),
-                  td('Retention', null, p.holdsFloor ? h('span', { class: 'badge warn' }, icon('lock', 12), 'holds the floor') : ''));
-              }))))),
+                meter.style.width = Math.round(100 * (1 - left / cap)) + '%';
+                return h('div', null, h('div', { class: 'meter', role: 'img', 'aria-label': `${fmtInt(left)} of ${fmtInt(cap)} versions of history left` }, meter),
+                  h('span', { class: 'sub' }, `${fmtInt(left)} versions${reader.timeUntilCutLoose != null ? ' · about ' + fmtMs(reader.timeUntilCutLoose) + ' at this rate' : ''}`));
+              } },
+              { label: 'Retention', cell: p => (p.holdsFloor ? h('span', { class: 'badge warn' }, icon('lock', 12), 'holds the floor') : '') },
+            ], detail.pipelines, { key: p => p.id, cls: 'data cards' }))),
 
         rowBrowser(ctx, name, t, exposing));
     },
@@ -950,17 +955,14 @@
         detail.pipeline.stateGrowingSince && notice('warn', h('strong', null, 'The state has grown without a pause since ', timeEl(detail.pipeline.stateGrowingSince), '. '),
           'A pipeline that keeps something per record — a retroactive join, a remembered lookup, a keyed input — holds it until something closes it. ',
           'Over a stream of facts, give the input event time and forget each record once it is final (EvictWhenFinal); see the guide, “Bounding a join over a stream of facts”.'),
-        h('div', { class: 'table-wrap' }, h('table', { class: 'data' },
-          h('thead', null, h('tr', null, h('th', null, 'Store'), h('th', null, 'Kind'), h('th', { class: 'r' }, 'Entries'), h('th', { class: 'r' }, 'Memory'),
-            h('th', { class: 'r', title: 'The objects of one entry’s key and value, from entries sized as they were written or read' }, 'One entry'),
-            h('th', { class: 'r', title: 'Mean size of the store’s records in the state changelog, before compression' }, 'One record'))),
-          h('tbody', null, stores.map(st => h('tr', { key: st.name },
-            h('td', { class: 'id wrap' }, st.name),
-            h('td', null, h('span', { class: 'tag', title: STORE_KINDS[st.kind] || '' }, st.kind)),
-            h('td', { class: 'r' }, fmtInt(st.entries)),
-            h('td', { class: 'r' }, '≈ ' + fmtBytes(st.estimatedBytes)),
-            h('td', { class: 'r' }, st.sampledEntries ? fmtNum(st.meanEntryBytes) + ' B' : '–'),
-            h('td', { class: 'r' }, st.meanRecordBytes ? fmtNum(st.meanRecordBytes) + ' B' : '–')))))),
+        h('div', { class: 'table-wrap' }, grid([
+          { label: 'Store', cellCls: 'id wrap', cell: st => st.name },
+          { label: 'Kind', cell: st => h('span', { class: 'tag', title: STORE_KINDS[st.kind] || '' }, st.kind) },
+          { label: 'Entries', cls: 'r', cell: st => fmtInt(st.entries) },
+          { label: 'Memory', cls: 'r', cell: st => '≈ ' + fmtBytes(st.estimatedBytes) },
+          { label: 'One entry', cls: 'r', title: 'The objects of one entry’s key and value, from entries sized as they were written or read', cell: st => (st.sampledEntries ? fmtNum(st.meanEntryBytes) + ' B' : '–') },
+          { label: 'One record', cls: 'r', title: 'Mean size of the store’s records in the state changelog, before compression', cell: st => (st.meanRecordBytes ? fmtNum(st.meanRecordBytes) + ' B' : '–') },
+        ], stores, { key: st => st.name })),
         z.stores > stores.length && h('p', { class: 'help' }, `The ${fmtInt(stores.length)} largest of ${fmtInt(z.stores)} stores.`),
         h('p', { class: 'help' },
           'Entries are counted. Memory is estimated: the objects of an entry — sized as entries are written to the changelog or read from it, each of a store’s first 256 and then one in 512 — times the entries, plus the store’s own maps. ',
@@ -1018,11 +1020,10 @@
           rows.truncated ? `This read looked at ${fmtInt(rows.scanned)} rows and stopped at its bound without a match. Keep scanning to look at the rows after them.`
             : rows.lagVersions ? `This node is ${plural(rows.lagVersions, 'version')} behind the table’s log: the row may not have arrived here yet.`
             : lookup ? `Not in version ${fmtInt(rows.version)} of the table.` : ui.contains ? 'No row contains that text.' : 'The table is empty.'),
-        rows && rows.rows.length > 0 && h('div', { class: 'table-wrap' }, h('table', { class: 'data rowgrid' },
-          h('thead', null, h('tr', null, h('th', null, 'Key'), columns.map(c => h('th', null, c)))),
-          h('tbody', null, rows.rows.map((r, i) => h('tr', { key: 'r' + i + cell(r.key) },
-            h('td', { class: 'cell id', title: cell(r.key) }, cell(r.key)),
-            columns.map(c => { const v = r.row && typeof r.row === 'object' ? r.row[c] : r.row; return h('td', { class: 'cell', title: cell(v) }, cell(v)); })))))),
+        rows && rows.rows.length > 0 && h('div', { class: 'table-wrap' }, grid([
+          { label: 'Key', cellCls: 'cell id', cell: r => cell(r.key), cellTitle: r => cell(r.key) },
+          ...columns.map(c => { const v = r => cell(r.row && typeof r.row === 'object' ? r.row[c] : r.row); return { label: c, cellCls: 'cell', cell: v, cellTitle: v }; }),
+        ], rows.rows, { key: (r, i) => 'r' + i + cell(r.key), cls: 'data rowgrid' })),
         rows && h('div', { class: 'pager' },
           h('span', { class: 'info' },
             `Version ${fmtInt(rows.version)} · ${fmtInt(rows.rows.length)} shown · `,
@@ -1046,13 +1047,11 @@
         h('span', { class: 'mono' }, st.name), h('span', { class: 'muted' }, `: ${st.jsonType}${st.default != null ? ' = ' + (typeof st.default === 'string' ? st.default : JSON.stringify(st.default)) : ''}${st.values && st.values.length ? ' (' + st.values.join(' | ') + ')' : ''}${st.minimum != null || st.maximum != null ? ` [${st.minimum ?? ''}..${st.maximum ?? ''}]` : ''}`),
         st.required && [' ', h('span', { class: 'tag' }, 'required')],
         st.stateNeutral && [' ', h('span', { class: 'tag', title: 'Changing it keeps the pipeline’s state without being asked' }, 'state-neutral')])));
-    const row = d => h('tr', { key: d.name },
-      h('td', { class: 'id' }, d.name),
-      h('td', { class: 'wrap' }, d.description || h('span', { class: 'muted' }, 'none')),
-      h('td', { class: 'wrap' }, settings(d)));
-    return h('div', { class: 'table-wrap' }, h('table', { class: 'data' },
-      h('thead', null, h('tr', null, h('th', null, 'Definition'), h('th', null, 'Description'), h('th', null, 'Settings'))),
-      h('tbody', null, p.definitions.map(row))));
+    return h('div', { class: 'table-wrap' }, grid([
+      { label: 'Definition', cellCls: 'id', cell: d => d.name },
+      { label: 'Description', cellCls: 'wrap', cell: d => d.description || h('span', { class: 'muted' }, 'none') },
+      { label: 'Settings', cellCls: 'wrap', cell: settings },
+    ], p.definitions, { key: d => d.name }));
   }
 
   const diffMark = { added: ['good', '+ added'], removed: ['crit', '− removed'], changed: ['warn', '~ changed'], unchanged: ['idle', 'unchanged'] };
@@ -1245,13 +1244,12 @@
           : h('div', { class: 'split' },
             h('div', null, letters ? lettersTab({ ...ctx, pageSaysSo: true, data: { letters, detail: { pipeline: pipelines.find(p => p.id === id) || {} } } }, id) : h('section', { class: 'card' }, empty('Choose a pipeline', 'Its dropped records appear here.'))),
             card('Pipelines', 'with dropped records, or able to drop them',
-              h('table', { class: 'data' },
-                h('thead', null, h('tr', null, h('th', null, 'Pipeline'), h('th', null, 'Stored in'), h('th', { class: 'r' }, 'Dropped'))),
-                h('tbody', null, pipelines.map(p => h('tr', { key: p.id, 'aria-current': p.id === id ? 'true' : null },
-                  h('td', { class: 'id' }, h('a', { href: '#/dead-letters/' + enc(p.id), 'aria-current': p.id === id ? 'page' : null }, p.id), p.id === id && h('span', { class: 'sub' }, 'shown')),
-                  h('td', null, p.deadLetterSink ? [h('span', { class: 'tag' }, p.deadLetterSink.connector), p.deadLetterSink.failedWrites > 0 && p.deadLetterSink.lastError && h('span', { class: 'sub err' }, 'a write failed')]
-                    : p.deadLettersBound ? h('span', { class: 'tag' }, 'bound') : h('span', { class: 'muted', title: 'No durable sink: kept in memory on the leader only' }, 'memory only')),
-                  h('td', { class: 'r' }, fmtNum(p.deadLetters)))))))));
+              grid([
+                { label: 'Pipeline', cellCls: 'id', cell: p => [h('a', { href: '#/dead-letters/' + enc(p.id), 'aria-current': p.id === id ? 'page' : null }, p.id), p.id === id && h('span', { class: 'sub' }, 'shown')] },
+                { label: 'Stored in', cell: p => (p.deadLetterSink ? [h('span', { class: 'tag' }, p.deadLetterSink.connector), p.deadLetterSink.failedWrites > 0 && p.deadLetterSink.lastError && h('span', { class: 'sub err' }, 'a write failed')]
+                  : p.deadLettersBound ? h('span', { class: 'tag' }, 'bound') : h('span', { class: 'muted', title: 'No durable sink: kept in memory on the leader only' }, 'memory only')) },
+                { label: 'Dropped', cls: 'r', cell: p => fmtNum(p.deadLetters) },
+              ], pipelines, { key: p => p.id, row: p => ({ 'aria-current': p.id === id ? 'true' : null }) }))));
     },
   };
 
@@ -1356,30 +1354,50 @@
         holdsCard(node),
 
         (() => {
-          // How each pipeline's last start went: a takeover's cost is in here, pipeline by pipeline.
+          // How each pipeline's last start went: a takeover's cost is in here, pipeline by
+          // pipeline. On a standby the same record is its build of the pipeline (run 0):
+          // nothing was started, so Start and Edges are not zero, they did not happen.
           const started = pipelines.items.filter(p => p.lastStart).sort((a, b) => b.lastStart.total - a.lastStart.total);
           if (started.length === 0) return null;
-          return card('Last start of each pipeline', `on this node · slowest first`,
-            h('div', { class: 'table-wrap' }, h('table', { class: 'data cards' },
-              h('thead', null, h('tr', null, ['Pipeline', 'When', 'How', 'Plugin', 'Build', 'Start', 'Edges', 'Total'].map((x, i) => h('th', { class: i >= 3 ? 'r' : null }, x)))),
-              h('tbody', null, started.map(p => h('tr', { key: p.id },
-                td('Pipeline', 'id', h('a', { href: '#/pipelines/' + encodeURIComponent(p.id) }, p.id)),
-                td('When', null, timeEl(p.lastStart.at)),
-                td('How', null, p.lastStart.warm ? h('span', { class: 'badge good', title: 'Built while standing by; the start ran it' }, 'warm') : h('span', { class: 'badge info', title: 'Built at the start' }, 'built at start')),
-                ...[['Plugin', 'plugin'], ['Build', 'build'], ['Start', 'start'], ['Edges', 'edges'], ['Total', 'total']].map(([l, k]) => td(l, 'r', fmtMs(p.lastStart[k])))))))),
+          const built = x => x.run === 0;
+          const builds = started.filter(p => built(p.lastStart)).length;
+          const [title, sub] = builds === started.length
+            ? ['Standby build of each pipeline', 'on this node · built on the state it follows, not started: a takeover starts them · slowest first']
+            : builds > 0 ? ['Last start or standby build of each pipeline', 'on this node · slowest first']
+            : ['Last start of each pipeline', 'on this node · slowest first'];
+          const notRun = h('span', { class: 'muted', title: 'Not started: a standby builds the circuit and starts it only if it takes over' }, '–');
+          return card(title, sub,
+            h('div', { class: 'table-wrap' }, grid([
+              { label: 'Pipeline', cellCls: 'id', cell: p => pipelineLink(p.id) },
+              { label: 'When', cell: p => timeEl(p.lastStart.at) },
+              { label: 'How', cell: p => (built(p.lastStart) ? h('span', { class: 'badge info', title: 'Built while standing by, on the state this node follows; a takeover starts it' }, 'standby build')
+                : p.lastStart.warm ? h('span', { class: 'badge good', title: 'Built while standing by; the start ran it' }, 'warm start')
+                : h('span', { class: 'badge info', title: 'Built when it was started' }, 'built at start')) },
+              { label: 'Plugin', cls: 'r', title: 'Getting the plugin version', cell: p => fmtMs(p.lastStart.plugin) },
+              { label: 'Build', cls: 'r', title: 'Running the definition and building the circuit on the pipeline’s state', cell: p => fmtMs(p.lastStart.build) },
+              { label: 'Start', cls: 'r', title: 'The circuit’s own start: the manifest check, recovery, the workers', cell: p => (built(p.lastStart) ? notRun : fmtMs(p.lastStart.start)) },
+              { label: 'Edges', cls: 'r', title: 'Creating the sinks and starting the sources at their committed positions', cell: p => (built(p.lastStart) ? notRun : fmtMs(p.lastStart.edges)) },
+              { label: 'Total', cls: 'r', cell: p => fmtMs(p.lastStart.total) },
+            ], started, { key: p => p.id, cls: 'data cards' })),
             { flush: true });
         })(),
 
         h('div', { class: 'grid two' },
           card('State lag by partition', role === 'Standby' ? 'records this node has yet to read' : 'measured on a standby',
             !node.stateLag ? empty(role === 'Leader' ? 'The leader writes the state log' : 'Not measured', role === 'Leader' ? 'Lag is a follower’s number: open the standby to see it.' : 'The backend did not report it.')
-              : h('table', { class: 'data' }, h('thead', null, h('tr', null, h('th', null, 'Partition'), h('th', { class: 'r' }, 'Behind'), h('th', null, h('span', { class: 'sr' }, 'Share')))),
-                h('tbody', null, node.stateLag.map((lag, i) => { const m = h('span'); m.style.width = Math.round(100 * lag / maxLag) + '%'; return h('tr', { key: 'p' + i }, h('td', null, i), h('td', { class: 'r' }, fmtInt(lag)), h('td', null, h('div', { class: 'meter' }, m))); })))),
+              : grid([
+                { label: 'Partition', cell: (lag, i) => String(i) },
+                { label: 'Behind', cls: 'r', cell: lag => fmtInt(lag) },
+                { label: 'Share', sr: true, cell: lag => { const m = h('span'); m.style.width = Math.round(100 * lag / maxLag) + '%'; return h('div', { class: 'meter' }, m); } },
+              ], node.stateLag, { key: (lag, i) => 'p' + i })),
           card('Table lag', role === 'Standby' ? 'versions this node has yet to apply' : 'measured on a standby',
             tables.items.length === 0 ? empty('No tables', 'Nothing to follow.')
-              : h('table', { class: 'data' }, h('thead', null, h('tr', null, h('th', null, 'Table'), h('th', null, 'State'), h('th', { class: 'r' }, 'Version'), h('th', { class: 'r' }, 'Behind'))),
-                h('tbody', null, tables.items.map(t => h('tr', { key: t.name }, h('td', { class: 'id' }, tableLink(t.name)), h('td', null, tableBadge(t.state)), h('td', { class: 'r' }, fmtInt(t.version)),
-                  h('td', { class: 'r' }, t.lagVersions == null ? h('span', { class: 'muted', title: 'The writer is never behind its own log' }, t.following ? '–' : 'writer') : fmtInt(t.lagVersions)))))))),
+              : grid([
+                { label: 'Table', cellCls: 'id', cell: t => tableLink(t.name) },
+                { label: 'State', cell: t => tableBadge(t.state) },
+                { label: 'Version', cls: 'r', cell: t => fmtInt(t.version) },
+                { label: 'Behind', cls: 'r', cell: t => (t.lagVersions == null ? h('span', { class: 'muted', title: 'The writer is never behind its own log' }, t.following ? '–' : 'writer') : fmtInt(t.lagVersions)) },
+              ], tables.items, { key: t => t.name }))),
 
         h('div', { class: 'grid two' },
           card('Last takeover', take ? `term ${take.term}, ${ago(take.at)} · ${fmtMs(stageTotal)} in the service` : null,
@@ -1476,19 +1494,18 @@
           store.who && !store.who.verified && 'Who is the name the host authenticated, where it does; here nobody is signed in, so it is the name a caller gave — marked self-declared — or “local”.'] }),
         h('section', { class: 'card' },
           audit.items.length === 0 ? empty('No entries', 'Deploys, resets, removals and role changes are recorded here with who asked for them.')
-            : h('div', { class: 'table-wrap' }, h('table', { class: 'data cards' },
-              h('thead', null, h('tr', null, h('th', { class: 'r' }, '#'), h('th', null, 'When'), h('th', null, 'Who'), h('th', null, 'Action'), h('th', null, 'Target'), h('th', null, 'Generation'), h('th', null, 'Node · term'), h('th', null, 'What it did'))),
-              h('tbody', null, audit.items.slice().reverse().map(a => h('tr', { key: 'a' + a.sequence },
-                td('#', 'r', a.sequence),
-                td('When', 'nowrap', timeEl(a.time, stamp(a.time))),
-                td('Who', null, callerCell(a.caller)),
-                td('Action', null, h('span', { class: 'tag' }, a.action)),
-                td('Target', 'id wrap', a.action.startsWith('pipeline.') && a.action !== 'pipeline.remove' ? pipelineLink(a.target) : a.target),
-                td('Generation', 'nowrap', a.generationBefore == null && a.generationAfter == null ? ''
-                  : a.generationBefore === a.generationAfter ? h('span', { title: 'The action did not change the generation' }, `${a.generationAfter}, unchanged`)
-                  : `${a.generationBefore ?? '–'} → ${a.generationAfter ?? '–'}`),
-                td('Node · term', 'nowrap', `${a.node} · ${a.term}`),
-                td('What it did', 'wrap', a.plan && a.plan.length ? h('details', { class: 'more' }, h('summary', null, plural(a.plan.length, 'step')), A.planList({ steps: a.plan })) : '')))))),
+            : h('div', { class: 'table-wrap' }, grid([
+              { label: '#', cls: 'r', cell: a => a.sequence },
+              { label: 'When', cellCls: 'nowrap', cell: a => timeEl(a.time, stamp(a.time)) },
+              { label: 'Who', cell: a => callerCell(a.caller) },
+              { label: 'Action', cell: a => h('span', { class: 'tag' }, a.action) },
+              { label: 'Target', cellCls: 'id wrap', cell: a => (a.action.startsWith('pipeline.') && a.action !== 'pipeline.remove' ? pipelineLink(a.target) : a.target) },
+              { label: 'Generation', cellCls: 'nowrap', cell: a => (a.generationBefore == null && a.generationAfter == null ? ''
+                : a.generationBefore === a.generationAfter ? h('span', { title: 'The action did not change the generation' }, `${a.generationAfter}, unchanged`)
+                : `${a.generationBefore ?? '–'} → ${a.generationAfter ?? '–'}`) },
+              { label: 'Node · term', cellCls: 'nowrap', cell: a => `${a.node} · ${a.term}` },
+              { label: 'What it did', cellCls: 'wrap', cell: a => (a.plan && a.plan.length ? h('details', { class: 'more' }, h('summary', null, plural(a.plan.length, 'step')), A.planList({ steps: a.plan })) : '') },
+            ], audit.items.slice().reverse(), { key: a => 'a' + a.sequence, cls: 'data cards' })),
           (audit.hasOlder || ctx.ui.before) && h('div', { class: 'pager' },
             h('span', { class: 'info' }, `${fmtInt(audit.total)} entries kept`),
             ctx.ui.before && h('button', { class: 'btn small', type: 'button', on: { click: () => { ctx.ui.before = null; ctx.reload(); } } }, 'Newest'),
