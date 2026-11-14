@@ -104,7 +104,12 @@ jobs:
           cat tests/Incremental.Service.Tests/bin/Release/net10.0/measurements.log || true
       - name: Container logs
         if: failure()
-        run: docker compose --profile connectors logs --no-color --tail 200
+        run: |
+          docker compose --profile connectors logs --no-color --tail 200
+          # The broker's log cleaner writes to a file of its own, and a test that waits
+          # for it to compact a topic skips (which fails the step above) when it has not:
+          # what the cleaner was doing is only here.
+          docker compose --profile connectors exec -T kafka sh -c 'tail -n 400 /opt/kafka/logs/log-cleaner.log' || true
       - name: Stop the stack
         if: always()
         run: docker compose --profile connectors down -v

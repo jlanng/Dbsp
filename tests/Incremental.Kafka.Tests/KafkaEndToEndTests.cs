@@ -537,6 +537,7 @@ public class KafkaEndToEndTests(ITestOutputHelper output)
             ["max.compaction.lag.ms"] = "1000",
         };
         var compacted = false;
+        var left = "";
 
         async Task WaitForCompactionAsync(KafkaLog log)
         {
@@ -554,13 +555,14 @@ public class KafkaEndToEndTests(ITestOutputHelper output)
             }
             while (held > end / 4 && waited.Elapsed < TimeSpan.FromSeconds(90));
             compacted = held <= end / 4;
+            left = $"end offset {end}, {held} records left";
             if (compacted)
                 KafkaEnv.Measured(output, $"state topic: end offset {end}, {held} records left after compaction ({waited.Elapsed.TotalSeconds:F0} s)");
         }
 
         await RunSinglePartitionAsync(stateTopic, WaitForCompactionAsync);
         if (!compacted)
-            Assert.Skip("The broker's log cleaner did not compact the state topic within 90 s.");
+            Assert.Skip($"The broker's log cleaner did not compact the state topic within 90 s ({left}).");
     }
 
     private Task RunSinglePartitionAsync(IReadOnlyDictionary<string, string> stateTopic, Func<KafkaLog, Task> beforeCrash) =>
