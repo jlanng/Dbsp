@@ -306,8 +306,17 @@ public class WarmStandbyTests
             };
             o.AfterStandbyBuild = async id =>
             {
-                if (id == "tc" && Interlocked.Increment(ref builds) == 1)
-                    boundAs = (await standby.Task).Node.Context.Storage.Pipeline("tc").Layout;
+                if (id != "tc")
+                    return;
+                // The layout first and the count after it: the test waits on the count
+                // and then reads the layout. (The other way round it read null once in
+                // some hundred runs on two cores — the hook's thread was taken off the
+                // processor between the two lines.) Builds of one pipeline come one at
+                // a time, under its queue.
+                var layout = (await standby.Task).Node.Context.Storage.Pipeline("tc").Layout;
+                if (Volatile.Read(ref builds) == 0)
+                    Volatile.Write(ref boundAs, layout);
+                Interlocked.Increment(ref builds);
             };
         });
         standby.SetResult(b);
@@ -316,7 +325,7 @@ public class WarmStandbyTests
         // tagged with generation 1's layout — not version 2's spec through version 1's types.
         await Eventually(() => Volatile.Read(ref builds) >= 1, "the standby's first build");
         Assert.Equal(1, first.Generation);
-        Assert.Equal(layout1, boundAs);
+        Assert.Equal(layout1, Volatile.Read(ref boundAs));
 
         await a.Running("tc");
         var more = Trades(150, 60);
