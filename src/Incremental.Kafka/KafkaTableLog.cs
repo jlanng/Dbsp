@@ -5,6 +5,7 @@ using System.Text.Json;
 using Confluent.Kafka;
 using Incremental.Storage;
 using Incremental.Tables;
+using Microsoft.Extensions.Logging;
 
 namespace Incremental.Kafka;
 
@@ -273,11 +274,14 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
         // elected a moment ago, after brokers came back. That passes, and until it has the
         // answer must not be believed: a takeover that did would fail (no head), or go on
         // from a version the table has left behind.
-        var deadline = Environment.TickCount64 + (long)_log.Options.OperationTimeout.TotalMilliseconds;
+        var began = Environment.TickCount64;
+        var deadline = began + (long)_log.Options.OperationTimeout.TotalMilliseconds;
         Head? head;
+        var reads = 0;
         while (true)
         {
             head = await ReadHeadAsync(cancellationToken).ConfigureAwait(false);
+            reads++;
             if (head is not null)
             {
                 CheckEpoch(head.Epoch);
@@ -293,7 +297,12 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
         NoteLast(head.Version);
         if (asWriter)
             _lastIsExact = true;
+        var read = Environment.TickCount64;
         await RefreshOldestAsync(cancellationToken).ConfigureAwait(false);
+        if (Environment.TickCount64 - began > 250)
+            _log.Options.Logger?.LogDebug(
+                "Table log {Table}: the last version took {Ms} ms to read: {HeadMs} ms and {Reads} read(s) for the head, {OldestMs} ms for where the changes begin",
+                _name, Environment.TickCount64 - began, read - began, reads, Environment.TickCount64 - read);
         return head.Version;
     }
 

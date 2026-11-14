@@ -220,6 +220,10 @@ internal sealed class SinkWriter : IAsyncDisposable
     private readonly KafkaSinkOptions _options;
     private readonly IProducer<byte[], byte[]>? _producer;
     private int _partitions;
+
+    // The disposal of the admin client that asked for the topic's partitions: its poll
+    // loop reads a queue of the producer's, so the producer is disposed after it.
+    private Task _askerClosed = Task.CompletedTask;
     private long _written;
 
     public SinkWriter(KafkaSinkOptions options)
@@ -279,8 +283,24 @@ internal sealed class SinkWriter : IAsyncDisposable
 
             return _partitions = await Task.Run(() =>
             {
-                using var admin = new DependentAdminClientBuilder(_producer!.Handle).Build();
-                var topic = admin.GetMetadata(Topic, TimeSpan.FromSeconds(30)).Topics.FirstOrDefault(t => t.Topic == Topic);
+                // The admin client is put away off this path and waited for when the sink
+                // is disposed: disposing one waits out its poll loop's 100 ms, which here
+                // would be a tenth of a second in front of the sink's first batch.
+                var admin = new DependentAdminClientBuilder(_producer!.Handle).Build();
+                TopicMetadata? topic;
+                try
+                {
+                    topic = admin.GetMetadata(Topic, TimeSpan.FromSeconds(30)).Topics.FirstOrDefault(t => t.Topic == Topic);
+                }
+                finally
+                {
+                    var before = _askerClosed;
+                    _askerClosed = Task.Run(async () =>
+                    {
+                        await before.ConfigureAwait(false);
+                        admin.Dispose();
+                    });
+                }
                 if (topic is null || topic.Error.IsError || topic.Partitions.Count == 0)
                     throw new KafkaSinkException(
                         $"Sink topic '{Topic}' cannot be written: {(topic is null || !topic.Error.IsError || topic.Error.Code == ErrorCode.UnknownTopicOrPart ? "it does not exist" : topic.Error.Reason)}. " +
@@ -361,11 +381,20 @@ internal sealed class SinkWriter : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         if (_producer is { } producer)
+        {
+            try
+            {
+                await _askerClosed.ConfigureAwait(false);
+            }
+            catch (KafkaException)
+            {
+            }
             await Task.Run(() =>
             {
                 producer.Flush(TimeSpan.FromSeconds(5));
                 producer.Dispose();
             }).ConfigureAwait(false);
+        }
     }
 }
 

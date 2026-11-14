@@ -588,8 +588,14 @@ public class KafkaLogTests(ITestOutputHelper output)
     {
         await using var env = KafkaEnv.Create();
         var log = await env.ConnectWriterAsync();
-        var end = await log.EndOffsetAsync(log.LeaderPartition, default);
-        Assert.True(end > 0, "the writer's term is in the leader topic");
+
+        // The writer's term is committed, and the end of committed data moves past it
+        // when the broker has written the transaction's marker — a moment after the
+        // commit returned (KafkaStateChangelog.EndOffsetAsync says so). Asked at once the
+        // end was still 0 on a busy runner, and with the broker held to a third of a
+        // processor in 5 of 40 tries.
+        var end = 0L;
+        await KafkaEnv.EventuallyAsync(async () => (end = await log.EndOffsetAsync(log.LeaderPartition, default)) > 0, "the writer's term is in the leader topic");
 
         int Records(IConsumer<byte[], byte[]> consumer, CancellationToken token)
         {
@@ -622,5 +628,55 @@ public class KafkaLogTests(ITestOutputHelper output)
             () => log.ShortReadAsync<int>(_ => throw new InvalidOperationException("the read broke"), default)).WaitAsync(Timeout);
         Assert.Equal(all, await log.ShortReadAsync(consumer => Records(consumer, default), default).WaitAsync(Timeout));
         Assert.Equal(2, log.ShortReadersCreated);
+    }
+
+    /// <summary>
+    /// Before the short reader is assigned to a topic it has not met, the topic's metadata
+    /// is asked for on its handle (or the running consumer waits a second for it). That
+    /// question was put through an admin client made for it and disposed at once — and
+    /// disposing an admin client waits for its poll loop, which looks up every 100 ms. So
+    /// every topic cost a tenth of a second the first time, one read at a time: nothing
+    /// for a standby whose statistics had read each table's head long before, and a
+    /// tenth of a second a table for a takeover whose short reader was new — replaced
+    /// after a read that failed, or not yet asked anything. On a runner that was
+    /// 2,164 ms of table stage for 21 tables, against 110 to 190 ms. The client is now
+    /// the consumer's for its whole life: one for each consumer, however many topics.
+    /// </summary>
+    [Fact]
+    public async Task A_short_reader_that_meets_many_topics_makes_one_client_to_ask_about_them()
+    {
+        const int Tables = 12;
+        await using var env = KafkaEnv.Create();
+        var writer = await env.ConnectWriterAsync();
+        for (var t = 0; t < Tables; t++)
+        {
+            var written = await writer.OpenTableLogAsync<int, Row>("rows" + t).WaitAsync(Timeout);
+            await written.AppendAsync(Version(1, new TableChange<int, Row>(1, null, new Row(1, "one"))));
+        }
+
+        // A standby opens them: its short reader meets every table's topics for the first time.
+        var standby = await env.ConnectAsync();
+        var opening = System.Diagnostics.Stopwatch.StartNew();
+        var logs = new List<KafkaTableLog<int, Row>>();
+        for (var t = 0; t < Tables; t++)
+            logs.Add(await standby.OpenTableLogAsync<int, Row>("rows" + t).WaitAsync(Timeout));
+        opening.Stop();
+        Assert.Equal(1, standby.ShortReadersCreated);
+        Assert.Equal(1, standby.ShortReadAdminsCreated);
+
+        // A read fails, the reader is replaced, and the next thing is a takeover's read
+        // of every table's head: every topic is new to the reader again.
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => standby.ShortReadAsync<int>(_ => throw new InvalidOperationException("the read broke"), default)).WaitAsync(Timeout);
+        var reading = System.Diagnostics.Stopwatch.StartNew();
+        foreach (var log in logs)
+            Assert.Equal(1, await log.LastVersionAsync().AsTask().WaitAsync(Timeout));
+        reading.Stop();
+        Assert.Equal(2, standby.ShortReadersCreated);
+        Assert.Equal(2, standby.ShortReadAdminsCreated);
+
+        KafkaEnv.Measured(output,
+            $"short reads of {Tables} tables whose topics are new to the reader: opened in {opening.ElapsedMilliseconds} ms, " +
+            $"last versions after the reader was replaced in {reading.ElapsedMilliseconds} ms (a client per topic cost 100 ms a topic)");
     }
 }

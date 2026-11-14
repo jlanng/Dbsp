@@ -131,7 +131,9 @@ internal sealed class TableHandle<TKey, TRow>(TableRegistry registry, TableDefin
     /// else is opened from the log as the writer, once.</summary>
     public async Task PromoteAsync(CancellationToken cancellationToken)
     {
+        var asked = Environment.TickCount64;
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var entered = Environment.TickCount64;
         try
         {
             if (_table is { IsFollowing: false })
@@ -141,6 +143,10 @@ internal sealed class TableHandle<TKey, TRow>(TableRegistry registry, TableDefin
                 try
                 {
                     await follower.PromoteAsync(cancellationToken).ConfigureAwait(false);
+                    if (Environment.TickCount64 - asked > 250)
+                        _logger.LogDebug(
+                            "Table {Table} was promoted in {Ms} ms ({GateMs} ms of them waiting for its turn)",
+                            Spec.Name, Environment.TickCount64 - asked, entered - asked);
                     return;
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)

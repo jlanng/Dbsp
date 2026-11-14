@@ -456,7 +456,15 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
             $"service kill -9 failover, {extraTables + 1} tables ({extraRows} rows each), 2 plugin pipelines: detection {detection} ms; " +
             $"takeover {Ms("totalMs"):F0} ms = fence {Ms("fenceMs"):F0} + catalog {Ms("catalogMs"):F0} + tables {Ms("tablesMs"):F0} + " +
             $"storage {Ms("storageMs"):F0} + start {Ms("startMs"):F0} (pipelines {Ms("pipelinesMs"):F0}); kill to Leader {failover} ms");
-        Assert.True(Ms("tablesMs") < 2000, $"the table stage took {Ms("tablesMs"):F0} ms for {extraTables + 1} tables; the target is under 2 s");
+
+        // Under a tenth of a second a table, which is what a wait of the client's per
+        // table costs when one creeps into the stage: tables are promoted one short read
+        // after another. 109 to 190 ms for the 21 on a runner and here; 2,164 ms the one
+        // time each table's topic was new to the reader and cost a client made and
+        // disposed for it (KafkaLogTests has that one by count, without a clock).
+        var tableCount = extraTables + 1;
+        Assert.True(Ms("tablesMs") < tableCount * 100,
+            $"the table stage took {Ms("tablesMs"):F0} ms for {tableCount} tables; under 100 ms a table is the bound");
 
         // The dead node comes back the only way it can: as the standby.
         using var again = new AppNode(env, "a", ports[0], ports[1], tables: extraTables);

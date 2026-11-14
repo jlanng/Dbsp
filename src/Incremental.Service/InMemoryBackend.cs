@@ -37,6 +37,16 @@ public sealed class InMemoryBackendOptions
     /// deployed</em>, not its data: pipelines start empty and replay their sources.
     /// </summary>
     public string? CatalogDirectory { get; init; }
+
+    /// <summary>
+    /// How long a takeover waits for a sink write the deposed leader had begun before it
+    /// was fenced. A leader that is replaced starts no write after that moment; one already
+    /// inside a sink is let finish before the new leader prepares anything, so that the
+    /// sink sees the old leader's last batch before the new leader's first and not after
+    /// it. A write that outlasts this is waited for no longer — the takeover goes on, and
+    /// the batch may then land late, as it can behind a Kafka node's lease.
+    /// </summary>
+    public TimeSpan DeposedWriteTimeout { get; init; } = TimeSpan.FromSeconds(5);
 }
 
 /// <summary>
@@ -75,7 +85,10 @@ public sealed class InMemoryServiceCluster
 /// <summary>
 /// The backend with no broker: <see cref="InMemoryTableLog{TKey,TRow}"/> per table and one
 /// <see cref="InMemoryStateChangelog"/>, held in an <see cref="InMemoryServiceCluster"/>.
-/// There are no heartbeats and no automatic election; leased sinks pass through.
+/// There are no heartbeats and no automatic election. A leased sink writes only while its
+/// node is the one the cluster calls leader: the node a takeover replaces begins no write
+/// after it, and the takeover waits for the one it was in the middle of
+/// (<see cref="InMemoryBackendOptions.DeposedWriteTimeout"/>).
 /// </summary>
 public sealed class InMemoryServiceBackend : IServiceBackend, ICatalogMirror
 {
@@ -339,6 +352,12 @@ public sealed class InMemoryServiceBackend : IServiceBackend, ICatalogMirror
 
             try
             {
+                // The deposed leader's circuits run on until its node has heard and torn
+                // them down. From the lock above its leased sinks begin no write; what one
+                // of them was in the middle of is let land before anything is delivered
+                // from here, within a bound.
+                if (deposed is not null)
+                    await deposed._leadership.WritesEnded().CompletesWithin(_cluster.Options.DeposedWriteTimeout).ConfigureAwait(false);
                 await callbacks.PrepareAsync(cancellationToken).ConfigureAwait(false);
                 ChangelogStorage[] storages;
                 lock (_storages)
@@ -440,8 +459,93 @@ public sealed class InMemoryServiceBackend : IServiceBackend, ICatalogMirror
             }
         }
 
-        public IUpsertSink<TKey, TRow> Leased<TKey, TRow>(IUpsertSink<TKey, TRow> sink) where TKey : notnull => sink;
+        // ── the lease: who may deliver to a sink ───────────────────────────────────────
+        //
+        // The cluster's leader, and nobody else. "Is it me" and "a write of mine is in
+        // flight" are decided under the cluster's gate, where a takeover names the new
+        // leader — so a write either began before the takeover, and the takeover waits
+        // for it, or finds that its node no longer leads and reaches no sink. Without
+        // this a deposed leader, which is told at once but tears its circuits down on a
+        // thread of its own a moment later, could read an input, join it against a table
+        // that no longer follows and put the row over the new leader's.
 
-        public IAppendSink<T> Leased<T>(IAppendSink<T> sink) => sink;
+        private int _writing;
+        private TaskCompletionSource? _writesEnded;
+
+        private void BeginWrite()
+        {
+            lock (_cluster.Gate)
+            {
+                if (!ReferenceEquals(_cluster.Leader, backend))
+                    throw new ChangelogFencedException(
+                        $"Node '{backend.NodeId}' does not lead (it is {_role}), so it must not deliver to sinks.");
+                _writing++;
+            }
+        }
+
+        private void EndWrite()
+        {
+            TaskCompletionSource? ended = null;
+            lock (_cluster.Gate)
+            {
+                if (--_writing == 0)
+                    (ended, _writesEnded) = (_writesEnded, null);
+            }
+            ended?.TrySetResult();
+        }
+
+        /// <summary>Completes when no leased sink of this node is inside a write.</summary>
+        private Task WritesEnded()
+        {
+            lock (_cluster.Gate)
+                return _writing == 0
+                    ? Task.CompletedTask
+                    : (_writesEnded ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+        }
+
+        public IUpsertSink<TKey, TRow> Leased<TKey, TRow>(IUpsertSink<TKey, TRow> sink) where TKey : notnull
+        {
+            ArgumentNullException.ThrowIfNull(sink);
+            return new LeasedUpsertSink<TKey, TRow>(this, sink);
+        }
+
+        public IAppendSink<T> Leased<T>(IAppendSink<T> sink)
+        {
+            ArgumentNullException.ThrowIfNull(sink);
+            return new LeasedAppendSink<T>(this, sink);
+        }
+
+        private sealed class LeasedUpsertSink<TKey, TRow>(NodeLeadership leadership, IUpsertSink<TKey, TRow> inner) : IUpsertSink<TKey, TRow>
+            where TKey : notnull
+        {
+            public async ValueTask WriteAsync(UpsertBatch<TKey, TRow> batch, CancellationToken cancellationToken)
+            {
+                leadership.BeginWrite();
+                try
+                {
+                    await inner.WriteAsync(batch, cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    leadership.EndWrite();
+                }
+            }
+        }
+
+        private sealed class LeasedAppendSink<T>(NodeLeadership leadership, IAppendSink<T> inner) : IAppendSink<T>
+        {
+            public async ValueTask WriteAsync(AppendBatch<T> batch, CancellationToken cancellationToken)
+            {
+                leadership.BeginWrite();
+                try
+                {
+                    await inner.WriteAsync(batch, cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    leadership.EndWrite();
+                }
+            }
+        }
     }
 }

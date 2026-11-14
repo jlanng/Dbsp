@@ -1493,7 +1493,10 @@ public sealed class KafkaLog : IAsyncDisposable
     /// <summary>Runs an admin call, retrying the failures a cluster produces while a topic
     /// is new or a partition's leader is moving, for up to the operation timeout.</summary>
     private Task<T> RetryAsync<T>(Func<TimeSpan, Task<T>> call, CancellationToken cancellationToken, params string[] topics) =>
-        RetryTransientAsync(call, _options.OperationTimeout, cancellationToken, () => RefreshMetadata(_admin, topics));
+        RetryTransientAsync(call, _options.OperationTimeout, cancellationToken, () => RefreshMetadata(_admin, topics),
+            _options.Logger is null ? null : (attempt, given, took, ex) => _options.Logger.LogDebug(
+                "Kafka log {Prefix}: an admin call for {Topics} failed on attempt {Attempt} after {Ms} ms of the {Given} ms it was given ({Code}: {Reason}); it is made again",
+                _options.TopicPrefix, string.Join(",", topics), attempt + 1, (long)took.TotalMilliseconds, (long)given.TotalMilliseconds, ex.Error.Code, ex.Error.Reason));
 
     /// <summary>Asks the cluster for the topics' metadata through <paramref name="admin"/>,
     /// which puts what it answers into that client's cache. Failures are the next
@@ -1527,7 +1530,8 @@ public sealed class KafkaLog : IAsyncDisposable
     /// <c>Incremental.Kafka.Tests</c> failed that way after 30 s.
     /// </summary>
     internal static async Task<T> RetryTransientAsync<T>(
-        Func<TimeSpan, Task<T>> call, TimeSpan timeout, CancellationToken cancellationToken, Action? betweenAttempts = null)
+        Func<TimeSpan, Task<T>> call, TimeSpan timeout, CancellationToken cancellationToken, Action? betweenAttempts = null,
+        Action<int, TimeSpan, TimeSpan, KafkaException>? onRetry = null)
     {
         var deadline = Environment.TickCount64 + (long)timeout.TotalMilliseconds;
         for (var attempt = 0; ; attempt++)
@@ -1535,12 +1539,15 @@ public sealed class KafkaLog : IAsyncDisposable
             cancellationToken.ThrowIfCancellationRequested();
             var left = TimeSpan.FromMilliseconds(Math.Max(100, deadline - Environment.TickCount64));
             var mine = TimeSpan.FromMilliseconds(500 << Math.Min(attempt, 6));
+            var given = mine < left ? mine : left;
+            var began = Environment.TickCount64;
             try
             {
-                return await call(mine < left ? mine : left).WaitAsync(cancellationToken).ConfigureAwait(false);
+                return await call(given).WaitAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (KafkaException ex) when (IsTransient(ex) && Environment.TickCount64 < deadline)
             {
+                onRetry?.Invoke(attempt, given, TimeSpan.FromMilliseconds(Environment.TickCount64 - began), ex);
                 if (betweenAttempts is not null)
                     await Task.Run(betweenAttempts, cancellationToken).ConfigureAwait(false);
                 await Task.Delay(100, cancellationToken).ConfigureAwait(false);
@@ -1650,11 +1657,18 @@ public sealed class KafkaLog : IAsyncDisposable
     /// short-read consumer, which <paramref name="read"/> assigns itself. One at a time.</summary>
     internal async Task<T> ShortReadAsync<T>(Func<IConsumer<byte[], byte[]>, T> read, CancellationToken cancellationToken)
     {
+        var asked = Environment.TickCount64;
         await _shortReadGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var entered = Environment.TickCount64;
         try
         {
             return await Task.Run(() =>
             {
+                var began = Environment.TickCount64;
+                if (began - asked > 250)
+                    _options.Logger?.LogDebug(
+                        "Kafka log {Prefix}: a short read waited {GateMs} ms for the reads before it and {ThreadMs} ms for a thread",
+                        _options.TopicPrefix, entered - asked, began - entered);
                 ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
                 var consumer = _shortReader;
                 if (consumer is null)
@@ -1694,13 +1708,7 @@ public sealed class KafkaLog : IAsyncDisposable
                     if (!keep)
                     {
                         _shortReader = null;
-                        try
-                        {
-                            consumer.Dispose();
-                        }
-                        catch (KafkaException)
-                        {
-                        }
+                        DisposeShortReader(consumer);
                     }
                     throw;
                 }
@@ -1712,9 +1720,16 @@ public sealed class KafkaLog : IAsyncDisposable
         }
     }
 
-    // Topics the current short reader has been told the leaders of. Guarded by the gate.
+    // Topics the current short reader has been told the leaders of, and the admin client
+    // that asks for them on its handle. Guarded by the gate.
     private readonly HashSet<string> _shortReaderTopics = new(StringComparer.Ordinal);
     private IConsumer<byte[], byte[]>? _shortReaderOfTopics;
+    private IAdminClient? _shortReaderAdmin;
+    private int _shortReadAdminsCreated;
+
+    /// <summary>How many admin clients the short reads have made to ask for a topic's
+    /// metadata: at most one for each consumer they have had. For tests.</summary>
+    internal int ShortReadAdminsCreated => Volatile.Read(ref _shortReadAdminsCreated);
 
     /// <summary>
     /// Assigns the short reader to <paramref name="position"/>, for a read inside
@@ -1730,15 +1745,61 @@ public sealed class KafkaLog : IAsyncDisposable
     {
         if (!ReferenceEquals(_shortReaderOfTopics, consumer))
         {
+            // Another consumer than the last one's (a test's own, or the next after a
+            // read that failed): what the last was told is not what this one knows.
+            try
+            {
+                _shortReaderAdmin?.Dispose();
+            }
+            catch (KafkaException)
+            {
+            }
+            _shortReaderAdmin = null;
             _shortReaderOfTopics = consumer;
             _shortReaderTopics.Clear();
         }
         if (_shortReaderTopics.Add(position.Topic))
         {
-            using var admin = new DependentAdminClientBuilder(consumer.Handle).Build();
-            admin.GetMetadata(position.Topic, _options.OperationTimeout);
+            // One admin client for the consumer's whole life, never one per question:
+            // disposing an admin client waits for its poll loop, which looks up every
+            // 100 ms, so a client made and disposed here cost a tenth of a second for
+            // each topic the consumer met — one read at a time, a takeover's tables in
+            // turn. (2,164 ms for 21 tables on a runner whose short reader had just been
+            // replaced; 110 to 190 ms when it had met the topics before.)
+            if (_shortReaderAdmin is null)
+            {
+                _shortReaderAdmin = new DependentAdminClientBuilder(consumer.Handle).Build();
+                Interlocked.Increment(ref _shortReadAdminsCreated);
+            }
+            _shortReaderAdmin.GetMetadata(position.Topic, _options.OperationTimeout);
         }
         consumer.Assign(position);
+    }
+
+    /// <summary>Disposes the short reader and the admin client that asked on its handle,
+    /// the admin client first: its poll loop reads a queue of the consumer's.</summary>
+    private void DisposeShortReader(IConsumer<byte[], byte[]> consumer)
+    {
+        if (ReferenceEquals(_shortReaderOfTopics, consumer))
+        {
+            _shortReaderOfTopics = null;
+            _shortReaderTopics.Clear();
+            try
+            {
+                _shortReaderAdmin?.Dispose();
+            }
+            catch (KafkaException)
+            {
+            }
+            _shortReaderAdmin = null;
+        }
+        try
+        {
+            consumer.Dispose();
+        }
+        catch (KafkaException)
+        {
+        }
     }
 
     /// <summary>Reads an assigned single-partition consumer until it has seen every
@@ -1957,13 +2018,8 @@ public sealed class KafkaLog : IAsyncDisposable
         // A short read in flight ends on the stop token; then its consumer can go.
         if (await _shortReadGate.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false))
         {
-            try
-            {
-                _shortReader?.Dispose();
-            }
-            catch (KafkaException)
-            {
-            }
+            if (_shortReader is { } reader)
+                DisposeShortReader(reader);
             _shortReader = null;
         }
 
