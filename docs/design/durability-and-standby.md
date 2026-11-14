@@ -2066,6 +2066,18 @@ table stage is inside `Prepare`; `ServiceTakeoverTimings` splits it out.
   never paid this, which is why followers, restores and step 5's one-table measurements
   did not show it. The suite in `tests/Incremental.Kafka.Tests` runs half a minute
   faster for it.
+  *Corrected 2026-11-14:* that metadata request was put through an admin client made
+  for it on the consumer's handle and disposed at once, and disposing an admin client
+  waits for its poll loop, which looks up every 100 ms (build 0.2 ms, the request
+  0.3 ms, the disposal 99.9 ms, measured). So the second had become a tenth of a
+  second, per topic, one read at a time: in every takeover's fence stage (the read of
+  the last term is the short reader's first sight of the leader topic), twice per table
+  when a node opens its tables, and once per table in a takeover whose short reader was
+  new. The admin client is now made once for the consumer and disposed with it. Twelve
+  tables on one broker: opening them as a reader 2,691 ms before and 217 ms after; their
+  last versions on a reader just replaced 1,299 ms and 84 ms. The takeover of
+  `KafkaEndToEndTests` (two tables): 120–140 ms of fence and 8, 110 or 215 ms of tables
+  before, 15–22 ms and 7–24 ms after. See enrichment-service.md, S8, *CI*.
 
 **Measured with the service** (two processes, 21 tables, two plugin pipelines, kill -9
 mid-stream, local broker): see enrichment-service.md, *As built*, S2 — detection is

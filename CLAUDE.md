@@ -7,6 +7,11 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
 - Build: `dotnet build`
 - Test: `dotnet test --project tests/Incremental.Tests` (xunit v3 on Microsoft.Testing.Platform,
   opted in by `global.json` — hence `--project`; Redis tests skip unless `docker compose up -d` has run)
+- CI (`.github/workflows/ci.yml`): three jobs on every push; a fourth, `broker-failures`
+  (the six broker tests on the `kafka3` profile), only by hand:
+  `gh workflow run CI --ref <branch> -f broker_tests=true`.
+  A test that reads "the end" of a Kafka partition right after its own commit must wait
+  for it (`KafkaEnv.EventuallyAsync`): the marker is written after the commit returns.
 - Kafka tests: `dotnet test --project tests/Incremental.Kafka.Tests` — integration tests of
   `Incremental.Kafka` against the connector stack (start it first, below): the logs,
   leadership, sources, sinks, and CDC from Postgres through Debezium. Tests skip, not fail,
@@ -206,6 +211,11 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   topic it has not seen waits a second for the client to look the leader up, and that
   consumer keeps `fetch.wait.max.ms` at 5 so one read does not wait out the last one's
   long poll. Both cost a takeover or a start-up a second or half a second per table.
+  The metadata question `AssignForShortRead` asks goes through one admin client kept
+  for the consumer's life: disposing an admin client (a `DependentAdminClientBuilder`
+  one too) waits out its poll loop's 100 ms, so one made and disposed per question is
+  a tenth of a second per topic — it was, in every takeover's fence stage and once per
+  table when the reader was new. Never dispose an admin client on a path that is timed.
   A short read its caller calls off (a status that gives a table's lag two seconds)
   keeps that consumer and what it knows of the topics; only a read that failed
   replaces it (`KafkaLogTests`, the short reader's test).
@@ -477,6 +487,12 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     `table-sources`, definition and template endpoints) returns names, kinds and config
     schemas, never a connection's settings. Describing a definition runs its `Build`
     against stand-in tables (`PipelineBuilder` detached) and is leader-only.
+  - The in-memory backend's fencing reaches the sinks: a leased sink begins no write
+    unless its node is the cluster's leader, decided under the cluster's gate, and a
+    takeover waits for the deposed leader's write in flight
+    (`InMemoryBackendOptions.DeposedWriteTimeout`) before it prepares anything. A
+    replaced leader is told at once but tears its circuits down a moment later; without
+    the lease its last rows land over the new leader's (`InMemoryFencingTests`).
   - The in-memory backend must stay bounded: the state log compacts itself
     (`StateCompactAbove`), table logs cap history by row changes, and a tombstone is
     dropped only once every enumerating reader has passed it.

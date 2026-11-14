@@ -8,6 +8,11 @@ on:
     branches: [main, enrichment-service]
   pull_request:
   workflow_dispatch:
+    inputs:
+      broker_tests:
+        description: "Also run the broker-failure tests on three brokers (the kafka3 compose profile)"
+        type: boolean
+        default: false
 
 jobs:
   build-and-test:
@@ -113,6 +118,55 @@ jobs:
       - name: Stop the stack
         if: always()
         run: docker compose --profile connectors down -v
+
+  # The tests that stop, kill and freeze brokers under a running pipeline, on the
+  # repository's three-broker compose profile. By hand only
+  # (`gh workflow run CI --ref <branch> -f broker_tests=true`): they take the whole of a
+  # runner for a quarter of an hour, and what they assert — one leader, nothing lost,
+  # the leadership not moved by one broker's loss — depends on three JVMs and two node
+  # processes keeping their heartbeats on two shared cores. docs/design/enrichment-service.md
+  # (S8, *CI*) has what the runs made of it so far cost and how they ended.
+  broker-failures:
+    if: github.event_name == 'workflow_dispatch' && inputs.broker_tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Start three brokers
+        run: docker compose --profile kafka3 up -d --wait --wait-timeout 240
+      - name: Build
+        run: dotnet build -c Release
+      - name: Broker-failure tests
+        env:
+          INCREMENTAL_KAFKA_BOOTSTRAP: localhost:9192,localhost:9292,localhost:9392
+          INCREMENTAL_KAFKA_REPLICATION: 3
+          INCREMENTAL_KAFKA_BROKERS: incremental-kafka3-1-1,incremental-kafka3-2-1,incremental-kafka3-3-1
+          INCREMENTAL_NODE_LOGS: ${{ runner.temp }}/node-logs
+        run: |
+          set -o pipefail
+          dotnet test --project tests/Incremental.Service.Tests -c Release --no-build -- --filter-method "*broker*" | tee broker-tests.log
+          # Here the brokers are there to be stopped: a skip means the run proved nothing.
+          sed 's/\x1b\[[0-9;]*m//g' broker-tests.log | grep -Eq '^\s*skipped: 0\s*$'
+      - name: What the runs measured
+        if: always()
+        run: |
+          cat tests/Incremental.Service.Tests/bin/Release/net10.0/measurements.log || true
+          cat tests/Incremental.Service.Tests/bin/Release/net10.0/broker-runs.jsonl || true
+      - name: Node logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: broker-failure-node-logs
+          path: ${{ runner.temp }}/node-logs
+      - name: Broker logs
+        if: failure()
+        run: docker compose --profile kafka3 logs --no-color --tail 300
+      - name: Stop the brokers
+        if: always()
+        run: docker compose --profile kafka3 down -v
 
   # Scaling assertions, not absolute timings: shared runners are too noisy to gate on
   # wall-clock numbers, so this job asserts that a fixed-size delta costs about the same
