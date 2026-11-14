@@ -75,6 +75,14 @@ public sealed class InMemoryCheckpointStorageProvider : ICheckpointStorageProvid
         }
     }
 
+    /// <summary>Entries the committed state holds, store by store (deadline stores
+    /// included): what a test reads to ask whether a pipeline's state returns to a bound.</summary>
+    public IReadOnlyDictionary<string, long> CommittedEntriesByStore()
+    {
+        lock (_stores)
+            return _stores.ToDictionary(store => store.Key, store => store.Value.CommittedCount, StringComparer.Ordinal);
+    }
+
     public string? CommittedManifest(string scope)
     {
         lock (_stores)
@@ -200,6 +208,20 @@ public sealed class InMemoryCheckpointStorageProvider : ICheckpointStorageProvid
             var group = GroupFor(key);
             group.Cleared = true;
             group.Values.Clear();
+        }
+
+        public void RemoveEntries(IReadOnlyList<KeyedValue<TKey, TValue>> entries)
+        {
+            for (var i = 0; i < entries.Count; i++)
+            {
+                var (key, value) = entries[i];
+                _staged.TryGetValue(key, out var group);
+                var weight = group is not null && group.Values.TryGetValue(value, out var staged)
+                    ? staged
+                    : CommittedWeight(key, value, group?.Cleared ?? false);
+                if (weight != 0)
+                    Update(key, value, -weight);
+            }
         }
 
         public void Promote()

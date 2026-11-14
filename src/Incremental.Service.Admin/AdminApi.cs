@@ -757,6 +757,8 @@ internal static class AdminApi
                 bytesHeldTwice = p.StateSize.BytesHeldTwice,
                 stores = p.StateSize.Stores.Count,
             },
+            // Set while the state has grown without a pause for StateGrowthAlarmAfter.
+            stateGrowingSince = p.StateGrowingSince,
             // Inputs whose source says that what it reads is not there, and since when.
             waiting = p.Sources.Where(s => s.Stats.WaitingFor is not null)
                 .Select(s => new { slot = s.Slot, waitingFor = s.Stats.WaitingFor, since = s.WaitingSince }).ToList() is { Count: > 0 } w ? w : null,

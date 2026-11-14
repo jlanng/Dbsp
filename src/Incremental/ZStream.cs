@@ -323,6 +323,30 @@ public class ZStream<T> where T : notnull
     }
 
     /// <summary>
+    /// Re-declares event time on a stream derived from one that already declared it —
+    /// after a <see cref="Select"/>, a join or a lookup has reshaped the record — so that
+    /// it can be grouped as an <see cref="EventTimeStream{T}"/> again (to window it, or for
+    /// <c>EvictWhenFinal</c>). Records behind the watermark are dropped here as at the
+    /// declaration, but the clock gains no source: the watermark stays what the upstream
+    /// declarations make it. That matters after a filter, which would otherwise hold the
+    /// watermark back to the newest record it lets through. Use the overload with a
+    /// lateness for a feed of its own, whose time nothing else tracks.
+    /// </summary>
+    public EventTimeStream<T> WithEventTime(Func<T, DateTimeOffset> eventTime)
+    {
+        ArgumentNullException.ThrowIfNull(eventTime);
+        Builder.RequireOutsideRecursion("WithEventTime");
+        var clock = Builder.WatermarkClock
+            ?? throw new InvalidOperationException(
+                "WithEventTime without a lateness re-declares event time that a stream upstream declared, and none has: " +
+                "call WithEventTime(eventTime, lateness) on the input first.");
+        return new EventTimeStream<T>(
+            Builder,
+            Builder.AddNode("eventTime", [NodeId], ctx => new WatermarkOperator<T>(ctx, clock, tracker: -1, eventTime)),
+            eventTime);
+    }
+
+    /// <summary>
     /// Marks this stream as a circuit output; redeem the returned definition with
     /// <see cref="Circuit.Handle{T}(Output{T})"/> after <c>Build()</c> for the live handle.
     /// A plain stream output is a pure changefeed: it has no meaningful "current state" to

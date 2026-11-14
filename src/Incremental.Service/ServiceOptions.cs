@@ -55,6 +55,18 @@ public sealed class ServiceOptions
     /// </summary>
     public TimeSpan MissingInputGrace { get; set; } = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// How long a pipeline's state may grow without a pause before the node says so: when
+    /// the entries it holds, sampled every fifteenth of this, have not fallen once in this
+    /// long and rose at no fewer than twelve of the fifteen samples, the pipeline is flagged
+    /// (<see cref="PipelineStatus.StateGrowingSince"/>, an event, the overview's attention
+    /// list, the gauge <c>incremental.service.pipeline.state_growing</c>). A state that is
+    /// bounded rises and falls once it is full; one that grows at every sample for half an
+    /// hour is keeping something per record that nothing closes. Read from the counts the
+    /// node already keeps, never by walking a store. Zero turns it off.
+    /// </summary>
+    public TimeSpan StateGrowthAlarmAfter { get; set; } = TimeSpan.FromMinutes(30);
+
     /// <summary>The drain a pipeline's teardown is given before its outputs are abandoned.</summary>
     public TimeSpan StopTimeout { get; set; } = TimeSpan.FromSeconds(20);
 

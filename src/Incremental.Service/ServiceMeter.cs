@@ -116,6 +116,9 @@ public static class ServiceMeter
         Meter.CreateObservableGauge("incremental.service.pipeline.state_memory", () => Each<long>(g => g.Pipelines.Select(p =>
                 new Measurement<long>(p.StateBytes, Tag("node", g.Node), Tag("pipeline", p.Id)))),
             "By", "Estimated bytes of managed heap the pipeline's state holds on this node.");
+        Meter.CreateObservableGauge("incremental.service.pipeline.state_growing", () => Each<long>(g => g.Pipelines.Select(p =>
+                new Measurement<long>(p.StateGrowing ? 1 : 0, Tag("node", g.Node), Tag("pipeline", p.Id)))),
+            description: "1 while the pipeline's state entries have grown without a pause for ServiceOptions.StateGrowthAlarmAfter (30 min): kept per record and never closed.");
         Meter.CreateObservableGauge("incremental.service.process.working_set", () => Process(m => m.WorkingSetBytes),
             "By", "The process's working set, as the operating system counts it.");
         Meter.CreateObservableGauge("incremental.service.process.gc.live", () => Process(m => m.GcLiveBytes),
@@ -158,7 +161,7 @@ public static class ServiceMeter
 
 internal readonly record struct PipelineGauge(
     string Id, PipelineState State, bool DesiredRunning, long? SourceLag, double? CheckpointAgeSeconds, double SinkAckWaitSeconds, long DeadLetters,
-    long StateEntries = 0, long StateBytes = 0);
+    long StateEntries = 0, long StateBytes = 0, bool StateGrowing = false);
 
 internal readonly record struct TableGauge(
     string Name, TableState State, long Rows, long Version, long? FollowerLag, long? LoaderLag,

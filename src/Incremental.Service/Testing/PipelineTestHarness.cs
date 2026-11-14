@@ -35,14 +35,16 @@ public sealed class PipelineTestHarness : IAsyncDisposable
     private readonly List<DeadLetter> _deadLetters = [];
     private readonly CancellationTokenSource _stop = new();
     private readonly string _id;
+    private readonly InMemoryCheckpointStorageProvider _storage;
 
     /// <summary>Starts describing a harness for the definition class
     /// <typeparamref name="TDefinition"/>.</summary>
     public static Builder For<TDefinition>() where TDefinition : class, new() => new(typeof(TDefinition));
 
-    private PipelineTestHarness(string id, Circuit circuit, PipelineBuilder pipeline, JsonSerializerOptions json)
+    private PipelineTestHarness(string id, Circuit circuit, PipelineBuilder pipeline, JsonSerializerOptions json, InMemoryCheckpointStorageProvider storage)
     {
         _id = id;
+        _storage = storage;
         _circuit = circuit;
         _pipeline = pipeline;
         Json = json;
@@ -138,6 +140,24 @@ public sealed class PipelineTestHarness : IAsyncDisposable
     /// <summary>The event-time watermark after the last step; null before any input with
     /// event time has seen a record.</summary>
     public DateTimeOffset? Watermark => _circuit.CurrentWatermark;
+
+    /// <summary>
+    /// What the pipeline's state holds as of the last step: entries per store and in all,
+    /// the same count a node shows as the pipeline's state entries. A store is named after
+    /// its operator — <c>named.priced.tableJoin.facts.w0</c> for the facts a join named
+    /// <c>priced</c> keeps on worker 0, <c>input.trades.upsert.rows.w0</c> for a keyed
+    /// input's rows, <c>….deadlines.w0</c> for what an operator waits on the watermark for.
+    /// For a test that feeds a definition a long stream and asserts that its state returns
+    /// to a bound once its windows close and its records are final.
+    /// </summary>
+    public HarnessStateSize StateSize
+    {
+        get
+        {
+            var stores = _storage.CommittedEntriesByStore();
+            return new HarnessStateSize(stores.Values.Sum(), stores);
+        }
+    }
 
     /// <summary>
     /// Runs one step: everything sent to the inputs and every change made to the tables
@@ -330,13 +350,14 @@ public sealed class PipelineTestHarness : IAsyncDisposable
             var settings = binding.BindSettings(_settings, json);
             var id = _id ?? (ServiceNames.IsValid(binding.Name) ? binding.Name : "pipeline");
             var spec = new PipelineSpec { Id = id, Plugin = "test", Version = "test", Definition = binding.Name, Settings = _settings, Tables = _bindings };
+            var storage = new InMemoryCheckpointStorageProvider();
             var circuit = new CircuitBuilder(new CircuitOptions
             {
                 Name = id,
                 Workers = _workers,
                 AutoStep = false,
                 // A checkpoint store makes a step wait for its sinks, as it does in the service.
-                Storage = new InMemoryCheckpointStorageProvider(),
+                Storage = storage,
                 ErrorPolicy = _errorPolicy,
                 AcknowledgeDeadLetters = true,
                 InputChannelCapacity = 1 << 20,
@@ -350,12 +371,16 @@ public sealed class PipelineTestHarness : IAsyncDisposable
             binding.Build(pipeline, settings);
             foreach (var fill in _fills)
                 await fill().ConfigureAwait(false);
-            var harness = new PipelineTestHarness(id, circuit.Build(), pipeline, json);
+            var harness = new PipelineTestHarness(id, circuit.Build(), pipeline, json, storage);
             await harness.StartAsync().ConfigureAwait(false);
             return harness;
         }
     }
 }
+
+/// <summary>What a <see cref="PipelineTestHarness"/>'s pipeline holds:
+/// <paramref name="Entries"/> in all, and per store, by the store's name.</summary>
+public sealed record HarnessStateSize(long Entries, IReadOnlyDictionary<string, long> Stores);
 
 /// <summary>A table of a <see cref="PipelineTestHarness"/>: what the test changes between
 /// steps, and what it reads of a table the pipeline writes.</summary>

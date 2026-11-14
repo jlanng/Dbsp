@@ -97,6 +97,7 @@ public sealed record CircuitGraph(
 public sealed class CircuitBuilder
 {
     private readonly List<NodeDefinition> _nodes = [];
+    private readonly List<KeyedInputRetention> _retentions = [];
     private readonly List<InputRegistration> _inputs = [];
     private readonly List<OutputRegistration> _outputs = [];
     private readonly List<LoopRegion> _loopRegions = [];
@@ -209,8 +210,11 @@ public sealed class CircuitBuilder
                 [source],
                 _ => new ExchangeOperator<KeyedCommand<TKey, TValue>>(c => routingHash!(c.Key)),
                 isExchange: true);
-        var state = AddNodeCore("upsert", [upstream], ctx => new UpsertOperator<TKey, TValue>(ctx),
+        var retention = new KeyedInputRetention<TValue> { InputName = name };
+        var state = AddNodeCore("upsert", [upstream], ctx => new UpsertOperator<TKey, TValue>(ctx, retention.Policy),
             isExchange: false, inputStateOf: name);
+        retention.UpsertNode = state;
+        _retentions.Add(retention);
 
         _inputs.Add(new KeyedInputRegistration<TKey, TValue>
         {
@@ -219,7 +223,7 @@ public sealed class CircuitBuilder
             KeySelector = keySelector,
             RoutingHash = routingHash,
         });
-        return new KeyedInputStream<TKey, TValue>(this, state, name);
+        return new KeyedInputStream<TKey, TValue>(this, state, name, retention);
     }
 
     /// <summary>Attaches a shared table: the circuit can join against its rows, and receives
@@ -560,6 +564,21 @@ public sealed class CircuitBuilder
                 throw new InvalidOperationException(
                     $"This circuit reads one table named '{derived.Table.Name}' and writes another. Both positions commit under " +
                     "the table's name; give the tables different names.");
+        // A keyed input that forgets its final rows owes no retraction for them, which is
+        // only unseen because the event-time declaration drops them anyway: so that must be
+        // the one way out of its state.
+        foreach (var retention in _retentions)
+        {
+            if (retention.WatermarkNode < 0)
+                continue;
+            var others = _nodes.Count(n => n.Id != retention.WatermarkNode && n.Inputs.Contains(retention.UpsertNode))
+                + _outputs.Count(o => o.NodeId == retention.UpsertNode);
+            if (others > 0)
+                throw new InvalidOperationException(
+                    $"Keyed input '{retention.InputName}' forgets its rows once they are final (WithEventTime with evictWhenFinal), " +
+                    "so every use of it must go through that event-time stream: use the stream WithEventTime returned, not the input itself.");
+        }
+
         var duplicateNames = _nodes.Where(n => n.StateId is not null)
             .GroupBy(n => n.StateId!, StringComparer.Ordinal)
             .Where(g => g.Count() > 1)

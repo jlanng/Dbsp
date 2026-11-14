@@ -36,7 +36,8 @@ public abstract class TableView<TKey, TRow>
         GroupedZStream<TKey, TFact> facts,
         string operation,
         Func<TKey, TFact, TRow, TOut> matched,
-        Func<TKey, TFact, TOut>? unmatched)
+        Func<TKey, TFact, TOut>? unmatched,
+        RecordEviction<TFact>? records = null)
         where TFact : notnull
         where TOut : notnull;
 
@@ -155,7 +156,8 @@ public sealed class TableRef<TKey, TRow> : TableView<TKey, TRow>
         GroupedZStream<TKey, TFact> facts,
         string operation,
         Func<TKey, TFact, TRow, TOut> matched,
-        Func<TKey, TFact, TOut>? unmatched)
+        Func<TKey, TFact, TOut>? unmatched,
+        RecordEviction<TFact>? records = null)
     {
         var changes = RouteLikeFacts<TFact, TableChange<TKey, TRow>>(facts, operation, ChangesNodeId, change => change.Key);
         var probe = Probe;
@@ -165,7 +167,7 @@ public sealed class TableRef<TKey, TRow> : TableView<TKey, TRow>
             Builder.AddNode(
                 "tableJoin",
                 [facts.NodeId, changes],
-                ctx => new TableJoinOperator<TKey, TFact, TRow, TOut>(ctx, probe, matched, unmatched, eviction)));
+                ctx => new TableJoinOperator<TKey, TFact, TRow, TOut>(ctx, probe, matched, unmatched, eviction, records)));
     }
 }
 
@@ -189,7 +191,8 @@ internal sealed class TableIndexView<TIndexKey, TKey, TRow>(TableRef<TKey, TRow>
         GroupedZStream<TIndexKey, TFact> facts,
         string operation,
         Func<TIndexKey, TFact, TRow, TOut> matched,
-        Func<TIndexKey, TFact, TOut>? unmatched)
+        Func<TIndexKey, TFact, TOut>? unmatched,
+        RecordEviction<TFact>? records = null)
     {
         // The table's changes are by primary key. Re-keyed by the index — the old row
         // leaving its group, the new row entering its own — they are the delta of exactly
@@ -206,7 +209,7 @@ internal sealed class TableIndexView<TIndexKey, TKey, TRow>(TableRef<TKey, TRow>
             Builder.AddNode(
                 "tableIndexJoin",
                 [facts.NodeId, changes],
-                ctx => new TableIndexJoinOperator<TIndexKey, TKey, TFact, TRow, TOut>(ctx, probe, matched, unmatched, eviction)));
+                ctx => new TableIndexJoinOperator<TIndexKey, TKey, TFact, TRow, TOut>(ctx, probe, matched, unmatched, eviction, records)));
     }
 }
 

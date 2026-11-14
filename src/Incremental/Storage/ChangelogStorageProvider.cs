@@ -1516,6 +1516,17 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         public void GetGroupsInto(IReadOnlyList<TKey> keys, List<WeightedValue<TValue>> into, List<int> bounds) =>
             _live.GetGroupsInto(keys, into, bounds);
 
+        /// <summary>A tombstone per entry that was held, through <see cref="Update"/>.</summary>
+        public void RemoveEntries(IReadOnlyList<KeyedValue<TKey, TValue>> entries)
+        {
+            for (var i = 0; i < entries.Count; i++)
+            {
+                var (key, value) = entries[i];
+                if (_live.WeightOf(key, value) is var weight and not 0)
+                    Update(key, value, -weight);
+            }
+        }
+
         /// <summary>One tombstone per member: the log has a record per entry, and no way to
         /// remove a group in one.</summary>
         public void RemoveGroup(TKey key)

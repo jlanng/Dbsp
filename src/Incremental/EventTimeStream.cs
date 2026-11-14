@@ -4,7 +4,7 @@ namespace Incremental;
 
 /// <summary>
 /// A stream whose records carry a declared event time (see
-/// <see cref="ZStream{T}.WithEventTime"/>). The timestamp selector travels in the type:
+/// <see cref="ZStream{T}.WithEventTime(Func{T,DateTimeOffset},TimeSpan)"/>). The timestamp selector travels in the type:
 /// groupings of this stream can be windowed, and operations that preserve the record shape
 /// (<see cref="Where"/>, <see cref="Distinct()"/>) keep the event time, while reshaping ones
 /// (<c>Select</c>, <c>SelectMany</c>) return a plain stream — the selector no longer applies

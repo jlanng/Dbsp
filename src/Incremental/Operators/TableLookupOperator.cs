@@ -50,7 +50,8 @@ internal sealed class TableLookupOperator<TKey, TFact, TRow, TOut> : IStepOperat
         TableGroupProbe<TKey, TRow> table,
         Func<TKey, TFact, TRow, TOut> matched,
         Func<TKey, TFact, TOut>? missing,
-        KeyEviction<TKey>? eviction)
+        KeyEviction<TKey>? eviction,
+        RecordEviction<TFact>? records = null)
     {
         _remembered = context.Storage.CreateIndexedWeightStore<KeyedValue<TKey, TFact>, LookupResult<TOut>>(
             context.StateName("remembered"));
@@ -63,9 +64,13 @@ internal sealed class TableLookupOperator<TKey, TFact, TRow, TOut> : IStepOperat
         // tracked and closes with its key. A fact that is taken back whole is forgotten
         // (EvictionTracker.Forget): the deadlines are the facts remembered, one each, and
         // not every version a corrected fact ever had.
+        // Under EvictWhenFinal each fact closes on its own, when the watermark passes its
+        // event time.
         if (eviction is not null)
             _eviction = new EvictionTracker<KeyedValue<TKey, TFact>>(
                 context, new KeyEviction<KeyedValue<TKey, TFact>>(eviction.Clock, fact => eviction.ClosesAt(fact.Key)));
+        else if (records is not null)
+            _eviction = new EvictionTracker<KeyedValue<TKey, TFact>>(context, records.ForKeyed<TKey>());
     }
 
     private readonly RecordErrors? _errors; // null under the default policy

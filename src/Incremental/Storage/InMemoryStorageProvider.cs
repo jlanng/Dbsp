@@ -256,6 +256,16 @@ public sealed class InMemoryStorageProvider : IStorageProvider
                 _entryCount--;
         }
 
+        public void RemoveEntries(IReadOnlyList<KeyedValue<TKey, TValue>> entries)
+        {
+            for (var i = 0; i < entries.Count; i++)
+            {
+                var (key, value) = entries[i];
+                if (WeightOf(key, value) is var weight and not 0)
+                    Update(key, value, -weight);
+            }
+        }
+
         /// <summary>The weight of one value under <paramref name="key"/>, 0 if absent.</summary>
         internal long WeightOf(TKey key, TValue value)
         {

@@ -141,6 +141,8 @@ internal sealed class WatermarkClock(int workers)
 
 /// <summary>
 /// Observes event times for the clock and drops records older than the current watermark.
+/// A negative <c>tracker</c> is a re-declaration (<c>WithEventTime</c> without a lateness):
+/// it drops, and observes nothing.
 /// Dropping here is what makes downstream eviction safe: state for a closed key can never
 /// be needed again, because nothing that would touch it can get past this operator.
 /// </summary>
@@ -173,7 +175,8 @@ internal sealed class WatermarkOperator<T>(
                     output.Add(value, weight);
             }
 
-        if (maxSeen != long.MinValue)
+        // A re-declaration (no tracker of its own) filters on the watermark and feeds nothing.
+        if (maxSeen != long.MinValue && tracker >= 0)
             clock.Observe(tracker, _worker, maxSeen);
         return output;
     }
@@ -210,6 +213,68 @@ internal sealed class KeyEviction<TKey>(WatermarkClock clock, Func<TKey, DateTim
 {
     public WatermarkClock Clock { get; } = clock;
     public Func<TKey, DateTimeOffset> ClosesAt { get; } = closesAt;
+}
+
+/// <summary>
+/// An eviction policy per record rather than per key (<c>EvictWhenFinal</c>): a record is
+/// final once the circuit's watermark has passed its own event time, and an operator that
+/// holds it may then forget it. Sound for the same reason <see cref="KeyEviction{TKey}"/>
+/// is: the <see cref="WatermarkOperator{T}"/> upstream drops every record whose event time
+/// is behind the watermark — the record's retraction and every later version of it
+/// included — so nothing that would touch a final record can arrive. The watermark keeps
+/// a record with ticks at or above it and <see cref="IDeadlineStore{TKey}.TakeDue"/> takes
+/// a deadline at or below it, hence one tick after the event time.
+/// </summary>
+internal sealed class RecordEviction<TValue>(WatermarkClock clock, Func<TValue, DateTimeOffset> eventTime)
+    where TValue : notnull
+{
+    public WatermarkClock Clock { get; } = clock;
+
+    public DateTimeOffset ClosesAt(TValue value) => eventTime(value).AddTicks(1);
+
+    /// <summary>Whether <paramref name="value"/> is final as of the running step's
+    /// watermark: an operator that applies a table change before it drains its deadlines
+    /// leaves such a record alone, so that a change corrects exactly the records whose
+    /// event time is at or after the watermark, whenever the eviction itself runs.</summary>
+    public bool IsFinal(TValue value) => eventTime(value).UtcTicks < Clock.FrozenTicks;
+
+    /// <summary>The same policy for an operator whose state holds records under a key.</summary>
+    public KeyEviction<KeyedValue<TKey, TValue>> ForKeyed<TKey>() where TKey : notnull =>
+        new(Clock, record => ClosesAt(record.Value));
+}
+
+/// <summary>
+/// The facts of a retroactive table join, forgotten one by one as they become final
+/// (<see cref="RecordEviction{TValue}"/>). The deadlines are an
+/// <see cref="EvictionTracker{TKey}"/> keyed by (key, fact), so they are checkpointed with
+/// the facts; a deadline outlives its fact only until it falls due, which bounds them by
+/// the same horizon as the facts.
+/// </summary>
+internal sealed class FactRetention<TKey, TFact>
+    where TKey : notnull
+    where TFact : notnull
+{
+    private readonly RecordEviction<TFact> _policy;
+    private readonly EvictionTracker<KeyedValue<TKey, TFact>> _tracker;
+    private readonly IIndexedWeightStore<TKey, TFact> _facts;
+
+    public FactRetention(OperatorContext context, RecordEviction<TFact> policy, IIndexedWeightStore<TKey, TFact> facts)
+    {
+        _policy = policy;
+        _tracker = new EvictionTracker<KeyedValue<TKey, TFact>>(context, policy.ForKeyed<TKey>());
+        _facts = facts;
+    }
+
+    public bool IsFinal(TFact fact) => _policy.IsFinal(fact);
+
+    public void Track(TKey key, TFact fact) => _tracker.Track(new KeyedValue<TKey, TFact>(key, fact));
+
+    /// <summary>Once per step, on every way out, after the last <see cref="Track"/>.</summary>
+    public void EvictFinal()
+    {
+        if (_tracker.DrainClosed() is { Count: > 0 } closed)
+            _facts.RemoveEntries(closed);
+    }
 }
 
 /// <summary>

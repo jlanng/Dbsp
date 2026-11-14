@@ -220,6 +220,25 @@ public interface IIndexedWeightStore<TKey, TValue>
         foreach (var key in keys)
             RemoveGroup(key);
     }
+
+    /// <summary>Drops each (key, value) entry whatever its weight, leaving the rest of its
+    /// group alone (watermark-driven eviction of single records, <c>EvictWhenFinal</c>).
+    /// No-op for an entry that is not held. The default reads each entry's group; a
+    /// provider with a single-entry read overrides it.</summary>
+    void RemoveEntries(IReadOnlyList<KeyedValue<TKey, TValue>> entries)
+    {
+        var comparer = EqualityComparer<TValue>.Default;
+        foreach (var (key, value) in entries)
+        {
+            var group = GetGroup(key);
+            for (var i = 0; i < group.Count; i++)
+                if (comparer.Equals(group[i].Value, value))
+                {
+                    Update(key, value, -group[i].Weight);
+                    break;
+                }
+        }
+    }
 }
 
 public interface IValueStore<TKey, TValue> where TKey : notnull

@@ -28,13 +28,56 @@ public sealed class KeyedInputStream<TKey, TValue> : ZStream<TValue>
     where TKey : notnull
     where TValue : notnull
 {
-    internal KeyedInputStream(CircuitBuilder builder, int nodeId, string name)
+    private readonly KeyedInputRetention<TValue> _retention;
+
+    internal KeyedInputStream(CircuitBuilder builder, int nodeId, string name, KeyedInputRetention<TValue> retention)
         : base(builder, nodeId)
     {
         InputName = name;
+        _retention = retention;
     }
 
     internal string InputName { get; }
+
+    /// <summary>
+    /// Declares event time on the keyed input's rows, as
+    /// <see cref="ZStream{T}.WithEventTime(Func{T,DateTimeOffset},TimeSpan)"/> does, and with
+    /// <paramref name="evictWhenFinal"/> also bounds the input's own state: the current row
+    /// of a key is forgotten once the watermark has passed its event time. That changes
+    /// nothing anyone sees — the retraction an upsert of that key would have owed is behind
+    /// the watermark and dropped here either way — and keeps the input from holding one row
+    /// for every key it ever had. A later upsert of a forgotten key is a new row.
+    /// <para>
+    /// With <paramref name="evictWhenFinal"/> every use of the input must go through the
+    /// stream this returns; <c>Build()</c> refuses a circuit that also reads the input
+    /// itself, which would see upserts without their retractions.
+    /// </para>
+    /// </summary>
+    public EventTimeStream<TValue> WithEventTime(Func<TValue, DateTimeOffset> eventTime, TimeSpan lateness, bool evictWhenFinal)
+    {
+        var timed = WithEventTime(eventTime, lateness);
+        if (!evictWhenFinal)
+            return timed;
+        if (_retention.Policy is not null)
+            throw new InvalidOperationException($"Keyed input '{InputName}' already forgets its final rows.");
+        _retention.Policy = new Operators.RecordEviction<TValue>(Builder.WatermarkClock!, eventTime);
+        _retention.WatermarkNode = timed.NodeId;
+        return timed;
+    }
+}
+
+/// <summary>What a keyed input knows of its own eviction (<c>evictWhenFinal</c>), set
+/// after the input is declared and read when its operator is made.</summary>
+internal abstract class KeyedInputRetention
+{
+    public required string InputName { get; init; }
+    public int UpsertNode { get; set; } = -1;
+    public int WatermarkNode { get; set; } = -1;
+}
+
+internal sealed class KeyedInputRetention<TValue> : KeyedInputRetention where TValue : notnull
+{
+    public Operators.RecordEviction<TValue>? Policy { get; set; }
 }
 
 /// <summary>

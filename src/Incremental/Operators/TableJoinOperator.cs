@@ -34,19 +34,22 @@ internal sealed class TableJoinOperator<TKey, TFact, TRow, TOut> : IStepOperator
     private readonly Func<TKey, TFact, TRow, TOut> _matched;
     private readonly Func<TKey, TFact, TOut>? _unmatched;
     private readonly EvictionTracker<TKey>? _eviction;
+    private readonly FactRetention<TKey, TFact>? _retention;
 
     public TableJoinOperator(
         OperatorContext context,
         TableProbe<TKey, TRow> table,
         Func<TKey, TFact, TRow, TOut> matched,
         Func<TKey, TFact, TOut>? unmatched,
-        KeyEviction<TKey>? eviction)
+        KeyEviction<TKey>? eviction,
+        RecordEviction<TFact>? records = null)
     {
         _facts = context.Storage.CreateIndexedWeightStore<TKey, TFact>(context.StateName("facts"));
         _table = table;
         _matched = matched;
         _unmatched = unmatched;
         _eviction = eviction is null ? null : new EvictionTracker<TKey>(context, eviction);
+        _retention = records is null ? null : new FactRetention<TKey, TFact>(context, records, _facts);
         _errors = context.Errors;
     }
 
@@ -57,7 +60,7 @@ internal sealed class TableJoinOperator<TKey, TFact, TRow, TOut> : IStepOperator
     // Every state change below is driven by a delta row, so an all-empty step is a
     // no-op — unless a KeyEviction is attached, whose DrainClosed fires off the
     // watermark instead and must run whether or not data arrived.
-    public object? EmptyStepResult => _eviction is null ? _empty : null;
+    public object? EmptyStepResult => _eviction is null && _retention is null ? _empty : null;
 
     // Per-step scratch, reused across steps (single-threaded per worker); see JoinOperator.
     private readonly List<(TKey Key, TFact Value, long Delta)> _factEntries = [];
@@ -86,6 +89,9 @@ internal sealed class TableJoinOperator<TKey, TFact, TRow, TOut> : IStepOperator
         // to the key's table row finds nothing to correct.
         if (_eviction?.DrainClosed() is { Count: > 0 } closed)
             _facts.RemoveGroups(closed);
+        // Under EvictWhenFinal, the facts the watermark has passed: one by one, since the
+        // key (an instrument, a trader) never closes.
+        _retention?.EvictFinal();
 
         var output = _current ?? _output.Next(0);
         _current = null;
@@ -116,6 +122,10 @@ internal sealed class TableJoinOperator<TKey, TFact, TRow, TOut> : IStepOperator
             for (var f = i == 0 ? 0 : _bounds[i - 1]; f < _bounds[i]; f++)
             {
                 var (fact, factWeight) = _factRows[f];
+                // Final, and only not yet evicted because eviction runs at the end of the
+                // step: a final fact's result is not corrected.
+                if (_retention is not null && _retention.IsFinal(fact))
+                    continue;
                 var weight = checked(changeWeight * factWeight);
                 Emit(output, change.Key, fact, change.Old, -weight);
                 Emit(output, change.Key, fact, change.New, weight);
@@ -157,6 +167,8 @@ internal sealed class TableJoinOperator<TKey, TFact, TRow, TOut> : IStepOperator
             var (key, fact, weight) = _factEntries[i];
             Emit(output, key, fact, _tableRows[_groupOfEntry[i]], weight);
             _eviction?.Track(key);
+            if (weight > 0)
+                _retention?.Track(key, fact);
         }
         _facts.ApplyAll(_factEntries);
     }

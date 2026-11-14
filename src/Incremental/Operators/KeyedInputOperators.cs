@@ -74,13 +74,28 @@ internal sealed class UpsertOperator<TKey, TValue> : IStepOperator
 {
     private readonly IValueStore<TKey, TValue> _rows;
 
-    public UpsertOperator(OperatorContext context) =>
+    // Under evictWhenFinal: each key's deadline, from its row's event time, and the keys
+    // that fell due this step. Set and removed with the row, so a key amended to a later
+    // time moves its deadline with it.
+    private readonly RecordEviction<TValue>? _retention;
+    private readonly IDeadlineStore<TKey>? _deadlines;
+    private readonly List<TKey> _due = [];
+
+    public UpsertOperator(OperatorContext context, RecordEviction<TValue>? retention = null)
+    {
         _rows = context.Storage.CreateValueStore<TKey, TValue>(context.StateName("rows"));
+        if (retention is not null)
+        {
+            _retention = retention;
+            _deadlines = context.Storage.CreateDeadlineStore<TKey>(context.StateName("deadlines"));
+        }
+    }
 
     private readonly ZSet<TValue> _empty = new();
 
-    // All state change is driven by commands, so an all-empty step is a no-op.
-    public object? EmptyStepResult => _empty;
+    // All state change is driven by commands, so an all-empty step is a no-op — unless the
+    // input forgets final rows, which happens off the watermark, data or not.
+    public object? EmptyStepResult => _retention is null ? _empty : null;
 
     // Per-step scratch, reused across steps (single-threaded per worker).
     private readonly Dictionary<TKey, int> _index = [];
@@ -93,6 +108,11 @@ internal sealed class UpsertOperator<TKey, TValue> : IStepOperator
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<KeyedCommand<TKey, TValue>>)inputs[0]!;
+        if (delta.IsEmpty && _deadlines is not null)
+        {
+            ForgetFinal();
+            return _output.Next(0);
+        }
 
         // The source resolved each process's commands to one per key; only a clustered
         // circuit can deliver two for a key here (two processes, one step), and then which
@@ -150,6 +170,25 @@ internal sealed class UpsertOperator<TKey, TValue> : IStepOperator
 
         _rows.PutAll(puts);
         _rows.RemoveAll(removes);
+        if (_deadlines is not null)
+        {
+            foreach (var (key, row) in puts)
+                _deadlines.Set(key, _retention!.ClosesAt(row).UtcTicks);
+            foreach (var key in removes)
+                _deadlines.Remove(key);
+            ForgetFinal();
+        }
         return output;
+    }
+
+    /// <summary>Forgets the rows the watermark has passed. Nothing is emitted: the
+    /// retraction each would owe is behind the watermark, where the event-time
+    /// declaration drops it.</summary>
+    private void ForgetFinal()
+    {
+        _due.Clear();
+        _deadlines!.TakeDue(_retention!.Clock.FrozenTicks, _due);
+        if (_due.Count > 0)
+            _rows.RemoveAll(_due);
     }
 }

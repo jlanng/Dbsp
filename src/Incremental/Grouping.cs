@@ -460,4 +460,98 @@ public sealed class GroupedEventTimeStream<TKey, TValue> : GroupedZStream<TKey, 
     /// margin is already inside the watermark itself.</summary>
     private KeyEviction<WindowKey<TKey>> WindowEviction() =>
         new(Builder.WatermarkClock!, static wk => wk.WindowEnd);
+
+    /// <summary>
+    /// Forgets each record once it is final: once the circuit's watermark has passed the
+    /// record's own event time, so that nothing can retract or amend it any more. For a
+    /// retroactive join or a remembered lookup against a table over a stream of facts —
+    /// trades, executions — whose key (an instrument, a trader, a counterparty) never
+    /// closes, which <see cref="GroupedZStream{TKey,TValue}.EvictWhen"/> would need. Until
+    /// then a change to the table corrects the record; after it, its result stays as last
+    /// emitted and the operator holds nothing for it.
+    /// <para>
+    /// How long a record stays open is the lateness given to <c>WithEventTime</c>: the
+    /// watermark runs that far behind the newest event time seen, and a record (or a
+    /// correction of it) arriving behind the watermark is dropped as late. So the state is
+    /// about <c>lateness × facts per unit of event time</c> entries, whatever the key.
+    /// </para>
+    /// <para>
+    /// Only joins and lookups against a table honour it, so only they are offered; a
+    /// grouping that aggregates keeps its key's records until the key closes.
+    /// </para>
+    /// </summary>
+    public FinalizingGroupedStream<TKey, TValue> EvictWhenFinal()
+    {
+        Builder.RequireOutsideRecursion("EvictWhenFinal");
+        return new FinalizingGroupedStream<TKey, TValue>(this, new RecordEviction<TValue>(Builder.WatermarkClock!, _eventTime));
+    }
+}
+
+/// <summary>
+/// A grouping of an event-timed stream whose records are each forgotten once final
+/// (<see cref="GroupedEventTimeStream{TKey,TValue}.EvictWhenFinal"/>). A staging type
+/// offering only what honours that: the retroactive join and left join against a table,
+/// and the remembered lookup.
+/// </summary>
+public sealed class FinalizingGroupedStream<TKey, TValue>
+    where TKey : notnull
+    where TValue : notnull
+{
+    private readonly GroupedZStream<TKey, TValue> _grouping;
+    private readonly RecordEviction<TValue> _records;
+
+    internal FinalizingGroupedStream(GroupedZStream<TKey, TValue> grouping, RecordEviction<TValue> records)
+    {
+        _grouping = grouping;
+        _records = records;
+    }
+
+    /// <summary>The retroactive join of <see cref="GroupedZStream{TKey,TValue}.Join{TRow,TOut}(TableView{TKey,TRow},Func{TKey,TValue,TRow,TOut})"/>,
+    /// correcting a record only while it is open and holding it no longer.</summary>
+    public ZStream<TOut> Join<TRow, TOut>(TableView<TKey, TRow> table, Func<TKey, TValue, TRow, TOut> resultSelector)
+        where TRow : class
+        where TOut : notnull
+    {
+        ArgumentNullException.ThrowIfNull(table);
+        ArgumentNullException.ThrowIfNull(resultSelector);
+        table.RequireUsableFrom(_grouping.Builder, "Join");
+        return table.Join(_grouping, "Join", resultSelector, unmatched: null, _records);
+    }
+
+    /// <summary>The retroactive left join of <see cref="GroupedZStream{TKey,TValue}.LeftJoin{TRow,TOut}(TableView{TKey,TRow},Func{TKey,TValue,TRow,TOut},Func{TKey,TValue,TOut})"/>,
+    /// switching a record between matched and unmatched only while it is open.</summary>
+    public ZStream<TOut> LeftJoin<TRow, TOut>(
+        TableView<TKey, TRow> table, Func<TKey, TValue, TRow, TOut> matched, Func<TKey, TValue, TOut> unmatched)
+        where TRow : class
+        where TOut : notnull
+    {
+        ArgumentNullException.ThrowIfNull(table);
+        ArgumentNullException.ThrowIfNull(matched);
+        ArgumentNullException.ThrowIfNull(unmatched);
+        table.RequireUsableFrom(_grouping.Builder, "LeftJoin");
+        return table.Join(_grouping, "LeftJoin", matched, unmatched, _records);
+    }
+
+    /// <summary>The remembered lookup of <see cref="GroupedZStream{TKey,TValue}.Lookup{TRow,TOut}"/>,
+    /// forgetting what it emitted for a record once the record is final.</summary>
+    public ZStream<TOut> Lookup<TRow, TOut>(
+        TableView<TKey, TRow> table, Func<TKey, TValue, TRow, TOut> matched, Func<TKey, TValue, TOut>? missing = null)
+        where TRow : class
+        where TOut : notnull
+    {
+        ArgumentNullException.ThrowIfNull(table);
+        ArgumentNullException.ThrowIfNull(matched);
+        var builder = _grouping.Builder;
+        table.RequireUsableFrom(builder, "Lookup");
+        var probe = table.GroupProbe;
+        var records = _records;
+        return new ZStream<TOut>(
+            builder,
+            builder.SetProbes(
+                builder.AddNode(
+                    "tableLookup",
+                    [_grouping.NodeId],
+                    ctx => new TableLookupOperator<TKey, TValue, TRow, TOut>(ctx, probe, matched, missing, eviction: null, records)),
+                table.TableNodeId));
+    }
 }

@@ -114,6 +114,9 @@ internal sealed class PipelineRuntime(PipelineSpec spec, ServiceOptions options)
     public int Restarts;
     public Ring<DeadLetterRecord> DeadLetters { get; } = new(options.DeadLetterBuffer);
 
+    /// <summary>Whether the state has grown without a pause (<see cref="ServiceOptions.StateGrowthAlarmAfter"/>).</summary>
+    public StateGrowth Growth { get; } = new();
+
     /// <summary>The dead-letter sink's last failed write, kept across generations.</summary>
     public volatile Tuple<string, DateTimeOffset>? DeadLetterSinkError;
     public long DeadLetterSinkFailures;
@@ -245,7 +248,8 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             runtime.Id, runtime.State, spec.Desired, spec.Generation, spec.Plugin, spec.Version, spec.Definition,
             blockedOn, runtime.Since, runtime.Operation, runtime.Restarts, runtime.DeadLetters.Total,
             generation?.Circuit.CommittedStep, committed, faults, runtime.Shape, sources, sinks, runtime.History.After(),
-            runtime.RolledBack, spec.Previous is not null, DeadLetterSink(runtime, spec, generation), runtime.LastStart, stateSize);
+            runtime.RolledBack, spec.Previous is not null, DeadLetterSink(runtime, spec, generation), runtime.LastStart, stateSize,
+            runtime.Growth.Since);
     }
 
     private DeadLetterSinkStatus? DeadLetterSink(PipelineRuntime runtime, PipelineSpec spec, Generation? generation)
@@ -361,7 +365,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         _pipelines.TryGetValue(id, out var runtime) && runtime.Exists && (runtime.Starting is not null || runtime.Current is not null);
 
     /// <summary>What the metrics sampler reads once a second: cheap, no copies of offsets.</summary>
-    internal void SampleInto(List<PipelineSampleInput> into)
+    internal void SampleInto(List<PipelineSampleInput> into, DateTimeOffset now)
     {
         foreach (var runtime in _pipelines.Values)
         {
@@ -400,15 +404,40 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             {
                 var size = context.Storage.Pipeline(runtime.Id).EstimateSize();
                 (stateEntries, stateBytes) = (size.Entries, size.EstimatedBytes);
+                NoteGrowth(runtime, stateEntries, now);
             }
             catch (ObjectDisposedException)
             {
             }
             into.Add(new PipelineSampleInput(
                 runtime.Id, generation?.Number ?? 0, records, lag, runtime.DeadLetters.Total,
-                runtime.State, runtime.Spec.Desired == DesiredState.Running, inFlightSince, stateEntries, stateBytes));
+                runtime.State, runtime.Spec.Desired == DesiredState.Running, inFlightSince, stateEntries, stateBytes,
+                runtime.Growth.Since is not null));
         }
     }
+
+    /// <summary>A state that has grown without a pause for
+    /// <see cref="ServiceOptions.StateGrowthAlarmAfter"/>: an event when it is flagged and
+    /// when it falls again. From the entry count just read, nothing more.</summary>
+    private void NoteGrowth(PipelineRuntime runtime, long entries, DateTimeOffset now)
+    {
+        var period = context.Options.StateGrowthAlarmAfter;
+        switch (runtime.Growth.Observe(now, entries, period))
+        {
+            case 1:
+                _logger.LogWarning("Pipeline {Pipeline}: its state has grown for {Period} without a pause, from {From} to {To} entries",
+                    runtime.Id, period, runtime.Growth.OldestEntries, entries);
+                context.Events.Publish("pipeline", runtime.Id,
+                    $"state growing: {runtime.Growth.OldestEntries:N0} to {entries:N0} entries in {Describe(period)} without falling once; something kept per record is never closed");
+                break;
+            case -1:
+                context.Events.Publish("pipeline", runtime.Id, $"state no longer growing: {entries:N0} entries");
+                break;
+        }
+    }
+
+    private static string Describe(TimeSpan period) =>
+        period.TotalMinutes >= 1 ? $"{period.TotalMinutes:0.#} min" : $"{period.TotalSeconds:0.#} s";
 
     /// <summary>A source that says what it reads is not there: since when, and — once
     /// that has lasted <see cref="ServiceOptions.MissingInputGrace"/> — an event, once.</summary>

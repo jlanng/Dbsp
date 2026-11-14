@@ -31,19 +31,22 @@ internal sealed class TableIndexJoinOperator<TIndexKey, TKey, TFact, TRow, TOut>
     private readonly Func<TIndexKey, TFact, TRow, TOut> _matched;
     private readonly Func<TIndexKey, TFact, TOut>? _unmatched;
     private readonly EvictionTracker<TIndexKey>? _eviction;
+    private readonly FactRetention<TIndexKey, TFact>? _retention;
 
     public TableIndexJoinOperator(
         OperatorContext context,
         TableIndexProbe<TIndexKey, TKey, TRow> index,
         Func<TIndexKey, TFact, TRow, TOut> matched,
         Func<TIndexKey, TFact, TOut>? unmatched,
-        KeyEviction<TIndexKey>? eviction)
+        KeyEviction<TIndexKey>? eviction,
+        RecordEviction<TFact>? records = null)
     {
         _facts = context.Storage.CreateIndexedWeightStore<TIndexKey, TFact>(context.StateName("facts"));
         _index = index;
         _matched = matched;
         _unmatched = unmatched;
         _eviction = eviction is null ? null : new EvictionTracker<TIndexKey>(context, eviction);
+        _retention = records is null ? null : new FactRetention<TIndexKey, TFact>(context, records, _facts);
         _errors = context.Errors;
     }
 
@@ -53,7 +56,7 @@ internal sealed class TableIndexJoinOperator<TIndexKey, TKey, TFact, TRow, TOut>
     private readonly ZSet<TOut> _empty = new();
 
     // As in TableJoinOperator: an all-empty step is a no-op unless eviction is attached.
-    public object? EmptyStepResult => _eviction is null ? _empty : null;
+    public object? EmptyStepResult => _eviction is null && _retention is null ? _empty : null;
 
     // Per-step scratch, reused across steps (single-threaded per worker); see JoinOperator.
     private readonly List<(TIndexKey Key, TFact Value, long Delta)> _factEntries = [];
@@ -80,6 +83,7 @@ internal sealed class TableIndexJoinOperator<TIndexKey, TKey, TFact, TRow, TOut>
 
         if (_eviction?.DrainClosed() is { Count: > 0 } closed)
             _facts.RemoveGroups(closed);
+        _retention?.EvictFinal();
 
         var output = _current ?? _output.Next(0);
         _current = null;
@@ -130,6 +134,9 @@ internal sealed class TableIndexJoinOperator<TIndexKey, TKey, TFact, TRow, TOut>
             for (var f = group == 0 ? 0 : _factBounds[group - 1]; f < _factBounds[group]; f++)
             {
                 var (fact, factWeight) = _factRows[f];
+                // Final, and not yet evicted only because eviction runs at the end of the step.
+                if (_retention is not null && _retention.IsFinal(fact))
+                    continue;
                 if (errors is null)
                     output.Add(_matched(change.Key, fact, change.Row), checked(changeWeight * factWeight));
                 else
@@ -157,6 +164,8 @@ internal sealed class TableIndexJoinOperator<TIndexKey, TKey, TFact, TRow, TOut>
             for (var f = start; f < _factBounds[group]; f++)
             {
                 var (fact, factWeight) = _factRows[f];
+                if (_retention is not null && _retention.IsFinal(fact))
+                    continue;
                 if (errors is null)
                     output.Add(_unmatched(key, fact), sign * factWeight);
                 else
@@ -208,6 +217,8 @@ internal sealed class TableIndexJoinOperator<TIndexKey, TKey, TFact, TRow, TOut>
                     errors.Emit(output, _unmatched, key, fact, weight);
             }
             _eviction?.Track(key);
+            if (weight > 0)
+                _retention?.Track(key, fact);
         }
         _facts.ApplyAll(_factEntries);
     }
