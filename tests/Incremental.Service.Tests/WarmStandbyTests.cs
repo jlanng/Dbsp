@@ -218,7 +218,10 @@ public class WarmStandbyTests
             "the standby to build version 2");
 
         // The takeover starts that circuit, and the counts continue: nothing was lost
-        // between two versions' types on the way through the standby.
+        // between two versions' types on the way through the standby. (The leader has
+        // committed what it counted: the new leader's forty records below are counted
+        // from that checkpoint.)
+        await a.Settled();
         await b.Node.TakeOverAsync(new NodeActionOptions(), default).WaitAsync(TestService.Timeout);
         await b.Running("tc");
         Assert.True(b.Pipelines.Get("tc").LastStart!.Warm);

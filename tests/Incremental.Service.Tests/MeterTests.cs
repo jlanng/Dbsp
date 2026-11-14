@@ -120,6 +120,8 @@ public class MeterTests
         await Eventually(() => service.Pipelines.Get("bad").State == PipelineState.Failed, "the faulting pipeline failing");
         await Eventually(() => service.Pipelines.Get("lenient").DeadLetters == 2, "the lenient pipeline's dead letters");
 
+        // A checkpoint's age and a sink's wait are figures of a pipeline that has committed.
+        await service.Settled();
         var seen = await SnapshotAsync(service, collected);
         (string, string) n = ("node", node);
 

@@ -24,6 +24,12 @@ public class ReplaceTests
         await service.DeployAsync(spec);
         var sink = service.Memory.UpsertSink<string, long>("out");
         await Eventually(() => Same(sink.Rows, Counts.Model(Trades(0, 200))), "the first output");
+
+        // What is refused below is read off the checkpoint, and the output is in the
+        // sink before the step that made it is committed (commit after delivery): asked
+        // in between, with no checkpoint yet, keep is open — and would be found out when
+        // the new generation starts, by a roll-back, which is another test.
+        await service.Settled();
         var history = service.Pipelines.Get("p").History!.Count;
 
         // Workers 1 → 2 with the state kept: the checkpoint was committed for one worker.
@@ -257,6 +263,9 @@ public class ReplaceTests
         await a.DeployAsync(spec);
         var sink = memory.UpsertSink<string, long>("out");
         await Eventually(() => Same(sink.Rows, Counts.Model(Trades(0, 100))), "the first leader's output");
+
+        // The mismatch is with a checkpoint: the first leader has committed one.
+        await a.Settled();
 
         // A spec changed behind the service's back: no dry run saw it, nothing was recorded.
         using (var write = await a.Node.Catalog.BeginAsync(default))

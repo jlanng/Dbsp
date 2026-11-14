@@ -54,6 +54,8 @@ public class MemoryFiguresTests
         await Eventually(() => sink.Rows.Values.Sum() == 3000, "the pipeline's output");
         await Eventually(() => a.Pipelines.Get("p").StateSize is { Entries: 700 }, "the state's entries, counted");
 
+        // Entries are sized as a commit writes them: the last step's commit first.
+        await a.Settled();
         var onLeader = a.Pipelines.Get("p").StateSize!;
         Assert.Equal(0, onLeader.EntriesAsBytes);
         Assert.Equal(0, onLeader.EntriesHeldTwice);

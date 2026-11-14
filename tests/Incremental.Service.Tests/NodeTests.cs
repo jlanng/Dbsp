@@ -87,6 +87,7 @@ public class NodeTests
         // appended while the service was down, on top of the state its checkpoint held.
         foreach (var id in new[] { "enrich", "counts", "positions" })
             Assert.Equal(later.Count, second.Pipelines.Get(id).Sources.Single().Stats.Records);
+        await second.Settled();
         Assert.Equal(649, second.Pipelines.Get("counts").CommittedOffsets["trades#p0"]);
 
         // The same spec, as a caller would format it rather than as the catalog stores it,
@@ -148,6 +149,8 @@ public class NodeTests
         Assert.Contains(dry.Steps, s => s.Contains("node 'a' is fenced"));
         Assert.Equal(NodeRole.Standby, b.Node.Status.Leadership.Role);
 
+        // "Resumed, not replayed" below is counted from the first leader's checkpoint.
+        await a.Settled();
         await b.Node.TakeOverAsync(new NodeActionOptions(Caller: "tester"), default);
         Assert.Equal(NodeRole.Leader, b.Node.Status.Leadership.Role);
         Assert.True(b.Node.Status.Leadership.Term > a.Node.Status.Leadership.Term);

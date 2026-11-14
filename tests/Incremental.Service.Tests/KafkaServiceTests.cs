@@ -87,7 +87,11 @@ public class KafkaServiceTests(ITestOutputHelper output)
         Assert.Equal(instruments.Count, followed.Rows);
         Assert.Equal(a.Tables.Stats("instruments").Epoch, followed.Epoch);
         Assert.Equal(0, followed.LagVersions);
-        Assert.Equal(0, b.Node.Status.Standby!.StateLagRecords);
+
+        // The state lag is a figure the node samples once a second, and the leader's
+        // last steps are in the sinks before they are committed: read at once it was
+        // 322 records on a runner, the commit of what the two sinks already showed.
+        await Eventually(() => b.Node.Status.Standby is { StateLagRecords: 0 }, "the standby to have followed the leader's last commit");
         Assert.Equal("a", b.Node.Status.Leadership.LeaderNodeId);
         Assert.NotNull(b.Node.Status.Leadership.Kafka);
         await Assert.ThrowsAsync<ServiceException>(() => b.Tables.DeclareAsync(InstrumentsFrom(instrumentsTopic, "other"), default));

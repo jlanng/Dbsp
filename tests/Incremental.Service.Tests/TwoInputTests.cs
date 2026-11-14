@@ -85,6 +85,9 @@ public class TwoInputTests
         tradeLog.AppendRange(trades.Take(100));
         fillLog.AppendRange(fills.Take(200));
         await SinksEqualAsync(memory, trades.Take(100).ToList(), fills.Take(200).ToList(), "under the first leader");
+
+        // "Resumed" below is measured from the first leader's checkpoint: it has one.
+        await a.Settled();
         await Eventually(() => b.Node.Status.Standby is { TakeoverWouldBeWarm: true }, "the standby being warm");
 
         // Both feeds keep moving, at different paces, across the change of leader.

@@ -129,6 +129,27 @@ internal sealed class TestService : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Waits until every running pipeline of this node has committed what it has read and
+    /// no sink of it is inside a write. A step's output is in the sink before the step is
+    /// committed (commit after delivery), so "the sink has it" says nothing yet about the
+    /// checkpoint: a test that has seen the output and goes on to something that reads
+    /// the checkpoint — a takeover or a restart that must resume and not replay, a
+    /// replace that keeps state, a figure taken at a commit — waits for this in between.
+    /// (Found with the sink's acknowledgement held back half a second after its rows
+    /// were visible: eight tests failed that had gone on at once.)
+    /// </summary>
+    public Task Settled() => Eventually(
+        () => Pipelines.Pipelines.Where(p => p.State == PipelineState.Running).All(p => IsSettled(Pipelines.Get(p.Id))),
+        "every running pipeline to have committed what it has read");
+
+    private static bool IsSettled(PipelineStatus status) =>
+        status.Sinks.All(sink => sink.WriteInFlightSince is null)
+        && status.Sources.All(source =>
+            source.Stats.Lag is null or 0
+            && (source.Stats.Positions ?? new Dictionary<int, long>()).All(at =>
+                at.Value < 0 || status.CommittedOffsets.GetValueOrDefault($"{source.Slot}#p{at.Key}", -1) >= at.Value));
+
     public Task Running(string id) => Eventually(() => Pipelines.Get(id).State == PipelineState.Running, $"pipeline {id} running (it is {Pipelines.Get(id).State})");
 
     public async ValueTask DisposeAsync()
