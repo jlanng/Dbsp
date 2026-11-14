@@ -2515,11 +2515,18 @@ client gives its records `transaction.timeout.ms` (`KafkaLogOptions.TransactionT
 60 s): then they fail, the transaction has to be aborted, and the abort of a
 transaction the coordinator never managed to register is refused
 (`INVALID_TXN_STATE`), which the client counts as fatal. The writer is finished and the
-node ends with exit code 3, sixty seconds into the outage and with nobody having taken
-anything over. That is what the 70-second test shows: the standby holds at the ceiling
-while the leader answers, the leader ends at sixty seconds, and the standby — or the
-restarted node, whichever is first when the brokers return — leads. An outage shorter
-than the timeout ends with the same leader. A deployment that must ride out longer
+node ends with exit code 3, with nobody having taken anything over. That is what the
+70-second test shows in two runs of three (the service design, S7, *The third
+review's findings*, series 2): the standby holds at the ceiling while the leader
+answers its probe; the leader's transaction times out at sixty seconds; its abort is
+refused — as `INVALID_TXN_STATE` once the brokers were back in one run, as "fenced by
+a newer instance" from the one broker left in the other, with no node having taken the
+log — and the leader ends; the standby, which no longer has a leader to wait for,
+takes over within a fifth of a second and leads when the brokers let it. In the third
+run the abort was accepted and the leader kept its term; what decides between them was
+not established. An outage shorter than the timeout ends with the same leader — six
+runs of six at forty seconds, one of which ran into the timeout because the brokers
+took twenty seconds to commit again, and had its abort accepted. A deployment that must ride out longer
 ones raises `TransactionTimeout` (the brokers allow up to `transaction.max.timeout.ms`,
 fifteen minutes by default); what it pays is that a writer that died with a transaction
 open blocks readers of its partitions for that long if nobody takes over, which a

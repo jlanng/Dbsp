@@ -2113,7 +2113,7 @@ Gauges are read from a snapshot each node refreshes once a second (tables every 
 | `incremental.service.pipeline.faults`, `.restarts`, `.rollbacks` (counters) | node, pipeline | faults; restarts scheduled after one; replaces rolled back |
 | `incremental.service.tables` | node, state | tables in each state |
 | `incremental.service.table.rows`, `.version` | node, table | |
-| `incremental.service.table.lag` | node, table | on a standby: versions of the table's log not yet applied |
+| `incremental.service.table.lag` | node, table | on a standby: versions of the table's log not yet applied. No value while the log cannot say where it ends — the brokers that hold the table's partitions are away: the question is given two seconds, and the status and the table pages say "not known" rather than wait |
 | `incremental.service.table.loader_lag` | node, table | on the leader: what the loader reports it has still to read |
 | `incremental.service.table.memory` (bytes) | node, table, part | the table on this node's heap, estimated, by part: `rows` (with the key map), `indexes`, `history` (superseded rows kept for readers) |
 | `incremental.service.pipeline.state_entries` | node, pipeline | entries its state holds on this node, counted — on a standby too |
@@ -2240,8 +2240,8 @@ sink timing what arrives):
 | one of three frozen for 20 s or 60 s: it answers nothing and its connections stay open | 9 | 0 | 11 to 16 s |
 | the same with the Kafka client's own default settings | 6 | 3 | 8 to 61 s |
 | every broker killed in turn, 15 s each | 2 | 0 | 13 to 14 s |
-| two of three stopped for 40 s: no quorum, nothing commits for just under a minute | 3 | 0 | 57 to 58 s |
-| two of three stopped for 70 s: nothing commits for a minute and a half or more | 4 | 4 | 90 to 117 s |
+| two of three stopped, or killed in one moment, for 40 s: no quorum, nothing commits for about a minute | 6 | 0 | 55 to 61 s |
+| the same for 70 s, which is past the leader's transaction timeout | 3 | 2 | 88 to 89 s |
 | one of three gone for ten minutes, the leader's process killed after five | 1 | yes, as intended: the standby led 3.5 s after the kill, on two brokers, and the killed node came back as its standby | 11 s (the broker's loss) |
 
 In every run the sink equalled the model, one node led and the other stood by, warm.
@@ -2284,10 +2284,13 @@ no leader that answers, or fewer replicas in sync that answer than
 leader can be heard first. It asks each broker itself: the cluster's own lists of who
 leads and who is in sync stop changing when the controllers have lost their quorum,
 and go on naming brokers that are gone. What a leader
-does not survive is `KafkaLogOptions.TransactionTimeout` (60 s) without a commit: its
-open transaction fails for good, the node ends with exit code 3, and the standby — or
-the node itself, started again — leads when the brokers return. Raise that timeout if
-your brokers may be without a quorum for longer and you would rather keep the leader.
+cannot count on surviving is `KafkaLogOptions.TransactionTimeout` (60 s) without a
+commit: its open transaction fails, and when the abort of it is refused as well — in
+two of the three 70 s outages above — the node ends with exit code 3 and the standby
+leads; the sink is complete either way. Forty seconds without a quorum is already
+close to it: the brokers took fifteen to twenty seconds more to commit again after
+they were back. Raise that timeout if your brokers may be without a quorum for longer
+and you would rather keep the leader.
 
 A standby that does start a takeover stops if the leader is heard again before it has
 taken the log (the transactional id). Once it has, the leader is fenced whatever it

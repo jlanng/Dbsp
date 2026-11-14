@@ -2002,6 +2002,24 @@ Each has a default this design is built on.
     (`docs/design/runs/`, S7): the third review found S7's tables citing a scratch
     directory that no longer existed. *Alternative:* keep citing nothing and say so; a
     table nobody can check is then all there is.
+67. **`KafkaLogOptions.TransactionTimeout` stays 60 s, and a leader whose transaction
+    ran into it is not saved** (S7, the third review, series 2). With two of three
+    brokers away for 70 s the leader's transaction timed out and its abort was refused
+    in two runs of three: the writer was finished, the node exited 3, the standby led
+    and the pipeline restarted there; nothing was lost. At 40 s the leader kept its
+    term in six of six, with the sink silent for up to 61 s — one of those six ran
+    into the timeout and its abort was accepted. *Alternatives:* a longer timeout
+    (the brokers allow fifteen minutes by default), at the price that a writer that
+    died with a transaction open blocks readers of its partitions for that long if
+    nobody takes over; or a leader that answers a refused abort by taking the log
+    again when the leader topic's last term is still its own — which is a second way
+    for a node to fence its successor in a race, and was not built.
+68. **A table's statistics give the log two seconds to say where it ends, and after
+    a question without an answer nobody asks for five** (S7, the third review): a
+    standby's lag is then "not known" in its status, the admin's table pages and the
+    gauges for as long as the brokers that hold the table's partitions do not answer.
+    *Alternative:* the last lag that was measured, with its age; it would be a figure
+    on a page that is wrong exactly while it matters.
 
 ## Not verified
 
@@ -5122,7 +5140,12 @@ A review of the round-three work confirmed twelve findings. Eleven are fixed in 
 made true in the documents, one is fixed by refusing what could not be made right in
 the time (a `files` input on a `files` sink's prefix), and one more defect turned up
 while the fixes were being measured and is fixed with them (a takeover decided on a
-silence that had ended). What each was, and what was done:
+silence that had ended). The step was made by two sessions: the first was cut off
+after the fixes, their tests, the core's mutation runs and the first series of broker
+runs; the second read its uncommitted changes and its records, gave the bounded lag
+question and the two mutants that had survived their tests, ran the mutations still
+outstanding, wrote the second series up from its records and ran the verification.
+What each finding was, and what was done:
 
 **Event-time state (the core).**
 
@@ -5250,8 +5273,88 @@ what the controller's loss adds when the broker killed was the active controller
 25.8 s once on a node's first lead with a plugin import pending. Which roles broker 2
 had in these three runs was not recorded; the series that follows records them.
 
-**Series 2** — after the second look at the decision, with the brokers restarted on
-time: being run as this is written; its rows are added here when it is done.
+**Series 2** — the build with the second look at the decision, the test starting the
+brokers again on time, and the standby asked for its status eight seconds before the
+end of each outage (records:
+`docs/design/runs/2026-11-12-broker-failures-series2.jsonl`). Two of three brokers
+away:
+
+| brokers | away for | the standby's `takeoversHeld` | its status, asked during the outage, came in | leads afterwards | leadership moved | node exits | sink silent |
+|---|---|---|---|---|---|---|---|
+| two stopped | 40.0 s | 24 | 20 ms | a, term 1 | no | none | 57.4 s |
+| two stopped | 40.0 s | 20 | 20 ms | a, term 1 | no | none | 55.4 s |
+| two stopped (see below) | 40.0 s | 21 | 19 ms | a, term 1 | no | none | 57.2 s |
+| two killed | 40.0 s | 6 | 2.0 s | a, term 1 | no | none | 61.5 s |
+| two killed | 40.0 s | 4 | 2.0 s | a, term 1 | no | none | 57.7 s |
+| two killed | 40.0 s | 3 | 2.0 s | a, term 1 | no | none | 58.9 s |
+| two stopped | 70.0 s | 85 | 20 ms | b, term 2 | **yes**, once the leader had ended | a: 3 | 88.4 s |
+| two killed | 70.0 s | 25 | 2.0 s | a, term 1 | no | none | 88.9 s |
+| two killed | 70.0 s | 22 | 2.0 s | b, term 2 | **yes**, once the leader had ended | a: 3 | 89.1 s |
+
+At 40 s the leadership stayed where it was in six runs of six, stopped or killed, and
+no node process ended. The standby held in all nine for as long as the leader answered
+its probe, and in none did it take over from a leader it had just heard. The sink was
+silent for 55 to 61 s over a 40 s outage: the brokers that had been started again took
+fifteen to twenty seconds more to take the leader's transaction. That is close to the
+leader's limit, which is the next paragraph's: in the 61.5 s run the transaction ran
+into its 60 s timeout, twenty seconds after the brokers were back, was aborted, and
+was tried again — that time the abort was accepted.
+
+At 70 s the leadership moved in two runs of three, and in neither by the standby's
+choice. The logs of both (kept by `INCREMENTAL_NODE_LOGS`; not in the repository) read
+the same way. Sixty seconds into the outage the leader's transaction times out in its
+client (`… message(s) timed out … requires epoch bump`). Its abort is then refused —
+`INVALID_TXN_STATE` in the stopped run, sixteen seconds after the brokers had been
+started again; `This instance has been fenced by a newer instance` in the killed one,
+five seconds after the timeout and with the two brokers still away, when no node had
+taken the log (the standby's `taking over` is 170 ms later in its log) — the client
+calls either fatal, the writer is finished and the node says `Fenced`. A fenced node
+no longer answers the probe as the leader, so the standby's next look, 19 ms and
+170 ms later, finds a silence past the ceiling and nothing to wait for; it leads 0.8 s
+later in the first run and 23 s later in the second, where `InitTransactions` waited
+for the brokers. The old leader exits 3 and comes back as the standby. In the third
+run the abort was accepted, twenty-eight seconds after the timeout, and the leader
+kept its term. What decides between the three — what the coordinator had registered of
+the transaction when the brokers went is the likely answer — was not established, and
+the "fenced by a newer instance" with nobody to do it is read here as the coordinator
+timing the transaction out itself; that was not shown either. It is
+`durability-and-standby.md`, *A leader does not outlive its transaction timeout*: an
+outage of the quorum longer than `KafkaLogOptions.TransactionTimeout` ends the
+leader's term more often than not, the sink is complete either way, and raising the
+timeout is the setting for a deployment that must ride out longer ones (Open for
+James 67).
+
+The third stopped run's record is whole but was made across a pause: the machine was
+suspended for eleven hours after that run's brokers had been started again (its lines
+in the measurements log are stamped 07:50 and 19:02). Its figures are the machine's
+running time and agree with the two before it; leave it out and the 40 s rows are five
+of five.
+
+The standby's status came back in 20 ms with the brokers stopped and in two seconds
+with them killed: a killed broker's partitions do not refuse a question, they do not
+answer it, and two seconds is the bound a table's statistics now put on asking a log
+where it ends (*Deviations*, below — in series 1 the same request took thirty).
+
+A takeover with one broker killed in the same moment as the leader, the broker chosen
+and its roles recorded (the same file; `leader-topic`, `state`, `input`: it led that
+partition; `coordinator`: the transaction coordinator's partition for the log's id;
+`controller`: the active controller):
+
+| broker killed | its roles | `kill -9` of the leader → the standby leads | of which silence until the decision | taking the log and committing the term |
+|---|---|---|---|---|
+| 1 | leader-topic, state | 10.7 s | 10.2 s | 0.2 s |
+| 3 | controller, coordinator, state | 14.5 s | 3.1 s | 11.2 s |
+| 1 | coordinator, leader-topic, state, input | 10.3 s | 10.0 s | 0.3 s |
+| 3 | coordinator, leader-topic, state, input | 9.0 s | 8.5 s | 0.2 s |
+
+Nine to eleven seconds when the broker killed led a partition the standby reads or
+writes, which is the nine seconds of the brokers' session timeout spent before the
+standby can confirm the silence (`hears no leader but cannot reach Kafka either; not
+taking over`, twice, in the first run's log) and a second of takeover; 14.5 s when it
+was the active controller and the coordinator, where the standby decided at three
+seconds and `InitTransactions` waited eleven for a new controller and then a new
+coordinator. That last is the review's 13.4 to 16.3 s. Four runs; a first lead with a
+plugin import pending (the review's 25.8 s) was not run again.
 
 **Files and tables.**
 
@@ -5289,9 +5392,11 @@ reads, are refused where they were accepted; a node whose own takeover failed ex
 where it exited 3; `AcquireWriterAsync`'s cancellation is unchanged, and the
 leadership's "heard the leader" no longer cancels an acquisition that has taken the
 transactional id; the `files` source's `settle` no longer reads the node's clock.
-Test seams (internal): `KafkaLog.BrokerAnswersOverride`, `WhyUnwritable`,
-`BrokerAnswersAsync`, `KafkaLeadership.Heard`, `RetryNotBefore`,
-`ChangelogStorageProvider.QueuedDeadlines`.
+A following table's `LagVersions` is null while its log does not say where it ends
+(it was a status that took thirty seconds). Test seams (internal):
+`KafkaLog.BrokerAnswersOverride`, `WhyUnwritable`, `BrokerAnswersAsync`, `AnsweredWith`,
+`KafkaLeadership.Heard`, `RetryNotBefore`, `ChangelogStorageProvider.QueuedDeadlines`,
+`TableRegistry.LagPatience`, `LagAskAgainAfter`.
 
 **Tests.**
 
@@ -5315,7 +5420,8 @@ Test seams (internal): `KafkaLog.BrokerAnswersOverride`, `WhyUnwritable`,
   from; a takeover that cannot start says it failed by its own doing and one that
   another node fenced does not; the probe asks each broker and judges what three
   brokers look like with two gone; a broker id nobody has is a second and a half of
-  silence.
+  silence; what counts as a broker's answer when the question fails (an error the
+  broker sent does, one the client made up and a wait that ran out do not).
 - Service (`tests/Incremental.Service.Tests`): an input onto what a `files` sink
   writes is refused and so is a sink onto what an input reads (prefix above, own
   spec, dead-letter slot, suffix); the `changes` format through two pipelines with
@@ -5323,7 +5429,13 @@ Test seams (internal): `KafkaLog.BrokerAnswersOverride`, `WhyUnwritable`,
   behind the node's and ninety seconds ahead, a backlog, an object that changes while
   it settles; a loaded table whose file was removed is not waiting after a takeover
   or on a node from nothing; an input named as the clock's keys begin in a dead
-  letter's positions; exit codes 3, 4 and 5 and the supervisor's delay for each.
+  letter's positions; exit codes 3, 4 and 5 and the supervisor's delay for each; a
+  backlog that is old by the store's own stamps read at once by a reader that has
+  only just seen it, with the store's clock an hour off as well; a takeover of the
+  node's own that fails on the Kafka backend is told as such and is exit code 5; a
+  standby's table statistics over three tables whose logs stop answering come back
+  after one wait, not three, with the lag not known, and know it again when the logs
+  answer.
 
 **Mutations.** Core: 13, all killed by `DeadlineStoreTests`, `EventTimeRestartTests`
 and `MemoryEstimateTests` — the queue not swept at a removal, never rebuilt, not
@@ -5335,8 +5447,27 @@ log's key; the row's key held without comparing. Five of them survived their fir
 run and got a test each (a key that only moves; the estimate with stale entries in
 the queue; a weight-two fact taken back once; a selector that changed) or simpler
 code (the clock's keys are no longer skipped at all: an input cannot have them). The
-Kafka and service list (30 mutations: `fix/svc.py` in the session's scratch directory)
-has not been run yet as this is written.
+second session ran the thirteen again on the committed code: thirteen killed.
+
+Kafka and service: 31 in the first list (17 service, 14 Kafka), run in two halves.
+The first session ran 21 of them: 19 killed, and two survived — a backlog that waits
+out `settle` object by object (the test's backlog had been seen by the reader for
+longer than `settle` already, so the store's stamps were never what read it), and
+the Kafka backend dropping `TakeoverFailed` on its way to the node (only the
+in-memory backend's was tested). The second session gave each a test (a reader
+that starts on a backlog a minute old by the store's stamps; a takeover that fails
+on a `KafkaServiceBackend`), which kill them, and ran the other ten: eight killed,
+two survived, both in what counts as a broker's answer — a wait that ran out counted
+as an answer, and an error the client made up counted as one. The one-broker test
+reaches neither branch (an id no broker has comes back as a plain client error). The
+judgement is now a function of its own (`KafkaLog.AnsweredWith`) with a test of each
+kind of failure, and five mutations of it are killed. Three more for the bounded lag
+question, all killed: the wait not given up, a question without an answer not
+standing for the other tables, the lag never asked again. In all: 13 core and 39
+Kafka and service; every one killed at the end, nine of them only after a test or a
+change was made for it. The lists and results were in the sessions' scratch
+directories (`mutations.txt`, `core.py`, `svc.py` and the second session's
+`svc2.py`, `kafka2.py`, `kafka3.py`), not the repository.
 
 **Deviations.**
 
@@ -5346,21 +5477,28 @@ has not been run yet as this is written.
   of its own first — and not prevented.
 - **The 40-second and 70-second rows of S7's table are replaced, not corrected in
   place**, and the older rows of that table stand on runs whose records are gone.
-- **The no-quorum test restarts the brokers before it reads the standby's counter.**
-  Read first, the standby's status once took thirty seconds to come back — a
-  standby's table statistics ask the log for its last version, and wait out the
-  operation timeout when the partition's broker is dead — and the "40-second" outage
-  was 70. That wait is not fixed: `GET tables` on a standby can take as long during a
-  broker outage.
+- **A standby's status took thirty seconds with brokers dead, and a table's
+  statistics now give up on the question.** In series 1 the no-quorum test read the
+  standby's counter before it started the brokers again, the status took thirty
+  seconds to come back, and two "40-second" outages were 70: a following table's
+  statistics ask the log where it ends, and a Kafka log waits out its operation
+  timeout when the partition's broker is dead. The statistics now wait two seconds
+  for that answer, whether or not the log's call honours the token, and after a
+  question that had none nobody asks again for five seconds — for any table, so
+  twenty tables do not wait in turn (`TableHandle.StatsAsync`,
+  `TableRegistry.LagPatience`, `LagAskAgainAfter`). The lag is then not known: null
+  in the status and the admin API, no value on the `table.lag` gauge. The test asks
+  for the status eight seconds before the end of the outage and fails above ten
+  seconds; series 2 has what it took (20 ms, and 2.0 s with the brokers killed). The
+  log's own call is not cut short — it ends at its own timeout with nobody waiting
+  for it — so a few of them are in flight on a standby during an outage, one more
+  for each question that is asked (Open for James 68).
 - **`A_takeover_with_one_broker_down…` takes `INCREMENTAL_KAFKA_FAULT` and
   `INCREMENTAL_KAFKA_BROKER`** and records the broker's roles; its default is what it
   did before (broker 2 shut down 1.5 s before the kill).
 
 **Left undone.**
 
-- Series 2, the mutation runs of the Kafka and service changes, and the full
-  verification of this step are still to come as this is written; this section is
-  finished when they are.
 - A `files` sink still has no commit marker a streaming reader could follow (Open for
   James 63).
 - The window between two slices of `InitTransactions` (Open for James 64).
@@ -5369,3 +5507,20 @@ has not been run yet as this is written.
   broker only, not behind SASL with ACLs (a refusal is counted as an answer, and that
   path was not exercised).
 - The key instance a restored table holds was not measured at a million rows.
+- A leader is not carried through a quorum outage longer than its transaction
+  timeout: two runs of three at 70 s moved the leadership (Open for James 67), and
+  what decides whether the timed-out transaction's abort is accepted was not
+  established.
+- A first lead with a plugin import pending and a broker killed in the same moment
+  (the review's 25.8 s) was not run again: in the four killed-broker takeovers of
+  series 2 the standby was warm, its plugin loaded.
+- The older rows of S7's first broker table (one broker killed, frozen, the rolling
+  restarts) stand on runs whose records are gone; only the two two-broker rows and
+  the takeover with a broker down were measured again.
+- Series 2 has one run made across a suspension of the machine, and its last ten
+  runs were made by the script with no session watching; they were written up from
+  the records and the node logs afterwards. Nothing in them was rerun.
+- The log's call behind a lag question that got no answer is left to end by itself
+  (Open for James 68).
+- None of the twelve findings was in the admin UI, so nothing was verified in a
+  browser in this step.

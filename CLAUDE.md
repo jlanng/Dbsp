@@ -414,6 +414,13 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   - Nothing waits without a bound, and nothing holds another pipeline's queue: teardown is
     `StopTimeout`, then abandon, then `Wedged`; a connector's `StartAsync` and `ResetAsync`
     are tenant code and get `ConnectorTimeout`.
+  - What a status, the admin API or a gauge reads must not wait on a broker. A following
+    table's lag is the one figure that asks the log (`TableHandle.StatsAsync`): the
+    question gets `TableRegistry.LagPatience` (2 s) whether or not the log's call
+    honours the token, and after one without an answer nobody asks for
+    `LagAskAgainAfter` (5 s) — for any table. The lag is then null ("not known"),
+    never a wait: with two of three brokers dead a standby's status once took thirty
+    seconds. A new figure that has to ask the backend gets a bound the same way.
   - Seeds are applied once per deployment and recorded in `node/seeds`; never test "the
     key is absent" to decide whether to seed — a removal makes that true again.
   - Nothing of a plugin's may be reachable from a static or a process-wide cache, or its
