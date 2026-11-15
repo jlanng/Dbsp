@@ -273,6 +273,9 @@ public sealed class KafkaLeadership : IAsyncDisposable
     // (KafkaLog.AcquireWriterUnlessAsync): from then on the leader is fenced and
     // the takeover goes through, whatever is heard.
     private CancellationTokenSource? _abandon;
+    private long _abandonWithin;
+    private long _lateSaidTicks = long.MinValue / 2;
+    private readonly HeartbeatDating _dating = new();
     private long _notBeforeTicks;
     private long _takeoversAbandoned;
     private long _takeoversHeld;
@@ -734,10 +737,13 @@ public sealed class KafkaLeadership : IAsyncDisposable
         }
     }
 
-    internal void Heard(KafkaLog.LeaderRecord record)
+    internal void Heard(KafkaLog.LeaderRecord record) => Heard(record, Environment.TickCount64);
+
+    internal void Heard(KafkaLog.LeaderRecord record, long now)
     {
         bool leaderChanged;
         CancellationTokenSource? abandon = null;
+        TimeSpan? late;
         lock (_lock)
         {
             if (record.Term < _leaderTerm)
@@ -748,16 +754,43 @@ public sealed class KafkaLeadership : IAsyncDisposable
             _leaderNode = record.Node;
             _leaderAt = record.At;
             _leaderResigned = record.Resigned;
-            _heardTicks = Environment.TickCount64;
+
+            // The leader was alive when it wrote this, which is the moment the silence
+            // counts from — and not always the moment of reading: the last heartbeat of
+            // a leader that died with a broker is readable only when the brokers give
+            // that broker up, seconds later (HeartbeatDating). Read at once, as almost
+            // every record is, the two are the same moment.
+            var written = _dating.Written(record.Term, record.At.ToUnixTimeMilliseconds(), now);
+            if (written > _heardTicks)
+                _heardTicks = written;
             _uncommittedEnd = -1;
-            Interlocked.Exchange(ref _lastHeldTicks, 0);
+
+            // A leader that has written within the takeover timeout is a leader: the
+            // brokers' word that held a takeover back is no longer needed.
+            var age = now - written;
+            if (age < (long)_options.TakeoverAfter.TotalMilliseconds)
+                Interlocked.Exchange(ref _lastHeldTicks, 0);
 
             // Heard while this node is on its way to fencing it: the leader is alive and
             // committing, so the takeover is given up while that is still free. Not a
-            // resignation, and not this node's own term record.
-            if (!record.Resigned && record.Node != NodeId)
+            // resignation, and not this node's own term record — and not a record so old
+            // that the takeover's reason stands with it: the silence it was decided on
+            // (or, at the ceiling, the ceiling) has passed since the leader wrote it.
+            if (!record.Resigned && record.Node != NodeId && age < _abandonWithin)
                 abandon = _abandon;
+            late = age >= (long)_options.TakeoverAfter.TotalMilliseconds && record.Node != NodeId && now - _lateSaidTicks >= 5_000
+                ? TimeSpan.FromMilliseconds(age)
+                : null;
+            if (late is not null)
+                _lateSaidTicks = now;
         }
+
+        // Worth a line: it is how a takeover that went on through "a heartbeat" is read
+        // afterwards, and how brokers that sat on the leader's records show.
+        if (late is { } old)
+            _logger?.LogInformation(
+                "Node {Node} read a record that node {Leader} wrote {Age} before: the brokers had not shown it until now. The leader's silence counts from when it was written.",
+                NodeId, record.Node, old);
         try
         {
             abandon?.Cancel();
@@ -1039,7 +1072,19 @@ public sealed class KafkaLeadership : IAsyncDisposable
             using (var abandon = new CancellationTokenSource())
             {
                 lock (_lock)
+                {
                     _abandon = reason == "manual" ? null : abandon;
+
+                    // How lately the leader must have written for a record of its to
+                    // call this off: within the silence the takeover was decided on.
+                    // After a resignation any record that is not one does.
+                    _abandonWithin = reason switch
+                    {
+                        "silence" => (long)_options.TakeoverAfter.TotalMilliseconds,
+                        "ceiling" => (long)_options.TakeoverCeiling.TotalMilliseconds,
+                        _ => long.MaxValue,
+                    };
+                }
                 Exception? lost = null;
                 try
                 {

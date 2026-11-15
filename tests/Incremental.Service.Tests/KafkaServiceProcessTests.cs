@@ -1151,7 +1151,7 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         // An outage the leader's transaction outlives — with half a minute for the
         // brokers to commit again, which took them 15 to 17 s in every run here — moves
         // nothing: the same node leads under the same term and no process ended. (With
-        // a 60 s timeout this outage ended the leader in ten runs of sixteen.)
+        // a 60 s timeout this outage ended the leader in ten runs of fourteen.)
         if (TimeSpan.FromSeconds(seconds + 30) < transactionTimeout)
         {
             Assert.False(moved, $"the leadership moved over an outage of {seconds} s, which is under the transaction timeout of {transactionTimeout}");

@@ -977,6 +977,157 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         Assert.False(a.Leadership.Status.TakeoverFailed);
     }
 
+    /// <summary>
+    /// A heartbeat says the leader was alive when it wrote it. One that the brokers
+    /// could not show until now — its partition waited on a replica that had died with
+    /// the leader, and is released when the brokers give that replica up, nine seconds
+    /// on — is news nine seconds old: it must not call off the takeover that those nine
+    /// seconds of silence began, and it must not start the silence again. It did both,
+    /// once in thirteen takeovers with a broker killed beside the leader, and the
+    /// standby led a takeover timeout later than it could have (11.9 s for 9.2).
+    /// </summary>
+    [Fact]
+    public async Task The_last_heartbeat_of_a_dead_leader_read_late_does_not_call_the_takeover_off()
+    {
+        await using var env = KafkaEnv.Create();
+        await using var a = await StartAsync(env, "a");
+        await LeadsAsync(a);
+        await using var b = await StartAsync(env, "b");
+        await Task.Delay(After);      // b has read a's heartbeats as they were written
+
+        using var stall = Stall(a);
+        var met = 0;
+        var silence = TimeSpan.Zero;
+        b.Log.WhileAcquiring = point =>
+        {
+            if (point != "begin" || Interlocked.Exchange(ref met, 1) != 0)
+                return;
+
+            // The standby has decided and waits on the brokers, as the leader's last
+            // record does. When they move, the watch reads that record: a heartbeat the
+            // leader wrote a tenth of a second after the last one that was heard, and
+            // more than the takeover timeout ago.
+            Thread.Sleep(After);
+            var written = DateTimeOffset.UtcNow - b.Leadership.Status.HeartbeatAge + Beat;
+            b.Leadership.Heard(new KafkaLog.LeaderRecord(1, "a", written, Sequence: int.MaxValue));
+            silence = b.Leadership.Status.HeartbeatAge;
+        };
+
+        await LeadsAsync(b);
+        Assert.Equal(1, met);
+        Assert.Equal(0, b.Leadership.TakeoversAbandoned);
+        Assert.Equal(0, b.Log.WriterResets);
+        Assert.Equal("silence", b.Leadership.Status.LastTakeover!.Reason);
+        Assert.Equal(2, b.Leadership.Term);
+
+        // The silence went on counting, from the moment the record was written.
+        Assert.InRange(silence, After, After * 2 + TimeSpan.FromSeconds(5));
+
+        // The old leader finds itself fenced, as after any takeover.
+        stall.Set();
+        await a.Leadership.WhenFinished.WaitAsync(Timeout);
+        Assert.Equal(NodeRole.Fenced, a.Role);
+    }
+
+    /// <summary>The other side: a record the leader wrote within the silence a takeover
+    /// was decided on calls it off, however late it is read — and at the ceiling, where
+    /// the leader is known to be alive and has been silent for longer than the takeover
+    /// timeout by definition, that silence is the ceiling.</summary>
+    [Fact]
+    public async Task A_heartbeat_written_within_the_ceiling_calls_a_takeover_at_the_ceiling_off()
+    {
+        await using var env = KafkaEnv.Create();
+        await using var a = await StartAsync(env, "a");
+        await LeadsAsync(a);
+        var ceiling = TimeSpan.FromSeconds(3);
+        await using var b = await StartAsync(env, "b", ceiling: ceiling, probe: _ => ValueTask.FromResult(true));
+        await Task.Delay(After);
+        b.Log.WritePathOverride = () => (KafkaLog.WritePath.Writable, null);
+
+        using var stall = Stall(a);
+        var met = 0;
+        b.Log.WhileAcquiring = point =>
+        {
+            if (point != "begin" || Interlocked.Exchange(ref met, 1) != 0)
+                return;
+
+            // Written longer ago than the takeover timeout and well within the ceiling:
+            // the leader that the probe says is there has shown itself.
+            var written = DateTimeOffset.UtcNow - After - Beat * 3;
+            b.Leadership.Heard(new KafkaLog.LeaderRecord(1, "a", written, Sequence: int.MaxValue));
+        };
+
+        await KafkaEnv.EventuallyAsync(() => Task.FromResult(b.Leadership.TakeoversAbandoned >= 1), "b's takeover at the ceiling to be given up");
+        Assert.Equal(1, met);
+        Assert.Equal(NodeRole.Standby, b.Role);
+        Assert.True(a.Log.IsWriter);
+        stall.Set();
+        await CommitStateAsync(a.Log, "p", "still mine");
+    }
+
+    /// <summary>After the brokers are back a leader they held up is given two takeover
+    /// timeouts to be heard. An old record of its, shown by the brokers as they return,
+    /// is not that: the wait goes on to its end and is not cut short for it — nor does
+    /// the record count as the leader having been heard.</summary>
+    [Fact]
+    public async Task An_old_heartbeat_shown_as_the_brokers_return_does_not_end_the_wait_for_the_leader()
+    {
+        await using var env = KafkaEnv.Create();
+        await using var a = await StartAsync(env, "a");
+        await LeadsAsync(a);
+        var ceiling = TimeSpan.FromSeconds(2);
+        await using var b = await StartAsync(env, "b", ceiling: ceiling, probe: _ => ValueTask.FromResult(true));
+        await Task.Delay(After);
+        b.Log.WritePathOverride = () => (KafkaLog.WritePath.Unwritable, "the test says so");
+
+        using var stall = Stall(a);
+        await Task.Delay(ceiling * 2);
+        Assert.Equal(NodeRole.Standby, b.Role);
+        Assert.True(b.Leadership.TakeoversHeld > 0);
+
+        // The brokers are back, and with them a heartbeat the leader wrote when they went.
+        b.Log.WritePathOverride = () => (KafkaLog.WritePath.Writable, null);
+        var back = Stopwatch.StartNew();
+        b.Leadership.Heard(new KafkaLog.LeaderRecord(1, "a", DateTimeOffset.UtcNow - ceiling, Sequence: int.MaxValue));
+        await b.Leadership.WhenRoleAsync(r => r != NodeRole.Standby).WaitAsync(Timeout);
+        Assert.True(back.Elapsed >= After * 2 - Beat * 2, $"the standby took over {back.Elapsed} after the brokers were back; the leader is given {After * 2}");
+        await LeadsAsync(b);
+        Assert.Equal("ceiling", b.Leadership.Status.LastTakeover!.Reason);
+        Assert.Equal(0, b.Leadership.TakeoversAbandoned);
+        stall.Set();
+        await a.Leadership.WhenFinished.WaitAsync(Timeout);
+    }
+
+    /// <summary>What a standby says of the leader's silence is counted from when the
+    /// leader wrote, too: a record read late does not make the leader look alive now,
+    /// and an older one does not move the count back.</summary>
+    [Fact]
+    public async Task The_silence_is_counted_from_when_a_heartbeat_was_written()
+    {
+        await using var env = KafkaEnv.Create();
+        await using var a = await StartAsync(env, "a");
+        await LeadsAsync(a);
+        await using var b = await StartAsync(env, "b", ceiling: TimeSpan.FromSeconds(60), probe: _ => ValueTask.FromResult(true));
+        await Task.Delay(After);
+
+        using var stall = Stall(a);
+        await KafkaEnv.EventuallyAsync(() => Task.FromResult(b.Leadership.Status.HeartbeatAge > TimeSpan.FromSeconds(2)), "the leader to have been silent for two seconds");
+
+        // Written a second ago, read now.
+        b.Leadership.Heard(new KafkaLog.LeaderRecord(1, "a", DateTimeOffset.UtcNow - TimeSpan.FromSeconds(1), Sequence: int.MaxValue));
+        Assert.InRange(b.Leadership.Status.HeartbeatAge, TimeSpan.FromMilliseconds(900), TimeSpan.FromMilliseconds(1_700));
+
+        // The one after it in the same batch, written half a second later.
+        b.Leadership.Heard(new KafkaLog.LeaderRecord(1, "a", DateTimeOffset.UtcNow - TimeSpan.FromSeconds(0.5), Sequence: int.MaxValue));
+        Assert.InRange(b.Leadership.Status.HeartbeatAge, TimeSpan.FromMilliseconds(400), TimeSpan.FromMilliseconds(900));
+
+        // Written now.
+        b.Leadership.Heard(new KafkaLog.LeaderRecord(1, "a", DateTimeOffset.UtcNow, Sequence: int.MaxValue));
+        Assert.InRange(b.Leadership.Status.HeartbeatAge, TimeSpan.Zero, TimeSpan.FromMilliseconds(300));
+        Assert.Equal(NodeRole.Standby, b.Role);
+        stall.Set();
+    }
+
     /// <summary>At the ceiling a standby takes over from a leader that still answers —
     /// unless the brokers say that nothing can be committed by anybody, in which case the
     /// leader's place is no better than its own.</summary>
