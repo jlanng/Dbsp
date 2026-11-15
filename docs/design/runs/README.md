@@ -177,3 +177,36 @@ read.
   killed was the active controller each time).
 - `2026-11-15-j4-check.measurements.log` — the lines those runs wrote to
   `measurements.log`.
+
+## 2026-11-15, the fourth review's step
+
+`docs/design/enrichment-service.md`, S8, *The fourth review's findings* and *The early
+critic's items*. The `kafka3` profile started for the step; the build is the tree as
+that step left it, but for the first three records.
+
+- `2026-11-15-r4-review.jsonl` and `.measurements.log` — in order:
+  - three runs of `*Seventy_seconds_without_a_quorum*` with `INCREMENTAL_KAFKA_FAULT=pause`
+    and `INCREMENTAL_KAFKA_OUTAGE_SECONDS=45` on the build that held for brokers that do
+    not answer and still counted the leader's time from the last hold: the leadership
+    moved in all three;
+  - one more of the same on the final rule that is **not counted**: another test was
+    freezing the same brokers while it ran (the fourth record);
+  - five at 45 s and three at 70 s on the final rule: nobody took over;
+  - seventeen runs of `*A_takeover_with_one_broker_down*` with
+    `INCREMENTAL_KAFKA_BROKER_AFTER_MS` 3050 to 3240 and `INCREMENTAL_KAFKA_BROKER` 0, 1, 2
+    (the leader killed first, the broker that many milliseconds later);
+  - `*Losing_one_broker_of_three*` with `INCREMENTAL_KAFKA_FAULT=kill`: twice with the
+    client traced (`debug=broker`; the first as the admin client was, the second with
+    `enable.sparse.connections=false` given as a client setting), three times on the
+    build with that setting as the admin clients' default (`standbyBusySeconds` 0), once
+    with the setting turned back on by `INCREMENTAL_KAFKA_CLIENT` — the run that fails,
+    as it should (`standbyBusySeconds` 5) — and once with `INCREMENTAL_KAFKA_FAULT=pause`.
+- `2026-11-15-r4-deadline-cost.txt` — what `EvictWhenFinal` costs per open trade in
+  memory and in the state topic: the output of a scratch harness on the core API, and
+  the topics' sizes on the broker's disk. One local broker.
+- `2026-11-15-r4-service-1000-per-second.jsonl` — the enrichment example on the
+  connector stack (`--kafka`, two processes, `--rate 1000`), read every ten seconds from
+  both nodes' admin API and the broker's disk: rates, step times, `trade-enrichment`'s
+  entries and estimated bytes on each node, the standby's state lag, both nodes'
+  working set and live heap, records written and the state topic's bytes.
+

@@ -1889,8 +1889,11 @@ connector call, cut off from the brokers but still reachable by its peer, or wai
 for the brokers themselves. It answers the probe, so the standby waits for
 `TakeoverCeiling` (30 s) of silence and takes over then — unless the brokers say
 outright that nobody can commit (a partition of the log has no leader, or too few
-replicas in sync), in which case the leader's place is no better than its own and it
-waits for them. Output stops for those 30 s and the takeover. The loss of one broker
+replicas in sync) or do not answer at all, in which case the leader's place is no
+better than its own and it waits for them. Output stops for those 30 s and the
+takeover. A takeover that has begun is carried through: the first request for the
+log's transactional id ends the old leader's writer, so there is nothing to call off
+after it. The loss of one broker
 does not get there: the sink is silent for 8 to 15 s and the leader carries on
 (*Through a broker failure*). Size a failover budget on both figures.
 
@@ -2405,6 +2408,8 @@ sink timing what arrives):
 | the same for 70 s | 6 | 0 | 85 to 86 s |
 | the same for 70 s with the leader's transaction timeout set to 60 s, which the outage then outlasts | 14 | 10: the leader's writer ended, the node exited 3, the standby led | 85 to 89 s (once 72 s and then a second silence) |
 | two of three away for 40 s, and for 70 s, on a cluster whose controllers are not its brokers | 5 | 0 | 42 to 44 s, and 72 to 74 s |
+| two of three frozen for 45 s, and for 70 s: they keep their connections and answer nothing | 8 | 0 | 46 to 47 s, and 71 to 72 s |
+| the same before the standby held for brokers that do not answer (the fourth review's runs) | 8 | 5: the standby took over within half a second of the brokers' return | |
 | one of three killed in the same moment as the leader's process | 21 | yes, as intended: the standby led 8.7 to 10.6 s after the kill, 13.2 to 14.5 s when the broker was also the active controller, and once after 35 s | about as long (these runs time the takeover, not the sink) |
 | one of three gone for ten minutes, the leader's process killed after five | 1 | yes, as intended: the standby led 3.5 s after the kill, on two brokers, and the killed node came back as its standby | 11 s (the broker's loss) |
 
@@ -2447,7 +2452,9 @@ no leader that answers, or fewer replicas in sync that answer than
 `min.insync.replicas`, it waits, and for a few seconds after they are back, so that the
 leader can be heard first. It asks each broker itself: the cluster's own lists of who
 leads and who is in sync stop changing when the controllers have lost their quorum,
-and go on naming brokers that are gone. What a leader
+and go on naming brokers that are gone. Brokers that do not answer the question at all
+— frozen, or cut off with their connections left open — hold it in the same way:
+nothing can be committed through brokers that cannot be asked. What a leader
 cannot count on surviving is `KafkaLogOptions.TransactionTimeout` without a commit —
 five minutes. Past it the leader's open transaction fails in its client, or is timed
 out by the brokers' transaction coordinator, and more often than not the writer is
@@ -2613,8 +2620,31 @@ a deadline for it, so an open trade costs two entries per stateful operator —
 
 ```
 entries ≈ 2 × stateful operators × trades per second × (openSeconds + one step)
-bytes   ≈ entries × about 310           (trade-enrichment's entries, measured)
+bytes   ≈ entries × about 310           (trade-enrichment's entries, as the node estimates them)
 ```
+
+The bytes are a standby's: the node that read the trades holds about a third of that
+while every record is of its own reading (*Sizing a node*, *Shared or not*). A
+deadline is kept under the record it closes, so on a standby it is as large as the
+record.
+
+**In the state log** an open trade is one record per entry when it arrives and one
+tombstone per entry when it is final: sixteen records for `trade-enrichment`'s eight
+entries, where the same pipeline without eviction wrote four and kept them for ever.
+A deadline's record carries the trade in its key, and so does its tombstone. Measured
+on one local broker (zstd, the log's default; replication factor 1), the reference
+shape with a nine-column trade: 2.1 KB of record values per trade on arrival before
+compression, 155 B on disk per open trade, 260 B on disk for a trade's whole life —
+against 88 B per trade, never reclaimed, without eviction. Flat out, a thousand
+trades to a step, that circuit ran 14,900 trades a second against the broker — 238,000
+state records a second — a step committing in 67 ms on average and 132 ms at most,
+with a follower holding typed stores never more than a step or two behind. On the
+example itself at a thousand trades a second (two processes, the connector stack):
+32,000 state records and 0.69 MB a second for its two trade pipelines, a standby
+whose state lag read nothing at sixteen readings of nineteen and under 1,700 records
+at the others, and a takeover of 0.9 s after the 3 s of silence. Not
+measured: three brokers and a network between them, the log cleaner's load on a topic
+that turns over this fast, and anything on MSK.
 
 Measured on the example after the change, at 50 trades a second with the seeded
 `openSeconds` of 120: 23,882 entries after one minute, 47,980 after two, 48,059 after
@@ -2719,11 +2749,32 @@ and an entry costs its key and value as objects plus a slot in the store's map:
 | a join's side: the same record under its join key (`Join`, `LeftJoin`: one per record) | 359 |
 | a running total or count per key (`Sum`, `Count`) | 61 |
 | a count per string key | 87 |
-| a deadline (`EvictWhen`, a window: one per open key; `EvictWhenFinal`: one per open record, in each operator) | 56 |
+| a deadline of a key (`EvictWhen`, a window, a keyed input's `evictWhenFinal`): one per open key | 56 to 66 |
+| a deadline of a record (`EvictWhenFinal()` on a join or a lookup): one per open record in each such operator, kept under the record itself | 115 where the record is shared with the operator's own store; the record's bytes again where it is not (345 to 600 for the records above) |
 
 A join over a keyed input keeps each record twice, once in each of the first two rows.
 `Lookup` remembers what it emitted per record; `LookupAppendOnly` and everything
 stateless keep nothing.
+
+**Shared or not** is the difference between the two nodes. On the node that read a
+record from its source, every store the record passes through holds the same objects:
+the keyed input's row, the lookup's remembered record, each join's fact and each
+deadline all point at one trade. A standby reads each store's entries from the state
+log, and each is then an object of its own — and so is whatever a node restored at a
+takeover or a restart, until it has been evicted. Measured on the reference shape (a
+keyed input, a lookup and two joins over a nine-column trade, 100,000 open trades, the
+state log on Kafka; the heap after a full collection):
+
+| per open trade | on the node that read it | on a standby | what the node says it holds |
+|---|---|---|---|
+| without eviction: four entries | 706 B | 2,243 B | 2,044 to 2,084 B |
+| with `EvictWhenFinal`: eight entries | 1,167 B | 3,891 B | 3,482 to 3,602 B |
+
+So the node's own figure for a pipeline's state is what a standby holds, to within
+7 %, and about three times what the leader holds while its state is all of its own
+reading. Size both nodes by it: the standby needs it, and the leader holds as much
+after a takeover. And the deadlines of `EvictWhenFinal` are not small on a standby:
+they add 1.6 KB to an open trade here, as much again as three of its four records.
 
 **Ask the node.** Do not work these out for a deployment that exists: every node says
 what it holds. A table's page shows its rows, indexes and retained history in bytes; a
@@ -2736,8 +2787,9 @@ or read — each of the first 256, then one in 512 — by reading their fields, 
 mean is multiplied by the count. Against the heap they were within 2 % for the tables
 above and within 5 % for the state. What they cannot see is sharing: a string instance
 that every row refers to is counted in each row (a table of such rows read 14 % high),
-and a record that two stores of one pipeline both hold is counted in both on the node
-that read it from its source.
+and a record that several stores of one pipeline hold is counted in each on the node
+that read it from its source — where a pipeline's state card and the memory card read
+up to three times the heap (*Shared or not*, above), and on a standby read right.
 
 ![The cluster page's memory card](images/enrichment-service/memory.png)
 

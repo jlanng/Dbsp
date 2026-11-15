@@ -1634,11 +1634,10 @@ numbers are the items' own, from the runs they cite.
    of the deployment runs; the brokers cap it (`transaction.max.timeout.ms`, fifteen
    minutes by default, MSK's too). Decide the value, and with it whether a leader that
    takes the log again in place — specified in 67, not built — is wanted at all.
-4. **Failover timing: `TakeoverAfter` 3 s, the ceiling 30 s** (32, 61, 64, 75). A bulk
+4. **Failover timing: `TakeoverAfter` 3 s, the ceiling 30 s** (32, 61, 75). A bulk
    load of five million rows stops a leader for about 2 s (61), close to the 3 s; a
-   takeover called off between one-second `InitTransactions` slices can still fence the
-   leader a takeover timeout later (64); a standby takes more than a processor for about
-   ten seconds per broker lost (75, found and not fixed). A broker lost in the same
+   standby takes more than a processor for about ten seconds per broker lost (75: see
+   the item for what the fourth review's step found and did). A broker lost in the same
    moment as the leader is a failover of ten seconds, thirteen to fifteen if it was the
    active controller as well: the brokers' session timeout, which no setting of the
    service shortens (S8). Decide the two timeouts for the production cluster, and
@@ -2065,15 +2064,14 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     is a change to the persisted object names and to the source's checkpoint, and a
     reader that must keep within one fold of its writer. Until then: a Kafka topic or a
     table between the pipelines.
-64. **A takeover is called off for a heard leader until the transactional id is
-    taken, and goes through after** (S7, the third review). Between two one-second
-    slices of `InitTransactions` it is still called off, and a request that had left
-    the client can then land all the same: the leader ends and the standby takes over
-    on its silence, one takeover timeout later. *Alternative:* never call a takeover
-    off once the first request may have been sent — no such case, and every ceiling
-    takeover that begins during a broker outage then moves the leadership when the
-    brokers return, whoever of the two was faster; or do not call takeovers off at
-    all, as before S7.
+64. *Closed (S8, the fourth review).* **A takeover is called off for a heard leader
+    only before its first request for the transactional id, and goes through after.**
+    As S7 built it the call-off was honoured between one-second slices of
+    `InitTransactions`, on the reasoning that a request "may" have left; it had, and it
+    fences a leader with a transaction open before the call returns, so every such
+    call-off (three of three seen) left a fenced leader and a standby that stood down.
+    *Alternative, not taken:* do not call takeovers off at all, as before S7 — the
+    difference is now only the instant between a decision and its first request.
 65. **A takeover of the node's own that fails after it took the log ends the process
     with exit code 5, not 3** (S7, the third review): 5 already meant "it could not
     lead" and is answered with a growing delay. *Alternative:* a code of its own (6),
@@ -2135,8 +2133,9 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     restored circuit does what the uninterrupted one would.
 70. **A pipeline whose state only grows is flagged, and nothing more** (S8): after
     `ServiceOptions.StateGrowthAlarmAfter` (30 min) with no fall and a rise at twelve of
-    fifteen samples it is marked, an event is raised and the gauge
-    `pipeline.state_growing` is 1. It is not a health reason and stops nothing.
+    fifteen samples of one of its stores it is marked, an event is raised and the gauge
+    `pipeline.state_growing` is 1 (store by store, and not for a store that closes on a
+    watermark that moves, since the fourth review). It is not a health reason and stops nothing.
     *Alternatives:* make it `Degraded` (a node with one leaky tenant pipeline would
     then always be degraded, and the readiness probe is not the place); a per-spec
     limit on state entries (`circuit.maxStateEntries`) that faults the pipeline when
@@ -2158,7 +2157,9 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
 72. **The definition's `openSeconds` defaults to an hour; the example seeds two minutes
     and the smoke test thirty seconds** (S8). An hour is a guess at how late a booking
     correction comes. At 1,000 trades a second it is about 9 GB of state per node for
-    `trade-enrichment` alone (the guide's arithmetic). *Alternative:* no default, so
+    `trade-enrichment` alone (the guide's arithmetic, which is a standby's figure; the
+    growth flag no longer takes the first hour of it for a leak, and the setting's
+    description says what a second of it holds). *Alternative:* no default, so
     that every spec has to say — the dry run would then refuse the template the admin
     offers, which today is valid as it stands.
 73. **An in-memory takeover waits up to five seconds for a sink write the replaced
@@ -2177,23 +2178,22 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     fails the build for a reason that is not the push's), or on a schedule (a nightly
     run on the default branch — cheap to add once the branch is merged: `schedule`
     only fires there).
-75. **A standby takes more than one processor for as long as a dead broker is still
-    listed as a partition's leader** (S8, *CI*): about ten seconds per broker lost,
-    1.35 to 1.42 processors measured here, 27,000 refused connections a second on a
-    runner. Its lag questions (`KafkaLeadership.MeasureLagAsync`, once a second from
-    the node's loop and again from the leadership's sampler) and its look at the
-    leader topic's end while the leader is quiet (`NoteProgressAsync`) are admin
-    requests that wait for a broker that refuses connections, and the Kafka client
-    connects again without a pause while one waits. Two nodes on hosts of their own
-    lose nothing by it but the processor; on one small host it starved the leader
-    once in the broker job's runs. *Alternatives:* give the state's lag question the
-    patience and the pause a table's has (two seconds, then nobody asks for five:
-    about a third of the time instead of all of it) and stop asking for progress
-    while the brokers themselves say a partition has no leader; or ask only brokers
-    the client holds a connection to. Either is a change to what a standby knows of
-    its lag during an outage, with the broker tests as its check; neither was built
-    in this step, which found it in its last hour. The node's loop also waits on that
-    lag question — a standby applies no catalog change while it is out.
+75. *Closed (S8, the fourth review's step).* **A standby took more than one processor
+    for as long as a dead broker was still listed as a partition's leader**: about ten
+    seconds per broker lost, 1.2 to 1.4 processors here, 27,000 to 30,000 refused
+    connections a second. It was the Kafka client's own doing, on the log's admin
+    client only: an admin request meant for one broker asks for that broker's
+    connection again at every change of any broker's state, asking resets the
+    reconnect delay, and a refused connection is a change of state. Admin clients now
+    keep a connection to every broker (`enable.sparse.connections=false`, in
+    `KafkaClientDefaults` for an `AdminClientConfig`), which asks for nothing: 0.16 to
+    0.23 of a processor at most in any second, in four runs. *What was not done:* the
+    other clients still connect on demand; an admin client made from a consumer's or a
+    producer's handle (a source's, a sink's, the short reader's) shares that client's
+    setting, and none of them was seen to spin (two to four such requests in a run
+    against 231,000). Keeping every client connected to every broker would close that
+    too, at brokers × clients connections per node — which on Amazon MSK with IAM
+    counts against a connection rate limit at start-up.
 76. **Two in-memory nodes in one process start a node again when it loses the
     leadership** (S8, J7; `NodeSupervisor.RunInProcessAsync`, `ServiceNode.Ended`), in
     the example's `--nodes 2`, its two-node smoke and the AdminHost: the same name, the
@@ -2216,7 +2216,9 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     a deployment on a service that refuses the topic setting (none was met; MSK accepts
     topic-level settings, by its documentation and not by a run).
 79. **A standby waits two takeover timeouts for a leader after the brokers can commit
-    again, and no longer** (S7; seen running out in S8). In one traced outage past a
+    again, and no longer** (S7; seen running out in S8; counted since the fourth
+    review from the first answer that is not a hold, and held for brokers that do not
+    answer as well as for brokers that say no). In one traced outage past a
     60 s timeout the leader's client was still held up six seconds after the brokers
     were back, and the standby took over; that leader's writer was about to end
     anyway. On the five-minute timeout the leader was heard within 1.1 s in every run
@@ -2258,7 +2260,9 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     was done, and one pass over the state by the leader that first runs the new
     generation. A deadline that is a function of the record itself could instead be an
     index the store keeps, with no record of its own in the state topic — which would
-    also halve what `EvictWhenFinal` writes there (see *What a deadline costs*).
+    also halve what `EvictWhenFinal` writes there and what a standby holds for it (S8,
+    *The early critic's items*, E2: 16 records and 3.9 KB per open trade, against 8 and
+    about 2.6 KB).
 
 ## Not verified
 
@@ -5959,7 +5963,11 @@ sample after the flag).
 - `trade-enrichment` drops a trade that arrives behind its watermark (a straggler),
   which it used to carry; the smoke test's model and claims say so.
 - With `EvictWhenFinal` a pipeline holds twice the entries per open record (the record
-  and its deadline); per byte the deadline is about a sixth of a join's record.
+  and its deadline). *Corrected by the fourth review's step:* the deadline is kept
+  under the record, so it is small only where the record's objects are shared with
+  the operator's own store — on the node that read the record from its source, about
+  115 bytes — and is the record's size again on a standby and after a restore; and it
+  doubles what the state log is given (*The early critic's items*, E2, below).
 
 **Not verified.** Nothing ran longer than ten minutes; the growth flag's thirty minutes
 were exercised with a clock the test drives, not waited out. `EvictWhenFinal` under a
@@ -6288,9 +6296,15 @@ test's own check that most of its crashes landed after a checkpoint. None has fa
 on a runner in any run. Left as they are, and named here so that the next one to fail
 is recognised.
 
-**Ten runs of one commit.** Ten runs of 53d8c83, the last commit that changed code
-or tests: the push's own and nine started by hand straight after it, the last with the
-broker tests. All ten green.
+**Ten runs of one commit.** Ten runs of 53d8c83, which was the last commit that had
+changed code or tests when they were made: the push's own and nine started by hand
+straight after it, the last with the broker tests. All ten green. (It is not the last
+any more. Nine later commits of this round changed code or tests — 6f39d94, d77f78b,
+69fa8a5, 22fcb1a, ee68f86, ac42c06, 809bbbc, 92a2b4f and 8a7b453: the admin UI, the
+in-process supervisor, the transaction timeout and the leadership's dating of
+heartbeats — and so did the fourth review's fixes after them. None of those was run
+ten times: each has its own push's run, and what the last of them has is in *The
+fourth review's findings*, under CI.)
 
 | run | started by | build-and-test | connector-stack | perf-contracts | broker-failures | result |
 |---|---|---|---|---|---|---|
@@ -6324,7 +6338,8 @@ Every job of every run, with its duration: `docs/design/runs/2026-11-14-j3-ci-ru
 **Twenty runs here on two cores.** The service test project — 251 tests, of which
 the six that need three brokers skip — pinned to two processors with `taskset`, and
 with it the node processes it starts; the one local broker was not limited. Twenty runs of
-the last build, 53d8c83: twenty green, 149 to 156 s each.
+53d8c83, the last build at the time (not of the commits after it, above): twenty green,
+149 to 156 s each.
 
 It took six goes at twenty. The first, on the build with the first two fixes, passed
 nineteen and failed the twentieth on the fold. The next three were stopped when a run
@@ -7003,4 +7018,202 @@ Tests: `EvictWhenFinalTests.A_record_first_seen_behind_the_watermark_is_dropped_
 *Mutations of 1 to 5:* 18, all killed in the end; two survived the first run (the
 supervisor judging the total; the supervisor not reading the watermark) and were killed
 by the node-level test's two new pipelines.
+
+**6. Brokers that go silent without refusing a connection did not hold a standby at
+the ceiling.** The fourth review froze two of three brokers (`docker pause`: the
+connections stay open and nothing answers) for 45 and 70 s; in five runs of eight the
+standby took over within half a second of the brokers' return from a leader that had
+ridden the outage out. Two causes, both fixed (`KafkaLeadership.HeldByBrokersAsync`,
+`KafkaLog.ProbeWritePathAsync`):
+
+- *The question was not answered, and that held nothing.* The write-path question
+  begins with a metadata request to any broker; with two of three frozen it sits on a
+  frozen one until its two seconds are up (the admin client has no socket timeout to
+  move it to the third), which was `WritePath.Unknown` — "cannot be told", no hold. It
+  is now `WritePath.Unreachable`, an answer of its own, and it holds a standby whose
+  leader answers its probe exactly as "nothing can be committed" does. An error a
+  broker *sends* is still `Unknown` (`KafkaLog.Unasked`).
+- *The leader's time after the outage was counted from the wrong end.* A leader is
+  given two takeover timeouts to be heard once the brokers answer again. They counted
+  from the last hold; but the question itself waits on the brokers — nine seconds were
+  seen, answered in the instant they thawed — and by then the six seconds had gone.
+  This was found by the first three runs made with the first fix alone: all three
+  still moved the leadership, with two holds each and a takeover 0.6 s after the thaw.
+  The time now counts from the first answer that is not a hold.
+
+On the three-broker profile after both (the no-quorum test with
+`INCREMENTAL_KAFKA_FAULT=pause`, which the test now takes): two of three frozen for
+45 s, five runs, and for 70 s, three runs — the leader kept term 1 in all eight, no
+process ended, the sink was silent 45.8 to 46.7 s and 71.1 to 72.0 s (the outage and
+about a second: frozen brokers have nothing to re-register), the standby held 2 to 9
+times and answered its status in 20 ms to 2.0 s. Tests:
+`KafkaLeadershipTests.At_the_ceiling_a_standby_does_not_take_over_while_the_brokers_do_not_answer_and_waits_for_the_leader_when_they_do`
+(the answer arrives after a wait longer than the leader's grace), and the mapping in
+`What_the_brokers_say_about_writing…`. A debug line at each question
+(`INCREMENTAL_LOG_LEVEL=Debug`) says what was answered and how long ago the standby
+was last held, which is how the second cause was read.
+
+**7. A takeover called off for a heard leader had already fenced that leader**
+(`KafkaLog.AcquireCoreAsync`; *Open for James* 64, which is closed by this). The
+acquisition looked at its call-off token between one-second slices of
+`InitTransactions`. But the first slice sends `InitProducerId`, and when the leader
+has a transaction open the coordinator's answer is to raise the epoch and abort that
+transaction at once, and to tell the standby to ask again until the abort is done: the
+leader is fenced while `InitTransactions` has not returned. A heartbeat heard in that
+second called the takeover off — three times of three in the review's runs — and left
+a fenced leader, a standby that had stood down, and nobody leading for a takeover
+timeout. The token is now looked at only before the first call; a takeover that has
+asked for the log goes through. What that gives up is the call-off itself, which is
+left only the instant between the decision and the first request; a takeover that
+begins during an outage of the coordinator alone is now carried through when it
+returns, where it might have been called off. With finding 6 fixed a ceiling takeover
+no longer begins while the brokers cannot be asked. Test:
+`KafkaLeadershipTests.A_takeover_that_hears_the_leader_after_it_has_asked_for_the_log_goes_through`
+(a leader stopped inside a transaction; the standby's calls for the id given 20 ms, so
+that the first runs out while the coordinator aborts; the leader heard there).
+
+**8. A takeover's table read that began as a partition lost its leader waited out a
+doubled attempt** (`KafkaLog.RetryTransientAsync`). Admin calls are short attempts with
+a metadata refresh between them, and the attempts doubled without a stop: 0.5, 1, 2,
+4, 8 s. An attempt that begins with no leader hears nothing until its time is up, so
+the 4 s and 8 s attempts ran to their ends although the partition had its leader
+again after about nine seconds: 15.6 s for the table stage in the review's run.
+Attempts are now 0.5, 1, 2, 2, 2, 2 s and only then 4 and 8
+(`KafkaLog.AttemptTimeout`), so a call loses at most two seconds once the leader is
+back while a broker's loss is being settled. Tests:
+`BrokerFaultSeamTests.An_admin_call_loses_at_most_two_seconds_once_the_partition_has_its_leader_back`
+(a call that hangs for its whole time while leaderless, 4.5 s: it returned 3.5 s after
+the leader was back with the old schedule, under 2.5 s now) and the schedule itself.
+
+**9. S8 said its ten green runs were of "the last commit that changed code or
+tests".** True when written and not at the end of the round: nine later commits
+changed code or tests. The sentence and the one about the twenty local runs now say
+which commit they were of and that the later ones were not run ten times.
+
+*Mutations of 6 to 8:* 8, all killed in the end; one survived the first run (the
+probe reporting silence as "not known", which nothing exercised at the call site) and
+was killed by a seam for the question itself failing (`BeforeWritePathQuestion`).
+
+**What the frozen-broker and late-kill runs gave** (records
+`docs/design/runs/2026-11-15-r4-review.*`; the three-broker profile, started for the
+step). Seventeen takeovers with a broker killed 3.05 to 3.24 s after the leader — the
+review's way of landing the broker's death in the standby's takeover: the standby led
+11.4 to 16.8 s after the kill in sixteen and 3.2 s in one (the broker died after the
+takeover was over). The wait was in whichever stage first needed a commit — the fence
+(9.0 to 12.9 s), the storage's promotion (9.7, 10.1 s) or the start (8.2 to 13.0 s) —
+which is the brokers' session timeout and nobody's to shorten here. The table stage
+was 5 to 14 ms in sixteen and 612 ms in one: none of the seventeen landed in a table
+read for more than one attempt, so the 15.6 s of finding 8 was not seen again, before
+or after its fix; what holds the fix is the test.
+
+#### The early critic's items (E1, E2, E5, E7)
+
+**E1 — the growth flag against a pipeline's own open window** is findings 3 and 5
+above. What the critic saw (the reference definition at its default hour, flagged at
+31 minutes) is `StateGrowthTests.A_definition_that_keeps_trades_open_for_an_hour_is_not_flagged_while_it_fills`
+and the node-level test's `fills` pipeline. The default `openSeconds` stays an hour
+(*Open for James* 72); its description in the deploy form now says what a second of
+it costs (eight entries per trade per second of the feed).
+
+**E2 — what an `EvictWhenFinal` deadline costs.** S8 said "about a sixth of a join's
+record" and the guide's table 56 bytes; the node's own state card showed deadline
+stores as large as the facts beside them. Both were right somewhere. A record's
+deadline is kept under the record (`EvictionTracker<KeyedValue<TKey,TFact>>`), so it
+costs its map and queue where the record's objects are the ones the operator's own
+store holds, and the record again where they are not. Measured (a scratch harness on
+the core API: a keyed input, a remembered lookup and two retroactive joins over a
+nine-column trade, `ChangelogStorage` on a `KafkaLog`, one local broker; the heap after
+full collections; records `docs/design/runs/2026-11-15-r4-deadline-cost.txt`):
+
+| per open trade | the node that read it from its source | a follower with typed stores | `EstimateSize` |
+|---|---|---|---|
+| no eviction (4 entries) | 706 B | 2,243 B | 2,044 / 2,084 B |
+| `EvictWhenFinal` (8 entries) | 1,167 B | 3,891 B | 3,482 / 3,602 B |
+
+- *On the node that read the trades* every store holds the same trade — the input's
+  row, the lookup's remembered record, each join's fact, each deadline — and the four
+  deadlines add 461 bytes, 115 each. The node's estimate, which sizes each store's
+  entries by themselves, reads three times the heap there, with or without eviction.
+  That was a known limit of the estimate ("an object two stores share is counted in
+  both"); its size on a real shape was not known, and it is not small.
+- *On a follower* each store's entries are read from the log as objects of their own,
+  and the estimate is right to within 7 % (it is 7 % under). The deadlines add
+  1,648 bytes to an open trade: 65 for the keyed input's, 384 to 598 for each record's.
+  The same holds on any node for state it restored.
+- So the estimate is what a standby holds, which is what both nodes must be sized for
+  (the leader holds as much after a takeover until its restored state has been
+  evicted), and it is not what a leader's heap shows. The guide's sizing section, the
+  state card's help and `EstimateSize`'s documentation say so with these figures; the
+  guide's table has the two kinds of deadline apart; S8's sentence above is corrected.
+  *Not done:* making the estimate see sharing (it would have to follow one record
+  through every store, or walk them), and making a follower share — a deadline that
+  is a function of its record could be an index the fact store keeps, with no entry
+  and no log record of its own (*Open for James* 82).
+
+*In the state topic* an open trade is one record per entry when it arrives and one
+tombstone per entry when it is final: 16.00 records per trade through its life,
+counted (`KafkaLog.RecordsWritten`), against 4 without eviction. A deadline's record
+and its tombstone carry the trade in their key (227 to 336 bytes of record for the
+three, 27 for the keyed input's). On the broker's disk, zstd: 88 bytes per trade
+without eviction, 155 per open trade with it, 258 for a trade's whole life. Flat out
+with a thousand trades to a step that circuit ran 14,850 trades a second — 238,000
+state records a second — committing a step in 67 ms on average and 132 ms at most; a
+follower with typed stores had the leader's entry count at eleven of eighteen
+readings and was one or two steps' entries behind at the others (8,000, and once
+16,400), all but one of them while the state was still filling.
+
+*On the service* (the example on the connector stack, `--kafka`, two processes,
+`--rate 1000`, three minutes; records
+`docs/design/runs/2026-11-15-r4-service-1000-per-second.jsonl`): `trade-enrichment`
+level at 960,400 to 961,800 entries on both nodes (2 × 4 × 1,000 × 120), 287 MB by the
+leader's estimate and 296 MB by the standby's; the state topic took 32,000 records
+and 0.69 MB a second for the two trade pipelines once both were full (that is 59 GB a
+day written and tombstoned again, which the log cleaner has to follow — not watched
+for longer than these minutes); the standby's state lag read 0 at sixteen of nineteen
+readings and 658 to 1,678 records at three; the node's steps averaged 15 to 21 ms in
+the seconds that had none of the alert pipelines' two-second file steps in them; once
+the state was full the leader's live heap was 250 to 360 MB and the standby's 600 to
+870 MB for the same state, the sharing again. A `kill -9` of the leader then: the standby led
+after 3 s of silence and 867 ms of takeover, 284 ms of it the service's (six
+pipelines started as built, 960,000 and 770,000 entries of state among them) — the
+guide's takeover screenshot, retaken from this run.
+
+**E5 — the broker-failure residue.** *Open for James* 75 is found and fixed: see the
+item. The reconnect delay of `KafkaClientDefaults` was being reset, not ignored. The
+log's admin client asks where a partition ends of the partition's leader; while that
+leader is a broker that has died and is still listed, the request waits for the
+broker, and the client's way of waiting is to ask for the broker's connection again
+at every change of any broker's state — which sets the delay before the next
+connection to nothing. A refused connection is a change of state. In a traced run
+(`debug=broker`, one broker of three killed for 20 s) the standby's admin client
+logged 231,436 such requests and as many refused connections in eight seconds, about
+30,000 a second, at 1.2 to 1.4 processors; every other client of the node had two to
+four. With `enable.sparse.connections=false` on admin clients nothing asks: the same
+run had 148 refused connections from all clients together, and the standby used at
+most 0.16 to 0.23 of a processor in any second the broker was away, in four runs
+(three kills, one freeze). The one-broker test now reads the standby's processor time
+each second and fails above 0.9 of a processor in more than two of them; with the
+setting turned back on by the test's own client setting it failed (five seconds, as
+it should). The CI job is under *Numbers* below.
+
+**E7 — seven small things in the admin UI,** each looked at in Chromium afterwards
+(the example, two nodes in memory, 1440 and 390 px; no console message; no page wider
+than its window):
+
+1. *Dead letters flooded the overview's recent events.* A pipeline that keeps
+   dropping records now says so as an event at once and then once a minute
+   (`PipelineSupervisor.DeadLetterEventEvery`; the log line stays every ten seconds),
+   and the card has a switch per kind of event, so a kind can be left out; it shows
+   the newest forty of the two hundred it reads.
+2. *A standby's rate tiles cut their text.* They say "shown on the leader".
+3. *The state timeline named the wrong generation for `Stopping`* after a replace:
+   the spec is already the new one when the old generation stops. It names the
+   generation that runs (`SupervisorTests`).
+4. *The takeover plan said the old leader "is fenced and ends".* It says the node
+   stops leading and is started again as the standby by whatever supervises it.
+5. *In memory the memory card named a Kafka client.* The texts depend on the backend.
+6. *The guide's takeover screenshot* (Kafka) is retaken, from the run above.
+7. *Pipelines were listed by their plugin's hash alone.* The list and the pipeline's
+   page show what the plugin's build calls itself beside it (`build` in the admin API,
+   from the package's manifest; `AdminApiTests`).
 
