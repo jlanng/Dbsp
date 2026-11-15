@@ -395,6 +395,17 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         var listed = (await Admin.Get("pipelines?limit=50"))["items"].EnumerateArray().Single(p => p.GetProperty("id").GetString() == "enrich-orders");
         Assert.Equal(state.GetProperty("stores").GetInt32(), listed.GetProperty("stateSize").GetProperty("stores").GetInt32());
 
+        // What a person tells a plugin version by is its build's own name, beside the hash
+        // of its files; and the figures that are in no dead letter and no fault.
+        var manifest = (await Admin.Get("plugins?limit=50"))["items"].EnumerateArray()
+            .First(p => p.GetProperty("name").GetString() == listed.GetProperty("plugin").GetString() && p.GetProperty("version").GetString() == listed.GetProperty("version").GetString());
+        // (This pipeline's plugin is compiled into the host: its build is the host's own.
+        // An imported one is named by its package — the upload test.)
+        Assert.True(manifest.GetProperty("builtIn").GetBoolean());
+        Assert.StartsWith("1.0.0", listed.GetProperty("build").GetString());
+        Assert.Equal(0, listed.GetProperty("lateRecords").GetInt64());
+        Assert.False(listed.TryGetProperty("stateGrowth", out var growing) && growing.ValueKind != JsonValueKind.Null);
+
         // The node sets the two against its process: totals, the largest of each, and the
         // collector's settings beside the figures they explain.
         JsonElement holds = default;
@@ -1050,6 +1061,20 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         Assert.Equal(version, stored["versions"][0].GetProperty("plugin").GetProperty("version").GetString());
         Assert.True(stored["versions"][0].GetProperty("files").GetArrayLength() >= 2);
         Assert.Equal("plugin.import", (await admin.Get("audit?limit=1"))["items"][0].GetProperty("action").GetString());
+
+        // A pipeline deployed from it is listed with what the package calls its build —
+        // what a person tells two versions apart by — beside the hash of its files.
+        var build = stored["versions"][0].GetProperty("plugin").GetProperty("informationalVersion").GetString();
+        Assert.StartsWith("1.0.0", build);
+        var deployed = await admin.SendAsync(HttpMethod.Put, "pipelines/uploaded-counts", $$"""
+            { "plugin": "acme.pipelines", "version": "{{version}}", "definition": "trader-counts",
+              "inputs": { "trades": { "connector": "memory", "name": "uploaded-in" } },
+              "sinks": { "counts": { "connector": "memory", "name": "uploaded-out" } } }
+            """);
+        Assert.True(deployed.Code is 200 or 201, $"deploying from the uploaded plugin answered {deployed.Code}");
+        var uploaded = (await admin.Get("pipelines?limit=50"))["items"].EnumerateArray().Single(p => p.GetProperty("id").GetString() == "uploaded-counts");
+        Assert.Equal(build, uploaded.GetProperty("build").GetString());
+        Assert.Equal(200, (await admin.SendAsync(HttpMethod.Delete, "pipelines/uploaded-counts?confirm=uploaded-counts")).Code);
 
         // Deleting it needs the name and the version, and says what it will do first.
         (await admin.SendAsync(HttpMethod.Delete, $"plugins/acme.pipelines/{version}")).IsError(400, "confirmation-required");

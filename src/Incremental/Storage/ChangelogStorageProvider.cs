@@ -379,9 +379,16 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
     /// do).
     /// </para>
     /// <para>
-    /// What it does not see: an object two stores share (the record a keyed input holds
-    /// and the join downstream of it holds too, on the node that read it from its
-    /// source) is counted in both; touched-entry maps and other scratch are not counted.
+    /// What it does not see: an object several stores share is counted in each. On the
+    /// node that read a record from its source every store the record passes through
+    /// holds the same objects — a keyed input's row, a lookup's remembered record, each
+    /// join's fact, and each <c>EvictWhenFinal</c> deadline, which is kept under the
+    /// record — so there the estimate reads up to three times the heap (measured: 3,482
+    /// against 1,167 bytes per open record on a lookup and two joins). A follower reads
+    /// each store's entries from the log as objects of their own, and so does a node
+    /// that restores: there it is right (3,602 against 3,891). It is therefore what a
+    /// standby needs, which is what both nodes must be sized for. Touched-entry maps and
+    /// other scratch are not counted.
     /// </para>
     /// </summary>
     public StateSizeEstimate EstimateSize()

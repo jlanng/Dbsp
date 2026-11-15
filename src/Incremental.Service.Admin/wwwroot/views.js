@@ -22,6 +22,13 @@
   };
   const rate = v => (v == null ? '–' : fmtNum(v));
 
+  // A plugin version as a person names it: what its build calls itself, then the hash of its files.
+  const pluginVersion = p => (p.build ? `${p.plugin} ${A.buildName(p.build)} · ${short(p.version)}` : `${p.plugin}@${short(p.version)}`);
+
+  // What a process holds outside the collector's heap depends on the backend: only one of them has a Kafka client.
+  const onKafka = node => !!(node && node.status && node.status.backend && /kafka/i.test(node.status.backend.kind));
+  const nativeHolds = node => (onKafka(node) ? 'the Kafka client’s buffers, the runtime, thread stacks' : 'the runtime, thread stacks');
+
   const eventList = events => h('ul', { class: 'events', role: 'log', 'aria-label': 'Recent events' },
     events.slice().reverse().map(e => h('li', { key: 'e' + e.sequence },
       h('span', { class: 'when' }, timeEl(e.time, clock(e.time))),
@@ -33,6 +40,27 @@
         clamped(e.message)))));
 
   // ── overview ────────────────────────────────────────────────────────────────────────
+
+  // Which kinds of event the overview's list leaves out: this page's choice, kept while the page is open.
+  const hiddenKinds = new Set();
+  const EVENTS_SHOWN = 40;
+
+  /** The newest events, with a switch per kind: a kind that repeats (dead letters, late
+   *  records) would otherwise push the ones that happen once out of sight. */
+  function recentEvents(ctx, items) {
+    const kinds = [...new Set(items.map(e => e.kind))].sort();
+    for (const kind of [...hiddenKinds]) if (!kinds.includes(kind)) hiddenKinds.delete(kind);
+    const shown = items.filter(e => !hiddenKinds.has(e.kind)).slice(-EVENTS_SHOWN);
+    return card('Recent events', hiddenKinds.size ? `this node, newest first · ${[...hiddenKinds].sort().join(', ')} left out` : 'this node, newest first',
+      items.length === 0 ? empty('No events yet', 'Role changes, pipeline and table transitions appear here as they happen.')
+        : h('div', { class: 'stack' },
+          kinds.length > 1 && h('div', { class: 'seg wrap', role: 'group', 'aria-label': 'Kinds of event shown' },
+            kinds.map(kind => h('button', { type: 'button', key: 'k' + kind, 'aria-pressed': String(!hiddenKinds.has(kind)),
+              title: hiddenKinds.has(kind) ? `Show ${kind} events` : `Leave ${kind} events out`,
+              on: { click: () => { if (hiddenKinds.has(kind)) hiddenKinds.delete(kind); else hiddenKinds.add(kind); ctx.render(); } } }, kind))),
+          shown.length ? h('div', { class: 'scroll' }, eventList(shown)) : empty('Nothing of the kinds shown', 'Every recent event is of a kind that is left out.')),
+      { flush: false });
+  }
 
   function nodeFacts(node) {
     const st = node.status, lead = st.leadership, kafka = lead.kafka;
@@ -52,13 +80,14 @@
     every: 3000,
     async load() {
       const [node, pipelines, tables, events, metrics] = await Promise.all([
-        api('node'), all('pipelines'), all('tables'), api('events/recent?limit=40'), api('node/metrics'),
+        api('node'), all('pipelines'), all('tables'), api('events/recent?limit=200'), api('node/metrics'),
       ]);
       seedSeries('', metrics.seconds);
       store.leader = node.leader;
       return { node, pipelines, tables, events };
     },
-    render({ data }) {
+    render(ctx) {
+      const { data } = ctx;
       const { node, pipelines, tables, events } = data;
       const st = node.status, role = st.leadership.role;
       const live = store.node || {};
@@ -110,10 +139,10 @@
 
         h('div', { class: 'tiles' },
           role !== 'Leader'
-            ? tile('Records in', '–', '', 'this node runs no pipeline: rates are on the leader', null)
+            ? tile('Records in', '–', '', 'shown on the leader', null)
             : tile('Records in', rate(total.in), '/s', `${fmtInt(total.steps || 0)} steps in the last second`, spark(seriesOf('', 'in'), { label: 'Records in per second', unit: '/s' })),
           role !== 'Leader'
-            ? tile('Records out', '–', '', 'nothing is delivered from here', null)
+            ? tile('Records out', '–', '', 'shown on the leader', null)
             : tile('Records out', rate(total.out), '/s', 'delivered to sinks', spark(seriesOf('', 'out'), { cls: 'out', label: 'Records out per second', unit: '/s' })),
           standby
             ? tile('State lag', fmtNum(live.stateLag ?? (st.standby && st.standby.stateLagRecords)), 'records', 'behind the state log', null)
@@ -152,8 +181,7 @@
                   leaderLink(' (', ')'), '. Here: the tables this node follows are open and it is ready to take over.'])
                 : role === 'Leader' ? empty('Nothing needs attention', 'Every pipeline and table is where it was asked to be.')
                 : empty('This node runs nothing', ['It no longer leads; what needs attention is shown on the leader', leaderLink(' (', ')'), '.'])),
-            card('Recent events', 'this node, newest first',
-              events.items.length ? h('div', { class: 'scroll' }, eventList(events.items)) : empty('No events yet', 'Role changes, pipeline and table transitions appear here as they happen.')))));
+            recentEvents(ctx, events.items))));
     },
   };
 
@@ -241,7 +269,7 @@
             : h('div', { class: 'table-wrap' }, grid([
               { label: 'Pipeline', sort: 'id', cellCls: 'id', cell: p => pipelineLink(p.id) },
               { label: 'State', sort: 'state', cell: p => [pipelineBadge(p.state), p.blockedOn && h('span', { class: 'sub' }, blockedText(p.blockedOn)), p.pending && h('span', { class: 'sub' }, `unfinished ${p.pending}`)] },
-              { label: 'Definition', sort: 'definition', cell: p => [p.definition, h('span', { class: 'sub mono' }, `${p.plugin}@${short(p.version)}`)] },
+              { label: 'Definition', sort: 'definition', cell: p => [p.definition, h('span', { class: 'sub mono', title: `Version ${p.version}: the hash of the plugin’s files` }, pluginVersion(p))] },
               !runsNothing && { label: 'In /s', sort: 'in', cls: 'r', cell: p => rate(rowRates(p).in) },
               !runsNothing && { label: 'In, last minute', sr: true, cellCls: 'spark', cell: p => spark(seriesOf(p.id, 'in'), { label: `${p.id}: records in per second`, unit: '/s' }) },
               !runsNothing && { label: 'Out /s', sort: 'out', cls: 'r', cell: p => rate(rowRates(p).out) },
@@ -307,7 +335,7 @@
           crumbs: h('a', { href: '#/pipelines' }, 'Pipelines'),
           title: [h('span', { class: 'mono' }, id), pipelineBadge(p.state)],
           lede: [
-            `${p.definition} from ${p.plugin}@${short(p.version)} · `,
+            `${p.definition} from ${pluginVersion(p)} · `,
             h('span', { title: 'The generation of its spec: it goes up with every change to the pipeline’s catalog entry, and is what the audit and the faults name. A restart builds the same generation again.' }, `generation ${p.generation}`),
             p.operation && ` · ${p.operation} in progress`,
             p.blockedOn && ` · ${blockedText(p.blockedOn)}`,
@@ -992,7 +1020,7 @@
         z.stores > stores.length && h('p', { class: 'help' }, `The ${fmtInt(stores.length)} largest of ${fmtInt(z.stores)} stores.`),
         h('p', { class: 'help' },
           'Entries are counted. Memory is estimated: the objects of an entry — sized as entries are written to the changelog or read from it, each of a store’s first 256 and then one in 512 — times the entries, plus the store’s own maps. ',
-          'An object two stores share is counted in both. A store that grows without a pause for half an hour (ServiceOptions.StateGrowthAlarmAfter) is flagged here, on the overview and as the gauge pipeline.state_growing; one that closes on the watermark (it has a deadlines store beside it) is flagged only if the watermark has not moved in that time — while it moves, the store is filling what the definition keeps open.')),
+          'An object several stores share is counted in each: on the node that read the records from their sources the stores of a pipeline hold the same objects and the heap has about a third of this, on a standby (and after a restore) each store has its own and this is what it holds. A store that grows without a pause for half an hour (ServiceOptions.StateGrowthAlarmAfter) is flagged here, on the overview and as the gauge pipeline.state_growing; one that closes on the watermark (it has a deadlines store beside it) is flagged only if the watermark has not moved in that time — while it moves, the store is filling what the definition keeps open.')),
       { flush: false });
   }
 
@@ -1314,7 +1342,7 @@
         ['Working set', [h('strong', { class: 'num' }, fmtBytes(m.workingSetBytes)), h('span', { class: 'muted' }, ' · what the operating system counts for the process')]],
         ['GC heap', [h('strong', { class: 'num' }, fmtBytes(m.gcLiveBytes || m.gcHeapBytes)), h('span', { class: 'muted' },
           m.gcLiveBytes ? ` live at the last collection · ${fmtBytes(m.gcCommittedBytes)} committed` : ` in use · ${fmtBytes(m.gcCommittedBytes)} committed`)]],
-        m.otherBytes != null && ['Not the collector’s', [h('strong', { class: 'num' }, fmtBytes(m.otherBytes)), h('span', { class: 'muted' }, ' · the Kafka client’s buffers, the runtime, thread stacks')]],
+        m.otherBytes != null && ['Not the collector’s', [h('strong', { class: 'num' }, fmtBytes(m.otherBytes)), h('span', { class: 'muted' }, ' · ' + nativeHolds(node))]],
         ['GC pauses', [h('strong', { class: 'num' }, fmtNum(m.gcPauseRecentPercent != null ? m.gcPauseRecentPercent : m.gcPausePercent) + ' %'), h('span', { class: 'muted' },
           m.gcPauseRecentPercent != null ? ` of the last minute · ${fmtNum(m.gcPausePercent)} % of the process’s life · ${plural(m.gen2Collections, 'full collection')}` : ` of the process’s life · ${plural(m.gen2Collections, 'full collection')}`)]],
         m.gc && ['Collector', h('span', { class: 'muted' }, gcText(m.gc))],
@@ -1463,7 +1491,7 @@
       ['Pipeline state', x.stateBytes, 'hold-2', `${plural(x.stateEntries, 'entry', 'entries')} in ${plural(x.pipelineCount, 'pipeline')}, estimated`],
       ['Everything else on the heap', rest, 'hold-3', 'circuits, buffers in flight, the plugins’ and the runtime’s own objects — and whatever the two estimates miss'],
       ['Committed and not in use', slack, 'hold-4', 'what the collector keeps ready beyond what was live at its last collection'],
-      m.otherBytes != null && ['Not the collector’s', m.otherBytes, 'hold-5', 'the Kafka client’s buffers, the runtime, thread stacks'],
+      m.otherBytes != null && ['Not the collector’s', m.otherBytes, 'hold-5', nativeHolds(node)],
       m.otherBytes != null && ['The program itself', Math.max(0, m.workingSetBytes - m.gcCommittedBytes - m.otherBytes), 'hold-6', 'the runtime’s and the assemblies’ code, and other files mapped into the process'],
     ].filter(Boolean);
     const total = Math.max(1, parts.reduce((a, [, v]) => a + v, 0));
@@ -1489,7 +1517,7 @@
               h('td', { class: 'id' }, pipelineLink(p.id)), h('td', { class: 'r' }, fmtNum(p.entries) + ' entries'), h('td', { class: 'r' }, '≈ ' + fmtBytes(p.bytes)))))))),
         node.memoryRelease && h('p', { class: 'help' },
           'Given back to the operating system since this process started: ', h('strong', { class: 'num' }, fmtBytes(node.memoryRelease.nativeReturnedBytesTotal)),
-          ' the Kafka client had freed and the C allocator kept',
+          onKafka(node) ? ' the Kafka client had freed and the C allocator kept' : ' that had been freed and the C allocator kept',
           node.memoryRelease.collectionsInducedTotal > 0 ? `; ${plural(node.memoryRelease.collectionsInducedTotal, 'young collection')} asked for so that the collector would let go of what a burst left it holding` : '',
           '. Last looked at ', timeEl(node.memoryRelease.at), '.'),
         h('p', { class: 'help' },

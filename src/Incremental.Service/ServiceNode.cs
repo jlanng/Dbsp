@@ -975,7 +975,9 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         var cold = running.Count - built;
         var plan = new ActionPlan("node.takeover", NodeId, options.DryRun,
         [
-            status.LeaderNodeId is { } leader ? $"node '{leader}' is fenced and ends" : "there is no leader to fence",
+            status.LeaderNodeId is { } leader
+                ? $"node '{leader}' is fenced and stops leading; whatever supervises it starts it again as this node's standby"
+                : "there is no leader to fence",
             $"node '{NodeId}' promotes the catalog, {_context.Tables.Tables.Count} table(s) and the state",
             running.Count == 0 ? "no pipeline is to run"
                 : built == running.Count ? $"it starts the {built} pipeline(s) it has built while standing by, at their committed step"

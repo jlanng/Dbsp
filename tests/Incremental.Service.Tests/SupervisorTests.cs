@@ -79,6 +79,12 @@ public class SupervisorTests
         var replaced = await service.DeployAsync(tightened, StateChoice.Reset);
         Assert.True(replaced.Spec.Generation > 1);
         await service.Running("other");
+        // The timeline names each generation by what happened to it: the one that ran is
+        // what stopped, though the new spec was in place by then.
+        var timeline = service.Pipelines.Get("other").History!.Select(t => (t.State, t.Generation)).ToList();
+        Assert.Contains((PipelineState.Stopping, 1L), timeline);
+        Assert.DoesNotContain(timeline, t => t.State == PipelineState.Stopping && t.Generation == replaced.Spec.Generation);
+        Assert.Equal((PipelineState.Running, replaced.Spec.Generation), timeline[^1]);
         var otherOut2 = service.Memory.UpsertSink<long, EnrichedTrade>("other-out");
         Assert.NotSame(otherOut, otherOut2);
         await Eventually(() => Same(otherOut2.Rows, Enrich.Model(otherTrades, instruments, minQuantity: 4)), "the replaced generation's output");

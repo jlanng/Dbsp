@@ -717,6 +717,9 @@ internal static class AdminApi
             generation = p.Generation,
             plugin = p.Plugin,
             version = p.Version,
+            // What the plugin's author called this build, when the package says: a person
+            // tells two versions apart by it, not by the hash of their files.
+            build = PluginBuild(state.Node, p.Plugin, p.Version),
             definition = p.Definition,
             blockedOn = p.BlockedOn,
             since = p.Since,
@@ -847,6 +850,18 @@ internal static class AdminApi
             pipelines = gauges.Pipelines.OrderByDescending(p => p.StateBytes).Take(top)
                 .Select(p => new { id = p.Id, entries = p.StateEntries, bytes = p.StateBytes }),
         };
+    }
+
+    private static string? PluginBuild(ServiceNode node, string plugin, string version)
+    {
+        try
+        {
+            return node.Plugins.Manifest(plugin, version)?.InformationalVersion;
+        }
+        catch (Exception ex) when (ex is ServiceException or ArgumentException)
+        {
+            return null; // a built-in plugin, or a version this node no longer has
+        }
     }
 
     private static object PluginItem(ServiceNode node, PluginInfo p, IReadOnlyList<PipelineSpec> specs)

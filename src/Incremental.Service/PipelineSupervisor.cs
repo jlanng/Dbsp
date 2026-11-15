@@ -543,11 +543,14 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             return;
         runtime.State = state;
         runtime.Since = DateTimeOffset.UtcNow;
-        runtime.History.Add(new PipelineTransition(runtime.Since, state, runtime.Spec.Generation, why));
+        // A replace has put the new spec in place by the time the old generation is
+        // stopped: what is stopping is the generation that runs, not the one to come.
+        var generation = state == PipelineState.Stopping && runtime.Current is { } stopping ? stopping.Number : runtime.Spec.Generation;
+        runtime.History.Add(new PipelineTransition(runtime.Since, state, generation, why));
         if (state is not PipelineState.Blocked)
             runtime.BlockedOn = null;
         _logger.LogInformation("Pipeline {Pipeline} generation {Generation} is {State}{Why}",
-            runtime.Id, runtime.Spec.Generation, state, why is null ? "" : ": " + why);
+            runtime.Id, generation, state, why is null ? "" : ": " + why);
         context.Events.Publish("pipeline", runtime.Id, why is null ? state.ToString() : $"{state}: {why}");
     }
 
@@ -2090,21 +2093,35 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
     {
         public DateTimeOffset LastLogged = DateTimeOffset.MinValue;
         public int SinceLogged;
+        public DateTimeOffset LastSaid = DateTimeOffset.MinValue;
+        public int SinceSaid;
     }
 
-    /// <summary>The ring, the count, and a line in the log every ten seconds at most.</summary>
+    /// <summary>How often a pipeline that keeps dropping records says so as an event: at
+    /// once the first time, then this often. A pipeline with a steady trickle of dead
+    /// letters would otherwise fill the node's event ring with them, and the events that
+    /// happen once — a takeover, a table that failed — would be gone from it in minutes.</summary>
+    internal static readonly TimeSpan DeadLetterEventEvery = TimeSpan.FromMinutes(1);
+
+    /// <summary>The ring, the count, a line in the log every ten seconds at most and an
+    /// event every minute at most.</summary>
     private void Remember(PipelineRuntime runtime, DeadLetter letter, string? record, DeadLetterNotes noted)
     {
         runtime.DeadLetters.Add(sequence => new DeadLetterRecord(
             sequence, DateTimeOffset.UtcNow, letter.Operator, letter.Weight,
             letter.Exception.GetType().Name, letter.Exception.Message, record));
         noted.SinceLogged++;
+        noted.SinceSaid++;
         var now = DateTimeOffset.UtcNow;
+        if (now - noted.LastSaid >= DeadLetterEventEvery)
+        {
+            context.Events.Publish("deadletter", runtime.Id, $"{noted.SinceSaid} record(s) dropped, the last at {letter.Operator}");
+            (noted.LastSaid, noted.SinceSaid) = (now, 0);
+        }
         if (now - noted.LastLogged < TimeSpan.FromSeconds(10))
             return;
         _logger.LogWarning("Pipeline {Pipeline} dropped {Count} record(s) to its dead letters; the last at {Operator}: {Message}",
             runtime.Id, noted.SinceLogged, letter.Operator, letter.Exception.Message);
-        context.Events.Publish("deadletter", runtime.Id, $"{noted.SinceLogged} record(s) dropped at {letter.Operator}");
         (noted.LastLogged, noted.SinceLogged) = (now, 0);
     }
 
