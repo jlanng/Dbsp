@@ -20,6 +20,20 @@ internal sealed class InputRejection(object? record, Exception error)
     /// on. It shares the rejection's slot so that an ordinary entry stays the size it was.</summary>
     public static readonly InputRejection Advance = new(null, new InvalidOperationException("An input position with no record."));
 
+    /// <summary>Not a rejection either, and not a position: the source says that it reads
+    /// the entry's partition and that records of it may be on their way
+    /// (<see cref="InputHandle{T}.ExpectPartitionAsync"/>). It travels in the channel so
+    /// that it takes effect in order with the records around it.</summary>
+    public static readonly InputRejection ExpectPartition = new(null, new InvalidOperationException("A partition the source reads."));
+
+    /// <summary>The source stands at the end of the entry's partition
+    /// (<see cref="InputHandle{T}.IdlePartitionAsync"/>).</summary>
+    public static readonly InputRejection IdlePartition = new(null, new InvalidOperationException("A partition the source has read to its end."));
+
+    /// <summary>True for the two notes about a partition, which carry no offset and are
+    /// read before the entry is admitted.</summary>
+    public bool IsPartitionNote => ReferenceEquals(this, ExpectPartition) || ReferenceEquals(this, IdlePartition);
+
     public object? Record { get; } = record;
     public Exception Error { get; } = error;
 
@@ -158,6 +172,47 @@ public sealed class InputHandle<T> where T : notnull
         return InputWrites.WriteAsync(_writer, new InputEntry<T>(default!, 0, partition, offset, InputRejection.Advance), cancellationToken);
     }
 
+    /// <summary>
+    /// Says that the source reads <paramref name="partition"/> and that its records may
+    /// still be on their way: from here the partition has an event-time clock of its own,
+    /// and the input's watermark is the least over such partitions — so a partition that
+    /// is behind the others (a backlog after a restart, a broker that was away) holds the
+    /// watermark back until it has caught up, where otherwise the others' newer records
+    /// would make its own late. A partition named here holds the watermark until it has
+    /// brought a record or is said to be idle (<see cref="IdlePartitionAsync"/>); named
+    /// again while idle, it holds the watermark again. Records of a partition never named
+    /// are timed together, as the input's always were.
+    /// <para>
+    /// A source says this for every partition when it starts — after a restart too: what
+    /// it knew of a partition's end before it stopped is no longer true. It has an effect
+    /// only where event time is declared on the input itself
+    /// (<c>input.WithEventTime(…, lateness)</c>) on an unclustered circuit; anywhere else
+    /// it is read and ignored. It travels through the channel like a record.
+    /// </para>
+    /// </summary>
+    public ValueTask ExpectPartitionAsync(int partition, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(partition);
+        _stamping.Lock(stamped: true);
+        return InputWrites.WriteAsync(_writer, new InputEntry<T>(default!, 0, partition, -1, InputRejection.ExpectPartition), cancellationToken);
+    }
+
+    /// <summary>
+    /// Says that the source stands at the end of <paramref name="partition"/>: there is
+    /// nothing more to read from it for now, so it stops holding the watermark back
+    /// (<see cref="ExpectPartitionAsync"/>). Its next record makes it count again. Say it
+    /// only of a partition known to be at its end — one that cannot be read (its broker
+    /// is away) is not idle, it is behind — and take it back with
+    /// <see cref="ExpectPartitionAsync"/> when that stops being known: a record that
+    /// arrives on an idle partition behind the watermark the others have made is late.
+    /// </summary>
+    public ValueTask IdlePartitionAsync(int partition, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(partition);
+        _stamping.Lock(stamped: true);
+        return InputWrites.WriteAsync(_writer, new InputEntry<T>(default!, 0, partition, -1, InputRejection.IdlePartition), cancellationToken);
+    }
+
     /// <summary>Signals that no more data will arrive on this input. Once every input of a
     /// circuit is complete and drained, its outputs complete too.</summary>
     public void Complete() => _writer.TryComplete();
@@ -290,6 +345,24 @@ public sealed class KeyedInputHandle<TKey, TValue>
         _stamping.Lock(stamped: true);
         return InputWrites.WriteAsync(_writer,
             new KeyedInputEntry<TKey, TValue>(default!, false, default, partition, offset, null, InputRejection.Advance), cancellationToken);
+    }
+
+    /// <inheritdoc cref="InputHandle{T}.ExpectPartitionAsync"/>
+    public ValueTask ExpectPartitionAsync(int partition, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(partition);
+        _stamping.Lock(stamped: true);
+        return InputWrites.WriteAsync(_writer,
+            new KeyedInputEntry<TKey, TValue>(default!, false, default, partition, -1, null, InputRejection.ExpectPartition), cancellationToken);
+    }
+
+    /// <inheritdoc cref="InputHandle{T}.IdlePartitionAsync"/>
+    public ValueTask IdlePartitionAsync(int partition, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(partition);
+        _stamping.Lock(stamped: true);
+        return InputWrites.WriteAsync(_writer,
+            new KeyedInputEntry<TKey, TValue>(default!, false, default, partition, -1, null, InputRejection.IdlePartition), cancellationToken);
     }
 
     /// <summary>Signals that no more data will arrive on this input; see <see cref="InputHandle{T}.Complete"/>.</summary>

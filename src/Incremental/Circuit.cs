@@ -449,6 +449,18 @@ public sealed class Circuit : IAsyncDisposable
     /// </summary>
     public long LateRecords => _watermarkClock?.LateRecords ?? 0;
 
+    /// <summary>What the watermark waits for, as of the end of the last step: the
+    /// event-time source whose time is the lowest and, where its input's source names
+    /// partitions, the partition of it that is behind (see
+    /// <see cref="InputHandle{T}.ExpectPartitionAsync"/>). A partition that stays here
+    /// while the others move on is one the source cannot read to its end — a broker that
+    /// is away, a backlog — and until it catches up nothing closes. Null without event
+    /// time and before the first step.</summary>
+    public WatermarkHold? WatermarkHeldBy =>
+        _watermarkClock is { HeldBy: { } held } clock
+            ? new WatermarkHold(held.Source, clock.InputOf(held.Source), held.Partition < 0 ? null : held.Partition)
+            : null;
+
     /// <summary>Redeems an input definition for its live handle. The definition must come
     /// from the builder that built this circuit.</summary>
     public InputHandle<T> Handle<T>(InputStream<T> input) where T : notnull

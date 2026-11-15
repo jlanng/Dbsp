@@ -92,6 +92,32 @@ public sealed class CircuitOptions
     /// store. Its channel holds <see cref="OutputChannelCapacity"/> batches. Default false.</summary>
     public bool AcknowledgeDeadLetters { get; init; }
 
+    /// <summary>How far ahead of the node's clock, and of the newest event time the input
+    /// has brought so far, a record's event time may be. A record beyond it is a record in
+    /// error: <see cref="ErrorPolicy"/> decides, as for a record its source could not read
+    /// — reported on the dead letters and passed over, or a fault. Without a bound
+    /// (null, the default) one record stamped far in the future moves the watermark to
+    /// its time, every record after it is late and dropped, and every open window and
+    /// key closes: the pipeline is stalled until the feed's time catches up.
+    /// <para>
+    /// The bound is applied where a record enters, by the input the event time is
+    /// declared on (<c>input.WithEventTime(…, lateness)</c>, on an unclustered circuit);
+    /// a declaration further down — after a <c>Select</c>, say — has none. It is judged
+    /// against the later of two clocks: the newest event time that input has accepted,
+    /// so that a feed whose time runs ahead of the node's (a replay of recorded data
+    /// with shifted times, a test) goes on as long as it moves in steps smaller than the
+    /// bound; and the node's own, so that a feed that has been quiet for longer than
+    /// the bound is taken up again. Because the node's clock is one of the two, a
+    /// record refused and not yet committed can pass when it is read again later — after
+    /// a restart, say; what a committed step did with it stays done. Set it well above
+    /// the skew between the clocks that stamp the records and this node's.
+    /// </para></summary>
+    public TimeSpan? MaxEventTimeAhead { get; init; }
+
+    /// <summary>The clock <see cref="MaxEventTimeAhead"/> is judged against. Tests
+    /// replace it.</summary>
+    public TimeProvider TimeProvider { get; init; } = TimeProvider.System;
+
     /// <summary>Runs this circuit as one process of a cluster: the same circuit definition
     /// runs on every process, each hosting a contiguous slice of the global worker set, and
     /// exchange operators shuffle across all of them. Null (default) — single process.</summary>

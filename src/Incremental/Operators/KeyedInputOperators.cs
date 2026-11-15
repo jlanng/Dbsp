@@ -168,7 +168,11 @@ internal sealed class UpsertOperator<TKey, TValue> : IStepOperator
             {
                 if (EqualityComparer<TValue>.Default.Equals(previous, next))
                     continue;
-                output.Add(previous!, -1);
+                // An input that forgets its final rows does not take back a row that the
+                // new one's own time has made final: that is a new record of the key,
+                // not an amendment (RecordEviction.Supersedes).
+                if (_retention is null || !BeginsNewRecord(previous!, next))
+                    output.Add(previous!, -1);
             }
             output.Add(next, 1);
             puts.Add((command.Key, next));
@@ -202,6 +206,15 @@ internal sealed class UpsertOperator<TKey, TValue> : IStepOperator
         ForgetFinal();
         return output;
     }
+
+    private bool BeginsNewRecord(TValue previous, TValue next) =>
+        _errors is null ? _retention!.Supersedes(previous, next) : BeginsNewRecordGuarded(previous, next);
+
+    // Under the dead-letter policy a row whose time cannot be read amends, as it always
+    // did; DeadlinesGuarded deals with it next.
+    private bool BeginsNewRecordGuarded(TValue previous, TValue next) =>
+        _retention!.TryEventTicks(previous, out var before) && _retention.TryEventTicks(next, out var after)
+        && _retention.Supersedes(before, after);
 
     /// <summary>The dead-letter policy's reading of the deadlines. A row whose event time
     /// cannot be read is not held: it has no deadline, so held it would stay for ever. It

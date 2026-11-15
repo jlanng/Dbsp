@@ -12,10 +12,21 @@ internal abstract class InputRegistration
 
 internal sealed class InputRegistration<T> : InputRegistration where T : notnull
 {
-    public override IInputPort CreatePort(CircuitOptions options) => new InputPort<T>(Name, NodeId, options);
+    /// <summary>Set when event time is declared on the input itself, before the circuit
+    /// is built: the port then feeds the clock (see <see cref="InputEventTime{T}"/>).</summary>
+    public InputEventTime<T>? EventTime { get; set; }
+
+    public override IInputPort CreatePort(CircuitOptions options) => new InputPort<T>(Name, NodeId, options, EventTime);
 }
 
-internal sealed class KeyedInputRegistration<TKey, TValue> : InputRegistration
+/// <summary>A keyed input's registration as the event-time binding sees it: by its row
+/// type alone.</summary>
+internal interface IKeyedInputEventTime<TValue> where TValue : notnull
+{
+    InputEventTime<TValue>? EventTime { get; set; }
+}
+
+internal sealed class KeyedInputRegistration<TKey, TValue> : InputRegistration, IKeyedInputEventTime<TValue>
     where TKey : notnull
     where TValue : notnull
 {
@@ -24,8 +35,15 @@ internal sealed class KeyedInputRegistration<TKey, TValue> : InputRegistration
     /// <summary>Null on an unsharded circuit, where every command goes to the one worker.</summary>
     public required Func<TKey, uint>? RoutingHash { get; init; }
 
+    /// <summary>As <see cref="InputRegistration{T}.EventTime"/>.</summary>
+    public InputEventTime<TValue>? EventTime { get; set; }
+
+    /// <summary>What the input knows of its own eviction; its policy is set, if at all,
+    /// before the circuit is built.</summary>
+    public KeyedInputRetention<TValue>? Retention { get; init; }
+
     public override IInputPort CreatePort(CircuitOptions options) =>
-        new KeyedInputPort<TKey, TValue>(Name, NodeId, options, KeySelector, RoutingHash);
+        new KeyedInputPort<TKey, TValue>(Name, NodeId, options, KeySelector, RoutingHash, EventTime, Retention?.Policy);
 }
 
 /// <summary>Encodes the checkpoint entry keys the committed-offsets marker uses: an
@@ -52,6 +70,31 @@ internal static class OffsetKeys
     /// <summary>The key one <c>WithEventTime</c> source's max event time seen travels
     /// under; sources are numbered in the order the definition declares them.</summary>
     public static string WatermarkSource(int source) => $"{Watermark}#s{source}";
+
+
+    /// <summary>The two keys one named partition of a source's input travels under: its
+    /// max event time seen (<c>m</c>; <see cref="long.MinValue"/> for a partition named
+    /// and not yet heard from) and whether it is idle (<c>i</c>: 1 or 0). Two keys with
+    /// names that never change, not one whose name says which: a provider may keep the
+    /// marker by setting the keys it is given and removing none (Redis does). They follow
+    /// the source's key and a <c>'#'</c>, so they are no input's keys and — having no
+    /// <c>#p</c> — never decode as a partition's position.</summary>
+    public static string WatermarkPartition(int source, int partition, bool idleFlag) =>
+        $"{Watermark}#s{source}#{(idleFlag ? 'i' : 'm')}{partition}";
+
+    public static bool TryDecodeWatermarkPartition(string key, out int source, out int partition, out bool idleFlag)
+    {
+        (source, partition, idleFlag) = (0, 0, false);
+        const string prefix = Watermark + "#s";
+        if (!key.StartsWith(prefix, StringComparison.Ordinal))
+            return false;
+        var separator = key.IndexOf('#', prefix.Length);
+        if (separator < 0 || separator + 2 > key.Length || key[separator + 1] is not ('m' or 'i'))
+            return false;
+        idleFlag = key[separator + 1] == 'i';
+        return int.TryParse(key.AsSpan(prefix.Length, separator - prefix.Length), System.Globalization.NumberStyles.None, null, out source)
+            && int.TryParse(key.AsSpan(separator + 2), System.Globalization.NumberStyles.None, null, out partition);
+    }
 
     public static string Encode(string inputName, int partition) => $"{inputName}{Separator}{partition}";
 
@@ -231,11 +274,13 @@ internal sealed class InputPort<T> : IInputPort, IDeadLetteringInput where T : n
     private readonly Channel<InputEntry<T>> _channel;
     private readonly int _nodeId;
     private readonly InputPosition _position;
+    private readonly InputEventTime<T>? _eventTime;
 
-    public InputPort(string name, int nodeId, CircuitOptions options)
+    public InputPort(string name, int nodeId, CircuitOptions options, InputEventTime<T>? eventTime = null)
     {
         Name = InputPorts.ValidateName(name);
         _nodeId = nodeId;
+        _eventTime = eventTime;
         _position = new InputPosition(name);
         _channel = InputPorts.CreateChannel<InputEntry<T>>(options);
         Handle = new InputHandle<T>(_channel.Writer);
@@ -269,9 +314,17 @@ internal sealed class InputPort<T> : IInputPort, IDeadLetteringInput where T : n
         ZSet<T>[]? staging = null;
         var target = 0;
         var drained = 0;
+        _eventTime?.BeginDrain();
         while (drained < maxItems && _channel.Reader.TryRead(out var entry))
         {
             drained++;
+            // A note about a partition has no offset: it is for the clock, in its place
+            // among the records, and for nothing else.
+            if (entry.Rejection is { IsPartitionNote: true } note)
+            {
+                _eventTime?.Note(entry.Partition, note);
+                continue;
+            }
             if (!_position.Admit(entry.Partition, entry.Offset))
                 continue;
 
@@ -285,6 +338,18 @@ internal sealed class InputPort<T> : IInputPort, IDeadLetteringInput where T : n
                 if (_errors is null)
                     throw rejection.Fault(Name, entry.Partition, entry.Offset);
                 _errors.Add(rejection.Record, 1, rejection.Error);
+                continue;
+            }
+
+            // Event time declared on this input: the clock is fed here, by partition, and
+            // a record too far ahead goes no further (CircuitOptions.MaxEventTimeAhead).
+            // Its offset is consumed, like a record the source could not read.
+            if (_eventTime is { } eventTime
+                && eventTime.Observe(entry.Value, entry.Offset >= 0 ? entry.Partition : -1, _errors is not null) is { } ahead)
+            {
+                if (_errors is null)
+                    throw InputPorts.AheadFault(Name, entry.Partition, entry.Offset, ahead);
+                _errors.Add(entry.Value, entry.Weight, ahead);
                 continue;
             }
 
@@ -331,12 +396,29 @@ internal sealed class KeyedInputPort<TKey, TValue> : IInputPort, IDeadLetteringI
     private readonly int _nodeId;
     private readonly InputPosition _position;
     private readonly Func<TKey, uint>? _routingHash;
+    private readonly InputEventTime<TValue>? _eventTime;
+
+    // Under evictWhenFinal: the event time of the last upsert drained for each key in
+    // this drain, so that the drain can stop before one that begins a new record of a key
+    // (RecordEviction.Supersedes) — the two then never share a step, which is the only
+    // order a delta has. Cleared per drain.
+    private readonly RecordEviction<TValue>? _retention;
+    private readonly Dictionary<TKey, long>? _upserted;
 
     public KeyedInputPort(string name, int nodeId, CircuitOptions options,
-        Func<TValue, TKey> keySelector, Func<TKey, uint>? routingHash)
+        Func<TValue, TKey> keySelector, Func<TKey, uint>? routingHash,
+        InputEventTime<TValue>? eventTime = null, RecordEviction<TValue>? retention = null)
     {
         Name = InputPorts.ValidateName(name);
         _nodeId = nodeId;
+        _eventTime = eventTime;
+        // Across processes two commands of a key can meet in a step whatever one
+        // process's port does (see UpsertOperator), so there the port does not try.
+        if (retention is not null && options.Cluster is null)
+        {
+            _retention = retention;
+            _upserted = [];
+        }
         _position = new InputPosition(name);
         _routingHash = routingHash;
         _channel = InputPorts.CreateChannel<KeyedInputEntry<TKey, TValue>>(options);
@@ -364,9 +446,34 @@ internal sealed class KeyedInputPort<TKey, TValue> : IInputPort, IDeadLetteringI
     public int DrainInto(Worker[] workers, int maxItems)
     {
         var drained = 0;
-        while (drained < maxItems && _channel.Reader.TryRead(out var entry))
+        _eventTime?.BeginDrain();
+        _upserted?.Clear();
+        while (drained < maxItems)
         {
+            // An input that forgets its final rows looks at an upsert before it takes it:
+            // one that begins a new record of a key this drain has already upserted stays
+            // in the channel for the next step.
+            var time = long.MinValue;
+            if (_upserted is not null)
+            {
+                if (!_channel.Reader.TryPeek(out var next))
+                    break;
+                if (next is { IsDelete: false, Error: null, Rejection: null }
+                    && _retention!.TryEventTicks(next.Value!, out time)
+                    && _upserted.TryGetValue(next.Key, out var before)
+                    && _retention.Supersedes(before, time))
+                    break;
+            }
+            if (!_channel.Reader.TryRead(out var entry))
+                break;
+
             drained++;
+            // A note about a partition has no offset: see InputPort.DrainInto.
+            if (entry.Rejection is { IsPartitionNote: true } note)
+            {
+                _eventTime?.Note(entry.Partition, note);
+                continue;
+            }
             if (!_position.Admit(entry.Partition, entry.Offset))
                 continue;
 
@@ -387,6 +494,26 @@ internal sealed class KeyedInputPort<TKey, TValue> : IInputPort, IDeadLetteringI
             {
                 _errors!.Add(entry.Value, 1, entry.Error);
                 continue;
+            }
+
+            // As in InputPort.DrainInto: the clock is fed here, by partition, from every
+            // upsert — one that the next upsert of its key replaces within the step
+            // included — and an upsert too far ahead is not applied at all.
+            if (!entry.IsDelete && _eventTime is { } eventTime
+                && eventTime.Observe(entry.Value!, entry.Offset >= 0 ? entry.Partition : -1, _errors is not null) is { } ahead)
+            {
+                if (_errors is null)
+                    throw InputPorts.AheadFault(Name, entry.Partition, entry.Offset, ahead);
+                _errors.Add(entry.Value, 1, ahead);
+                continue;
+            }
+
+            if (_upserted is not null)
+            {
+                if (entry.IsDelete)
+                    _upserted.Remove(entry.Key);
+                else if (time != long.MinValue)
+                    _upserted[entry.Key] = time;
             }
 
             var target = _routingHash is null ? 0 : (int)(_routingHash(entry.Key) % (uint)workers.Length);
@@ -417,6 +544,14 @@ internal static class InputPorts
                         $"Input name '{name}' is reserved: the checkpoint commits the circuit's event-time watermark under it.",
                         nameof(name))
                     : name;
+
+    /// <summary>What a drain throws under <see cref="RecordErrorPolicy.Fault"/> for a
+    /// record beyond <see cref="CircuitOptions.MaxEventTimeAhead"/>.</summary>
+    public static InvalidOperationException AheadFault(string inputName, int partition, long offset, EventTimeAheadException ahead) => new(
+        $"Input '{inputName}' was handed a record it does not take" +
+        (offset >= 0 ? $" (partition {partition}, offset {offset})" : "") +
+        $": {ahead.Message} Under RecordErrorPolicy.DeadLetter the record is reported on Circuit.DeadLetters and skipped instead.",
+        ahead);
 
     public static Channel<TEntry> CreateChannel<TEntry>(CircuitOptions options) =>
         Channel.CreateBounded<TEntry>(new BoundedChannelOptions(options.InputChannelCapacity)

@@ -170,9 +170,16 @@ public class EventTimeRestartTests
         var a = builder.Input<Ev>("a");
         var b = builder.Input<Ev>("b");
         var taps = new List<ITap>();
-        Scenarios[scenario](builder, a, b, rates, taps);
+        Scenarios[scenario.Replace(ByPartition, "")](builder, a, b, rates, taps);
         return new Definition(builder, a, b, taps);
     }
+
+    /// <summary>A scenario named with this at its end is fed as a source with three
+    /// partitions feeds it: every record stamped with a partition (its key's) and an
+    /// offset, the partitions named at the first step, and now and then one called idle
+    /// or named again. The clock then keeps a time per partition, and that is restored
+    /// too.</summary>
+    private const string ByPartition = "+partitions";
 
     // ── the workload ───────────────────────────────────────────────────────────────────
 
@@ -348,10 +355,34 @@ public class EventTimeRestartTests
         {
             var a = _circuit.Handle(_definition.A);
             var b = _circuit.Handle(_definition.B);
-            foreach (var (ev, weight) in batch.A)
-                await a.SendAsync(ev, weight);
-            foreach (var (ev, weight) in batch.B)
-                await b.SendAsync(ev, weight);
+            if (scenario.EndsWith(ByPartition))
+            {
+                // The notes are part of the feed: a step run again says them again, in
+                // its place.
+                if (step == 1)
+                    for (var partition = 0; partition < 3; partition++)
+                    {
+                        await a.ExpectPartitionAsync(partition);
+                        await b.ExpectPartitionAsync(partition);
+                    }
+                if (step % 7 == 3)
+                    await a.IdlePartitionAsync(2);
+                if (step % 11 == 5)
+                    await b.IdlePartitionAsync(0);
+                if (step % 13 == 6)
+                    await a.ExpectPartitionAsync(2);
+                for (var i = 0; i < batch.A.Count; i++)
+                    await a.SendAsync(batch.A[i].Event, batch.A[i].Weight, batch.A[i].Event.Key % 3, step * 10_000 + i);
+                for (var i = 0; i < batch.B.Count; i++)
+                    await b.SendAsync(batch.B[i].Event, batch.B[i].Weight, batch.B[i].Event.Key % 3, step * 10_000 + i);
+            }
+            else
+            {
+                foreach (var (ev, weight) in batch.A)
+                    await a.SendAsync(ev, weight);
+                foreach (var (ev, weight) in batch.B)
+                    await b.SendAsync(ev, weight);
+            }
             await _circuit.StepAsync().WaitAsync(Timeout);
 
             var lines = _drains.SelectMany(drain => drain()).ToList();
@@ -530,6 +561,8 @@ public class EventTimeRestartTests
             expected.CommittedOffsets().OrderBy(o => o.Key, StringComparer.Ordinal),
             actual.CommittedOffsets().OrderBy(o => o.Key, StringComparer.Ordinal));
         Assert.Contains("$watermark", actual.CommittedOffsets().Keys);
+        if (scenario.EndsWith(ByPartition))
+            Assert.Contains(actual.CommittedOffsets().Keys, key => key.StartsWith("$watermark#s0#m"));
         if (backing is Backing.ChangelogCold or Backing.ChangelogWarm)
             Assert.Equal(expected.DescribeState(), await actual.DescribeColdCopyAsync());
     }
@@ -541,6 +574,9 @@ public class EventTimeRestartTests
             foreach (var backing in Enum.GetValues<Backing>())
                 foreach (var workers in new[] { 1, 4 })
                     cases.Add(scenario, backing, workers, workers == 1 ? 3 : 1);
+        foreach (var scenario in new[] { "tumbling", "joins", "final" })
+            foreach (var backing in Enum.GetValues<Backing>())
+                cases.Add(scenario + ByPartition, backing, backing == Backing.InMemory ? 4 : 1, 3);
         return cases;
     }
 
@@ -830,14 +866,14 @@ public class EventTimeRestartTests
             circuit.Start();
             await circuit.StepAsync();
         }
-        Rewrite(plain, manifest => manifest.Replace("format=7", "format=6"));
+        Rewrite(plain, manifest => manifest.Replace("format=8", "format=6"));
         await using (var resumed = Counting(plain, eventTime: false).Build())
         {
             resumed.Start();
             Assert.Contains("format=6", plain.CommittedManifest("local"));
             await resumed.StepAsync();
         }
-        Assert.Contains("format=7", plain.CommittedManifest("local"));
+        Assert.Contains("format=8", plain.CommittedManifest("local"));
 
         var timed = new InMemoryCheckpointStorageProvider();
         await using (var circuit = Counting(timed, eventTime: true).Build())
@@ -846,7 +882,7 @@ public class EventTimeRestartTests
             await circuit.StepAsync();
         }
         Assert.Contains("eventtime=1", timed.CommittedManifest("local"));
-        Rewrite(timed, manifest => manifest.Replace("format=7", "format=6").Replace("eventtime=1\n", ""));
+        Rewrite(timed, manifest => manifest.Replace("format=8", "format=6").Replace("eventtime=1\n", ""));
         await using var refused = Counting(timed, eventTime: true).Build();
         var mismatch = Assert.Throws<CircuitStateMismatchException>(refused.Start);
         Assert.Contains("before event-time state was checkpointed", mismatch.Message);

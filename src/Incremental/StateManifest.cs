@@ -35,7 +35,11 @@ public sealed record CircuitStateStore(string Name, int NodeId, CircuitStateStor
 internal static class StateManifest
 {
     /// <summary>The format this version writes.</summary>
-    private const string Format = "7";
+    private const string Format = "8";
+
+    /// <summary>The format before an input's partitions had event times of their own; see
+    /// <see cref="Problems"/>.</summary>
+    private const string FormatWithoutPartitionTimes = "7";
 
     /// <summary>The format before event-time state was checkpointed; see <see cref="Problems"/>.</summary>
     private const string FormatWithoutEventTime = "6";
@@ -45,14 +49,25 @@ internal static class StateManifest
         IEnumerable<(string Table, string Epoch)> tables, IEnumerable<string> sortedStoreNames)
     {
         var manifest = new System.Text.StringBuilder();
-        // format 7: event-time state is checkpointed. The watermark and each source's max
+        // format 8: an input's partitions have event times of their own. Where event time
+        // is declared on an input and its source names its partitions, the offsets marker
+        // holds each one's max event time under `$watermark#s{n}#m{partition}` and
+        // whether it is idle under `…#i{partition}`, beside the source's own. A format-7
+        // checkpoint has none of these keys and everything else a format-8 one has: it
+        // resumes as it is (see Problems) — the clock then has the source's one time
+        // until the source names its partitions, which hold every claim back until each
+        // has brought a record or is idle, so the watermark stays where it was committed
+        // and never regresses. A version that writes format 7 refuses a format-8
+        // checkpoint, as it must: it would drop the partitions' times and go on from the
+        // newest of them.
+        // (format 7: event-time state is checkpointed. The watermark and each source's max
         // event time commit in the offsets marker (`$watermark`, `$watermark#s{n}`), and
         // every eviction, window-close and session deadline lives in a deadline store
         // (`{node}.deadlines.w{n}`). A circuit with event time adds an `eventtime={sources}`
         // line. A format-6 checkpoint of such a circuit has neither: resumed, its watermark
         // would start again from nothing and the keys it holds would have no deadline, so
         // it must not resume. A format-6 checkpoint of a circuit with no event time holds
-        // exactly what format 7 would and resumes as it is (see Problems).
+        // exactly what format 7 would and resumes as it is (see Problems).)
         // (format 6: every checkpoint commits the step sequence under `$step` and a restart
         // resumes it, which is what keeps an acknowledged output's batch sequences stable
         // across a crash. A format-5 checkpoint has none: resuming it would restart the
@@ -120,10 +135,15 @@ internal static class StateManifest
         var eventTime = currentFacts.ContainsKey("eventtime");
         if (committedFormat != currentFormat)
         {
-            // The one migration: format 6 → 7 changed nothing for a circuit without event
-            // time, whose checkpoint therefore resumes as it is and is rewritten as format
-            // 7 by the next commit.
-            if (committedFormat == FormatWithoutEventTime && currentFormat == Format)
+            // The migrations. Format 7 → 8 added keys to the offsets marker and changed
+            // nothing else: a format-7 checkpoint resumes as it is and is rewritten as
+            // format 8 by the next commit. Format 6 → 7 changed nothing for a circuit
+            // without event time, whose checkpoint resumes the same way.
+            if (committedFormat == FormatWithoutPartitionTimes && currentFormat == Format)
+            {
+                // Nothing stops it.
+            }
+            else if (committedFormat == FormatWithoutEventTime && currentFormat == Format)
             {
                 if (eventTime)
                     problems.Add(
@@ -145,7 +165,7 @@ internal static class StateManifest
         // A circuit that gains its first event-time source starts a clock; one that loses
         // its last has none to restore. Between two counts the committed max event times
         // would be handed to the wrong sources.
-        if (committedFormat == currentFormat
+        if ((committedFormat == currentFormat || committedFormat == FormatWithoutPartitionTimes)
             && committedFacts.TryGetValue("eventtime", out var committedSources)
             && currentFacts.TryGetValue("eventtime", out var currentSources)
             && committedSources != currentSources)

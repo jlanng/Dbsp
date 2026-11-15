@@ -93,6 +93,31 @@ public sealed class KafkaSourceOptions
     /// sooner after the last record leaves the position at that record. Default 30 s.</summary>
     public TimeSpan CommitIdlePositionAfter { get; init; } = TimeSpan.FromSeconds(30);
 
+    /// <summary>Circuit inputs only: how long the source must have stood at the end of a
+    /// partition before it calls the partition idle
+    /// (<see cref="InputHandle{T}.IdlePartitionAsync"/>). Where event time is declared on
+    /// the input, the watermark is the least over the topic's partitions: a partition
+    /// that is behind holds it back, so that its records are not late when they come. A
+    /// partition with nothing to read would hold it for ever, so one the source has read
+    /// to its end stops counting — after this long, so that a pause between two records
+    /// is not taken for the end and the price is paid once per quiet spell: the circuit
+    /// runs a step for it. Until then a quiet partition holds the watermark at its own
+    /// last record, and windows close this much later than they would. A record that
+    /// arrives on an idle partition is late if it is behind the watermark the others
+    /// have made: the same as on a topic of one partition. Default 5 s.</summary>
+    public TimeSpan IdlePartitionAfter { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>Circuit inputs only: how often the source asks again whether a partition
+    /// it stands at the end of is still at its end (it seeks to where it stands, and the
+    /// broker's answer says so). A partition whose leader is away does not answer: after
+    /// three intervals without one the source no longer calls it idle, and it holds the
+    /// watermark until it is read to its end again and has stood there for
+    /// <see cref="IdlePartitionAfter"/> — which is what keeps the records that waited
+    /// for the broker from being late. A lateness shorter than three intervals is not
+    /// covered: the other partitions can move the watermark that far before the source
+    /// knows. Default 1 s.</summary>
+    public TimeSpan IdlePartitionConfirmEvery { get; init; } = TimeSpan.FromSeconds(1);
+
     /// <summary>How long start-up requests (metadata, offsets) may take, retries of a
     /// partition without a leader included.</summary>
     public TimeSpan OperationTimeout { get; init; } = TimeSpan.FromSeconds(30);
@@ -116,6 +141,8 @@ public sealed class KafkaSourceOptions
         ArgumentOutOfRangeException.ThrowIfLessThan(PauseAfter, TimeSpan.Zero);
         ArgumentOutOfRangeException.ThrowIfLessThan(CommitIdlePositionAfter, TimeSpan.Zero);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(OperationTimeout, TimeSpan.Zero);
+        ArgumentOutOfRangeException.ThrowIfLessThan(IdlePartitionAfter, TimeSpan.Zero);
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(IdlePartitionConfirmEvery, TimeSpan.Zero);
     }
 }
 
@@ -380,7 +407,14 @@ public sealed class KafkaSource : IAsyncDisposable
                 Pin(consumer, pins);
             _started.TrySetResult();
             if (!_target.Batches)
+            {
+                // Every partition, before any of its records: each holds the input's
+                // watermark until it has been read to its end. After a restart too — what
+                // the checkpoint says of a partition's end was true when it was written.
+                for (var p = 0; p < _next.Length; p++)
+                    Await(consumer, _target.ExpectPartitionAsync(p, _stop.Token));
                 Pin(consumer, pins);
+            }
             Loop(consumer);
             _completion.TrySetResult();
         }
@@ -623,9 +657,15 @@ public sealed class KafkaSource : IAsyncDisposable
         for (var p = 0; p < handed.Length; p++)
             handed[p] = next[p] - 1;
         var aheadSince = new long[next.Length];
+        var ends = _target.NamesPartitions ? new PartitionEnds(this, consumer, next.Length) : null;
+        var sinceChecked = 0;
 
         while (!token.IsCancellationRequested)
         {
+            // Between records as well: a partition goes idle while the others are busy.
+            if (ends is not null && (++sinceChecked & 63) == 0)
+                ends.Check(staged);
+
             // With changes staged, do not wait for more: commit them as soon as the client
             // has nothing fetched.
             var result = consumer.ConsumeAssigned(_target.Staged > 0 ? TimeSpan.Zero : TimeSpan.FromMilliseconds(100));
@@ -634,13 +674,18 @@ public sealed class KafkaSource : IAsyncDisposable
                 // The end-of-partition event carries the position past whatever follows
                 // the last record: its transaction's marker, say.
                 if (result is not null)
+                {
                     staged[result.Partition.Value] = Math.Max(staged[result.Partition.Value], result.Offset.Value);
+                    ends?.AtEnd(result.Partition.Value);
+                }
                 Flush(consumer, next, staged);
                 RecordIdlePositions(consumer, staged, handed, aheadSince);
+                ends?.Check(staged);
                 continue;
             }
 
             var record = new KafkaRecord(result);
+            ends?.Read(record.Partition);
             Await(consumer, _target.HandleAsync(in record, ref _unreadable, token));
             Interlocked.Increment(ref _read);
             staged[record.Partition] = record.Offset + 1;
@@ -698,6 +743,87 @@ public sealed class KafkaSource : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// What the source knows of each partition's end, for an input whose watermark is
+    /// kept per partition. A partition is at its end from the client's end-of-partition
+    /// event until its next record. The event comes once, so the source asks again —
+    /// it seeks to where it stands, which makes the client fetch afresh and report the
+    /// end again — every <see cref="KafkaSourceOptions.IdlePartitionConfirmEvery"/>: an
+    /// answer is evidence that the partition's leader is there and has nothing more.
+    /// The source calls a partition idle once it has stood at the end, with fresh
+    /// evidence, for <see cref="KafkaSourceOptions.IdlePartitionAfter"/>, and takes that
+    /// back when the evidence is three intervals old: a broker that is away does not
+    /// answer, and what is produced to its partitions meanwhile arrives when it is back,
+    /// stamped with times the other partitions have long passed.
+    /// </summary>
+    private sealed class PartitionEnds(KafkaSource source, IConsumer<byte[], byte[]> consumer, int partitions)
+    {
+        private readonly bool[] _atEnd = new bool[partitions];
+        private readonly long[] _since = new long[partitions];       // at the end, with evidence, since; 0: not counted yet
+        private readonly long[] _confirmedAt = new long[partitions]; // the last end-of-partition event
+        private readonly long[] _askedAt = new long[partitions];
+        private readonly bool[] _idle = new bool[partitions];        // what the input has been told
+        private readonly long _idleAfter = (long)source._options.IdlePartitionAfter.TotalMilliseconds;
+        private readonly long _confirmEvery = Math.Max(1, (long)source._options.IdlePartitionConfirmEvery.TotalMilliseconds);
+
+        public void AtEnd(int partition)
+        {
+            var now = Environment.TickCount64;
+            _atEnd[partition] = true;
+            _confirmedAt[partition] = now;
+            if (_since[partition] == 0)
+                _since[partition] = now;
+        }
+
+        /// <summary>A record: the partition is not at its end, and the input counts it
+        /// again by itself.</summary>
+        public void Read(int partition)
+        {
+            _atEnd[partition] = false;
+            _idle[partition] = false;
+            _since[partition] = 0;
+        }
+
+        public void Check(long[] staged)
+        {
+            var now = Environment.TickCount64;
+            for (var p = 0; p < _atEnd.Length; p++)
+            {
+                if (!_atEnd[p])
+                    continue;
+
+                if (now - _confirmedAt[p] >= _confirmEvery && now - _askedAt[p] >= _confirmEvery)
+                {
+                    _askedAt[p] = now;
+                    try
+                    {
+                        consumer.Seek(new TopicPartitionOffset(source._options.Topic, p, staged[p]));
+                    }
+                    catch (KafkaException)
+                    {
+                        // Not answered is all it comes to: the evidence goes stale.
+                    }
+                }
+
+                var fresh = now - _confirmedAt[p] <= 3 * _confirmEvery;
+                if (_idle[p] && !fresh)
+                {
+                    source.Await(consumer, source._target.ExpectPartitionAsync(p, source._stop.Token));
+                    _idle[p] = false;
+                    _since[p] = 0; // at its end again, for as long again, before it is idle again
+                    source._options.Logger?.LogInformation(
+                        "Kafka source {Topic}: partition {Partition} has not confirmed its end for {Silence} ms and holds the watermark again",
+                        source._options.Topic, p, now - _confirmedAt[p]);
+                }
+                else if (!_idle[p] && fresh && _since[p] != 0 && now - _since[p] >= _idleAfter)
+                {
+                    source.Await(consumer, source._target.IdlePartitionAsync(p, source._stop.Token));
+                    _idle[p] = true;
+                }
+            }
+        }
+    }
+
     /// <summary>Waits for a write on the source's thread. One that takes longer than
     /// <see cref="KafkaSourceOptions.PauseAfter"/> pauses the partitions meanwhile: the
     /// client fetches nothing, drops what it had fetched ahead at its next poll, and
@@ -745,6 +871,14 @@ public sealed class KafkaSource : IAsyncDisposable
         /// <summary>Records that the source has read up to and including each offset, with
         /// nothing (more) to hand on for it.</summary>
         public abstract ValueTask AdvanceAsync(IReadOnlyList<(int Partition, long Offset)> positions, CancellationToken cancellationToken);
+
+        /// <summary>True for a target that is told of each partition and of its end: a
+        /// circuit input, whose watermark may be kept per partition.</summary>
+        public virtual bool NamesPartitions => false;
+
+        public virtual ValueTask ExpectPartitionAsync(int partition, CancellationToken cancellationToken) => default;
+
+        public virtual ValueTask IdlePartitionAsync(int partition, CancellationToken cancellationToken) => default;
 
         /// <summary>The last offset of <paramref name="partition"/> the target has on
         /// record, given the last one the source handed it (<paramref name="handed"/>).</summary>
@@ -802,6 +936,14 @@ public sealed class KafkaSource : IAsyncDisposable
             foreach (var (partition, offset) in positions)
                 await handle.AdvanceAsync(partition, offset, cancellationToken).ConfigureAwait(false);
         }
+
+        public override bool NamesPartitions => true;
+
+        public override ValueTask ExpectPartitionAsync(int partition, CancellationToken cancellationToken) =>
+            handle.ExpectPartitionAsync(partition, cancellationToken);
+
+        public override ValueTask IdlePartitionAsync(int partition, CancellationToken cancellationToken) =>
+            handle.IdlePartitionAsync(partition, cancellationToken);
     }
 
     private sealed class KeyedTarget<TKey, TValue>(
@@ -842,6 +984,14 @@ public sealed class KafkaSource : IAsyncDisposable
             foreach (var (partition, offset) in positions)
                 await handle.AdvanceAsync(partition, offset, cancellationToken).ConfigureAwait(false);
         }
+
+        public override bool NamesPartitions => true;
+
+        public override ValueTask ExpectPartitionAsync(int partition, CancellationToken cancellationToken) =>
+            handle.ExpectPartitionAsync(partition, cancellationToken);
+
+        public override ValueTask IdlePartitionAsync(int partition, CancellationToken cancellationToken) =>
+            handle.IdlePartitionAsync(partition, cancellationToken);
     }
 
     private sealed class TableTarget<TKey, TRow>(

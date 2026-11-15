@@ -7,24 +7,53 @@ namespace Incremental.Operators;
 /// The circuit's event-time clock. Each <c>WithEventTime</c> call registers a tracker;
 /// workers record the max event time they have seen per tracker during a step, and the
 /// coordinator freezes the global watermark between steps as
-/// min over trackers of (max event time seen − allowed lateness), monotonically
+/// min over trackers of (the tracker's event time − allowed lateness), monotonically
 /// non-decreasing. Freezing between steps means every worker sees the same watermark for
 /// the whole of a step, so shard-local eviction decisions are consistent.
 /// <para>
-/// The clock is checkpointed: every commit carries the frozen watermark and each source's
-/// max event time in the offsets marker (<see cref="AppendCheckpoint"/>), and a circuit
-/// that resumes puts them back before its first step (<see cref="Restore"/>). So the
-/// watermark never regresses across a restart or a takeover — a record that was late
-/// before it is late after it — and the first step after resumes from exactly where the
-/// committed step left off.
+/// <b>Partitions.</b> A tracker's event time is the newest it has seen — unless its input
+/// feeds it by partition (<see cref="InputEventTime{T}"/>: event time declared
+/// on the input itself, and a source that names its partitions). Then each named
+/// partition keeps a max of its own and the tracker's time is the <i>least</i> over the
+/// partitions that are not idle: a partition that is behind the others holds the
+/// watermark where its own records are, so they are not late. A partition named and not
+/// yet heard from holds every claim back. One the source calls idle stops counting until
+/// its next record; with every partition idle the tracker's time is the newest seen
+/// anywhere, as without partitions. Only the coordinator touches the partitions, between
+/// steps.
+/// </para>
+/// <para>
+/// The clock is checkpointed: every commit carries the frozen watermark, each source's
+/// max event time and each named partition's in the offsets marker
+/// (<see cref="AppendCheckpoint"/>), and a circuit that resumes puts them back before its
+/// first step (<see cref="Restore"/>). So the watermark never regresses across a restart
+/// or a takeover — a record that was late before it is late after it — and the first
+/// step after resumes from exactly where the committed step left off.
 /// </para>
 /// </summary>
 internal sealed class WatermarkClock(int workers)
 {
+    private sealed class PartitionTime
+    {
+        public long MaxSeenTicks = long.MinValue;
+        public bool Idle;
+    }
+
     private sealed class Tracker(long latenessTicks, long[] maxSeenTicks)
     {
         public long LatenessTicks { get; } = latenessTicks;
         public long[] MaxSeenTicks { get; } = maxSeenTicks;
+
+        /// <summary>The partitions the input's source has named, in partition order (the
+        /// checkpoint's keys are written in it). Null until one is named.</summary>
+        public SortedDictionary<int, PartitionTime>? Partitions;
+
+        /// <summary>The newest event time the input has observed for this tracker, in any
+        /// partition or none: what <see cref="CircuitOptions.MaxEventTimeAhead"/> is
+        /// measured from. Kept only for a tracker its input feeds.</summary>
+        public long NewestTicks = long.MinValue;
+
+        public string? InputName;
     }
 
     private readonly List<Tracker> _trackers = [];
@@ -69,21 +98,27 @@ internal sealed class WatermarkClock(int workers)
     private readonly List<string> _sourceKeys = [];
 
     /// <summary>Adds the clock's state to a checkpoint's offsets marker: the frozen
-    /// watermark, and each source's max event time seen (the maximum across workers — which
-    /// worker saw it does not matter to <see cref="Freeze"/>). A value still unset is left
-    /// out. Called by the coordinator between steps, after <see cref="Freeze"/>.</summary>
+    /// watermark, each source's max event time seen (the maximum across workers — which
+    /// worker saw it does not matter to <see cref="Freeze"/>), and each named partition's
+    /// max and whether it is idle (<see cref="OffsetKeys.WatermarkPartition"/>). A source's value still unset is
+    /// left out; a partition named and not yet heard from is written, as
+    /// <see cref="long.MinValue"/>, because that it was named is state.
+    /// Called by the coordinator between steps, after <see cref="Freeze"/>.</summary>
     public void AppendCheckpoint(Dictionary<string, long> offsets)
     {
         if (_frozenTicks != long.MinValue)
             offsets[OffsetKeys.Watermark] = _frozenTicks;
         for (var t = 0; t < _trackers.Count; t++)
         {
-            var maxSeen = long.MinValue;
-            var slots = _trackers[t].MaxSeenTicks;
-            for (var w = 0; w < slots.Length; w++)
-                maxSeen = Math.Max(maxSeen, Volatile.Read(ref slots[w]));
+            var maxSeen = MaxAcrossWorkers(_trackers[t]);
             if (maxSeen != long.MinValue)
                 offsets[_sourceKeys[t]] = maxSeen;
+            if (_trackers[t].Partitions is { } partitions)
+                foreach (var (partition, time) in partitions)
+                {
+                    offsets[OffsetKeys.WatermarkPartition(t, partition, idleFlag: false)] = time.MaxSeenTicks;
+                    offsets[OffsetKeys.WatermarkPartition(t, partition, idleFlag: true)] = time.Idle ? 1 : 0;
+                }
         }
     }
 
@@ -96,9 +131,32 @@ internal sealed class WatermarkClock(int workers)
         Volatile.Write(ref _frozenTicks, offsets.GetValueOrDefault(OffsetKeys.Watermark, long.MinValue));
         for (var t = 0; t < _trackers.Count; t++)
         {
-            var slots = _trackers[t].MaxSeenTicks;
+            var tracker = _trackers[t];
+            var slots = tracker.MaxSeenTicks;
             Array.Fill(slots, long.MinValue);
             Volatile.Write(ref slots[0], offsets.GetValueOrDefault(_sourceKeys[t], long.MinValue));
+            tracker.Partitions = null;
+            tracker.NewestTicks = slots[0];
+        }
+
+        // The partitions' keys are found by what they are, exactly: a source's key, then
+        // '#', which no input's name may hold (see OffsetKeys).
+        foreach (var (key, ticks) in offsets)
+        {
+            if (!OffsetKeys.TryDecodeWatermarkPartition(key, out var source, out var partition, out var idleFlag)
+                || source >= _trackers.Count)
+                continue;
+            var tracker = _trackers[source];
+            var partitions = tracker.Partitions ??= [];
+            if (!partitions.TryGetValue(partition, out var time))
+                partitions[partition] = time = new PartitionTime();
+            if (idleFlag)
+                time.Idle = ticks != 0;
+            else
+            {
+                time.MaxSeenTicks = ticks;
+                tracker.NewestTicks = Math.Max(tracker.NewestTicks, ticks);
+            }
         }
     }
 
@@ -109,6 +167,86 @@ internal sealed class WatermarkClock(int workers)
             Volatile.Write(ref slot, eventTicks);
     }
 
+    // ── fed by the input, between steps, on the coordinator ────────────────────────────
+
+    /// <summary>The source reads <paramref name="partition"/> and its records may be on
+    /// their way: it has a time of its own from here and holds the tracker's back until
+    /// it has brought a record or is idle. Said of an idle partition, it counts again.</summary>
+    public void ExpectPartition(int tracker, int partition)
+    {
+        var partitions = _trackers[tracker].Partitions ??= [];
+        if (partitions.TryGetValue(partition, out var time))
+            time.Idle = false;
+        else
+            partitions[partition] = new PartitionTime();
+    }
+
+    /// <summary>The source stands at the end of <paramref name="partition"/>: it stops
+    /// holding the tracker's time back until its next record.</summary>
+    public void IdlePartition(int tracker, int partition)
+    {
+        var partitions = _trackers[tracker].Partitions ??= [];
+        if (partitions.TryGetValue(partition, out var time))
+            time.Idle = true;
+        else
+            partitions[partition] = new PartitionTime { Idle = true };
+    }
+
+    /// <summary>One record's event time, seen by the input as it drains: into its
+    /// partition's time if the source has named the partition (which is then no longer
+    /// idle), else into the tracker's own, with the records of no partition.</summary>
+    public void ObserveFromInput(int tracker, int partition, long eventTicks)
+    {
+        var state = _trackers[tracker];
+        if (eventTicks > state.NewestTicks)
+            state.NewestTicks = eventTicks;
+        if (partition >= 0 && state.Partitions is { } partitions && partitions.TryGetValue(partition, out var time))
+        {
+            time.Idle = false;
+            if (eventTicks > time.MaxSeenTicks)
+                time.MaxSeenTicks = eventTicks;
+            return;
+        }
+        Observe(tracker, 0, eventTicks);
+    }
+
+    /// <summary>The newest event time the input has observed for
+    /// <paramref name="tracker"/>, this run or before the checkpoint it resumed;
+    /// <see cref="long.MinValue"/> before the first.</summary>
+    public long NewestFromInput(int tracker) => _trackers[tracker].NewestTicks;
+
+    private static long MaxAcrossWorkers(Tracker tracker)
+    {
+        var maxSeen = long.MinValue;
+        var slots = tracker.MaxSeenTicks;
+        for (var w = 0; w < slots.Length; w++)
+            maxSeen = Math.Max(maxSeen, Volatile.Read(ref slots[w]));
+        return maxSeen;
+    }
+
+    /// <summary>The tracker's event time, or <see cref="long.MinValue"/> while it can
+    /// claim none: the least over its partitions that are not idle — none at all if one
+    /// of them has brought nothing yet — and, with no such partition, the newest seen in
+    /// any partition or outside them. <paramref name="least"/> is the partition that
+    /// time is, or −1.</summary>
+    private static long TimeOf(Tracker tracker, out int least)
+    {
+        least = -1;
+        var newest = MaxAcrossWorkers(tracker);
+        if (tracker.Partitions is not { } partitions)
+            return newest;
+
+        var leastTicks = long.MaxValue;
+        foreach (var (partition, time) in partitions)
+        {
+            if (time.Idle)
+                newest = Math.Max(newest, time.MaxSeenTicks);
+            else if (time.MaxSeenTicks < leastTicks)
+                (leastTicks, least) = (time.MaxSeenTicks, partition);
+        }
+        return least < 0 ? newest : leastTicks;
+    }
+
     /// <summary>Cluster support: this process's max event time seen per tracker
     /// (<see cref="long.MinValue"/> where a source has seen nothing), in tracker
     /// registration order — deterministic, since every process builds the same circuit.
@@ -117,13 +255,7 @@ internal sealed class WatermarkClock(int workers)
     {
         var result = new long[_trackers.Count];
         for (var t = 0; t < _trackers.Count; t++)
-        {
-            var maxSeen = long.MinValue;
-            var slots = _trackers[t].MaxSeenTicks;
-            for (var w = 0; w < slots.Length; w++)
-                maxSeen = Math.Max(maxSeen, Volatile.Read(ref slots[w]));
-            result[t] = maxSeen;
-        }
+            result[t] = MaxAcrossWorkers(_trackers[t]);
         return result;
     }
 
@@ -145,18 +277,42 @@ internal sealed class WatermarkClock(int workers)
     public void Freeze()
     {
         var candidate = long.MaxValue;
-        foreach (var tracker in _trackers)
+        long heldBy = -1;
+        for (var t = 0; t < _trackers.Count; t++)
         {
-            var maxSeen = long.MinValue;
-            for (var w = 0; w < tracker.MaxSeenTicks.Length; w++)
-                maxSeen = Math.Max(maxSeen, Volatile.Read(ref tracker.MaxSeenTicks[w]));
-            if (maxSeen == long.MinValue)
-                return; // a source has seen nothing yet: no watermark can be claimed
-            candidate = Math.Min(candidate, maxSeen - tracker.LatenessTicks);
+            var tracker = _trackers[t];
+            var time = TimeOf(tracker, out var partition);
+            if (time == long.MinValue)
+            {
+                // A source, or a partition of one, has seen nothing yet: no watermark can
+                // be claimed, and that is what the clock waits for.
+                Volatile.Write(ref _heldBy, ((long)t << 32) | (uint)(partition + 1));
+                return;
+            }
+            if (time - tracker.LatenessTicks < candidate)
+                (candidate, heldBy) = (time - tracker.LatenessTicks, ((long)t << 32) | (uint)(partition + 1));
         }
+        Volatile.Write(ref _heldBy, heldBy);
         if (_trackers.Count > 0 && candidate > _frozenTicks)
             Volatile.Write(ref _frozenTicks, candidate);
     }
+
+    // Which source, and which of its partitions (−1: none), the last freeze found
+    // lowest, packed into one word so that a reader on another thread sees a pair that
+    // belongs together. −1 before the first freeze that could claim a watermark.
+    private long _heldBy = -1;
+
+    /// <summary>The source whose time was the lowest at the last freeze — the one the
+    /// watermark waits for — and the partition of it that was, or −1 where the source
+    /// has no partitions or all of them are idle. Null before any watermark.</summary>
+    public (int Source, int Partition)? HeldBy =>
+        Volatile.Read(ref _heldBy) is var held && held < 0 ? null : ((int)(held >> 32), (int)(held & 0xFFFFFFFF) - 1);
+
+    /// <summary>The name of the input that feeds <paramref name="source"/> by itself
+    /// (event time declared on the input), or null.</summary>
+    public string? InputOf(int source) => _trackers[source].InputName;
+
+    public void BindInput(int tracker, string inputName) => _trackers[tracker].InputName = inputName;
 }
 
 /// <summary>
@@ -260,6 +416,42 @@ internal sealed class RecordEviction<TValue>(WatermarkClock clock, Func<TValue, 
     where TValue : notnull
 {
     public WatermarkClock Clock { get; } = clock;
+
+    /// <summary>For a keyed input that forgets its final rows: how long a row stays open
+    /// behind the newest event time — the lateness of the input's declaration.</summary>
+    public long OpenTicks { get; init; }
+
+    /// <summary>
+    /// Whether an upsert with event time <paramref name="nextTicks"/> begins a new record
+    /// of a key whose row has event time <paramref name="previousTicks"/>, rather than
+    /// amending that row: it does when its own time puts the earlier row behind the
+    /// watermark — when it is later by more than the rows stay open. The earlier row is
+    /// then final by the later one's own time, whatever the circuit's watermark says at
+    /// the step the two meet in: it is not taken back, and the two are never in one step
+    /// (the input's port sees to that). So what a key's records give does not depend on
+    /// whether the watermark had already passed the earlier one when the later arrived —
+    /// which depends on how the records fell into steps.
+    /// </summary>
+    public bool Supersedes(long previousTicks, long nextTicks) => nextTicks - OpenTicks > previousTicks;
+
+    public bool Supersedes(TValue previous, TValue next) =>
+        Supersedes(eventTime(previous).UtcTicks, eventTime(next).UtcTicks);
+
+    /// <summary>The row's event time, or false where the selector throws: the row then has
+    /// no time here, and whoever asks treats it as an amendment.</summary>
+    public bool TryEventTicks(TValue value, out long ticks)
+    {
+        try
+        {
+            ticks = eventTime(value).UtcTicks;
+            return true;
+        }
+        catch (Exception)
+        {
+            ticks = long.MinValue;
+            return false;
+        }
+    }
 
     public DateTimeOffset ClosesAt(TValue value) => eventTime(value).AddTicks(1);
 

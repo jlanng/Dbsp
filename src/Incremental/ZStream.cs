@@ -308,6 +308,17 @@ public class ZStream<T> where T : notnull
     /// watermark are dropped here — the trade-off for being able to evict closed-window
     /// state downstream. An idle event-time source stalls the watermark (and therefore
     /// window closes and eviction) until it advances.
+    /// <para>
+    /// Declare it on the input itself where the input is read from a source with
+    /// partitions: only there is the watermark kept per partition (the least over the
+    /// partitions the source names, <see cref="InputHandle{T}.ExpectPartitionAsync"/>), so
+    /// that a partition behind the others — a backlog, a broker that was away — does not
+    /// have its records dropped as late; and only there does
+    /// <see cref="CircuitOptions.MaxEventTimeAhead"/> apply. A declaration after a
+    /// <c>Select</c> or a lookup sees records, not where they came from: declare on the
+    /// input and re-declare (<see cref="WithEventTime(Func{T, DateTimeOffset})"/>) on the
+    /// new shape.
+    /// </para>
     /// </summary>
     public EventTimeStream<T> WithEventTime(Func<T, DateTimeOffset> eventTime, TimeSpan lateness)
     {
@@ -316,11 +327,18 @@ public class ZStream<T> where T : notnull
         Builder.RequireOutsideRecursion("WithEventTime");
         var clock = Builder.GetOrCreateWatermarkClock();
         var tracker = clock.RegisterTracker(lateness.Ticks);
+        // Declared on an input itself, the input feeds the clock as it drains — it knows
+        // each record's partition — and the operator only filters.
+        var observes = InputNameOrNull is { } input && Builder.BindInputEventTime(input, clock, tracker, eventTime) ? -1 : tracker;
         return new EventTimeStream<T>(
             Builder,
-            Builder.AddNode("eventTime", [NodeId], ctx => new WatermarkOperator<T>(ctx, clock, tracker, eventTime)),
+            Builder.AddNode("eventTime", [NodeId], ctx => new WatermarkOperator<T>(ctx, clock, observes, eventTime)),
             eventTime);
     }
+
+    /// <summary>The input this stream is, for a stream that is one; null for every stream
+    /// derived from anything.</summary>
+    private protected virtual string? InputNameOrNull => null;
 
     /// <summary>
     /// Re-declares event time on a stream derived from one that already declared it —

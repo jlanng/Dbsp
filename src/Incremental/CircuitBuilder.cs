@@ -121,6 +121,10 @@ public sealed class CircuitBuilder
         if (Options.CheckpointMaxDelay is { } maxDelay && maxDelay <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(
                 nameof(Options.CheckpointMaxDelay), maxDelay, "CheckpointMaxDelay must be positive, or null for no time bound.");
+        if (Options.MaxEventTimeAhead is { } ahead && ahead < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(
+                nameof(Options.MaxEventTimeAhead), ahead, "MaxEventTimeAhead must not be negative; null is no bound.");
+        ArgumentNullException.ThrowIfNull(Options.TimeProvider, nameof(Options.TimeProvider));
         if (Options.Cluster is { } cluster)
         {
             ArgumentOutOfRangeException.ThrowIfLessThan(cluster.ProcessCount, 1, nameof(Options.Cluster));
@@ -145,6 +149,33 @@ public sealed class CircuitBuilder
     internal WatermarkClock? WatermarkClock { get; private set; }
 
     internal WatermarkClock GetOrCreateWatermarkClock() => WatermarkClock ??= new WatermarkClock(Options.Workers);
+
+    /// <summary>Event time declared on an input itself: the input's port feeds
+    /// <paramref name="tracker"/> from here on, by partition, and applies
+    /// <see cref="CircuitOptions.MaxEventTimeAhead"/> (see <see cref="InputEventTime{T}"/>).
+    /// False — and nothing changes — on a clustered circuit, whose processes each see a
+    /// part of an input and share one time per source, and for an input that already has
+    /// a declaration feeding the clock.</summary>
+    internal bool BindInputEventTime<T>(string inputName, WatermarkClock clock, int tracker, Func<T, DateTimeOffset> eventTime)
+        where T : notnull
+    {
+        if (Options.Cluster is not null)
+            return false;
+        var bound = new InputEventTime<T>(clock, tracker, eventTime, Options);
+        switch (_inputs.Find(i => i.Name == inputName))
+        {
+            case InputRegistration<T> { EventTime: null } plain:
+                plain.EventTime = bound;
+                break;
+            case IKeyedInputEventTime<T> { EventTime: null } keyed:
+                keyed.EventTime = bound;
+                break;
+            default:
+                return false;
+        }
+        clock.BindInput(tracker, inputName);
+        return true;
+    }
 
     /// <summary>Declares a named input. Redeem the returned definition after
     /// <see cref="Build"/> via <see cref="Circuit.Handle{T}(InputStream{T})"/>. The name is
@@ -222,6 +253,7 @@ public sealed class CircuitBuilder
             NodeId = source,
             KeySelector = keySelector,
             RoutingHash = routingHash,
+            Retention = retention,
         });
         return new KeyedInputStream<TKey, TValue>(this, state, name, retention);
     }

@@ -16,6 +16,8 @@ public sealed class InputStream<T> : ZStream<T> where T : notnull
     }
 
     internal string InputName { get; }
+
+    private protected override string? InputNameOrNull => InputName;
 }
 
 /// <summary>
@@ -39,6 +41,8 @@ public sealed class KeyedInputStream<TKey, TValue> : ZStream<TValue>
 
     internal string InputName { get; }
 
+    private protected override string? InputNameOrNull => InputName;
+
     /// <summary>
     /// Declares event time on the keyed input's rows, as
     /// <see cref="ZStream{T}.WithEventTime(Func{T,DateTimeOffset},TimeSpan)"/> does, and with
@@ -47,6 +51,18 @@ public sealed class KeyedInputStream<TKey, TValue> : ZStream<TValue>
     /// nothing anyone sees — the retraction an upsert of that key would have owed is behind
     /// the watermark and dropped here either way — and keeps the input from holding one row
     /// for every key it ever had. A later upsert of a forgotten key is a new row.
+    /// <para>
+    /// So that this does not depend on how the records fall into steps, an upsert whose
+    /// event time is later than the held row's by more than <paramref name="lateness"/>
+    /// is a new row too, whether or not the watermark has passed the held one yet: the
+    /// held row is final by the newer one's own time, it is not retracted, and the input
+    /// never runs the two in one step. An upsert within <paramref name="lateness"/> of
+    /// the held row amends it — and whether the amended row is still taken back
+    /// downstream depends on where the watermark stands when the amendment is read. A
+    /// key that is used again for another record must therefore not come back within
+    /// <paramref name="lateness"/> of event time, and an amendment must not move a row's
+    /// event time forward by more than that.
+    /// </para>
     /// <para>
     /// With <paramref name="evictWhenFinal"/> every use of the input must go through the
     /// stream this returns; <c>Build()</c> refuses a circuit that also reads the input
@@ -60,7 +76,7 @@ public sealed class KeyedInputStream<TKey, TValue> : ZStream<TValue>
             return timed;
         if (_retention.Policy is not null)
             throw new InvalidOperationException($"Keyed input '{InputName}' already forgets its final rows.");
-        _retention.Policy = new Operators.RecordEviction<TValue>(Builder.WatermarkClock!, eventTime);
+        _retention.Policy = new Operators.RecordEviction<TValue>(Builder.WatermarkClock!, eventTime) { OpenTicks = lateness.Ticks };
         _retention.WatermarkNode = timed.NodeId;
         return timed;
     }
