@@ -290,6 +290,41 @@ public class StateGrowthTests
             Assert.Contains(3L, counted);
     }
 
+    /// <summary>
+    /// Round five, K3. A trade stamped far in the future used to move the watermark to
+    /// its time: every trade after it late. On a node it is a record in error — more than
+    /// <see cref="ServiceOptions.MaxEventTimeAhead"/> ahead of the node's clock — and the
+    /// pipeline's error policy deals with it; a spec may set a bound of its own.
+    /// </summary>
+    [Fact]
+    public async Task A_trade_stamped_far_ahead_is_a_dead_letter_on_a_node_and_a_spec_may_allow_it()
+    {
+        var node = "fa" + Guid.NewGuid().ToString("N")[..8];
+        await using var service = await StartAsync(nodeId: node);
+        Assert.Equal(TimeSpan.FromDays(1), service.Node.Options.MaxEventTimeAhead);
+        await service.DeclareInstrumentsAsync(Instruments(10));
+        var now = DateTimeOffset.UtcNow;
+
+        var spec = Spec("bounded", "open-trades", "fa-in", "fa-out", settings: """{ "openSeconds": 10 }""");
+        await service.DeployAsync(spec with { Circuit = spec.Circuit with { ErrorPolicy = RecordErrorPolicy.DeadLetter } });
+        var input = service.Memory.KeyedLog<long, TimedTrade>("fa-in");
+        var sink = service.Memory.UpsertSink<long, EnrichedTrade>("fa-out");
+        input.Upsert(new TimedTrade(1, 1, "t", now.AddSeconds(-60)));
+        input.Upsert(new TimedTrade(2, 1, "t", T0));                    // the year 2100
+        input.Upsert(new TimedTrade(3, 1, "t", now.AddSeconds(-30)));
+        await Eventually(() => sink.Rows.Count == 2 && service.Pipelines.Get("bounded").DeadLetters == 1, "two trades through and one refused");
+        Assert.Equal([1L, 3L], sink.Rows.Keys.Order());
+        Assert.Equal(0, service.Pipelines.Get("bounded").LateRecords);
+        Assert.True(service.Pipelines.Get("bounded").Watermark < now, "the watermark went to the refused trade's time");
+
+        // The same feed into a pipeline whose spec says that its time may be that far ahead.
+        var wide = Spec("wide", "open-trades", "fa-in", "fa-wide", settings: """{ "openSeconds": 10 }""");
+        await service.DeployAsync(wide with { Circuit = wide.Circuit with { MaxEventTimeAhead = TimeSpan.FromDays(365 * 100) } });
+        var all = service.Memory.UpsertSink<long, EnrichedTrade>("fa-wide");
+        await Eventually(() => all.Rows.ContainsKey(2), "the trade of 2100 through the pipeline that allows it");
+        await Eventually(() => service.Pipelines.Get("wide").Watermark > now, "its watermark at that trade");
+    }
+
     [Fact]
     public async Task A_node_flags_the_pipeline_that_keeps_every_record_and_not_the_one_that_counts()
     {

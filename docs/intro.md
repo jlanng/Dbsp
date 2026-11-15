@@ -185,13 +185,30 @@ time-based:
   has seen them before — a record is late by its time alone — and counted:
   `circuit.LateRecords` and the counter `incremental.circuit.late_records` (insertions; the
   retraction of a record that is final is dropped and not counted). One record stamped far
-  ahead moves the watermark and makes everything behind it late (**TODO:** late-event
-  side-channel — design pending);
+  ahead moves the watermark and makes everything behind it late — unless
+  `CircuitOptions.MaxEventTimeAhead` is set: a record further ahead than that of the
+  node's clock (and of the newest event time its input has brought) is then a record in
+  error, a dead letter or a fault as the circuit's `ErrorPolicy` says, and moves nothing.
+  The bound is applied by the input, so it needs the declaration to be on the input
+  (**TODO:** late-event side-channel — design pending);
 - `circuit.CurrentWatermark` exposes the current value for monitoring.
 
 Because the watermark is the minimum across sources, an **idle source stalls it** — windows
 stop closing and state stops evicting until that source advances. (**TODO:** idleness
-handling — timeout/mark-idle design pending.)
+handling for a whole source — timeout/mark-idle design pending.)
+
+**Partitions.** Declared on an input itself (`input.WithEventTime(…, lateness)`, not after a
+`Select`), event time is kept per partition of the input's source where the source names
+its partitions: `handle.ExpectPartitionAsync(p)` for each when it starts, and
+`handle.IdlePartitionAsync(p)` when it stands at the end of one. The source's time is then
+the *least* over its partitions that are not idle, so a partition that is behind the
+others — a backlog read one partition at a time, a broker that was away — holds the
+watermark where its own records are and they are not dropped as late. A partition named
+and not yet heard from holds every claim back; an idle one stops counting until its next
+record; with all of them idle the time is the newest seen anywhere. `KafkaSource` does
+this by itself. Records of partitions nobody named, and unstamped records, are timed
+together as before. `circuit.WatermarkHeldBy` says which input and partition the
+watermark waits for.
 
 **When do windowed results emit?** Live, every step: as events arrive you see the current
 count rise via retract-and-assert corrections. If you only want each window's *final* result,
@@ -224,6 +241,8 @@ changelog.
 Two consequences for whoever changes a definition. A checkpoint taken before this was
 so (state manifest format 6) does not resume a circuit that uses event time — start
 that one from an empty state store — while one without event time resumes untouched.
+(Format 8 added the partitions' times to the checkpoint; a format-7 checkpoint resumes
+as it is, and a build that writes format 7 refuses a format-8 one.)
 And the number of `WithEventTime` sources is part of the manifest: adding or removing
 one, other than the first or the last, needs a fresh state store too.
 

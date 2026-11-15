@@ -81,6 +81,11 @@ public sealed class InputHandle<T> where T : notnull
 
     internal InputHandle(ChannelWriter<InputEntry<T>> writer) => _writer = writer;
 
+    /// <summary>Set by the input's port when event time is declared on the input: only
+    /// then does a note about a partition mean anything, and only then is it sent. An
+    /// input without it would run a step — and commit — for a note it then ignores.</summary>
+    internal bool TimesPartitions { get; init; }
+
     /// <summary>Inserts <paramref name="value"/> (weight +1), unstamped.</summary>
     public ValueTask InsertAsync(T value, CancellationToken cancellationToken = default) =>
         SendAsync(value, 1, cancellationToken);
@@ -187,13 +192,15 @@ public sealed class InputHandle<T> where T : notnull
     /// it knew of a partition's end before it stopped is no longer true. It has an effect
     /// only where event time is declared on the input itself
     /// (<c>input.WithEventTime(…, lateness)</c>) on an unclustered circuit; anywhere else
-    /// it is read and ignored. It travels through the channel like a record.
+    /// nothing is sent. It travels through the channel like a record.
     /// </para>
     /// </summary>
     public ValueTask ExpectPartitionAsync(int partition, CancellationToken cancellationToken = default)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(partition);
         _stamping.Lock(stamped: true);
+        if (!TimesPartitions)
+            return default;
         return InputWrites.WriteAsync(_writer, new InputEntry<T>(default!, 0, partition, -1, InputRejection.ExpectPartition), cancellationToken);
     }
 
@@ -210,6 +217,8 @@ public sealed class InputHandle<T> where T : notnull
     {
         ArgumentOutOfRangeException.ThrowIfNegative(partition);
         _stamping.Lock(stamped: true);
+        if (!TimesPartitions)
+            return default;
         return InputWrites.WriteAsync(_writer, new InputEntry<T>(default!, 0, partition, -1, InputRejection.IdlePartition), cancellationToken);
     }
 
@@ -267,6 +276,9 @@ public sealed class KeyedInputHandle<TKey, TValue>
     /// record's place in the feed, so its offset is consumed like any other — instead of
     /// the exception reaching the producer. Written once, before the circuit is handed out.</summary>
     internal bool ReportsBadKeys { get; set; }
+
+    /// <summary>As <see cref="InputHandle{T}.TimesPartitions"/>.</summary>
+    internal bool TimesPartitions { get; init; }
 
     private ValueTask Upsert(TValue value, int partition, long offset, CancellationToken cancellationToken)
     {
@@ -352,6 +364,8 @@ public sealed class KeyedInputHandle<TKey, TValue>
     {
         ArgumentOutOfRangeException.ThrowIfNegative(partition);
         _stamping.Lock(stamped: true);
+        if (!TimesPartitions)
+            return default;
         return InputWrites.WriteAsync(_writer,
             new KeyedInputEntry<TKey, TValue>(default!, false, default, partition, -1, null, InputRejection.ExpectPartition), cancellationToken);
     }
@@ -361,6 +375,8 @@ public sealed class KeyedInputHandle<TKey, TValue>
     {
         ArgumentOutOfRangeException.ThrowIfNegative(partition);
         _stamping.Lock(stamped: true);
+        if (!TimesPartitions)
+            return default;
         return InputWrites.WriteAsync(_writer,
             new KeyedInputEntry<TKey, TValue>(default!, false, default, partition, -1, null, InputRejection.IdlePartition), cancellationToken);
     }

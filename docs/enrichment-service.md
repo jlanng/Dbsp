@@ -126,10 +126,19 @@ with `Incremental.`: it collides with `Incremental.Tables`.
 /// What that costs: a trade is late by its time alone. One that <em>first</em> arrives
 /// with an execution time behind the watermark is dropped like a late amendment — it never
 /// reaches the sink, and it is no dead letter; the pipeline counts it as a late record.
-/// The watermark follows the newest execution time read from any partition, so
-/// <c>OpenSeconds</c> must cover how far apart in time the feed can arrive (a partition
-/// read behind the others after an outage), and one trade stamped far ahead closes every
-/// trade behind it until the feed's time catches up.
+/// The watermark follows the newest execution time read — from a topic of several
+/// partitions, the least of what its partitions have brought, so a partition read behind
+/// the others (a backlog, a broker that was away) holds it back and its trades are not
+/// late. A trade stamped more than a day ahead of the node's clock
+/// (<c>circuit.maxEventTimeAhead</c>) is refused as a record in error, where it would
+/// otherwise close every trade behind it.
+/// </para>
+/// <para>
+/// A trade's id is its key for as long as the trade is open and no longer. An upsert of
+/// an id within <c>OpenSeconds</c> of the row the input holds amends that trade; one
+/// later than that by its own execution time is another trade, and the earlier is left
+/// as delivered. So an id must not come back within <c>OpenSeconds</c>, and an amendment
+/// must not move a trade's execution time forward by more.
 /// </para>
 /// </summary>
 [Pipeline("trade-enrichment", Description = "Trades with counterparty (on arrival), instrument and desk (retroactive while open), filtered by notional.")]
@@ -2323,7 +2332,7 @@ commit every step; a pipeline with `checkpointMaxDelay` or slow sinks needs its 
 | Table faulted | `tables{state="Faulted"} + tables{state="Failed"} > 0` | Pipelines that read it are `Blocked`. |
 | Node near its memory | `process.working_set` above 85 % of the container's limit for 10 min | The next bulk load or restore may not fit (*Sizing a node*). Which table or pipeline grew is in `table.memory` and `pipeline.state_memory`. |
 | State growing without end | `pipeline.state_growing == 1` (ticket) | The event and the pipeline's page name the store. Either something kept per record is never closed — a retroactive join, a remembered lookup, a keyed input or a total per record over a stream of facts — and the definition wants `EvictWhenFinal`, `EvictWhen`, a window or `LookupAppendOnly` (*Bounding a join over a stream of facts*); or the store does close on the watermark and the watermark has not moved in the period, which is an event-time input with no records. The node raises it itself after `StateGrowthAlarmAfter` (30 min) of growth with no fall; a store still filling the window its definition keeps open is not flagged, however long the window. |
-| Records dropped as late | `increase(pipeline.late_records[5m]) > 0`, where none is expected (ticket) | Records whose event time was behind the watermark when they arrived: late amendments, but also records never seen before. A burst after a quiet count is a record stamped far ahead (the watermark jumped, and everything behind it is late until the feed's time catches up) or partitions read far apart in time after an outage. They are in no dead letter and are not delivered. |
+| Records dropped as late | `increase(pipeline.late_records[5m]) > 0`, where none is expected (ticket) | Records whose event time was behind the watermark when they arrived: late amendments, but also records never seen before. A burst after a quiet count is a record stamped ahead by less than `maxEventTimeAhead` (the watermark jumped, and everything behind it is late until the feed's time catches up), or — where event time is not declared on the input — partitions read far apart in time after an outage. They are in no dead letter and are not delivered. |
 | Collector busy | `process.gc.pause_ratio > 0.1` for 10 min | The node is short of memory for what it allocates, or its collector is not set as *Sizing a node* says. |
 | Takeover slow | on Kafka, `takeover.duration{stage="total"}` above about 3 s, and `{stage="silence"}` above your failover budget | `total` is the takeover from the decision to leading: `fence`, `storage`, `catalog`, `tables`, then `start_leading` (the leader record, seeds, `pipelines`, loaders). It is about a second locally, half of it the `fence`, and does not grow with state when the standby was warm — so a long one is a slow fence (the brokers), or a `pipelines` stage that had to build circuits the standby had not (`standby.pipelines_to_build` was not 0). `silence` is how long the leader had been quiet when the standby went: 3 s for a dead leader, 30 s for one that still answered its probe. `start_leading` alone leaves out the fence and the wait, which is where a slow takeover is slow. |
 
@@ -2602,19 +2611,16 @@ What it means for a trade, with `openSeconds` as the lateness:
   emitted; an amendment that arrives later is behind the watermark and dropped as late.
   A later trade under the same id is a new trade: nothing is retracted for the old one,
   so an upsert sink overwrites the row — or keeps the old row, if the filter drops the
-  new trade.
+  new trade. See *An id that comes back* below for when "later" begins.
 - A trade is late by its time alone. One that *first* arrives with an execution time
   behind the watermark is dropped as an amendment would be: it never reaches the sink,
-  and it is not a dead letter. The watermark follows the newest execution time read —
-  from any partition of the input — so two things make honest trades late: partitions
-  read more than `openSeconds` apart in time (one partition's backlog replayed ahead
-  of another's after an outage), and one trade stamped far ahead, which closes every
-  trade behind it until the feed's time catches up. The pipeline counts what it drops:
+  and it is not a dead letter. The pipeline counts what it drops:
   *late records* on its page, `pipeline.late_records` on the meter, an event when it
   starts and at most every ten minutes while it goes on (`PipelineTestHarness.LateRecords`
-  in a test). Choose `openSeconds` to cover the disorder the feed can have, not only how
-  late a correction may come. Nothing guards against a time in the future (*Open for
-  James* 81 in the design document).
+  in a test). Choose `openSeconds` to cover the disorder the feed can have within a
+  partition, not only how late a correction may come. What the watermark follows, and
+  the two things that used to make honest trades late, are under *Event time on a
+  topic of several partitions* and *A record stamped in the future* below.
 - A change of reference data corrects exactly the trades at or after the watermark,
   however the steps fall: a final trade not yet evicted is left alone too.
 - A record whose event time cannot be read — the selector throws on it — is a dead
@@ -2630,6 +2636,99 @@ Choose `openSeconds` as how late a correction may come and still count: a trade 
 in error and amended within the hour, a desk move that should still carry the morning's
 trades. It is a setting, so an operator changes it with a replace (the state's shape is
 unchanged; the watermark simply moves).
+
+**Event time on a topic of several partitions.** Declare event time on the input
+itself — `p.Input<T>(slot).WithEventTime(…, lateness)` or the keyed form, before any
+`Select` or lookup; re-declare it without a lateness on what follows, as
+`execution-quality` and `desk-exposure` do. Only the input knows which partition a
+record came from, and a Kafka source tells it which partitions the topic has. The
+input's time is then the *least* of what its partitions have brought, not the newest
+read from any of them. A partition that is behind the others — a backlog after a
+restart or a takeover, which the client hands over a partition at a time; the
+partitions of a broker that was away — holds the watermark where its own records are,
+and they are not late. Before this they were: with three partitions and ten minutes of
+backlog on each, read with one time for the input, 1,155 and 1,188 of 1,800 records
+were dropped as late in two runs; with a time per partition, none.
+
+- *A quiet partition.* A partition with nothing to read would hold the watermark for
+  ever, so one the source has read to its end stops counting once it has stood there
+  for five seconds (`KafkaSourceOptions.IdlePartitionAfter`). Until then it holds the
+  watermark at its own last record: on a topic where one partition goes quiet, windows
+  close up to five seconds later than they would on one partition. A record that
+  arrives on an idle partition behind the watermark the others have made is late, as
+  it would be on a topic of one partition.
+- *A partition that cannot be read.* The source asks each partition it stands at the
+  end of, once a second, whether it is still at its end; a partition whose leader is
+  away does not answer, and after five seconds without an answer it holds the
+  watermark again until it has been read to its end and has stood there five seconds
+  more. So a broker's loss holds the watermark — nothing closes, state grows by the
+  feed's rate — for as long as its partitions have no leader, and what was produced to
+  them meanwhile is not late when it comes. Measured on three brokers, six partitions,
+  300 records a second stamped as produced, one broker killed or frozen for 20 s, a
+  lateness of 5 s, three runs of each: no record late, where the same topic read with
+  one time for the input lost 955 to 2,174 of about 10,000. A lateness under five
+  seconds is not covered: the other partitions can move the watermark that far before
+  the source knows.
+- *What the watermark waits for* is on the pipeline's page when its state is flagged as
+  growing, and in its status as `watermarkHeldBy`: the input and the partition. A
+  partition that stays there while the others move on is one the source cannot read to
+  its end.
+- *After a restart or a takeover* every partition holds the watermark until it has been
+  read to its end again, whatever the checkpoint said: closes resume once the backlog
+  is read, and at the earliest five seconds after the start.
+- A declaration that is not on the input (after a `Select`, a lookup, a join), a
+  source that names no partitions (the `files` connector, a connector of your own that
+  does not call `ExpectPartitionAsync`) and a clustered circuit have one time for the
+  input: the newest read.
+
+**A record stamped in the future.** A record whose event time is more than a day ahead
+of the node's clock is a record in error, not a record: under `errorPolicy: DeadLetter`
+it is a dead letter (`EventTimeAheadException`, with the record) and the pipeline goes
+on; under `Fault` the pipeline faults on it, as on any record a delegate throws on,
+and starts again onto the same record until it is skipped by a reset or its time has
+come. Before this bound such a record moved the watermark to its time: every record
+after it was late and every open trade and window closed, with nothing but the
+late-record count to show for it, and the only way out was a reset.
+
+- The bound is `ServiceOptions.MaxEventTimeAhead` for the node (a day; null for none)
+  and `circuit.maxEventTimeAhead` in a spec for one pipeline (`"400.00:00:00"` for a
+  pipeline whose time is a settlement date). Keep it well above the skew between the
+  clocks that stamp the records and the node's.
+- It is measured from the later of the node's clock and the newest event time the
+  input has taken, so a replay of recorded data with shifted times goes on as long as
+  it moves in steps shorter than the bound, and a feed that was quiet for a week is
+  taken up again.
+- It applies where event time is declared on the input, like the watermark per
+  partition. A record refused is not applied at all — a keyed input does not take it
+  as the key's row — and its offset is consumed.
+- If a pipeline under `Fault` has stopped on such a record: deploy it with
+  `errorPolicy: DeadLetter` (a replace that keeps state), or raise its bound if the
+  record is right.
+- A record less than the bound ahead is taken, and holds everything behind it late
+  until the feed's time has caught up: the bound limits the harm to its own length.
+
+**An id that comes back.** A keyed input's key is a record's identity only while the
+record is open. For `trade-enrichment`:
+
+- An upsert of an id whose execution time is within `openSeconds` of the row the input
+  holds for that id *amends* the trade.
+- An upsert later than that — by the two trades' own execution times — is *another
+  trade*. The earlier one is final by the later one's time: it is not retracted, the
+  input never runs the two in one step, and the sink receives them in order. That is
+  so whether the pipeline reads them a second apart or together in a backlog, and
+  whether or not the watermark had passed the earlier one. (Until round five it
+  depended on exactly that: a pipeline that read both in one step took them for one
+  trade amended and never delivered the first.)
+- So **an id must not be used for another trade within `openSeconds`** of event time:
+  the second would amend the first. And an amendment must not move a trade's execution
+  time *forward* by more than `openSeconds`: it would be taken for another trade, and
+  the row it meant to replace would stay. Within the window the service cannot tell
+  the two apart — both are an upsert of a key — and no rule can: what an amendment
+  that arrives near the edge of the window does to the sink (whether the row it
+  replaces is still taken back) depends on where the watermark stands when it is
+  read, which depends on what was read before it and in which step, as lateness
+  itself does. If the upstream system reuses ids sooner, key the input by more than
+  the id (the id and the trade date, say).
 
 **The arithmetic.** With `EvictWhenFinal` every operator that keeps a record also keeps
 a deadline for it, so an open trade costs two entries per stateful operator —

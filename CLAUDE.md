@@ -64,7 +64,8 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   version 2 (`Pipelines.V2/`, the same sources with `V2` defined) to `plugin-packages/`.
   `--poison N` sets how many generated trades have no quantity (the dead letters; 200);
   `--trade-ids N` makes trade ids come round after N (default 0: never — the pipelines'
-  state is bounded by event time, not by the generator).
+  state is bounded by event time, not by the generator). On Kafka the trades and quotes
+  topics have three partitions (`KafkaStack.FeedPartitions`).
   The definitions' own tests are `dotnet test --project
   examples/Incremental.EnrichmentService/Pipelines.Tests` (xunit v3 on
   `PipelineTestHarness`; under a second, and CI runs them).
@@ -382,7 +383,8 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   the lookup probes the table and does not consume its changes, so the edge belongs to
   the picture and must never become an execution input.
 - Event-time state is checkpointed state (docs/design/durability-and-standby.md, *Event-time
-  state*). The clock commits in the offsets marker (`$watermark`, `$watermark#s{n}`) and is
+  state*). The clock commits in the offsets marker (`$watermark`, `$watermark#s{n}`, and
+  per named partition `$watermark#s{n}#m{p}` and `#i{p}`) and is
   restored at `Start()`; those keys exactly — never tell the clock's entries from an
   input's by how a key starts (`$watermark-feed` is an input). Every deadline an operator waits on lives in an `IDeadlineStore`
   (`{node}.deadlines.w{n}`), never in a field: an operator that evicts or announces on the
@@ -404,6 +406,51 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   not only when `TakeDue` drains it (`DeadlineStoreTests`). `EventTimeRestartTests` is the
   check: killed and restored at any step, a circuit's outputs and final state equal the
   uninterrupted run's.
+- Event time where records enter (`Runtime/InputEventTime.cs`, `WatermarkClock`;
+  docs/design/enrichment-service.md, S9). `WithEventTime(sel, lateness)` declared on an
+  input itself binds the input's port to the clock: the port feeds the tracker as it
+  drains — on the coordinator, between steps — and the declaration's operator only
+  filters (it is built with tracker −1). Two things live there and nowhere else:
+  - *A time per partition.* A source names its partitions (`ExpectPartitionAsync`) and
+    says when it stands at the end of one (`IdlePartitionAsync`); these travel in the
+    input's channel, in order with the records, and are read before `Admit` (they have
+    no offset). The tracker's time is the least over the named partitions that are not
+    idle; a named partition with no record yet holds every claim back; with none
+    counting it is the newest seen anywhere. Records of partitions nobody named go to
+    the tracker's own slot, as all records did. The partitions' times and idle flags
+    commit under `$watermark#s{n}#m{p}` and `$watermark#s{n}#i{p}` — two keys whose
+    names never change, because a provider may keep the marker by setting keys and
+    removing none (Redis does): do not put a flag in a key's name. State manifest
+    format 8; a format-7 checkpoint resumes as it is. Never make a partition idle on
+    the passing of time: a source says so only on evidence that it is at the end
+    (`KafkaSource.PartitionEnds`: on an end-of-partition answer, after
+    `IdlePartitionAfter`), takes it back when the evidence stops coming, and names
+    every partition again at every start — what a checkpoint says of a partition's end
+    was true when it was written. Clustered circuits are not bound (one time per
+    source, shared between processes).
+  - *The bound on a time in the future* (`CircuitOptions.MaxEventTimeAhead`,
+    `ServiceOptions.MaxEventTimeAhead`, `circuit.maxEventTimeAhead`). A record beyond it
+    is refused at the port, like a record its source could not read: offset consumed,
+    dead letter or fault. It must stay at the port. The verdict depends on the node's
+    clock, so judged inside the circuit an insertion and its later retraction could be
+    judged differently; a record refused at the port never enters, and a keyed input's
+    refused upsert is never the key's row. Do not move it into `WatermarkOperator`.
+  A definition that declares event time after a `Select` or a lookup gets neither: the
+  example's definitions declare on the input and re-declare (`WithEventTime(sel)`)
+  after reshaping. `PartitionWatermarkTests`, `KafkaPartitionWatermarkTests` (two of
+  its tests need the `kafka3` profile, as the service's broker tests do) and the
+  `+partitions` cases of `EventTimeRestartTests` are the checks.
+- A keyed input that forgets its final rows judges a returning key by the records' own
+  times (`RecordEviction.Supersedes`): an upsert later than the held row by more than
+  the lateness is a new record — `UpsertOperator` emits no retraction for the held row —
+  and `KeyedInputPort.DrainInto` peeks before it reads and ends the drain before such
+  an upsert of a key it has already drained, so the two are never in one step (a delta
+  has no order; steps are the only order a sink sees). Both halves are needed: without
+  the cut a step's commands collapse to the last per key and the earlier record is
+  never delivered. Whoever steps a circuit by hand steps until `HasPendingInput` is
+  false (`PipelineTestHarness.StepAsync` does). Within the lateness an upsert is an
+  amendment, and no rule tells a reused key from one there: the guide says ids must
+  not come back within the open window.
 - Per-record eviction (`EvictWhenFinal()` → `FinalizingGroupedStream`; docs/design/shared-tables.md,
   *Per fact*). A record's deadline is one tick after its own event time (the watermark
   keeps ticks ≥ it, `TakeDue` takes ≤ it), tracked by (key, record) in an

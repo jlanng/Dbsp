@@ -2254,6 +2254,21 @@ re-sent. Nothing is skipped by how a key starts now; the clock's keys cannot be 
 input's, because the one is refused as a name and the others contain `#`.) Cost: one
 dictionary entry per source per commit, nothing per step.
 
+*Added in round five of the enrichment service (2026-11-15; enrichment-service.md, S9).*
+Where event time is declared on an input and the input's source names its partitions,
+the clock keeps a time per partition and the source's time is the least over the
+partitions that are not idle. Each named partition adds two entries to the marker:
+`$watermark#s{n}#m{partition}`, its max event time seen (`long.MinValue` for a
+partition named and not yet heard from — that it was named is state), and
+`$watermark#s{n}#i{partition}`, 1 while it is idle and 0 otherwise. The flag has a key
+of its own, with a name that does not change, because a provider may keep the marker by
+setting the keys it is given and removing none: Redis's does (`HSET`), and the first
+build, which wrote the flag into the key's name (`…#a3` or `…#i3`), left both names
+behind on Redis after a partition's first change — `EventTimeRestartTests`' partitioned
+cases found it there and nowhere else. `$watermark#s{n}` stays what it was: the max of
+the records of no named partition. The state manifest is format 8 for it; a format-7
+checkpoint has none of the new keys and resumes as it is.
+
 **The deadlines.** A fourth store kind, `IDeadlineStore<TKey>`
 (`IStorageProvider.CreateDeadlineStore`): key → deadline in ticks, with `AddAll` (add the
 keys not held, asking for a deadline only for those), `Set`, `Remove` and

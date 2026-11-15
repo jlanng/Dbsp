@@ -393,7 +393,7 @@ public class KafkaSourcePositionTests(ITestOutputHelper output)
             BootstrapServers = KafkaEnv.Bootstrap, Topic = topic, FetchBufferKilobytes = 64, PauseAfter = TimeSpan.FromMilliseconds(200),
         };
         await using var source = await KafkaSource.StartAsync(sums.Circuit, sums.Events, options).WaitAsync(Timeout);
-        await KafkaEnv.EventuallyAsync(() => Task.FromResult(source.RecordsRead == Capacity - 1 && source.IsPaused), "the source is held back and paused"); // one place in the channel is the partition's note
+        await KafkaEnv.EventuallyAsync(() => Task.FromResult(source.RecordsRead == Capacity && source.IsPaused), "the source is held back and paused");
 
         // Retention passes the source: everything it has not read is gone.
         await KafkaEnv.DeleteRecordsBeforeAsync(topic, 0, Records);

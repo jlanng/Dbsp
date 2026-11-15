@@ -27,10 +27,19 @@ namespace Enrichment.Pipelines;
 /// What that costs: a trade is late by its time alone. One that <em>first</em> arrives
 /// with an execution time behind the watermark is dropped like a late amendment — it never
 /// reaches the sink, and it is no dead letter; the pipeline counts it as a late record.
-/// The watermark follows the newest execution time read from any partition, so
-/// <c>OpenSeconds</c> must cover how far apart in time the feed can arrive (a partition
-/// read behind the others after an outage), and one trade stamped far ahead closes every
-/// trade behind it until the feed's time catches up.
+/// The watermark follows the newest execution time read — from a topic of several
+/// partitions, the least of what its partitions have brought, so a partition read behind
+/// the others (a backlog, a broker that was away) holds it back and its trades are not
+/// late. A trade stamped more than a day ahead of the node's clock
+/// (<c>circuit.maxEventTimeAhead</c>) is refused as a record in error, where it would
+/// otherwise close every trade behind it.
+/// </para>
+/// <para>
+/// A trade's id is its key for as long as the trade is open and no longer. An upsert of
+/// an id within <c>OpenSeconds</c> of the row the input holds amends that trade; one
+/// later than that by its own execution time is another trade, and the earlier is left
+/// as delivered. So an id must not come back within <c>OpenSeconds</c>, and an amendment
+/// must not move a trade's execution time forward by more.
 /// </para>
 /// </summary>
 [Pipeline("trade-enrichment", Description = "Trades with counterparty (on arrival), instrument and desk (retroactive while open), filtered by notional.")]

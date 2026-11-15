@@ -283,7 +283,7 @@ internal sealed class InputPort<T> : IInputPort, IDeadLetteringInput where T : n
         _eventTime = eventTime;
         _position = new InputPosition(name);
         _channel = InputPorts.CreateChannel<InputEntry<T>>(options);
-        Handle = new InputHandle<T>(_channel.Writer);
+        Handle = new InputHandle<T>(_channel.Writer) { TimesPartitions = eventTime is not null };
     }
 
     public string Name { get; }
@@ -422,7 +422,7 @@ internal sealed class KeyedInputPort<TKey, TValue> : IInputPort, IDeadLetteringI
         _position = new InputPosition(name);
         _routingHash = routingHash;
         _channel = InputPorts.CreateChannel<KeyedInputEntry<TKey, TValue>>(options);
-        Handle = new KeyedInputHandle<TKey, TValue>(_channel.Writer, keySelector);
+        Handle = new KeyedInputHandle<TKey, TValue>(_channel.Writer, keySelector) { TimesPartitions = eventTime is not null };
     }
 
     public string Name { get; }
