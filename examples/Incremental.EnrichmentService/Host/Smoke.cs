@@ -386,16 +386,14 @@ public sealed class Smoke(ExampleOptions options)
     {
         Console.WriteLine();
         Console.WriteLine($"2. 2,000 trades are published over {_shape.TradeKeySpace:N0} trade ids, so a quarter of them reuse the id of an earlier, final trade.");
-        // Two halves, the second once the first is through: never two trades of one id in a
-        // step. Through both pipelines that key the trades by id, each of which cuts its
-        // own steps: on a slow runner large-trades was still on the first half when the
-        // second arrived, took a reused id's two trades for one trade amended, and never
-        // delivered the first of them (19 rows short of the model's 1,095).
-        await PublishAsync(1000);
-        await Claim("the first 1,000 trades are through trade-enrichment and large-trades", () => Task.Run(() =>
-            Model.Difference(_model.Enrichments["trade-enrichment"].Expected(), Sink("trade-enrichment"))
-            ?? Model.Difference(_model.Enrichments["large-trades"].Expected(), Sink("large-trades"))));
-        await PublishAsync(1000);
+        // All at once: a backlog, so the two trades of a reused id can be in the input
+        // together, 375 s of event time apart where a trade stays open for thirty. The
+        // later one is another trade, not an amendment of the earlier — it is later by
+        // more than the open window — and the input never runs the two in one step, so
+        // both are delivered, in order, however the pipeline cuts its steps. (Until round
+        // five the smoke published two halves and waited between them: read in one
+        // step, the two were one trade amended and the first was never delivered.)
+        await PublishAsync(2000);
         await EnrichedIs($"trade-enrichment delivered exactly the {_model.Enrichments["trade-enrichment"].Expected().Count:N0} live trades at or above its minimum notional, each joined to three tables");
         await EnrichedIs($"large-trades, the same definition with other settings and its own state, delivered its {_model.Enrichments["large-trades"].Expected().Count:N0}", "large-trades");
         await SinkIs($"desk-exposure delivered {_model.Exposure!.Expected().Count} window totals — every execution counted once, in the minute of its execution time",
@@ -695,6 +693,14 @@ public sealed class Smoke(ExampleOptions options)
     /// ask as well that the last two readings be within a tenth of the first two; on a
     /// runner they came as 1,602, 1,738, 1,954, 1,952, every one inside the bound.)
     /// </para>
+    /// <para>
+    /// On Kafka the trades topic has several partitions and the watermark is the least
+    /// of what each has brought, so it stands at the newest trade of the partition whose
+    /// newest is oldest — a trade or two behind the feed's newest, and that many more
+    /// trades are open (1,988 against 1,976 in the first run with three partitions). The
+    /// bound allows twenty-five: the last twenty-five trades miss one of three
+    /// partitions once in ten thousand runs.
+    /// </para>
     /// </summary>
     private async Task StateLevelsOffAsync()
     {
@@ -707,7 +713,8 @@ public sealed class Smoke(ExampleOptions options)
             readings.Add((await _admin.GetAsync("pipelines/trade-enrichment"))["pipeline"]!["stateSize"]?["entries"]?.GetValue<long>() ?? -1);
         }
         var open = _model.Enrichments["trade-enrichment"].OpenTrades;
-        var bound = 8L * (open + batch + 1);
+        var behind = _kafka is null ? 0 : 25;
+        var bound = 8L * (open + batch + 1 + behind);
         await Claim($"trade-enrichment's state levels off as the feed goes on: {string.Join(", ", readings.Select(r => r.ToString("N0")))} entries after the four batches, " +
                     $"at most 8 per open trade and per trade of the last batch ({bound:N0}), where keeping every trade would be four per trade id ({4 * _shape.TradeKeySpace:N0})",
             () => Unless(readings.All(r => r > 0 && r <= bound), $"the readings were {string.Join(", ", readings)}"));
@@ -761,20 +768,34 @@ public sealed class Smoke(ExampleOptions options)
             await process.WaitForExitAsync();
         }
         _admin = standby;
+
+        // The first execution the new leader reads is a straggler: it carries the time of
+        // the feed's first trade, in windows that closed long ago under node a. On Kafka
+        // the 500 trades are published while nobody leads: the new leader finds them as a
+        // backlog on the three partitions of the topic.
+        _shape.Stragglers.Add(_model.Trades);
+        if (_kafka is not null)
+            await PublishAsync(500);
         await Claim("b leads", async () => await RoleAsync(standby) is "Leader" ? null : "b is not the leader");
         Console.WriteLine($"        ({moved.Elapsed.TotalSeconds:N1} s from {(_kafka is null ? "the request" : "the kill")} to b ready as leader)");
         await Claim("its six pipelines are Running, on the versions the catalog names", async () =>
             await RunningAsync("trader-desks", "sanctions-alerts", "credit-alerts") ?? await VersionAsync("trade-enrichment", _v2)
             ?? await VersionAsync("desk-exposure", _v2) ?? await VersionAsync("execution-quality", _v2));
 
-        // The first execution the new leader reads is a straggler: it carries the time of
-        // the feed's first trade, in windows that closed long ago under node a.
-        _shape.Stragglers.Add(_model.Trades);
-        await PublishAsync(500);
+        if (_kafka is null)
+            await PublishAsync(500);
         await EnrichedIs("500 more trades: trade-enrichment's sink equals the model — state, offsets and tables all carried over");
         await SinkIs("so does desk-exposure's, and the first of those trades was many minutes of event time late: b dropped it as a would have, " +
                      "because the watermark came over with the checkpoint — no closed window was reopened", "desk-exposure", ExpectedExposure);
         await QualityIs("and execution-quality's: the stream join's state, its keys still to close, and two input positions, one of them " + (_kafka is null ? "a file and a line" : "on a second topic"));
+        if (_kafka is not null)
+            await Claim($"those 500 were a backlog on the trades topic's {KafkaStack.FeedPartitions} partitions when b took over, and b dropped one record as late — the straggler: " +
+                        "the watermark is the least of what the partitions have brought, so the partition read last was not behind it", async () =>
+            {
+                var exposure = (await _admin.GetAsync("pipelines/desk-exposure"))["pipeline"]!["lateRecords"]!.GetValue<long>();
+                var enrichment = (await _admin.GetAsync("pipelines/trade-enrichment"))["pipeline"]!["lateRecords"]!.GetValue<long>();
+                return Unless(exposure == 1 && enrichment == 1, $"desk-exposure dropped {exposure} as late and trade-enrichment {enrichment}");
+            });
         await Claim("b's own checkpoints carry the watermark on from where a's stood", async () =>
         {
             var now = Watermark(await _admin.GetAsync("pipelines/desk-exposure"));

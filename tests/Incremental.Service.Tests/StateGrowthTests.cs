@@ -16,7 +16,9 @@ public class StateGrowthTests
 {
     // Ahead of the clock: the node's own sampler reads once a second at the real time, and
     // a reading earlier than the last one taken is not a new sample, so it cannot interleave.
-    private static readonly DateTimeOffset T0 = new(2026, 1, 1, 12, 0, 0, TimeSpan.Zero);
+    // Trades stamped then are far beyond ServiceOptions.MaxEventTimeAhead, which these
+    // tests therefore turn off.
+    private static readonly DateTimeOffset T0 = new(2100, 1, 1, 12, 0, 0, TimeSpan.Zero);
     private static readonly TimeSpan Period = TimeSpan.FromMinutes(15);
 
     private const long NoWatermark = long.MinValue;
@@ -180,6 +182,7 @@ public class StateGrowthTests
         await using var pipeline = await Testing.PipelineTestHarness.For<OpenTrades>()
             .Settings($$"""{ "openSeconds": 3600, "countPerTrade": {{(countPerTrade ? "true" : "false")}} }""")
             .Table(Acme.Contracts.Tables.Instruments, Instruments(10))
+            .MaxEventTimeAhead(null)
             .StartAsync();
         var trades = pipeline.KeyedInput<long, TimedTrade>("trades");
         var growth = new StateGrowth();
@@ -252,7 +255,7 @@ public class StateGrowthTests
         });
         listener.Start();
 
-        await using var service = await StartAsync(nodeId: node);
+        await using var service = await StartAsync(nodeId: node, options: o => o.MaxEventTimeAhead = null);
         await service.DeclareInstrumentsAsync(Instruments(10));
         await service.DeployAsync(Spec("open", "open-trades", "lt-in", "lt-out", settings: """{ "openSeconds": 10 }"""));
         var input = service.Memory.KeyedLog<long, TimedTrade>("lt-in");
@@ -274,7 +277,7 @@ public class StateGrowthTests
         Assert.Equal([1L, 2L, 5L], sink.Rows.Keys.Order());
         Assert.Equal(0, service.Pipelines.Get("open").DeadLetters);
         var said = Assert.Single(service.Node.RecentEvents(), e => e.Subject == "open" && e.Message.StartsWith("late records:"));
-        Assert.StartsWith("late records: 2 dropped behind the watermark (2026-01-01 12:01:30Z), 2 since this node first ran it", said.Message);
+        Assert.StartsWith("late records: 2 dropped behind the watermark (2100-01-01 12:01:30Z), 2 since this node first ran it", said.Message);
 
         // More of them: counted, and not said again within the ten minutes.
         input.Upsert(new TimedTrade(6, 2, "t", T0.AddSeconds(70)));
@@ -312,7 +315,7 @@ public class StateGrowthTests
         // Off until the first reading below is about to be taken: the node's own sampler
         // reads once a second at the real time, and a reading of its own before the first
         // one here would be the run's first sample.
-        await using var service = await StartAsync(nodeId: node, options: o => o.StateGrowthAlarmAfter = TimeSpan.Zero);
+        await using var service = await StartAsync(nodeId: node, options: o => (o.StateGrowthAlarmAfter, o.MaxEventTimeAhead) = (TimeSpan.Zero, null));
         await service.DeclareInstrumentsAsync(Instruments(10));
         // "enrich" joins every trade to its instrument and keeps it: one fact per trade, for
         // ever. "counts" keeps a count per trader: five entries however many trades.

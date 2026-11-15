@@ -102,7 +102,14 @@ public sealed partial class KafkaStack : IAsyncDisposable
         await connect.WaitUntilRunningAsync(Connector, TimeSpan.FromSeconds(60));
 
         using var admin = new AdminClientBuilder(new AdminClientConfig { BootstrapServers = Bootstrap }).Build();
-        var topics = PlainTopics.Select(topic => new TopicSpecification { Name = topic, NumPartitions = 1, ReplicationFactor = 1 }).ToList();
+        // The two feeds have several partitions, as a production topic has: a pipeline's
+        // watermark is then the least over a feed's partitions (event time is declared
+        // on the inputs), and a takeover's backlog, read a partition at a time, is not
+        // late. Records are placed by key — a trade's id, a quote's instrument.
+        var topics = PlainTopics.Select(topic => new TopicSpecification
+        {
+            Name = topic, NumPartitions = topic == TradesTopic || topic == QuotesTopic ? FeedPartitions : 1, ReplicationFactor = 1,
+        }).ToList();
         topics.AddRange(SinkTopics.Select(topic => new TopicSpecification
         {
             Name = topic, NumPartitions = 1, ReplicationFactor = 1,
@@ -135,13 +142,24 @@ public sealed partial class KafkaStack : IAsyncDisposable
     private IProducer<byte[], byte[]> Producer => _producer ??= new ProducerBuilder<byte[], byte[]>(
         new ProducerConfig { BootstrapServers = Bootstrap, LingerMs = 5, EnableIdempotence = true }).Build();
 
-    /// <summary>How many trades the topic holds: with one partition and one producer at a
-    /// time, record <c>n</c> of the feed is at offset <c>n</c>.</summary>
-    public long TradesPublished()
+    /// <summary>How many partitions the trades and quotes topics have.</summary>
+    public const int FeedPartitions = 3;
+
+    /// <summary>How many trades the topic holds: its producers write no transactions, so
+    /// every offset of every partition is a record, and with one producer at a time the
+    /// feed's first <c>n</c> records are what the partitions hold between them.</summary>
+    public long TradesPublished() => Published(TradesTopic);
+
+    private long Published(string topic)
     {
         using var consumer = new ConsumerBuilder<byte[], byte[]>(
             new ConsumerConfig { BootstrapServers = Bootstrap, GroupId = "enrichment-example-probe", EnableAutoCommit = false }).Build();
-        return consumer.QueryWatermarkOffsets(new TopicPartition(TradesTopic, 0), TimeSpan.FromSeconds(10)).High.Value;
+        using var admin = new DependentAdminClientBuilder(consumer.Handle).Build();
+        var partitions = admin.GetMetadata(topic, TimeSpan.FromSeconds(10)).Topics.Single().Partitions.Count;
+        long total = 0;
+        for (var partition = 0; partition < partitions; partition++)
+            total += consumer.QueryWatermarkOffsets(new TopicPartition(topic, partition), TimeSpan.FromSeconds(10)).High.Value;
+        return total;
     }
 
     /// <summary>Appends the feed's records <c>from … from + count - 1</c>: keyed by trade
@@ -161,12 +179,7 @@ public sealed partial class KafkaStack : IAsyncDisposable
     }
 
     /// <summary>How many quotes the quotes topic holds.</summary>
-    public long QuotesPublished()
-    {
-        using var consumer = new ConsumerBuilder<byte[], byte[]>(
-            new ConsumerConfig { BootstrapServers = Bootstrap, GroupId = "enrichment-example-probe", EnableAutoCommit = false }).Build();
-        return consumer.QueryWatermarkOffsets(new TopicPartition(QuotesTopic, 0), TimeSpan.FromSeconds(10)).High.Value;
-    }
+    public long QuotesPublished() => Published(QuotesTopic);
 
     /// <summary>Appends quotes to the quotes topic, keyed by instrument.</summary>
     public async Task ProduceQuotesAsync(IEnumerable<Quote> quotes)
