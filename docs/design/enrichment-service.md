@@ -7284,11 +7284,19 @@ shut down in turn: 0.7 s. A broker away 64 s with the leader killed half way: th
 standby led 3.4 s after the kill. A takeover with a broker shut down 1.5 s before:
 3.3 s.
 
-**CI.** Each of the step's first three pushes had its own run and all three were green
-(43701879223, 43707559251, 43707944137: build-and-test, connector-stack,
-perf-contracts). The runs of the later pushes, and the `broker-failures` job started by
-hand on the last commit, finish after this text is committed: they are in the step's
-report.
+**CI.** The step's first four pushes each had a run and all four were green
+(43701879223, 43707559251, 43707944137, 43708659102: build-and-test, connector-stack,
+perf-contracts). The fifth (43710439541) was red in build-and-test, on a test this
+step had not touched: `FileConnectorTests.The_append_sink_holds_each_record_once_across_a_restart…`
+read the pipeline's committed step as soon as the sink's objects were there, and a
+step's objects are there before the step is committed (commit after delivery) — on
+that runner the first commit had not happened and there was no step to read. It is
+the race S8's CI section fixed in eight other tests (`TestService.Settled`), in one it
+missed; the test waits for the checkpoint now. A run of the same commit started by
+hand a few seconds later (43710447803) passed build-and-test, connector-stack and
+perf-contracts. The run of the push that carries this paragraph, and the
+`broker-failures` job started by hand on it, finish after it is committed: they are
+in the step's report.
 
 **Left undone.**
 

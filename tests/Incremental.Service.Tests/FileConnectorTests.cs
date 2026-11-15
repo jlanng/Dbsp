@@ -264,6 +264,9 @@ public class FileConnectorTests : IDisposable
             await first.DeployAsync(spec);
             log.AppendRange(trades.Take(120));
             await EventuallyAsync(async () => (await AppendsAsync<Trade>("out/big-")).Order(ById).SequenceEqual(BigTrades.Model(trades.Take(120))), "the first run's records, and no ghost");
+            // The objects are there before their step is committed (commit after delivery):
+            // on a runner the first commit had not happened yet, and there was no step to read.
+            await first.Settled();
             committed = first.Pipelines.Get("big").CommittedStep!.Value;
             Assert.All(await FileSinkFormat.StepObjectsAsync(_store, "out/big-"), name =>
             {
