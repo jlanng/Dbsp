@@ -6849,7 +6849,9 @@ two five-second stretches have forgotten faster deliveries, so for up to ten sec
 after brokers turn slow the tolerance was half of what it had been. A test written to
 find out — a leader whose every commit takes 1.2 s, a takeover timeout of 2 s, a
 standby with no probe — had the standby fence the leader in three runs of three on
-that build, and in none of three with the leadership as it was before S8. With a probe that answers the standby would have
+that build, and in none of three with the leadership as it was before S8; the same
+again, three and three, with the clocks the test now has (1.8 s against 3 s, wider for
+a slow machine). With a probe that answers the standby would have
 waited for the ceiling, so the service as the guide configures it was not exposed
 unless the probe failed in the same seconds; a deployment without `PeerProbe`, and any
 user of `KafkaLeadership` without one, was. The second cost was quieter: the delivery
@@ -6866,8 +6868,8 @@ untouched — the dead leader's last heartbeat was 8.9 s old — and what is giv
 the case nobody measured: a dead leader's last record read late by less than the
 takeover timeout starts the silence again, as it always did (Open for James 80).
 `KafkaLeadershipTests.A_leader_whose_commits_are_slow_and_inside_the_takeover_timeout_is_left_alone`
-is the test (it says so and checks nothing on a machine where a commit took the whole
-timeout), and `The_silence_is_counted…` has a third record, half a takeover timeout
+is the test (it says so and checks nothing on a machine where a commit took four
+fifths of the timeout), and `The_silence_is_counted…` has a third record, half a takeover timeout
 old. Four mutations, all killed: every record counted from its writing (S8's first
 build: both tests fail), every record heard now (before S8: the dead leader's
 heartbeat calls the takeover off again), "younger" meaning within the ceiling,

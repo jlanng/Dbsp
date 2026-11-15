@@ -2574,7 +2574,8 @@ worth knowing before believing a number from a container cluster.
   transaction begins and readable when it commits, so with commits that take *c* the
   record is *c* old when it is read and the next one is read *c* later: counted from
   the writing the leader is silent for 2*c*, counted from the reading for *c*. A
-  leader whose commits took 1.2 s against a takeover timeout of 2 s, committing all
+  leader whose commits took 1.2 s against a takeover timeout of 2 s (and 1.8 s
+  against 3 s), committing all
   along, was taken over from by a standby without a probe in three runs of three
   (`KafkaLeadershipTests.A_leader_whose_commits_are_slow_and_inside_the_takeover_timeout_is_left_alone`,
   written to find out); the tolerance for slow brokers had been halved, for as long

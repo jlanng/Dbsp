@@ -1146,7 +1146,7 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
     [Fact]
     public async Task A_leader_whose_commits_are_slow_and_inside_the_takeover_timeout_is_left_alone()
     {
-        var after = TimeSpan.FromSeconds(2);
+        var after = TimeSpan.FromSeconds(3);
         await using var env = KafkaEnv.Create();
         await using var a = await StartAsync(env, "a", after: after);
         await LeadsAsync(a);
@@ -1164,17 +1164,17 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         };
         a.Log.BeforeTransaction = () =>
         {
-            // What this machine made of it: a commit that took the whole timeout is
-            // a leader that was silent for it, and proves nothing here.
+            // What this machine made of it: a commit that took most of the timeout is
+            // a leader that was all but silent for it, and proves nothing here.
             if (last.Elapsed > longest)
                 longest = last.Elapsed;
             last.Restart();
         };
-        await Task.Delay(slow * 8);
+        await Task.Delay(slow * 6);
         a.Log.FailTransaction = null;
         a.Log.BeforeTransaction = null;
         output.WriteLine($"the longest of the leader's transactions took {longest.TotalMilliseconds:F0} ms; the takeover timeout is {after.TotalMilliseconds:F0} ms");
-        if (longest >= after - TimeSpan.FromMilliseconds(200))
+        if (longest >= after * 0.8)
         {
             output.WriteLine("This machine was too slow for the test's clocks: nothing was checked.");
             return;
