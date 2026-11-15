@@ -260,7 +260,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             generation?.Circuit.CommittedStep, committed, faults, runtime.Shape, sources, sinks, runtime.History.After(),
             runtime.RolledBack, spec.Previous is not null, DeadLetterSink(runtime, spec, generation), runtime.LastStart, stateSize,
             runtime.Growth.Since, runtime.Growth.Current is { } growing ? new PipelineStateGrowth(growing.Store, growing.Since, growing.WatermarkStalled) : null,
-            Volatile.Read(ref runtime.LateRecords), generation?.Circuit.CurrentWatermark);
+            Volatile.Read(ref runtime.LateRecords), generation?.Circuit.CurrentWatermark, generation?.Circuit.WatermarkHeldBy);
     }
 
     private DeadLetterSinkStatus? DeadLetterSink(PipelineRuntime runtime, PipelineSpec spec, Generation? generation)
@@ -575,6 +575,8 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         ServiceNames.Validate(spec.Plugin, "plugin name");
         if (spec.Circuit.Workers < 1)
             throw ServiceException.Invalid("circuit.workers must be at least 1.");
+        if (spec.Circuit.MaxEventTimeAhead is { } ahead && ahead < TimeSpan.Zero)
+            throw ServiceException.Invalid("circuit.maxEventTimeAhead must not be negative.");
         spec = spec with { Version = context.Plugins.ResolveVersion(spec.Plugin, spec.Version) };
         return (spec, await context.Plugins.AcquireAsync(spec.Plugin, spec.Version, cancellationToken).ConfigureAwait(false));
     }
@@ -1954,6 +1956,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             CheckpointMaxDelay = spec.Circuit.CheckpointMaxDelay,
             ErrorPolicy = spec.Circuit.ErrorPolicy,
             MaxStepItemsPerInput = spec.Circuit.MaxStepItemsPerInput ?? 8192,
+            MaxEventTimeAhead = spec.Circuit.MaxEventTimeAhead ?? context.Options.MaxEventTimeAhead,
             // With a dead-letter sink bound, a dropped record is in the sink before the
             // checkpoint that passes it.
             AcknowledgeDeadLetters = spec.DeadLetters is not null,

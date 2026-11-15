@@ -55,13 +55,20 @@ public sealed class ExecutionQuality : IPipelineDefinition<ExecutionQuality.Sett
 
         // One slot per input; the spec binds each to a connector of its own.
         var executions = p.Input<Trade>("executions")
+            // Event time is declared on the input, before anything reshapes the record:
+            // only the input knows which partition a record came from, so only here is
+            // the watermark the least over the topic's partitions — a partition that is
+            // behind the others holds it back instead of having its records dropped as
+            // late — and only here is a record stamped far ahead refused.
+            .WithEventTime(t => t.ExecutedAt, lateness)
             // A table lookup before the stream join: the instrument's asset class, as of
             // arrival. Executions only ever arrive, so the lookup remembers nothing. After
             // the join it would have to (the join takes rows back), one entry per
             // execution with nothing to close them: state that grows for ever.
             .LookupAppendOnly(p.Table(Reference.Instruments), t => t.InstrumentId,
                 (t, i) => new ClassedTrade(i.AssetClass, t.InstrumentId, t.ExecutedAt, t.Price))
-            .WithEventTime(t => t.ExecutedAt, lateness);
+            // The new shape says where its time is; the clock is the input's.
+            .WithEventTime(t => t.ExecutedAt);
         var quotes = p.Input<Quote>("quotes").WithEventTime(q => q.At, lateness);
 
         var priced = executions

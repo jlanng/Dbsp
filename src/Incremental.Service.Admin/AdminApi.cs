@@ -729,6 +729,8 @@ internal static class AdminApi
             // Insertions dropped behind the watermark since this node first ran it, and the watermark now.
             lateRecords = p.LateRecords,
             watermark = p.Watermark,
+            // What the watermark waits for: the input and, where the source has several, the partition that is behind.
+            watermarkHeldBy = p.WatermarkHeldBy is null ? null : new { source = p.WatermarkHeldBy.Source, input = p.WatermarkHeldBy.Input, partition = p.WatermarkHeldBy.Partition },
             deadLetterSink = p.DeadLetterSink is null ? null : new
             {
                 connector = p.DeadLetterSink.Connector,

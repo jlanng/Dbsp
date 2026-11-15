@@ -41,6 +41,14 @@
 
   // ── overview ────────────────────────────────────────────────────────────────────────
 
+  // What a pipeline's watermark waits for, as a sentence; '' when the node does not say.
+  function heldBy(hold) {
+    if (!hold || !hold.input) return '';
+    return hold.partition === null || hold.partition === undefined
+      ? ` It waits for input ${hold.input}.`
+      : ` It waits for partition ${hold.partition} of input ${hold.input}: the source has not read that partition to its end, and until it has, nothing closes.`;
+  }
+
   // Which kinds of event the overview's list leaves out: this page's choice, kept while the page is open.
   const hiddenKinds = new Set();
   const EVENTS_SHOWN = 40;
@@ -387,7 +395,7 @@
         'Their event time was behind the watermark when they reached the pipeline',
         p.watermark ? [' (it is now at ', h('span', { class: 'mono' }, stamp(p.watermark)), ')'] : '',
         ': an amendment of a record that is final, or a record never seen before — a record is late by its time alone. ',
-        'They are in no dead letter. The watermark follows the newest event time read, less the lateness the definition declares, so one record stamped far ahead makes those behind it late.'),
+        'They are in no dead letter. The watermark follows the newest event time read — from a topic of several partitions, the least of what its partitions have brought — less the lateness the definition declares. A record stamped further ahead of the node’s clock than circuit.maxEventTimeAhead allows is refused as a record in error and moves nothing.'),
       p.state === 'Built' && notice('info', 'This node is a standby: it has built this pipeline’s circuit on the state it follows and starts it when it takes over. Rates are on the leader.'),
       p.state === 'Unbuilt' && notice('info', 'This node has not built this pipeline’s circuit: it follows its state as bytes and builds the circuit if it takes over. ' + ((detail.history || []).filter(t => t.state === 'Unbuilt' && t.why).map(t => t.why).pop() || 'A standby builds a pipeline once the leader has run it; one that writes a table is built at takeover.')),
 
@@ -1005,7 +1013,8 @@
           h('strong', null, `${detail.pipeline.stateGrowth ? detail.pipeline.stateGrowth.store : 'A store'} has grown without a pause since `, timeEl(detail.pipeline.stateGrowingSince), '. '),
           ...(detail.pipeline.stateGrowth && detail.pipeline.stateGrowth.watermarkStalled
             ? ['What it holds closes on the watermark, and the watermark has not moved in that time: nothing it holds can become final. ',
-              'The watermark is the lowest of the event-time inputs’, so an input with no records — or one whose records are stamped far behind the others — holds it back.']
+              'The watermark is the lowest of the event-time inputs’, so an input with no records — or one whose records are stamped far behind the others — holds it back.',
+              heldBy(detail.pipeline.watermarkHeldBy)]
             : ['A pipeline that keeps something per record — a retroactive join, a remembered lookup, a keyed input, a total per record — holds it until something closes it. ',
               'Over a stream of facts, give the input event time and forget each record once it is final (EvictWhenFinal); see the guide, “Bounding a join over a stream of facts”.'])),
         h('div', { class: 'table-wrap' }, grid([

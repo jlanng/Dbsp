@@ -359,6 +359,13 @@ public sealed record PipelineCircuitOptions
     public TimeSpan? CheckpointMaxDelay { get; init; }
     public RecordErrorPolicy ErrorPolicy { get; init; } = RecordErrorPolicy.Fault;
     public int? MaxStepItemsPerInput { get; init; }
+
+    /// <summary><see cref="CircuitOptions.MaxEventTimeAhead"/> for this pipeline: how far
+    /// ahead of the node's clock (and of the newest event time an input has brought) a
+    /// record's event time may be before the record is one in error. Null (the default)
+    /// is the node's <see cref="ServiceOptions.MaxEventTimeAhead"/>. Set it for a
+    /// pipeline whose event time is rightly in the future — a settlement date, say.</summary>
+    public TimeSpan? MaxEventTimeAhead { get; init; }
 }
 
 /// <summary>
@@ -501,7 +508,9 @@ public sealed record SourceSlotStatus(string Slot, SourceStats Stats, DateTimeOf
 /// insertions the pipeline's circuits dropped at an event-time declaration for being
 /// behind the watermark, since this node first ran it (<see cref="Circuit.LateRecords"/>,
 /// read once a second) — they are in no dead letter and no fault. <c>Watermark</c>: the
-/// running circuit's event-time watermark; null when it has none or does not run here.</remarks>
+/// running circuit's event-time watermark; null when it has none or does not run here.
+/// <c>WatermarkHeldBy</c>: what that watermark waits for (<see cref="Circuit.WatermarkHeldBy"/>)
+/// — the input and, on a topic of several partitions, the partition that is behind.</remarks>
 public sealed record PipelineStatus(
     string Id, PipelineState State, DesiredState Desired, long Generation, string Plugin, string Version, string Definition,
     string? BlockedOn, DateTimeOffset? Since, string? Operation, int Restarts, long DeadLetters,
@@ -517,7 +526,8 @@ public sealed record PipelineStatus(
     DateTimeOffset? StateGrowingSince = null,
     PipelineStateGrowth? StateGrowth = null,
     long LateRecords = 0,
-    DateTimeOffset? Watermark = null);
+    DateTimeOffset? Watermark = null,
+    WatermarkHold? WatermarkHeldBy = null);
 
 /// <summary>The store that is flagged as growing (<see cref="ServiceOptions.StateGrowthAlarmAfter"/>):
 /// its name, since when, and whether it is a store that closes on the watermark and the

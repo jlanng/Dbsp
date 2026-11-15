@@ -449,6 +449,21 @@ public sealed class Circuit : IAsyncDisposable
     /// </summary>
     public long LateRecords => _watermarkClock?.LateRecords ?? 0;
 
+    /// <summary>Whether an input holds records no step has taken yet. After a step it is
+    /// true when the step's share was full (<see cref="CircuitOptions.MaxStepItemsPerInput"/>)
+    /// or an input left a record for the next step; a caller that steps the circuit by
+    /// hand and wants everything it sent taken steps until this is false.</summary>
+    public bool HasPendingInput
+    {
+        get
+        {
+            foreach (var input in _inputs)
+                if (input is not ITablePort && input.HasPending)
+                    return true;
+            return false;
+        }
+    }
+
     /// <summary>What the watermark waits for, as of the end of the last step: the
     /// event-time source whose time is the lowest and, where its input's source names
     /// partitions, the partition of it that is behind (see

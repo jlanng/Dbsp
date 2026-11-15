@@ -389,11 +389,12 @@ public class KafkaSourceTests(ITestOutputHelper output)
             int.Parse(Encoding.UTF8.GetString(data[..data.IndexOf((byte)'|')]));
         await using var source = await KafkaSource.StartAsync(circuit, input, options, id).WaitAsync(Timeout);
 
-        // Stalled: the channel fills, and the source has read exactly one record more than
-        // it holds — the one it is waiting to write.
-        await KafkaEnv.EventuallyAsync(() => Task.FromResult(source.RecordsRead == Capacity), "the source filled the input and stopped");
+        // Stalled: the channel fills — two of its places with the notes that name the
+        // topic's two partitions — and the source has read exactly one record more than
+        // it holds: the one it is waiting to write.
+        await KafkaEnv.EventuallyAsync(() => Task.FromResult(source.RecordsRead == Capacity - 2), "the source filled the input and stopped");
         await Task.Delay(TimeSpan.FromSeconds(2));
-        Assert.Equal(Capacity, source.RecordsRead);
+        Assert.Equal(Capacity - 2, source.RecordsRead);
         Assert.Equal(pause, source.IsPaused);
         Assert.Equal(pause ? 1 : 0, source.Pauses);
 

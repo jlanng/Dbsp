@@ -16,7 +16,7 @@ public class StateGrowthTests
 {
     // Ahead of the clock: the node's own sampler reads once a second at the real time, and
     // a reading earlier than the last one taken is not a new sample, so it cannot interleave.
-    private static readonly DateTimeOffset T0 = new(2100, 1, 1, 12, 0, 0, TimeSpan.Zero);
+    private static readonly DateTimeOffset T0 = new(2026, 1, 1, 12, 0, 0, TimeSpan.Zero);
     private static readonly TimeSpan Period = TimeSpan.FromMinutes(15);
 
     private const long NoWatermark = long.MinValue;
@@ -274,7 +274,7 @@ public class StateGrowthTests
         Assert.Equal([1L, 2L, 5L], sink.Rows.Keys.Order());
         Assert.Equal(0, service.Pipelines.Get("open").DeadLetters);
         var said = Assert.Single(service.Node.RecentEvents(), e => e.Subject == "open" && e.Message.StartsWith("late records:"));
-        Assert.StartsWith("late records: 2 dropped behind the watermark (2100-01-01 12:01:30Z), 2 since this node first ran it", said.Message);
+        Assert.StartsWith("late records: 2 dropped behind the watermark (2026-01-01 12:01:30Z), 2 since this node first ran it", said.Message);
 
         // More of them: counted, and not said again within the ten minutes.
         input.Upsert(new TimedTrade(6, 2, "t", T0.AddSeconds(70)));

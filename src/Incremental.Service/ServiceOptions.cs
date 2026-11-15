@@ -77,6 +77,19 @@ public sealed class ServiceOptions
     /// </summary>
     public TimeSpan StateGrowthAlarmAfter { get; set; } = TimeSpan.FromMinutes(30);
 
+    /// <summary>
+    /// How far ahead of this node's clock a record's event time may be
+    /// (<see cref="CircuitOptions.MaxEventTimeAhead"/>), for every pipeline whose spec does
+    /// not say otherwise (<see cref="PipelineCircuitOptions.MaxEventTimeAhead"/>). A record
+    /// beyond it is a record in error: a dead letter under that policy, a fault of the
+    /// pipeline under the other — and not what it was before this bound, a record that
+    /// moved the watermark to its time and made every record after it late. It applies
+    /// where event time is declared on the input. Default one day: far above any skew
+    /// between clocks, far below the stamp of a record whose time is in the wrong unit
+    /// or the wrong century. Null turns it off.
+    /// </summary>
+    public TimeSpan? MaxEventTimeAhead { get; set; } = TimeSpan.FromDays(1);
+
     /// <summary>The drain a pipeline's teardown is given before its outputs are abandoned.</summary>
     public TimeSpan StopTimeout { get; set; } = TimeSpan.FromSeconds(20);
 

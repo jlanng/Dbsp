@@ -147,6 +147,9 @@ public sealed class PipelineTestHarness : IAsyncDisposable
     /// dead letters; a node shows the same count on the pipeline's page.</summary>
     public long LateRecords => _circuit.LateRecords;
 
+    /// <summary>What the watermark waits for; see <see cref="Circuit.WatermarkHeldBy"/>.</summary>
+    public WatermarkHold? WatermarkHeldBy => _circuit.WatermarkHeldBy;
+
     /// <summary>
     /// What the pipeline's state holds as of the last step: entries per store and in all,
     /// the same count a node shows as the pipeline's state entries. A store is named after
@@ -172,7 +175,16 @@ public sealed class PipelineTestHarness : IAsyncDisposable
     /// exception under the <c>Fault</c> policy, a retraction on an append sink — is thrown
     /// from here.
     /// </summary>
-    public Task StepAsync(CancellationToken cancellationToken = default) => _circuit.StepAsync(cancellationToken);
+    public async Task StepAsync(CancellationToken cancellationToken = default)
+    {
+        // More than one step of the circuit where an input holds a record back for the
+        // next: a keyed input that forgets its final rows never runs two records of one
+        // key in a step (KeyedInputStream.WithEventTime). A running pipeline's pump does
+        // the same.
+        do
+            await _circuit.StepAsync(cancellationToken).ConfigureAwait(false);
+        while (_circuit.HasPendingInput);
+    }
 
     private async Task StartAsync()
     {
@@ -266,6 +278,8 @@ public sealed class PipelineTestHarness : IAsyncDisposable
         private string? _id;
         private int _workers = 1;
         private RecordErrorPolicy _errorPolicy = RecordErrorPolicy.Fault;
+        private TimeSpan? _maxEventTimeAhead = new ServiceOptions().MaxEventTimeAhead;
+        private TimeProvider _clock = TimeProvider.System;
         private IServiceProvider? _services;
         private ILoggerFactory? _logging;
 
@@ -323,6 +337,24 @@ public sealed class PipelineTestHarness : IAsyncDisposable
             return this;
         }
 
+        /// <summary>How far ahead of the clock a record's event time may be, as a spec's
+        /// <c>circuit.maxEventTimeAhead</c>; the node's default (a day) unless set, null
+        /// for no bound. A test whose records are stamped in the future sets one of the
+        /// two — or the <see cref="Clock"/>.</summary>
+        public Builder MaxEventTimeAhead(TimeSpan? bound)
+        {
+            _maxEventTimeAhead = bound;
+            return this;
+        }
+
+        /// <summary>The clock <see cref="MaxEventTimeAhead"/> is judged against; the
+        /// system's unless set.</summary>
+        public Builder Clock(TimeProvider clock)
+        {
+            _clock = clock;
+            return this;
+        }
+
         /// <summary>The worker count, as a spec's <c>circuit.workers</c>. A definition
         /// whose keyed state is wrongly partitioned shows it only with more than one.</summary>
         public Builder Workers(int workers)
@@ -365,6 +397,8 @@ public sealed class PipelineTestHarness : IAsyncDisposable
                 // A checkpoint store makes a step wait for its sinks, as it does in the service.
                 Storage = storage,
                 ErrorPolicy = _errorPolicy,
+                MaxEventTimeAhead = _maxEventTimeAhead,
+                TimeProvider = _clock,
                 AcknowledgeDeadLetters = true,
                 InputChannelCapacity = 1 << 20,
                 MaxStepItemsPerInput = 1 << 20,

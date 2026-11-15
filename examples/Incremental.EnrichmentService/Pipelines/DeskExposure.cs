@@ -29,9 +29,11 @@ public sealed class DeskExposure : IPipelineDefinition<DeskExposure.Settings>
     public void Build(PipelineBuilder p, Settings s)
     {
         var exposure = p.Input<Trade>("executions")
+            // On the input: the watermark is then kept per partition of its topic.
+            .WithEventTime(t => t.ExecutedAt, TimeSpan.FromSeconds(s.LatenessSeconds))
             .LookupAppendOnly(p.Table(Reference.TraderDesks), t => t.TraderId,
                 (t, td) => new DeskExecution(Group(td), t.Quantity * t.Price, t.ExecutedAt))
-            .WithEventTime(x => x.ExecutedAt, TimeSpan.FromSeconds(s.LatenessSeconds))
+            .WithEventTime(x => x.ExecutedAt)
             .GroupBy(x => x.Group)
             .TumblingWindow(TimeSpan.FromSeconds(s.WindowSeconds))
             .Sum(x => x.Notional).Named("exposure")

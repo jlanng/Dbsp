@@ -109,13 +109,13 @@ public sealed class KafkaSourceOptions
 
     /// <summary>Circuit inputs only: how often the source asks again whether a partition
     /// it stands at the end of is still at its end (it seeks to where it stands, and the
-    /// broker's answer says so). A partition whose leader is away does not answer: after
-    /// three intervals without one the source no longer calls it idle, and it holds the
-    /// watermark until it is read to its end again and has stood there for
-    /// <see cref="IdlePartitionAfter"/> — which is what keeps the records that waited
-    /// for the broker from being late. A lateness shorter than three intervals is not
-    /// covered: the other partitions can move the watermark that far before the source
-    /// knows. Default 1 s.</summary>
+    /// broker's answer says so, within a second). A partition whose leader is away does
+    /// not answer: after three intervals and two seconds without an answer the source no
+    /// longer calls it idle, and it holds the watermark until it is read to its end again
+    /// and has stood there for <see cref="IdlePartitionAfter"/> — which is what keeps the
+    /// records that waited for the broker from being late. A lateness shorter than that
+    /// (5 s by default) is not covered: the other partitions can move the watermark that
+    /// far before the source knows. Default 1 s.</summary>
     public TimeSpan IdlePartitionConfirmEvery { get; init; } = TimeSpan.FromSeconds(1);
 
     /// <summary>How long start-up requests (metadata, offsets) may take, retries of a
@@ -750,9 +750,10 @@ public sealed class KafkaSource : IAsyncDisposable
     /// it seeks to where it stands, which makes the client fetch afresh and report the
     /// end again — every <see cref="KafkaSourceOptions.IdlePartitionConfirmEvery"/>: an
     /// answer is evidence that the partition's leader is there and has nothing more.
-    /// The source calls a partition idle once it has stood at the end, with fresh
-    /// evidence, for <see cref="KafkaSourceOptions.IdlePartitionAfter"/>, and takes that
-    /// back when the evidence is three intervals old: a broker that is away does not
+    /// The source calls a partition idle on an answer that finds it has stood at the end
+    /// for <see cref="KafkaSourceOptions.IdlePartitionAfter"/> — never on the passing of
+    /// time alone, which is all a partition without a leader offers — and takes that
+    /// back when the evidence is three intervals and two seconds old: a broker that is away does not
     /// answer, and what is produced to its partitions meanwhile arrives when it is back,
     /// stamped with times the other partitions have long passed.
     /// </summary>
@@ -761,18 +762,32 @@ public sealed class KafkaSource : IAsyncDisposable
         private readonly bool[] _atEnd = new bool[partitions];
         private readonly long[] _since = new long[partitions];       // at the end, with evidence, since; 0: not counted yet
         private readonly long[] _confirmedAt = new long[partitions]; // the last end-of-partition event
-        private readonly long[] _askedAt = new long[partitions];
+        private readonly bool[] _asked = new bool[partitions];       // a question is out and not yet answered
         private readonly bool[] _idle = new bool[partitions];        // what the input has been told
         private readonly long _idleAfter = (long)source._options.IdlePartitionAfter.TotalMilliseconds;
         private readonly long _confirmEvery = Math.Max(1, (long)source._options.IdlePartitionConfirmEvery.TotalMilliseconds);
 
+        // An answer takes up to two of the client's fetch waits (the fetch in flight,
+        // then the new one: a second, measured), so the evidence is this old before it
+        // counts as gone.
+        private readonly long _staleAfter = 3 * Math.Max(1, (long)source._options.IdlePartitionConfirmEvery.TotalMilliseconds) + 2000;
+
+        /// <summary>The client's end-of-partition event: the leader has just said there
+        /// is nothing more. Only here — on evidence of this instant — is a partition
+        /// called idle, once it has stood at its end for long enough.</summary>
         public void AtEnd(int partition)
         {
             var now = Environment.TickCount64;
             _atEnd[partition] = true;
+            _asked[partition] = false;
             _confirmedAt[partition] = now;
             if (_since[partition] == 0)
                 _since[partition] = now;
+            if (!_idle[partition] && now - _since[partition] >= _idleAfter)
+            {
+                source.Await(consumer, source._target.IdlePartitionAsync(partition, source._stop.Token));
+                _idle[partition] = true;
+            }
         }
 
         /// <summary>A record: the partition is not at its end, and the input counts it
@@ -780,10 +795,13 @@ public sealed class KafkaSource : IAsyncDisposable
         public void Read(int partition)
         {
             _atEnd[partition] = false;
+            _asked[partition] = false;
             _idle[partition] = false;
             _since[partition] = 0;
         }
 
+        /// <summary>Asks the partitions the source stands at the end of whether they are
+        /// still at their ends, and takes "idle" back from one that has not answered.</summary>
         public void Check(long[] staged)
         {
             var now = Environment.TickCount64;
@@ -792,12 +810,15 @@ public sealed class KafkaSource : IAsyncDisposable
                 if (!_atEnd[p])
                     continue;
 
-                if (now - _confirmedAt[p] >= _confirmEvery && now - _askedAt[p] >= _confirmEvery)
+                // One question at a time: while one is unanswered, the fetch it began is
+                // the one that will be answered when the leader is there, and asking
+                // again would only begin it again.
+                if (now - _confirmedAt[p] >= _confirmEvery && !_asked[p])
                 {
-                    _askedAt[p] = now;
                     try
                     {
                         consumer.Seek(new TopicPartitionOffset(source._options.Topic, p, staged[p]));
+                        _asked[p] = true;
                     }
                     catch (KafkaException)
                     {
@@ -805,21 +826,20 @@ public sealed class KafkaSource : IAsyncDisposable
                     }
                 }
 
-                var fresh = now - _confirmedAt[p] <= 3 * _confirmEvery;
-                if (_idle[p] && !fresh)
-                {
-                    source.Await(consumer, source._target.ExpectPartitionAsync(p, source._stop.Token));
-                    _idle[p] = false;
-                    _since[p] = 0; // at its end again, for as long again, before it is idle again
-                    source._options.Logger?.LogInformation(
-                        "Kafka source {Topic}: partition {Partition} has not confirmed its end for {Silence} ms and holds the watermark again",
-                        source._options.Topic, p, now - _confirmedAt[p]);
-                }
-                else if (!_idle[p] && fresh && _since[p] != 0 && now - _since[p] >= _idleAfter)
-                {
-                    source.Await(consumer, source._target.IdlePartitionAsync(p, source._stop.Token));
-                    _idle[p] = true;
-                }
+                if (now - _confirmedAt[p] <= _staleAfter)
+                    continue;
+
+                // No answer for too long: the leader is away, and what is produced to the
+                // partition meanwhile will come when it is back. The partition has to be
+                // seen at its end again, and for as long again, before it is idle.
+                _since[p] = 0;
+                if (!_idle[p])
+                    continue;
+                source.Await(consumer, source._target.ExpectPartitionAsync(p, source._stop.Token));
+                _idle[p] = false;
+                source._options.Logger?.LogInformation(
+                    "Kafka source {Topic}: partition {Partition} has not confirmed its end for {Silence} ms and holds the watermark again",
+                    source._options.Topic, p, now - _confirmedAt[p]);
             }
         }
     }
