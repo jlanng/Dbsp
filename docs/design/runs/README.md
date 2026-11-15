@@ -209,4 +209,8 @@ that step left it, but for the first three records.
   both nodes' admin API and the broker's disk: rates, step times, `trade-enrichment`'s
   entries and estimated bytes on each node, the standby's state lag, both nodes'
   working set and live heap, records written and the state topic's bytes.
+- `2026-11-15-r4-final-brokers.jsonl` and `.measurements.log` — the broker tests once
+  each with their defaults on the step's final build (`--filter-method "*broker*"`: six
+  records; 7 of 7 passed in 7 min 14 s). The profile's containers had been up for an
+  hour and a half, through everything above.
 

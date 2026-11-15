@@ -7217,3 +7217,92 @@ than its window):
    page show what the plugin's build calls itself beside it (`build` in the admin API,
    from the package's manifest; `AdminApiTests`).
 
+#### The fourth review's step: what it added, changed and left
+
+**Public API added.** Core: `Circuit.LateRecords` and the counter
+`incremental.circuit.late_records`. Service: `PipelineStatus.StateGrowth`
+(`PipelineStateGrowth`), `PipelineStatus.LateRecords` and `Watermark`,
+`PipelineTestHarness.LateRecords`, the counter
+`incremental.service.pipeline.late_records`. Admin JSON, on a pipeline: `stateGrowth`,
+`lateRecords`, `watermark`, `build`. Kafka: `KafkaClientDefaults.Settings` has
+`enable.sparse.connections` (applied to admin clients only). Test seams, internal:
+`KafkaLog.InitTransactionsSlice`, `BeforeWritePathQuestion`, `Unasked`,
+`AttemptTimeout`, `WritePath.Unreachable`; the `slice` point of `WhileAcquiring`.
+
+**Behaviour that changed.**
+
+- `Circuit.Start` and `CircuitBuilder.CheckState` refuse a checkpoint on which an
+  operator that holds state gains deadlines; the service answers `state-incompatible`.
+  Before, such a start went through and left the old state for good.
+- The growth flag is per store and waits on the watermark for stores that close on it;
+  its event names the store; a flag clears after a period without a rise as well as on
+  a fall.
+- A dead-letter event is `N record(s) dropped, the last at {operator}`, at most one a
+  minute per pipeline (it was `… dropped at {operator}` every ten seconds).
+- A takeover is not called off once it has asked for the transactional id. A standby
+  at the ceiling waits for brokers that do not answer, and the leader's time after an
+  outage counts from the first answer that is not a hold.
+- An admin call's attempts are 0.5, 1, 2, 2, 2, 2, 4, 8 s (they were 0.5 doubling to
+  32).
+- Admin clients keep a connection to every broker.
+
+**Deviations and choices.**
+
+- Finding 2 is a refusal, not a repair: the old state is not given deadlines (82).
+- Finding 4 is a count and a notice, not a guard: a record stamped ahead still moves
+  the watermark (81).
+- Finding 7 gives up the call-off rather than trying to tell whether the first request
+  had left; S7's line was drawn where the client returns, and the coordinator acts
+  before that.
+- The node's state estimate is left as it is — a standby's figure — and said to be
+  one, rather than made to see what stores share (E2).
+- Sparse connections are turned off for admin clients only, not for every client
+  (75).
+- The frozen-quorum fix was made in two goes: the first three runs after the first
+  half still moved the leadership, and those records are kept.
+
+**Numbers on the final tree.** `dotnet build --no-incremental`: 0 warnings.
+`tests/Incremental.Tests` 717, 716 passed, 1 skipped (710 before the step: seven new);
+`tests/Incremental.Kafka.Tests` 150 of 150 (147: three new); `tests/Incremental.Service.Tests`
+260, 254 passed, 6 skipped — the broker tests, run below (253: seven new);
+`Pipelines.Tests` 18 of 18 (17). Smokes: `--headless` 55 claims, `--headless --nodes 2`
+70, `--headless --kafka` 69 (2.8 s from the kill to b leading), `TradeEnrichment` 13;
+all exit 0. `benchmarks -- --assert`: all 10 contracts hold. Mutations: 32 in
+all, every one killed in the end; three survived a first run and got a test (two in the
+supervisor's use of the growth rule, one at the probe's call site). Not mutated: the
+dead-letter event's one-a-minute rule, which no test times. The admin UI's
+changes were looked at in Chromium on the example, in memory (two nodes) and on Kafka
+(the takeover).
+
+**The broker tests on the final build** (the three-broker profile; records
+`docs/design/runs/2026-11-15-r4-final-brokers.*`): 7 of 7 in 7 min 14 s. Seventy
+seconds without a quorum (stopped): the leader kept term 1, the standby held 23 times,
+the sink was silent 84.3 s. One broker killed for 20 s — the active controller, the
+coordinator and the leader topic's leader: nothing moved, and the standby used at most
+0.17 of a processor in any second. Every broker killed in turn: 14.5 s of silence;
+shut down in turn: 0.7 s. A broker away 64 s with the leader killed half way: the
+standby led 3.4 s after the kill. A takeover with a broker shut down 1.5 s before:
+3.3 s.
+
+**CI.** Each of the step's first three pushes had its own run and all three were green
+(43701879223, 43707559251, 43707944137: build-and-test, connector-stack,
+perf-contracts). The runs of the later pushes, and the `broker-failures` job started by
+hand on the last commit, finish after this text is committed: they are in the step's
+report.
+
+**Left undone.**
+
+- The 15.6 s table stage of finding 8 was not reproduced, before or after the fix:
+  seventeen attempts did not land a broker's death inside a table read for more than
+  one attempt.
+- Nothing ran for longer than three minutes; the log cleaner on a state topic that
+  turns over at 32,000 records a second was not watched, nor three brokers under that
+  load.
+- A leak inside a store that also evicts, and a stalled watermark on a pipeline whose
+  stores do not grow at twelve samples of fifteen, are not flagged.
+- An admin client made from a consumer's or a producer's handle still connects on
+  demand (75).
+- MSK, IAM, S3 and the owner's adapters (the critic's E3), memory headroom over hours
+  (E4), a reused trade id (E6) and the size of this document (E8) were not this
+  step's.
+

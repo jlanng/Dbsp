@@ -2438,7 +2438,17 @@ store): `reconnect.backoff.ms` 50, `reconnect.backoff.max.ms` 1000, `socket.time
 broker waiting for a dead replica answers "timed out" and the request is made again on
 the same connection), `socket.connection.setup.timeout.ms` 5000,
 `topic.metadata.refresh.interval.ms` 2000. A caller's `ClientConfig` is applied after
-them and wins. An admin client is not given the socket timeout: its calls carry their
+them and wins. An admin client alone is given `enable.sparse.connections=false`: it
+keeps a connection to every broker instead of connecting when it has something to
+send. An admin request meant for one broker — where a partition ends, asked of its
+leader — waits for that broker by asking for its connection again each time any
+broker's state changes, and asking sets the reconnect delay to nothing; while a dead
+broker is still listed as a leader it refuses the connection at once, which is a
+change of state, and the client connected again without a pause: 231,436 times in
+eight seconds on a standby that asks its lag once a second, at 1.2 to 1.4 processors
+(the fourth review's step; *Open for James* 75 in the service's design). With
+connections kept, nothing is asked for and the dead broker is tried at the reconnect
+delay. An admin client is not given the socket timeout: its calls carry their
 own (a topic's creation the operation timeout, a leader lookup half a second and then
 longer), and six seconds cut all of them — a node restarted while the brokers were
 between controllers could not create its topics and ended. `EnsureTopicAsync` now also

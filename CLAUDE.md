@@ -103,7 +103,10 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   do; `INCREMENTAL_KAFKA_OUTAGE_SECONDS` and
   `INCREMENTAL_KAFKA_TRANSACTION_TIMEOUT_SECONDS` set the no-quorum test's outage and
   the nodes' transaction timeout (60 with the default outage is an outage past the
-  timeout, where the leader usually ends and only "nothing lost" is required);
+  timeout, where the leader usually ends and only "nothing lost" is required;
+  `INCREMENTAL_KAFKA_FAULT=pause` freezes its two brokers instead of stopping them);
+  `INCREMENTAL_KAFKA_BROKER_AFTER_MS` kills the takeover test's broker that long after
+  the leader instead of before it;
   `INCREMENTAL_NODE_LOGS=<dir>`, `INCREMENTAL_LOG_LEVEL=Debug` and
   `INCREMENTAL_KAFKA_CLIENT="debug=eos,protocol"` keep each node's Kafka client
   log in a file, which is how a stall is read (add `broker` to the debug list only
@@ -264,6 +267,13 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   socket timeout 6 s, a metadata refresh every 2 s), applied before the caller's own
   settings: librdkafka's defaults leave a healthy leader silent for 10 to 60 s after a
   broker goes, which is a takeover. A new client that skips them brings that back.
+  An admin client also gets `enable.sparse.connections=false` from them: one that
+  connects on demand asks for a dead broker's connection at every change of broker
+  state while a request waits for that broker, which resets the reconnect delay —
+  30,000 refused connections a second and more than a processor on a standby. An admin
+  client made from another client's handle shares that client's setting: do not give
+  it requests meant for one broker (`ListOffsets`, a broker's `DescribeConfigs`) on a
+  path that runs while a broker may be down.
 - Memory a node holds and does not use (docs/enrichment-service.md, *Sizing a node*;
   docs/design/enrichment-service.md, S7, *Memory*). Three things made a node's working
   set three to five times its live heap, and each has one answer that must stay:

@@ -1742,8 +1742,10 @@ use ([intro.md](intro.md#looking-at-it-the-admin-api-and-ui) has the endpoint ta
 The screenshots are of the example.
 
 **Overview.** The node's role and health, rates across all pipelines, what needs
-attention, tables, and the node's recent events. A long event — an exception message —
-is cut short with *show all*.
+attention, tables, and the node's recent events, with a switch per kind of event: a
+kind that repeats (dead letters, once a minute per pipeline that drops records; late
+records) can be left out so that the events that happen once stay in sight. A long
+event — an exception message — is cut short with *show all*.
 
 ![Overview](images/enrichment-service/overview.png)
 
@@ -1754,10 +1756,14 @@ delivered; per table the version the pipeline's checkpoint has committed beside 
 table's current one; and its state, store by store — entries, counted, and the bytes
 of this node's heap they take, estimated, with the size of one entry and of one record
 in the state log. A definition whose state grows without end shows there first; the
-list of pipelines has the same two figures as a column, and a pipeline whose state has
-grown without a pause for half an hour is marked *growing* there, on its page and on
-the overview's attention list
-([Bounding a join over a stream of facts](#bounding-a-join-over-a-stream-of-facts)). The buttons are the actions: each shows its plan first, and reset
+list of pipelines has the same two figures as a column, and a pipeline with a store
+that has grown without a pause for half an hour is marked *growing* there, on its page
+and on the overview's attention list, with the store's name and whether it is one
+that closes on a watermark that has stopped
+([Bounding a join over a stream of facts](#bounding-a-join-over-a-stream-of-facts)).
+Records dropped as late — behind the watermark, and in no dead letter — are counted in
+a notice on the page. A pipeline's plugin version is shown as what its build calls
+itself, with the hash of its files beside it. The buttons are the actions: each shows its plan first, and reset
 and remove want the id typed. *Generation* is the generation of the pipeline's spec
 everywhere — the header, the timeline, the audit, `If-Match`; a fault also says which
 *run* it was, since a restart builds the same generation again.
@@ -2434,7 +2440,9 @@ broker that went away and sixty for one that stops answering, which is how a lea
 came to be silent for thirty to fifty seconds and lose the leadership to its standby
 over one broker. Every client the service creates now starts from settings of its own
 (`KafkaClientDefaults`: reconnect within a second, give a silent broker six seconds,
-ask for the topics' leaders every two); what you put in a connection's `ClientConfig`
+ask for the topics' leaders every two, and — admin clients — keep a connection to every
+broker, without which a standby reconnected to a dead broker thirty thousand times a
+second); what you put in a connection's `ClientConfig`
 is applied on top. Leave them unless you have measured otherwise — in particular a
 `socket.timeout.ms` near the takeover ceiling brings the leadership moves back.
 
