@@ -2206,7 +2206,14 @@ invisible on one plaintext broker:
   (`RetryTransientAsync` with an attempt timeout; `LeadersKnownAsync` after a topic is
   created). An admin call that needs a leader takes it from the client's cache, where a
   topic created a moment ago can sit with no leader; the call waited out the whole
-  operation timeout and the same call again found the same cache.
+  operation timeout and the same call again found the same cache. An attempt is half a
+  second, a second, then two seconds four times, and only after those ten seconds four
+  and eight (`KafkaLog.AttemptTimeout`). As first built it doubled without a stop, and
+  an attempt that begins while a partition has no leader hears nothing until its time
+  is up: a takeover whose table read began as a broker died — 3.05 s after the leader,
+  just behind a 42 ms fence — spent 4 s and then 8 s in two attempts and took 15.6 s
+  over its tables, where the partition had its leader again after about nine (the
+  fourth review). Two seconds is now the most a call loses there.
 - **A consumer's callbacks run only inside `Consume`**, the OAUTHBEARER token refresh
   among them. `AssignedConsumer.ServeCallbacks` is called before a consumer is asked
   for metadata or watermarks (the log's short reader, the service's blob store).
@@ -2465,31 +2472,42 @@ worth knowing before believing a number from a container cluster.
 
 ### The leadership rules
 
-- **A takeover is given up when the leader is heard — until the transactional id is
-  taken, and not after.** Between the decision and the moment `InitTransactions`
-  returns, the node's watch of the leader topic is still reading. A heartbeat from
-  another node calls the acquisition off (`KafkaLeadership.Heard`): the leader was slow,
-  its brokers were, and it is committing again. Not on a manual takeover, which is the
-  operator's word against the leader's. And not once `InitTransactions` has returned:
-  from that moment the leader's epoch is gone, whatever it committed a moment before,
-  and the acquisition goes through — reads the term, commits its own, leads
-  (`KafkaLog.AcquireWriterUnlessAsync`: the token that calls it off is looked at only
-  until then). As first built the token was honoured to the end, so a heartbeat read
-  after the fence stopped the takeover there: the standby stood down, the fenced leader
-  ended at its next transaction, and nobody led until the standby's wait had passed and
-  a silence after it. That is what the third review read in a node's log after a
-  two-broker outage, and `KafkaLeadershipTests` now holds the other outcome at both
-  points after the fence.
+- **A takeover is given up when the leader is heard — until the transactional id has
+  been asked for, and not after.** Between the decision and the first call of
+  `InitTransactions`, the node's watch of the leader topic is still reading. A
+  heartbeat from another node calls the acquisition off (`KafkaLeadership.Heard`): the
+  leader was slow, its brokers were, and it is committing again. Not on a manual
+  takeover, which is the operator's word against the leader's. And not once the first
+  call has been made (`KafkaLog.AcquireWriterUnlessAsync`: the token that calls it off
+  is looked at only before it): the acquisition goes through — reads the term, commits
+  its own, leads.
+
+  Where that line is was got wrong twice. As first built the token was honoured to the
+  end, so a heartbeat read after the fence stopped the takeover there: the standby
+  stood down, the fenced leader ended at its next transaction, and nobody led until
+  the standby's wait had passed and a silence after it (the third review). The line
+  was then put where `InitTransactions` returns — but the leader is fenced before
+  that. `InitTransactions` sends `InitProducerId`, and when the previous writer has a
+  transaction open the coordinator answers by raising the epoch and aborting that
+  transaction, there and then, and tells the caller to ask again
+  (`CONCURRENT_TRANSACTIONS`) until the abort is done. The call was made in
+  one-second slices with the token looked at between them, so a leader heard in that
+  second called off a takeover whose first request had already ended that leader:
+  three call-offs of three in the fourth review's runs (two of three brokers frozen
+  and released) left a fenced leader and a standby that had stood down, with nobody
+  leading for a takeover timeout. `KafkaLeadershipTests` holds the outcome at all
+  three points: heard after the first request, after the id is taken, after the term
+  is read.
+
+  What the earlier line bought is gone with it and was small: a takeover is called off
+  only in the instant between its decision and its first request. A takeover that
+  begins is carried through, and it begins only after the questions the next rules
+  ask.
 - **A takeover given up for a heard leader holds nothing back.** The silence goes on
   counting from the record that was heard, and the node may take over again as soon as
   that silence is long enough — it does not wait the one to two takeover timeouts of a
-  takeover lost to a fence (next but one). The reason is the one case that is left: the
-  acquisition is called off between two one-second slices of `InitTransactions`, and a
-  request for the id that had already left the client can still land, although the
-  client is put away. Whether it did cannot be asked. If it did, the leader's next
-  transaction fails and it ends, and the standby answers its silence as it answers any
-  dead leader's — one takeover timeout and a takeover, which is the failover the
-  design budgets for, not two or three timeouts more.
+  takeover lost to a fence (next but one). Nothing of the leader's has been touched
+  when a takeover is given up now, so there is nothing to wait for.
 - **A cancelled or fenced acquisition puts the client away.** `KafkaLog.AcquireAsync`
   replaces the producer and fails with `KafkaLogNotAcquiredException`; the log is a
   reader again. The client must go because a fenced one is finished, and because a
@@ -2509,9 +2527,28 @@ worth knowing before believing a number from a container cluster.
   `String.hashCode`, as the brokers place it): no leader, a leader that does not
   answer, or fewer replicas in sync *that answer* than `min.insync.replicas`, and
   nobody can commit — the standby waits (`TakeoversHeld`), and for two takeover
-  timeouts after the brokers last said so: a leader they held up has to find them again
-  before it can be heard, and without that pause the standby took over in the instant
-  they returned.
+  timeouts after the brokers first say otherwise: a leader they held up has to find
+  them again before it can be heard, and without that pause the standby took over in
+  the instant they returned.
+
+  Brokers that cannot be asked hold it too (`WritePath.Unreachable`, the fourth
+  review). Killed or stopped brokers refuse connections, and the question finds a
+  broker that is left; brokers that are frozen — a zone cut off, a host that stopped
+  where it stood — keep their connections and answer nothing, and the metadata request
+  sits on one of them until its time is up (the admin client has no socket timeout to
+  move it on). That used to read as "not known", which held nothing: only the
+  takeover's last check, which could not reach Kafka either, kept the standby back
+  while the outage lasted, and the moment the brokers answered it took over — five
+  runs of eight with two of three brokers paused for 45 and 70 s, the leader alive
+  throughout. Silence from the brokers is now an answer of its own, and as good a
+  reason to wait as "nothing can be committed": a standby that cannot ask the brokers
+  could not commit through them either. An error a broker *sends* (it refuses the
+  question) is still "not known" and holds nothing.
+
+  And the two takeover timeouts count from the first answer that is not a "no", not
+  from the last "no". The question itself waits on the brokers — up to nine seconds
+  were seen with two of three frozen, answered in the instant they thawed — and
+  counted from the last "no" the leader's time was already up when the answer came.
 
   "That answer" is what the third review's runs added. Who leads a partition and who
   is in sync is metadata, and metadata is the controller's: with no controller quorum

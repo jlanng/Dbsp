@@ -280,6 +280,7 @@ public sealed class KafkaLeadership : IAsyncDisposable
     private long _takeoversAbandoned;
     private long _takeoversHeld;
     private long _lastHeldTicks;
+    private long _heldEndedTicks;
     private long _lastHeldLogTicks;
     private FollowerLag? _lag;
     private TakeoverTimings? _lastTakeover;
@@ -777,7 +778,10 @@ public sealed class KafkaLeadership : IAsyncDisposable
             // A leader that has written within the takeover timeout is a leader: the
             // brokers' word that held a takeover back is no longer needed.
             if (fresh)
+            {
                 Interlocked.Exchange(ref _lastHeldTicks, 0);
+                Interlocked.Exchange(ref _heldEndedTicks, 0);
+            }
 
             // Heard while this node is on its way to fencing it: the leader is alive and
             // committing, so the takeover is given up while that is still free. Not a
@@ -980,34 +984,56 @@ public sealed class KafkaLeadership : IAsyncDisposable
     }
 
     /// <summary>Whether a takeover at the ceiling should wait: the leader answers its
-    /// probe as the leader, and the brokers say outright that the log cannot be written
+    /// probe as the leader, and the log cannot be written — the brokers say so outright
     /// (<see cref="KafkaLog.ProbeWritePathAsync"/>: a partition without a leader that
-    /// answers, or with too few replicas in sync that answer) or said so until a moment
-    /// ago. Anything short of that — a leader that no longer answers, brokers that cannot
-    /// be asked or see nothing wrong — and the ceiling stands.</summary>
+    /// answers, or with too few replicas in sync that answer), or none of them answers
+    /// the question at all — or could not until a moment ago. Brokers that have gone
+    /// silent without refusing a connection (a frozen zone, a partition of the network)
+    /// are the second kind: nothing can be asked of them, and nothing committed through
+    /// them. Anything short of that — a leader that no longer answers, brokers that
+    /// answer and see nothing wrong — and the ceiling stands.</summary>
     private async Task<bool> HeldByBrokersAsync(TimeSpan silence, CancellationToken token)
     {
         if (!await ProbeAsync(token).ConfigureAwait(false))
+        {
+            _logger?.LogDebug("Node {Node} at the ceiling: the leader does not answer its probe as the leader.", NodeId);
             return false;
+        }
         var (path, why) = await _log.ProbeWritePathAsync(token).ConfigureAwait(false);
         var now = Environment.TickCount64;
-        if (path != KafkaLog.WritePath.Unwritable)
+        _logger?.LogDebug(
+            "Node {Node} at the ceiling: the leader answers its probe; the brokers' write path is {Path} ({Why}); last held back {Ago} ms ago.",
+            NodeId, path, why ?? "nothing wrong", Interlocked.Read(ref _lastHeldTicks) is var held and not 0 ? now - held : -1);
+        if (path is not (KafkaLog.WritePath.Unwritable or KafkaLog.WritePath.Unreachable))
         {
             // The brokers can commit again, or it cannot be told. A leader that was held
             // up by them needs a moment to say so — its client has to find them first —
-            // and gets two takeover timeouts from the last "no" before its silence is
-            // its own again.
-            var last = Interlocked.Read(ref _lastHeldTicks);
-            return last != 0 && now - last < (long)(_options.TakeoverAfter.TotalMilliseconds * 2);
+            // and gets two takeover timeouts before its silence is its own again. They
+            // count from this answer, the first that is not a "no", and not from the
+            // last "no": the question that brings the answer may have waited on the
+            // brokers itself for longer than that (nine seconds with two of three
+            // frozen, answered the moment they thawed), and counted from the last "no"
+            // the leader's time was up before anybody knew the brokers were back.
+            if (Interlocked.Read(ref _lastHeldTicks) == 0)
+                return false;
+            var ended = Interlocked.Read(ref _heldEndedTicks);
+            if (ended == 0)
+                Interlocked.Exchange(ref _heldEndedTicks, ended = now);
+            if (now - ended < (long)(_options.TakeoverAfter.TotalMilliseconds * 2))
+                return true;
+            Interlocked.Exchange(ref _lastHeldTicks, 0);
+            Interlocked.Exchange(ref _heldEndedTicks, 0);
+            return false;
         }
         Interlocked.Exchange(ref _lastHeldTicks, now);
+        Interlocked.Exchange(ref _heldEndedTicks, 0);
         Interlocked.Increment(ref _takeoversHeld);
         if (now - Interlocked.Read(ref _lastHeldLogTicks) >= 10_000 || Interlocked.Read(ref _lastHeldLogTicks) == 0)
         {
             Interlocked.Exchange(ref _lastHeldLogTicks, now);
             _logger?.LogWarning(
-                "Node {Node}: the leader has been silent for {Silence} and still answers its probe, and nothing can be committed ({Why}): not taking over, which could do no better.",
-                NodeId, silence, why);
+                "Node {Node}: the leader has been silent for {Silence} and still answers its probe, and {What} ({Why}): not taking over, which could do no better.",
+                NodeId, silence, path == KafkaLog.WritePath.Unreachable ? "the brokers do not answer" : "nothing can be committed", why);
         }
         return true;
     }
@@ -1070,13 +1096,14 @@ public sealed class KafkaLeadership : IAsyncDisposable
         try
         {
             // Fences the previous leader and settles its last transaction; commits the term.
-            // Until the transactional id is taken the takeover costs nothing to give up,
-            // and it is given up when the leader is heard after all (a manual takeover is
-            // the operator's word against the leader's, and is not). The log decides
-            // where "until" ends: once it has the id the leader is fenced, and it
-            // carries the acquisition through whatever this node hears meanwhile — a
-            // takeover given up there would leave a fenced leader and a standby that had
-            // just stood down.
+            // Until the transactional id has been asked for the takeover costs nothing
+            // to give up, and it is given up when the leader is heard after all (a manual
+            // takeover is the operator's word against the leader's, and is not). The log
+            // decides where "until" ends: its first request for the id fences a leader
+            // that has a transaction open, before the id is this node's, so from that
+            // request on it carries the acquisition through whatever this node hears
+            // meanwhile — a takeover given up there would leave a fenced leader and a
+            // standby that had just stood down.
             using (var abandon = new CancellationTokenSource())
             {
                 lock (_lock)

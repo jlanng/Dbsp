@@ -52,6 +52,20 @@ public static class KafkaClientDefaults
 
         // Connecting to a host that does not answer at all: thirty seconds by default.
         ["socket.connection.setup.timeout.ms"] = "5000",
+
+        // An admin client's only (see Apply). By default a client connects to a broker
+        // when it has something to send it ("sparse connections"), and an admin request
+        // that is meant for one broker — where a partition ends, asked of its leader —
+        // waits for that broker by asking for the connection again each time any
+        // broker's state changes. Asking again resets the reconnect delay above. A
+        // broker that has died is still a partition's leader until the controller gives
+        // it up (nine seconds), it refuses the connection at once, that is a change of
+        // state, and so the client connects again without a pause for as long as the
+        // request waits: 30,000 refused connections a second, counted, and more than a
+        // processor, on a standby that asks its lag once a second. With connections
+        // kept to every broker nothing is asked for: the dead broker is tried again at
+        // the reconnect delay, like any other.
+        ["enable.sparse.connections"] = "false",
     };
 
     /// <summary>Sets each of <see cref="Settings"/> on <paramref name="config"/> unless it
@@ -70,6 +84,11 @@ public static class KafkaClientDefaults
             if (key == "request.timeout.ms" && config is not ProducerConfig)
                 continue;
             if (key == "socket.timeout.ms" && config is AdminClientConfig)
+                continue;
+            // Only an admin client waits for one broker in the way that turns sparse
+            // connections into a reconnect storm; every other client keeps to the
+            // brokers it needs, which on a large cluster is far fewer connections.
+            if (key == "enable.sparse.connections" && config is not AdminClientConfig)
                 continue;
             if (config.Get(key) is null)
                 config.Set(key, value);

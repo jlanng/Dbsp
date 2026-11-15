@@ -344,11 +344,14 @@ public sealed class KafkaLog : IAsyncDisposable
     /// <see cref="AcquireWriterAsync"/> for a caller that may find the
     /// acquisition is not needed after all (a standby that hears its leader):
     /// <paramref name="whileFree"/> calls it off for as long as that costs nothing, which
-    /// is until the transactional id is this process's. From that moment the previous
-    /// writer is fenced, whatever it was doing, and an acquisition that stopped there
-    /// would leave the log with no writer at all: the token is no longer looked at, and
-    /// the call goes on to commit its term. <paramref name="cancellationToken"/> is the
-    /// caller going away, and ends the call at any point.
+    /// is until the first request for the transactional id may have left this process.
+    /// The coordinator fences the previous writer on that request — at once if it has a
+    /// transaction open, which it aborts under a new epoch while this process is still
+    /// told to wait — so from the first call of <c>InitTransactions</c> an acquisition
+    /// that stopped would leave the log with no writer at all: the token is no longer
+    /// looked at, and the call goes on to commit its term.
+    /// <paramref name="cancellationToken"/> is the caller going away, and ends the call
+    /// at any point.
     /// </summary>
     internal Task AcquireWriterUnlessAsync(CancellationToken whileFree, CancellationToken cancellationToken)
     {
@@ -378,12 +381,18 @@ public sealed class KafkaLog : IAsyncDisposable
     public long WriterResets => Interlocked.Read(ref _writerResets);
 
     /// <summary>Called at points of an acquisition, with the point's name (<c>begin</c>:
-    /// nothing has been asked of the brokers yet; <c>initialised</c>: the transactional id
-    /// is this process's; <c>term-read</c>: the last term is known and this process's is
-    /// about to be committed). For tests:
+    /// nothing has been asked of the brokers yet; <c>slice</c>: a call of
+    /// <c>InitTransactions</c> has run out of its time with the request under way;
+    /// <c>initialised</c>: the transactional id is this process's; <c>term-read</c>: the
+    /// last term is known and this process's is about to be committed). For tests:
     /// throwing here, or fencing the log from another, is an acquisition that is lost
     /// where a real one can be.</summary>
     internal Action<string>? WhileAcquiring { get; set; }
+
+    /// <summary>How long one call of <c>InitTransactions</c> is given before the
+    /// acquisition looks at its tokens again. For tests: a short one runs out while the
+    /// coordinator is still aborting the previous writer's transaction.</summary>
+    internal TimeSpan InitTransactionsSlice { get; set; } = TimeSpan.FromSeconds(1);
 
     private async Task AcquireAsync(CancellationToken cancellationToken, CancellationToken whileFree)
     {
@@ -466,25 +475,34 @@ public sealed class KafkaLog : IAsyncDisposable
         {
             begun();
             WhileAcquiring?.Invoke("begin");
+            var asked = false;
             while (true)
             {
-                // The one stretch in which the acquisition can be called off for nothing
-                // (whileFree). A slice that has timed out may have a request on its way
-                // that still lands — the client is put away, and its request with it if
-                // it had not left — so "for nothing" is the rule and not a certainty; the
-                // caller's answer to the exception is to watch the writer it spared.
-                whileFree.ThrowIfCancellationRequested();
+                // The acquisition can be called off for nothing (whileFree) only before
+                // the first call below. That call sends InitProducerId, and the
+                // coordinator's answer to it, when the previous writer has a transaction
+                // open, is to raise the epoch and abort that transaction — the writer is
+                // fenced there and then — and to tell this client to ask again until the
+                // abort is done. So a call that has run out of its time has, as a rule,
+                // fenced the writer already: called off between two slices, the takeover
+                // left a fenced leader and a standby that had stood down (three times of
+                // three when a leader was heard in that second). Once asked, it goes
+                // through.
+                if (!asked)
+                    whileFree.ThrowIfCancellationRequested();
                 cancellationToken.ThrowIfCancellationRequested();
                 _stop.Token.ThrowIfCancellationRequested();
                 try
                 {
                     // Resumable: a call that times out is retried and carries on where the
-                    // last one stopped. In slices, so that an abandoned takeover stops soon.
-                    _producer.InitTransactions(TimeSpan.FromSeconds(1));
+                    // last one stopped. In slices, so that a caller going away stops soon.
+                    asked = true;
+                    _producer.InitTransactions(InitTransactionsSlice);
                     break;
                 }
                 catch (KafkaRetriableException)
                 {
+                    WhileAcquiring?.Invoke("slice");
                 }
                 catch (KafkaException ex) when (ex.Error.Code == ErrorCode.InvalidTransactionTimeout)
                 {
@@ -509,9 +527,10 @@ public sealed class KafkaLog : IAsyncDisposable
         begun();
         WhileAcquiring?.Invoke("initialised");
 
-        // The point of no return for whileFree: the previous writer is fenced. Nothing
-        // below looks at that token — a call that stopped here because its caller had
-        // changed its mind would leave a fenced writer and no other.
+        // Long past the point of no return for whileFree (the first InitTransactions
+        // call): the previous writer is fenced. Nothing below looks at that token — a
+        // call that stopped here because its caller had changed its mind would leave a
+        // fenced writer and no other.
         //
         // Every earlier writer's transactions are decided now, so the leader topic's last
         // term is final.
@@ -1316,8 +1335,15 @@ public sealed class KafkaLog : IAsyncDisposable
     /// <summary>What the brokers say about writing to this log's topics.</summary>
     internal enum WritePath
     {
-        /// <summary>It could not be asked, or the answer says nothing either way.</summary>
+        /// <summary>The brokers answered and the answer says nothing either way: a topic
+        /// described without its partitions, a question this node may not ask.</summary>
         Unknown,
+
+        /// <summary>No broker answered the question in its time: the brokers are not
+        /// there for this node, whatever they are for others. Nothing can be committed
+        /// through brokers that do not answer, so to a standby that has reached its
+        /// ceiling this is no better news than <see cref="Unwritable"/>.</summary>
+        Unreachable,
 
         /// <summary>The leader topic's partition, and the partition that holds this
         /// log's transactional id, have a leader that answers and enough replicas in
@@ -1335,6 +1361,10 @@ public sealed class KafkaLog : IAsyncDisposable
 
     /// <summary>For tests: says whether a broker answers, instead of asking it.</summary>
     internal Func<int, bool>? BrokerAnswersOverride { get; set; }
+
+    /// <summary>For tests: called with the topic before its metadata is asked for.
+    /// Throwing here is that question failing, as it does when no broker answers it.</summary>
+    internal Action<string>? BeforeWritePathQuestion { get; set; }
 
     private readonly Dictionary<string, int> _minInSync = new(StringComparer.Ordinal);
 
@@ -1370,7 +1400,7 @@ public sealed class KafkaLog : IAsyncDisposable
         }
         catch (Exception ex) when (ex is KafkaException or TimeoutException or OperationCanceledException or InvalidOperationException)
         {
-            return (WritePath.Unknown, ex.Message);
+            return (Unasked(ex), ex.Message);
         }
 
         try
@@ -1389,10 +1419,21 @@ public sealed class KafkaLog : IAsyncDisposable
         return (WritePath.Writable, null);
     }
 
+    /// <summary>What a question about the write path that failed says: silence — a wait
+    /// that ran out, a request the client gave up, no broker to send it to — is
+    /// <see cref="WritePath.Unreachable"/>; an error a broker sent, or an answer that
+    /// could not be read, is <see cref="WritePath.Unknown"/>. Brokers that have stopped
+    /// answering without closing their connections (a frozen zone) are silence: the
+    /// metadata request sits on one of them until its time is up, and the admin client
+    /// has no socket timeout to move it to another.</summary>
+    internal static WritePath Unasked(Exception failure) =>
+        failure is InvalidOperationException || AnsweredWith(failure) ? WritePath.Unknown : WritePath.Unreachable;
+
     /// <summary>Why one partition of <paramref name="topic"/> cannot be written; null if it can.</summary>
     private async Task<string?> UnwritableAsync(string topic, Func<int, int> partitionOf, CancellationToken cancellationToken)
     {
         var timeout = TimeSpan.FromSeconds(2);
+        BeforeWritePathQuestion?.Invoke(topic);
 
         // Any broker's word (a Metadata request), not the controller's: a cluster that has
         // lost its controller quorum never answers what is asked of the controller, and
@@ -1567,9 +1608,11 @@ public sealed class KafkaLog : IAsyncDisposable
     }
 
     /// <summary>
-    /// As the other overload, giving each attempt its own request timeout — half a second
-    /// for the first, doubling, never past what is left of <paramref name="timeout"/> —
-    /// and running <paramref name="betweenAttempts"/> after a failure that passes. An
+    /// As the other overload, giving each attempt its own request timeout
+    /// (<see cref="AttemptTimeout"/>: half a second for the first, doubling to two seconds
+    /// and staying there for the first six, then longer; never past what is left of
+    /// <paramref name="timeout"/>) and running <paramref name="betweenAttempts"/> after a
+    /// failure that passes. An
     /// admin call that needs a partition's leader (<c>ListOffsets</c>, <c>DeleteRecords</c>)
     /// takes it from the client's metadata cache. On a cluster of several brokers a topic
     /// created a moment ago can be in that cache with no leader — the answer at the instant
@@ -1579,6 +1622,15 @@ public sealed class KafkaLog : IAsyncDisposable
     /// for outright, which replaces the cached answer. Given the whole operation timeout,
     /// the first attempt used all of it: on three brokers one test in five of
     /// <c>Incremental.Kafka.Tests</c> failed that way after 30 s.
+    /// <para>
+    /// An attempt that begins while a partition has no leader runs its whole time even
+    /// if the partition gets one meanwhile — the new leader is only seen by the refresh
+    /// between attempts — so an attempt's length is what a call can lose after the
+    /// brokers are whole again. Doubling without a stop made that four and then eight
+    /// seconds just when a broker's loss is being settled (nine seconds, the brokers'
+    /// session timeout): a takeover's table stage took 15.6 s where the partition had
+    /// its leader back after about nine.
+    /// </para>
     /// </summary>
     internal static async Task<T> RetryTransientAsync<T>(
         Func<TimeSpan, Task<T>> call, TimeSpan timeout, CancellationToken cancellationToken, Action? betweenAttempts = null,
@@ -1589,7 +1641,7 @@ public sealed class KafkaLog : IAsyncDisposable
         {
             cancellationToken.ThrowIfCancellationRequested();
             var left = TimeSpan.FromMilliseconds(Math.Max(100, deadline - Environment.TickCount64));
-            var mine = TimeSpan.FromMilliseconds(500 << Math.Min(attempt, 6));
+            var mine = AttemptTimeout(attempt);
             var given = mine < left ? mine : left;
             var began = Environment.TickCount64;
             try
@@ -1605,6 +1657,14 @@ public sealed class KafkaLog : IAsyncDisposable
             }
         }
     }
+
+    /// <summary>The request timeout of attempt <paramref name="attempt"/> (from 0) of
+    /// <see cref="RetryTransientAsync{T}(Func{TimeSpan,Task{T}},TimeSpan,CancellationToken,Action?,Action{int,TimeSpan,TimeSpan,KafkaException}?)"/>:
+    /// 0.5 s, 1 s, then 2 s for four attempts — some ten seconds in which a call loses at
+    /// most two after a partition has its leader again — and then 4 s and 8 s, for a
+    /// broker that is there and slow.</summary>
+    internal static TimeSpan AttemptTimeout(int attempt) => TimeSpan.FromMilliseconds(
+        attempt < 6 ? Math.Min(500 << attempt, 2000) : 2000 << Math.Min(attempt - 5, 2));
 
     /// <summary>Runs <paramref name="call"/>, and again every 100 ms while it fails in a way
     /// that passes (<see cref="IsTransient"/>), until <paramref name="timeout"/> has gone

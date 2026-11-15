@@ -978,6 +978,73 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
     }
 
     /// <summary>
+    /// The first request for the transactional id is what fences a leader that has a
+    /// transaction open: the coordinator raises the epoch and aborts that transaction,
+    /// and tells the standby to ask again until the abort is done — so the leader is
+    /// fenced while the standby's <c>InitTransactions</c> has not yet returned. A leader
+    /// heard in that stretch is a leader that is already finished. Called off there, the
+    /// takeover left a fenced leader and a standby that had stood down, and nobody led
+    /// for a takeover timeout (three call-offs of three, in runs with brokers frozen and
+    /// released). It goes through.
+    /// </summary>
+    [Fact]
+    public async Task A_takeover_that_hears_the_leader_after_it_has_asked_for_the_log_goes_through()
+    {
+        await using var env = KafkaEnv.Create();
+        await using var a = await StartAsync(env, "a");
+        await LeadsAsync(a);
+        await using var b = await StartAsync(env, "b");
+        await Task.Delay(After);
+
+        // The leader stops inside a transaction: its heartbeats stop, the transaction stays open.
+        using var frozen = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        a.Log.WhileProducing = () =>
+        {
+            frozen.Set();
+            release.Wait(Timeout);
+        };
+        var commit = a.Log.CommitAsync(StateRecords(a.Log, 2048));
+        Assert.True(frozen.Wait(Timeout));
+
+        // The standby's first call for the transactional id runs out of its time: the
+        // coordinator has to abort that transaction and be asked again, which takes
+        // longer than the call is given here. With the request under way, a heartbeat
+        // the leader committed just before is read.
+        b.Log.InitTransactionsSlice = TimeSpan.FromMilliseconds(20);
+        var slices = 0;
+        b.Log.WhileAcquiring = at =>
+        {
+            if (at == "slice" && Interlocked.Increment(ref slices) == 1)
+                b.Leadership.Heard(new KafkaLog.LeaderRecord(1, "a", DateTimeOffset.UtcNow, Sequence: int.MaxValue));
+        };
+
+        try
+        {
+            await LeadsAsync(b);
+        }
+        finally
+        {
+            release.Set();
+        }
+        Assert.True(Volatile.Read(ref slices) >= 1, "no call for the id ran out of time: the leader was not heard in the middle of the acquisition");
+        Assert.Equal(0, b.Leadership.TakeoversAbandoned);
+        Assert.Equal(0, b.Log.WriterResets);
+        Assert.Equal(2, b.Leadership.Term);
+        Assert.Equal(["prepare", "start 2"], b.Calls);
+        List<NodeRole> roles;
+        lock (b.Changes)
+            roles = [.. b.Changes.Select(c => c.Role)];
+        Assert.DoesNotContain(NodeRole.Standby, roles.SkipWhile(r => r != NodeRole.Promoting));
+
+        // The old leader's transaction was aborted under it by that first request.
+        release.Set();
+        await Assert.ThrowsAsync<KafkaLogFencedException>(() => commit).WaitAsync(Timeout);
+        await a.Leadership.WhenFinished.WaitAsync(Timeout);
+        Assert.Equal(NodeRole.Fenced, a.Role);
+    }
+
+    /// <summary>
     /// A heartbeat says the leader was alive when it wrote it. One that the brokers
     /// could not show until now — its partition waited on a replica that had died with
     /// the leader, and is released when the brokers give that replica up, nine seconds
@@ -1225,6 +1292,68 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         Assert.Equal(NodeRole.Fenced, a.Role);
     }
 
+    /// <summary>Brokers that go silent without refusing a connection — a frozen zone, a
+    /// partition of the network — cannot say that nothing can be committed: the question
+    /// itself is never answered. That is no better news than their saying so, and it
+    /// holds a standby at the ceiling in the same way, with the same two takeover
+    /// timeouts for the leader to be heard once they answer again. As first built only
+    /// an outright "no" held, and a standby took over within half a second of the
+    /// brokers' return from a leader that had ridden the outage out (five runs of eight
+    /// with two of three brokers paused for 45 and 70 s).</summary>
+    [Fact]
+    public async Task At_the_ceiling_a_standby_does_not_take_over_while_the_brokers_do_not_answer_and_waits_for_the_leader_when_they_do()
+    {
+        await using var env = KafkaEnv.Create();
+        await using var a = await StartAsync(env, "a");
+        await LeadsAsync(a);
+        var ceiling = TimeSpan.FromSeconds(2);
+        await using var b = await StartAsync(env, "b", ceiling: ceiling, probe: _ => ValueTask.FromResult(true));
+        await Task.Delay(After);
+        b.Log.WritePathOverride = () => (KafkaLog.WritePath.Unreachable, "Local: Timed out");
+
+        using var stall = Stall(a);
+        await Task.Delay(ceiling * 2.5);
+        Assert.Equal(NodeRole.Standby, b.Role);
+        Assert.True(b.Leadership.TakeoversHeld > 0);
+        Assert.True(a.Log.IsWriter);
+
+        // The brokers answer again and see nothing wrong — and the question that finds it
+        // out had been waiting on them for longer than the leader's two takeover
+        // timeouts: those count from the answer, or the leader's time would be up before
+        // anybody knew the brokers were back. The leader, which was alive all along,
+        // commits a moment later, inside them.
+        using var answered = new ManualResetEventSlim();
+        b.Log.WritePathOverride = () =>
+        {
+            if (!answered.IsSet)
+            {
+                Thread.Sleep(After * 2.5);
+                answered.Set();
+            }
+            return (KafkaLog.WritePath.Writable, null);
+        };
+        Assert.True(answered.Wait(Timeout));
+        await Task.Delay(Beat * 2);
+        Assert.Equal(NodeRole.Standby, b.Role);
+        stall.Set();
+        await Task.Delay(After * 3);
+        Assert.Equal(NodeRole.Leader, a.Role);
+        Assert.True(a.Log.IsWriter);
+        Assert.Equal(NodeRole.Standby, b.Role);
+        Assert.Equal(1, b.Leadership.Status.LeaderTerm);
+        Assert.Equal(0, b.Leadership.TakeoversAbandoned);
+        Assert.Empty(b.Calls);
+        await CommitStateAsync(a.Log, "p", "still mine");
+
+        // An answer that says nothing either way is not a hold: the ceiling stands.
+        b.Log.WritePathOverride = () => (KafkaLog.WritePath.Unknown, "the topic was described without partitions");
+        using var again = Stall(a);
+        await LeadsAsync(b);
+        Assert.Equal("ceiling", b.Leadership.Status.LastTakeover!.Reason);
+        again.Set();
+        await a.Leadership.WhenFinished.WaitAsync(Timeout);
+    }
+
     [Fact]
     public async Task What_the_brokers_say_about_writing_is_asked_of_them_and_the_coordinator_is_placed_as_they_place_it()
     {
@@ -1255,6 +1384,27 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         Assert.False(KafkaLog.AnsweredWith(new KafkaException(new Error(ErrorCode.Local_Transport))));
         Assert.False(KafkaLog.AnsweredWith(new KafkaException(new Error(ErrorCode.Local_TimedOut))));
         Assert.False(KafkaLog.AnsweredWith(new TimeoutException()));
+
+        // And what the question about the write path makes of a failure: silence is
+        // "the brokers are not there", anything a broker said is "not known".
+        Assert.Equal(KafkaLog.WritePath.Unreachable, KafkaLog.Unasked(new TimeoutException()));
+        Assert.Equal(KafkaLog.WritePath.Unreachable, KafkaLog.Unasked(new OperationCanceledException()));
+        Assert.Equal(KafkaLog.WritePath.Unreachable, KafkaLog.Unasked(new KafkaException(new Error(ErrorCode.Local_TimedOut))));
+        Assert.Equal(KafkaLog.WritePath.Unreachable, KafkaLog.Unasked(new KafkaException(new Error(ErrorCode.Local_Transport))));
+        Assert.Equal(KafkaLog.WritePath.Unreachable, KafkaLog.Unasked(new KafkaException(new Error(ErrorCode.Local_AllBrokersDown))));
+        Assert.Equal(KafkaLog.WritePath.Unknown, KafkaLog.Unasked(new KafkaException(new Error(ErrorCode.TopicAuthorizationFailed))));
+        Assert.Equal(KafkaLog.WritePath.Unknown, KafkaLog.Unasked(new InvalidOperationException("Topic 'p.leader' was described without partitions")));
+
+        // The question itself, failing in each way: about the leader topic it decides the
+        // answer; about the coordinator's topic, which a node may not be allowed to
+        // describe, a failure is not a "no".
+        log.BeforeWritePathQuestion = topic => throw (topic.EndsWith(".leader") ? new KafkaException(new Error(ErrorCode.Local_TimedOut)) : new InvalidOperationException("not asked"));
+        Assert.Equal((KafkaLog.WritePath.Unreachable, "Local: Timed out"), await log.ProbeWritePathAsync(default).WaitAsync(Timeout));
+        log.BeforeWritePathQuestion = topic => throw (topic.EndsWith(".leader") ? new KafkaException(new Error(ErrorCode.TopicAuthorizationFailed)) : new InvalidOperationException("not asked"));
+        Assert.Equal(KafkaLog.WritePath.Unknown, (await log.ProbeWritePathAsync(default).WaitAsync(Timeout)).Path);
+        log.BeforeWritePathQuestion = topic => { if (!topic.EndsWith(".leader")) throw new TimeoutException(); };
+        Assert.Equal(KafkaLog.WritePath.Writable, (await log.ProbeWritePathAsync(default).WaitAsync(Timeout)).Path);
+        log.BeforeWritePathQuestion = null;
 
         var asked = new List<int>();
         log.BrokerAnswersOverride = broker =>

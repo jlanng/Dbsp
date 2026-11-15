@@ -171,6 +171,8 @@ try
             catalog = status.CatalogVersion,
             peer = status.Peer,
             pid = Environment.ProcessId,
+            // Processor time this process has used, for the tests that watch what a broker's loss costs a node.
+            cpuMs = System.Diagnostics.Process.GetCurrentProcess().TotalProcessorTime.TotalMilliseconds,
             counters = node.Backend.Describe().Counters,
             takeover = kafka?.LastTakeover is { } t
                 ? new

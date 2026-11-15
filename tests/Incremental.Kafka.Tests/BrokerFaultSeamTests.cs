@@ -57,9 +57,13 @@ public class BrokerFaultSeamTests
         Assert.Equal(7, await KafkaLog.RetryTransientAsync(Ask, TimeSpan.FromSeconds(60), default, () => refreshes++).WaitAsync(TimeSpan.FromSeconds(30)));
 
         // Half a second first — not the whole timeout, which a cached "no leader" would
-        // use up — then twice as long each time.
-        Assert.Equal([500, 1000, 2000, 4000, 8000], attempts.Select(a => (int)a.TotalMilliseconds).ToArray());
+        // use up — then twice as long, and no longer than two seconds while a broker's
+        // loss is being settled: an attempt that began without a leader runs its whole
+        // time, so its length is what the call loses once the leader is back.
+        Assert.Equal([500, 1000, 2000, 2000, 2000], attempts.Select(a => (int)a.TotalMilliseconds).ToArray());
         Assert.Equal(4, refreshes);
+        Assert.Equal([500, 1000, 2000, 2000, 2000, 2000, 4000, 8000, 8000, 8000],
+            Enumerable.Range(0, 10).Select(n => (int)KafkaLog.AttemptTimeout(n).TotalMilliseconds).ToArray());
 
         // Never longer than what is left of the timeout.
         attempts.Clear();
@@ -78,6 +82,30 @@ public class BrokerFaultSeamTests
             }, TimeSpan.FromSeconds(10), default, () => refreshes++));
         Assert.Equal(1, asked);
         Assert.Equal(0, refreshes);
+    }
+
+    /// <summary>What a call loses once a partition has its leader back: no more than an
+    /// attempt. A call that asks while there is no leader hears nothing until its
+    /// request's time is up — the new leader is seen only by the refresh between
+    /// attempts — and with attempts that doubled without a stop the one that began at
+    /// 3.8 s ran to 7.9 s: a takeover's read of a table's head took 15.6 s where the
+    /// partition had its leader again after about nine.</summary>
+    [Fact]
+    public async Task An_admin_call_loses_at_most_two_seconds_once_the_partition_has_its_leader_back()
+    {
+        var leaderless = TimeSpan.FromSeconds(4.5);
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        async Task<int> Ask(TimeSpan attempt)
+        {
+            if (clock.Elapsed >= leaderless)
+                return 7;
+            await Task.Delay(attempt);          // no leader: nothing is heard until the request's time is up
+            throw new KafkaException(new Error(ErrorCode.Local_NoEnt, "Failed to query partition leaders: No leaders found"));
+        }
+
+        Assert.Equal(7, await KafkaLog.RetryTransientAsync(Ask, TimeSpan.FromSeconds(30), default).WaitAsync(TimeSpan.FromSeconds(30)));
+        var lost = clock.Elapsed - leaderless;
+        Assert.True(lost < TimeSpan.FromSeconds(2.5), $"the call returned {lost.TotalSeconds:F1} s after the partition had its leader back");
     }
 
     // ── a consumer that is assigned and never joins a group ────────────────────────────
@@ -176,6 +204,17 @@ public class BrokerFaultSeamTests
         var admin = KafkaClientDefaults.Apply(new AdminClientConfig());
         Assert.Null(admin.Get("socket.timeout.ms"));
         Assert.Equal("1000", admin.Get("reconnect.backoff.max.ms"));
+
+        // And an admin client keeps a connection to every broker: one that connects on
+        // demand asks again for a dead broker's connection at every change of state,
+        // which resets the reconnect delay (30,000 refused connections a second while a
+        // dead broker was still listed as a leader). The other clients connect as needed.
+        Assert.Equal("false", admin.Get("enable.sparse.connections"));
+        Assert.Null(producer.Get("enable.sparse.connections"));
+        Assert.Null(consumer.Get("enable.sparse.connections"));
+        var sparse = new AdminClientConfig();
+        sparse.Set("enable.sparse.connections", "true");
+        Assert.Equal("true", KafkaClientDefaults.Apply(sparse).Get("enable.sparse.connections"));
 
         // What the caller set stands.
         var own = KafkaClientDefaults.Apply(new ProducerConfig { ReconnectBackoffMaxMs = 250, SocketTimeoutMs = 30_000 });

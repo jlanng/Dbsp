@@ -296,7 +296,10 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   token refresh runs only inside `Consume`. Take a `ListOffsets` answer through
   `KafkaLog.OffsetOf`: a partition with no leader comes back as an unset offset, not an
   exception, and −1001 read as "empty" has cost a repeated term and a lost table head.
-  Admin calls go through `RetryAsync` with the attempt's timeout. Build every client
+  Admin calls go through `RetryAsync` with the attempt's timeout, and an attempt is no
+  longer than two seconds while a broker's loss is being settled
+  (`KafkaLog.AttemptTimeout`): one that begins without a partition leader runs its
+  whole time, so its length is what a takeover loses once the leader is back. Build every client
   with the connection's `Configure…` callback, or it cannot authenticate where tokens
   come from a handler.
 - Kafka sources and sinks (`KafkaSource`, `KafkaSinks.cs`). A source's position lives in
@@ -323,11 +326,13 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   returns, and that must stay so. Such an acquisition replaces the producer
   (`KafkaLogNotAcquiredException`); never keep a client whose `InitTransactions` was
   cancelled — it finishes by itself and fences the leader. A takeover is called off
-  for a heard leader only until `InitTransactions` has returned
-  (`AcquireWriterUnlessAsync`): after that the leader is fenced and the takeover must go
-  through — do not add a check of the abandon token past that point, or a fenced
-  leader and a standby that stood down are what is left. A takeover given up for a
-  heard leader holds the next attempt back by nothing; one lost to a fence waits.
+  for a heard leader only before the first call of `InitTransactions`
+  (`AcquireWriterUnlessAsync`): that call's first request makes the coordinator fence a
+  leader whose transaction is open, long before the call returns, and the takeover
+  must go through — do not look at the abandon token between its slices or past them,
+  or a fenced leader and a standby that stood down are what is left. A takeover given
+  up for a heard leader holds the next attempt back by nothing; one lost to a fence
+  waits.
   The process must run under something that starts it again after exit codes
   3, 4 and 5 (`NodeSupervisor`, or the platform's restart policy): without it a
   deployment is one node after its first takeover. 3 and 4 are how a healthy node ends
@@ -337,6 +342,12 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   map a failure of the node's own to 3. Nodes that share a process (the in-memory
   backend's two) cannot exit for it: their `ExitOnLeadershipLoss` is off and
   `NodeSupervisor.RunInProcessAsync` starts one again on `ServiceNode.Ended`.
+  At the ceiling a standby is held by brokers that say nothing can be committed and by
+  brokers that do not answer the question at all (`WritePath.Unreachable`: frozen
+  brokers keep their connections and time the question out) — not by an error a broker
+  sends. The leader's two takeover timeouts afterwards count from the first answer that
+  is not a hold, never from the last hold: the question itself can wait on the brokers
+  for longer than that.
   The ceiling's question to the brokers (`KafkaLog.ProbeWritePathAsync`) does not
   believe the metadata's lists of leaders and replicas in sync by themselves: with no
   controller quorum they never change. It asks any broker for the metadata and each

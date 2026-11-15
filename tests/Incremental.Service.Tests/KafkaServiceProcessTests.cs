@@ -892,22 +892,45 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         var load = new Load(env, d);
         await Task.Delay(3000);
         var roles = await RolesAsync(index, env.Prefix, d);
+        // What the loss costs the standby in processor time, second by second: a node
+        // that only follows has little to do, and one whose Kafka client connects again
+        // without a pause to a broker that refuses it takes more than a processor for as
+        // long as the broker is still listed as a leader (Open for James 75).
+        var standby = (await a.StatusAsync()).GetProperty("role").GetString() == "Leader" ? b : a;
+        var busiest = 0.0;
+        var busySeconds = 0;
         try
         {
             await DockerAsync(fault switch { "pause" => ["pause", broker], "stop" => ["stop", "-t", "30", broker], _ => ["kill", broker] });
-            await Task.Delay(away);
+            var gone = Stopwatch.StartNew();
+            var (lastCpu, lastAt) = ((await standby.StatusAsync()).GetProperty("cpuMs").GetDouble(), gone.Elapsed.TotalMilliseconds);
+            while (gone.Elapsed < away)
+            {
+                await Task.Delay(1000);
+                var (cpu, at) = ((await standby.StatusAsync()).GetProperty("cpuMs").GetDouble(), gone.Elapsed.TotalMilliseconds);
+                var used = (cpu - lastCpu) / Math.Max(1, at - lastAt);
+                busiest = Math.Max(busiest, used);
+                if (used > 0.9)
+                    busySeconds++;
+                (lastCpu, lastAt) = (cpu, at);
+            }
         }
         finally
         {
             await DockerAsync(fault == "pause" ? ["unpause", broker] : ["start", broker]);
         }
+        Measured($"kafka3 {fault}-one: the standby ({standby.Id}) used at most {busiest:F2} of a processor in any second the broker was away, and more than 0.9 in {busySeconds} of them");
         await ClusterWholeAsync(env.Prefix);
         await Task.Delay(3000);
         var (trades, stall) = await load.StopAsync();
         var moved = await ConcludeAsync(
             fault + "-one", env, d, trades, stall, $"broker {index + 1} ({(roles.Count == 0 ? "no role" : string.Join(", ", roles))}) was lost by {fault} for {away.TotalSeconds:F0} s",
-            new() { ["broker"] = index + 1, ["roles"] = roles, ["awayS"] = away.TotalSeconds });
+            new() { ["broker"] = index + 1, ["roles"] = roles, ["awayS"] = away.TotalSeconds, ["standbyBusiestSecond"] = Math.Round(busiest, 2), ["standbyBusySeconds"] = busySeconds });
         Assert.False(moved, "the loss of one broker of three moved the leadership");
+
+        // It was eight to eleven such seconds, at 1.2 to 1.4 processors each, while the
+        // admin client connected on demand.
+        Assert.True(busySeconds <= 2, $"the standby used more than 0.9 of a processor in {busySeconds} of the seconds the broker was away (at most {busiest:F2})");
 
         // The bound is the takeover ceiling, not the 9 to 15 s this takes almost always:
         // in one kill of thirty the two brokers that were left spent the whole twenty
@@ -1029,27 +1052,47 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         // leader die in the same moment, as a zone does — the standby takes over on a
         // cluster that will go on believing in the dead broker for its session timeout,
         // and its takeover waits that out.
+        // INCREMENTAL_KAFKA_BROKER_AFTER_MS turns the order round: the leader is killed
+        // first and the broker that many milliseconds later — at about 3,000, in the
+        // middle of the standby's takeover, whose reads then begin as a partition loses
+        // its leader.
         var fault = Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_FAULT") is "kill" ? "kill" : "stop";
         var index = int.TryParse(Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_BROKER"), out var chosen) ? chosen % Brokers.Length : 1;
+        var brokerAfter = int.TryParse(Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_BROKER_AFTER_MS"), out var afterMs) ? afterMs : -1;
         var roles = await RolesAsync(index, env.Prefix, d);
-        if (fault == "kill")
+        long killedAt;
+        if (brokerAfter >= 0)
+        {
+            fault = "kill";
+            a.Kill();
+            killedAt = Now;
+            await Task.Delay(brokerAfter);
             await DockerAsync("kill", Brokers[index]);
+        }
         else
         {
-            await DockerAsync("stop", "-t", "1", Brokers[index]);
-            await Task.Delay(1500);
+            if (fault == "kill")
+                await DockerAsync("kill", Brokers[index]);
+            else
+            {
+                await DockerAsync("stop", "-t", "1", Brokers[index]);
+                await Task.Delay(1500);
+            }
+            a.Kill();
+            killedAt = Now;
         }
-        a.Kill();
-        var killedAt = Now;
         var leading = await b.WaitForRoleAsync("Leader");
         var running = await b.StatusWhenAsync(s => State(s, "main") == "Running", "the pipeline to run on the new leader");
         var takeover = running.GetProperty("takeover");
         Measured(
-            $"kafka3: kill -9 with broker {index + 1} of three ({(roles.Count == 0 ? "no role" : string.Join(", ", roles))}) {(fault == "kill" ? "killed in the same moment" : "shut down 1.5 s before")}: kill to Leader {T(leading) - killedAt} ms " +
-            $"(silence {takeover.GetProperty("silenceMs").GetDouble():F0} ms, fence {takeover.GetProperty("fenceMs").GetDouble():F0} ms, takeover {takeover.GetProperty("totalMs").GetDouble():F0} ms)");
+            $"kafka3: kill -9 with broker {index + 1} of three ({(roles.Count == 0 ? "no role" : string.Join(", ", roles))}) " +
+            $"{(brokerAfter >= 0 ? $"killed {brokerAfter} ms after it" : fault == "kill" ? "killed in the same moment" : "shut down 1.5 s before")}: kill to Leader {T(leading) - killedAt} ms " +
+            $"(silence {takeover.GetProperty("silenceMs").GetDouble():F0} ms, fence {takeover.GetProperty("fenceMs").GetDouble():F0} ms, " +
+            $"tables {takeover.GetProperty("tablesMs").GetDouble():F0} ms, takeover {takeover.GetProperty("totalMs").GetDouble():F0} ms)");
         Result(new Dictionary<string, object?>
         {
             ["scenario"] = "takeover-broker-down", ["prefix"] = env.Prefix, ["fault"] = fault, ["broker"] = index + 1, ["roles"] = roles, ["killToLeaderMs"] = T(leading) - killedAt,
+            ["brokerAfterMs"] = brokerAfter >= 0 ? brokerAfter : null,
             ["takeover"] = takeover.Clone(),
         });
 
@@ -1095,15 +1138,18 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         // INCREMENTAL_KAFKA_FAULT=kill takes the two away in one command and without a
         // word to the controller; otherwise they are stopped one after the other, a
         // second each to shut down in (which the second of them may not manage).
+        // INCREMENTAL_KAFKA_FAULT=pause freezes them: they keep their connections and
+        // answer nothing, as a zone cut off from the network does, and nothing refuses
+        // the nodes' requests — they wait out their timeouts.
         var seconds = int.TryParse(Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_OUTAGE_SECONDS"), out var asked) ? asked : 70;
-        var fault = Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_FAULT") is "kill" ? "kill" : "stop";
+        var fault = Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_FAULT") is { } named && named is "kill" or "pause" ? named : "stop";
         var transactionTimeout = double.TryParse(
             Environment.GetEnvironmentVariable("INCREMENTAL_KAFKA_TRANSACTION_TIMEOUT_SECONDS"), CultureInfo.InvariantCulture, out var given)
             ? TimeSpan.FromSeconds(given)
             : new Incremental.Kafka.KafkaLogOptions { BootstrapServers = "unused" }.TransactionTimeout;
         var outage = Stopwatch.StartNew();
-        if (fault == "kill")
-            await DockerAsync("kill", Brokers[0], Brokers[1]);
+        if (fault is "kill" or "pause")
+            await DockerAsync(fault, Brokers[0], Brokers[1]);
         else
         {
             await DockerAsync("stop", "-t", "1", Brokers[0]);
@@ -1123,11 +1169,11 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         // it: the outage is as long as it was asked to be, whatever the counter costs
         // to read.
         var downFor = outage.ElapsedMilliseconds;
-        await DockerAsync("start", Brokers[0], Brokers[1]);
+        await DockerAsync(fault == "pause" ? "unpause" : "start", Brokers[0], Brokers[1]);
         var startedAfter = outage.ElapsedMilliseconds;
         var held = (await b.StatusAsync()).GetProperty("counters").GetProperty("takeoversHeld").GetInt64();
         Measured(
-            $"kafka3: two of three brokers {(fault == "kill" ? "killed" : "stopped")} and down for {downFor} ms (started again by {startedAfter} ms); " +
+            $"kafka3: two of three brokers {(fault == "kill" ? "killed" : fault == "pause" ? "frozen" : "stopped")} and down for {downFor} ms (started again by {startedAfter} ms); " +
             $"the standby held its takeover back {held} time(s) at the ceiling and answered a status request in {statusMs} ms during the outage");
         Assert.True(statusMs < 10_000, $"the standby took {statusMs} ms to answer a status request with two brokers down");
         await ClusterWholeAsync(env.Prefix);
