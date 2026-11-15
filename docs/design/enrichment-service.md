@@ -2223,13 +2223,21 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     read. *Alternative:* wait up to the ceiling again once the brokers are back — a
     leader that is alive and truly stuck then holds the deployment for another thirty
     seconds.
-80. **A heartbeat counts from when its writer wrote it** (S8, J4; `HeartbeatDating`):
+80. **A heartbeat that is read a takeover timeout or more after it was written counts
+    from when its writer wrote it** (S8, J4; `HeartbeatDating`):
     the last heartbeat of a leader that died with a broker, readable only when the
     brokers give the broker up, no longer calls a takeover off or starts the silence
     again (it cost one takeover timeout, once in thirteen such takeovers). It rests on
     the writer's wall clock moving forward at the pace of the reader's; the two are
-    never compared. *Alternative:* count from the reading, as before — nothing to
-    assume about clocks, and three seconds more in that one case; or a monotonic
+    never compared, and a record the dating puts less than a takeover timeout back is
+    heard when it is read, so a clock error has to make a record three seconds old to
+    matter. *Alternatives:* count from the reading always, as before S8 — nothing to
+    assume about clocks, and three seconds more in that one case; count from the
+    writing always, as S8 first built it — up to three seconds sooner when a dead
+    leader's last record is read late by less than the takeover timeout, and a healthy
+    leader whose commits take over half the takeover timeout is taken over from by a
+    standby that has no probe to ask (shown by test; S8, *Finished by a second
+    session*); or a monotonic
     reading of the writer's clock in the heartbeat record, which a clock that is set
     cannot disturb and a suspended host can.
 
@@ -6641,8 +6649,9 @@ standby has seen (`HeartbeatDating`; the two clocks are never compared, so their
 does not matter, and the estimate is never earlier than the writing). A record written
 within the silence a takeover was decided on calls it off, as before; an older one does
 not, does not start the silence again, and does not end the wait for a leader that the
-brokers had held up. Read at once, as nearly every record is, a record is dated when it
-is read and nothing changes.
+brokers had held up. A record younger than the takeover timeout is heard when it is
+read, as before (*Finished by a second session*, below, has why that had to be put
+back).
 
 Nine more takeovers were made on that build, and three on the final one (below, *A
 check on a cluster just started*): none was called off. That is not the fix shown at
@@ -6731,7 +6740,7 @@ Changed: `KafkaLogOptions.TransactionTimeout` defaults to five minutes;
 `AcquireWriterAsync` fails with a plain `KafkaLogException` for a timeout the brokers
 refuse; topics the log creates carry `unclean.leader.election.enable=false`; a
 standby's `LeadershipStatus.HeartbeatAge` counts from when the leader wrote its last
-record. The backend's settings (`BackendInfo`, the admin's cluster page) show
+record if that record was a takeover timeout old or more when it was read. The backend's settings (`BackendInfo`, the admin's cluster page) show
 `transactionTimeout`. Test seams (internal): `HeartbeatDating`,
 `KafkaLeadership.Heard(record, now)`, `KafkaLog.ShortReadLeadersFor`,
 `ShortReadLeadersAsked`. The failover app takes
@@ -6791,14 +6800,16 @@ tolerate a machine too slow for their clocks, and the Kafka project ran again: 1
 
 - **The default timeout changed**; a deployment that relied on a dead writer's
   transaction being gone after a minute with no node running now waits five.
-- **Heartbeats are dated by their writer's wall clock.** A leader whose clock is set
-  back by less than the gap between two heartbeats, or slowed by its time daemon, is
-  taken for up to that much more silent than it is — under a second — for at most ten
-  seconds of its heartbeats; one whose commit
+- **Heartbeats are dated by their writer's wall clock**, and the date is acted on for
+  a record it puts a takeover timeout or more before its reading. A leader whose clock
+  is set back by less than the gap between two heartbeats, or slowed by its time
+  daemon, has its records dated early by up to that much — under a second — for at
+  most ten seconds of its heartbeats, which matters only to a record that was already
+  most of a takeover timeout late; one whose commit
   takes longer than the takeover timeout after its last heartbeat, and that is heard
   only then by a standby already taking over, is no longer spared. Both need a standby
-  that is taking over — the leader's probe unanswered, or the ceiling — and neither
-  was seen.
+  that is taking over — the leader's probe unanswered or not configured, or the
+  ceiling — and neither was seen.
 - **Short reads cost a metadata request** when the last answer for the topic is over a
   second old: one for each table in a takeover, and one a second per table for a
   standby's statistics.
@@ -6822,3 +6833,78 @@ tolerate a machine too slow for their clocks, and the Kafka project ran again: 1
   not taken apart further: a new partition leader does not give its end until a
   follower has caught up with it, the coordinator loads its partition, and the dead
   leader's transaction is aborted; which of them is the longest was not measured.
+
+**Finished by a second session** (2026-11-15). The session that did the work above was
+cut off before it could report. A second one read its three commits against the
+leadership's rules, its tables against the records (they agree), and ran the checks
+again. It changed one thing.
+
+*A heartbeat younger than the takeover timeout is heard when it is read.* As built
+above, the silence counted from every record's writing. A heartbeat is written when its
+transaction begins and is readable when the transaction commits, so on brokers where a
+commit takes *c* each record is *c* old when it is read and the next is read *c* later:
+counted from the writing, a leader that commits all along is silent for 2*c*; counted
+from the reading, as before S8, for *c*. The dating absorbs a slowdown only once its
+two five-second stretches have forgotten faster deliveries, so for up to ten seconds
+after brokers turn slow the tolerance was half of what it had been. A test written to
+find out — a leader whose every commit takes 1.2 s, a takeover timeout of 2 s, a
+standby with no probe — had the standby fence the leader in three runs of three on
+that build, and in none of three with the leadership as it was before S8. With a probe that answers the standby would have
+waited for the ceiling, so the service as the guide configures it was not exposed
+unless the probe failed in the same seconds; a deployment without `PeerProbe`, and any
+user of `KafkaLeadership` without one, was. The second cost was quieter: the delivery
+lease is argued from "the standby's silence starts no earlier than its reading of the
+heartbeat", and a silence counted from an estimate of the writing puts the writer's
+wall clock into that argument — an estimate up to a second early (above) against a
+lease margin of one second.
+
+Now `KafkaLeadership.Heard` uses the date only for a record it puts a takeover timeout
+or more before its reading: that record does not start the silence again, and the
+rules for calling a takeover off and for ending the wait after an outage are as above.
+A younger record counts from its reading, exactly as before S8. The case S8 fixed is
+untouched — the dead leader's last heartbeat was 8.9 s old — and what is given back is
+the case nobody measured: a dead leader's last record read late by less than the
+takeover timeout starts the silence again, as it always did (Open for James 80).
+`KafkaLeadershipTests.A_leader_whose_commits_are_slow_and_inside_the_takeover_timeout_is_left_alone`
+is the test (it says so and checks nothing on a machine where a commit took the whole
+timeout), and `The_silence_is_counted…` has a third record, half a takeover timeout
+old. Four mutations, all killed: every record counted from its writing (S8's first
+build: both tests fail), every record heard now (before S8: the dead leader's
+heartbeat calls the takeover off again), "younger" meaning within the ceiling,
+nothing younger.
+
+*What else the reading looked for and did not find.* A node whose transaction timeout
+the brokers refuse is not `Fenced` and fences nobody: the brokers refuse before they
+touch the id (the refused-timeout test now also asks with a writer in place, which
+commits again afterwards), and the node stands by and says the limit's name at every
+attempt, a takeover timeout or two apart — it never leads, which is the
+configuration's doing, and nothing but its log says so. The five-minute timeout changes nothing in how soon
+a dead leader is found: that is the heartbeat's silence, and a takeover's
+`InitTransactions` aborts whatever was open. The producer's socket timeout stays at
+`KafkaClientDefaults`' six seconds (the client would otherwise take it from the
+transaction timeout). The short reader's second question waits at most half a second
+and its failure is not the read's, so a broker that pauses adds at most that to a read
+that would have waited on the same broker.
+
+*The check* (records `docs/design/runs/2026-11-15-j4-check.*`; the profile's containers
+removed and started nine seconds before): the broker tests once each, 7 of 7 in
+7 min 27 s. Seventy seconds without a quorum: the leader kept term 1, no process
+ended, the sink was silent 84.8 s, the standby held 377 times and answered its status
+in 20 ms. One broker killed for 20 s — this time the active controller, the
+coordinator and the leader topic's leader — moved nothing (14.2 s); every broker
+killed in turn 14.3 s, shut down in turn 1.3 s. Broker 3 away 79 s with the leader
+killed half way: the standby led 3.4 s after the kill. A takeover with broker 2 shut
+down 1.5 s before: 4.4 s, of which 1.0 s was `InitTransactions` (one whole one-second
+slice; 13 to 670 ms in the five such runs of record before it — one run, not looked
+into). Then three takeovers with a broker killed beside the leader, each time the
+active controller: 13.5, 13.3 and 13.9 s, none called off. The standby's log has the
+late records: a live leader's shown 7.1 to 14.5 s late by a broker's loss and 83.4 s
+late after the outage, with the leadership where it was.
+
+*Numbers on the final tree.* `dotnet build --no-incremental` 0 warnings;
+`tests/Incremental.Tests` 710, 709 passed, 1 skipped; `tests/Incremental.Kafka.Tests` 147/147 (146 before:
+the new test); `tests/Incremental.Service.Tests` 253, 247 passed, 6 skipped — the six skipped are the
+broker tests, run as above; `Pipelines.Tests` 17/17. Smokes: `--headless` 55 claims,
+`--headless --nodes 2` 70, `--headless --kafka` 69 (3.1 s from the kill to b leading),
+`TradeEnrichment` 13; all exit 0. `benchmarks -- --assert` was not run: `src/Incremental`
+is untouched.

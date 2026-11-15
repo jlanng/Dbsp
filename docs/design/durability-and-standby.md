@@ -2557,14 +2557,32 @@ worth knowing before believing a number from a container cluster.
   and by an `At` that goes backwards (a clock set back by less than the gap between
   two heartbeats, or slowed by a time daemon, dates records early by under a second
   for ten seconds). With the date: the silence counts from the
-  latest record's writing; a record calls a takeover off only if it was written
+  writing of a record that is a takeover timeout old or more when it is read; a
+  record calls a takeover off only if it was written
   within the silence the takeover was decided on (the takeover timeout, or the
   ceiling for a takeover at the ceiling; after a resignation any record does); and
   only a record written within the takeover timeout ends the wait for a leader that
   the brokers had held up. What it gives up: a leader whose commit took longer than
   the takeover timeout after its last heartbeat, heard just then by a standby that
   was already taking over, used to be spared and is not now. A standby takes over
-  only from a leader whose probe does not answer, or at the ceiling.
+  only from a leader whose probe does not answer (or that has none), or at the
+  ceiling.
+
+  A record younger than the takeover timeout is heard when it is read, as every
+  record was before. As first built the silence counted from every record's writing,
+  and that was wrong for a leader on slow brokers. A heartbeat is written when its
+  transaction begins and readable when it commits, so with commits that take *c* the
+  record is *c* old when it is read and the next one is read *c* later: counted from
+  the writing the leader is silent for 2*c*, counted from the reading for *c*. A
+  leader whose commits took 1.2 s against a takeover timeout of 2 s, committing all
+  along, was taken over from by a standby without a probe in three runs of three
+  (`KafkaLeadershipTests.A_leader_whose_commits_are_slow_and_inside_the_takeover_timeout_is_left_alone`,
+  written to find out); the tolerance for slow brokers had been halved, for as long
+  as the dating remembered faster ones — up to ten seconds of every slowdown. It also put
+  the writer's clock into the delivery lease's argument (a lease ends before the
+  standby's silence does because the silence starts no earlier than the reading):
+  now a clock error can only matter to a record it makes a whole takeover timeout
+  old.
 
 ### A leader does not outlive its transaction timeout
 

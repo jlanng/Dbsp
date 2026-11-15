@@ -121,6 +121,14 @@ public class KafkaLogTests(ITestOutputHelper output)
         var other = await env.ConnectWriterAsync(env.Options(nodeId: "other"));
         Assert.Equal(1, other.Term);
         await CommitAsync(await other.State.AcquireWriterAsync(), 0, ("k", (string?)"v"));
+
+        // And nothing is taken from a writer that is there: the brokers refuse the
+        // timeout before they touch the id, so a node configured with one they will not
+        // have cannot fence the leader it tries to replace.
+        await Assert.ThrowsAsync<KafkaLogException>(() => log.AcquireWriterAsync().WaitAsync(Timeout));
+        await CommitAsync(await other.State.AcquireWriterAsync(), 0, ("k", (string?)"again"));
+        Assert.False(other.IsFenced);
+        Assert.Equal(3, log.WriterResets);
     }
 
     [Fact]

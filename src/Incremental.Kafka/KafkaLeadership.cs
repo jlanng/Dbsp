@@ -755,20 +755,28 @@ public sealed class KafkaLeadership : IAsyncDisposable
             _leaderAt = record.At;
             _leaderResigned = record.Resigned;
 
-            // The leader was alive when it wrote this, which is the moment the silence
-            // counts from — and not always the moment of reading: the last heartbeat of
-            // a leader that died with a broker is readable only when the brokers give
-            // that broker up, seconds later (HeartbeatDating). Read at once, as almost
-            // every record is, the two are the same moment.
+            // The leader was alive when it wrote this, and that is not always the moment
+            // of reading: the last heartbeat of a leader that died with a broker is
+            // readable only when the brokers give that broker up, seconds later
+            // (HeartbeatDating). A record that is a takeover timeout old or more when it
+            // is read is no news about the leader now, and the silence counts from its
+            // writing. A younger one is heard now, as every record was before records
+            // were dated: a leader whose commits are slow writes each heartbeat one
+            // commit before it can be read, and counted from the writing its silence
+            // would be twice the commit — a healthy leader on slow brokers taken over
+            // from at half the takeover timeout. It also keeps the writer's clock out of
+            // every decision but the one about a record that is long late.
             var written = _dating.Written(record.Term, record.At.ToUnixTimeMilliseconds(), now);
-            if (written > _heardTicks)
-                _heardTicks = written;
+            var age = now - written;
+            var fresh = age < (long)_options.TakeoverAfter.TotalMilliseconds;
+            var heard = fresh ? now : written;
+            if (heard > _heardTicks)
+                _heardTicks = heard;
             _uncommittedEnd = -1;
 
             // A leader that has written within the takeover timeout is a leader: the
             // brokers' word that held a takeover back is no longer needed.
-            var age = now - written;
-            if (age < (long)_options.TakeoverAfter.TotalMilliseconds)
+            if (fresh)
                 Interlocked.Exchange(ref _lastHeldTicks, 0);
 
             // Heard while this node is on its way to fencing it: the leader is alive and
@@ -778,7 +786,7 @@ public sealed class KafkaLeadership : IAsyncDisposable
             // (or, at the ceiling, the ceiling) has passed since the leader wrote it.
             if (!record.Resigned && record.Node != NodeId && age < _abandonWithin)
                 abandon = _abandon;
-            late = age >= (long)_options.TakeoverAfter.TotalMilliseconds && record.Node != NodeId && now - _lateSaidTicks >= 5_000
+            late = !fresh && record.Node != NodeId && now - _lateSaidTicks >= 5_000
                 ? TimeSpan.FromMilliseconds(age)
                 : null;
             if (late is not null)

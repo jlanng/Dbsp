@@ -1099,8 +1099,9 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
     }
 
     /// <summary>What a standby says of the leader's silence is counted from when the
-    /// leader wrote, too: a record read late does not make the leader look alive now,
-    /// and an older one does not move the count back.</summary>
+    /// leader wrote, too, for a record that is a takeover timeout old or more: read
+    /// late, it does not make the leader look alive now. A record younger than that is
+    /// heard when it is read, whatever its writer's clock says.</summary>
     [Fact]
     public async Task The_silence_is_counted_from_when_a_heartbeat_was_written()
     {
@@ -1119,11 +1120,71 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         b.Leadership.Heard(new KafkaLog.LeaderRecord(1, "a", DateTimeOffset.UtcNow - TimeSpan.FromSeconds(2), Sequence: int.MaxValue));
         Assert.InRange(b.Leadership.Status.HeartbeatAge, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2.8));
 
+        // Written half a takeover timeout ago, read now: heard now. The silence is what
+        // has passed since the reading, and no part of the record's age.
+        var read = Stopwatch.StartNew();
+        b.Leadership.Heard(new KafkaLog.LeaderRecord(1, "a", DateTimeOffset.UtcNow - After / 2, Sequence: int.MaxValue));
+        var age = b.Leadership.Status.HeartbeatAge;
+        Assert.InRange(age, TimeSpan.Zero, read.Elapsed + TimeSpan.FromMilliseconds(100));
+
         // Written now.
         b.Leadership.Heard(new KafkaLog.LeaderRecord(1, "a", DateTimeOffset.UtcNow, Sequence: int.MaxValue));
         Assert.InRange(b.Leadership.Status.HeartbeatAge, TimeSpan.Zero, TimeSpan.FromMilliseconds(500));
         Assert.Equal(NodeRole.Standby, b.Role);
         stall.Set();
+    }
+
+    /// <summary>
+    /// A leader on brokers that are slow and not gone: every commit takes most of the
+    /// takeover timeout, so each heartbeat is that old when it can be read and the next
+    /// is read that much later again. Dated from its writing, each record would leave
+    /// the leader silent for twice the commit's length — past the takeover timeout,
+    /// with the leader committing all along. A record younger than the takeover timeout
+    /// is therefore heard when it is read, as it always was; only one that is older
+    /// counts from its writing.
+    /// </summary>
+    [Fact]
+    public async Task A_leader_whose_commits_are_slow_and_inside_the_takeover_timeout_is_left_alone()
+    {
+        var after = TimeSpan.FromSeconds(2);
+        await using var env = KafkaEnv.Create();
+        await using var a = await StartAsync(env, "a", after: after);
+        await LeadsAsync(a);
+        await using var b = await StartAsync(env, "b", after: after);
+        await Task.Delay(after);      // b has read a's heartbeats as they were written
+
+        // Between a transaction's heartbeat and its commit: 0.6 of the takeover timeout.
+        var slow = after * 0.6;
+        var longest = TimeSpan.Zero;
+        var last = Stopwatch.StartNew();
+        a.Log.FailTransaction = _ =>
+        {
+            Thread.Sleep(slow);
+            return false;
+        };
+        a.Log.BeforeTransaction = () =>
+        {
+            // What this machine made of it: a commit that took the whole timeout is
+            // a leader that was silent for it, and proves nothing here.
+            if (last.Elapsed > longest)
+                longest = last.Elapsed;
+            last.Restart();
+        };
+        await Task.Delay(slow * 8);
+        a.Log.FailTransaction = null;
+        a.Log.BeforeTransaction = null;
+        output.WriteLine($"the longest of the leader's transactions took {longest.TotalMilliseconds:F0} ms; the takeover timeout is {after.TotalMilliseconds:F0} ms");
+        if (longest >= after - TimeSpan.FromMilliseconds(200))
+        {
+            output.WriteLine("This machine was too slow for the test's clocks: nothing was checked.");
+            return;
+        }
+
+        Assert.Equal(0, b.Leadership.TakeoversAbandoned);
+        Assert.Equal(NodeRole.Standby, b.Role);
+        Assert.Equal(NodeRole.Leader, a.Role);
+        Assert.Equal(1, a.Leadership.Term);
+        await CommitStateAsync(a.Log, "p", "still mine");
     }
 
     /// <summary>At the ceiling a standby takes over from a leader that still answers —

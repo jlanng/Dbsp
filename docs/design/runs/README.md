@@ -162,3 +162,18 @@ The run with a longest silence of 72.3 s (`sb5cdd318d216404b`, 70 s on the 60 s
 timeout, killed) is not a shorter outage: one record became readable two seconds after
 the brokers were started and the next fourteen seconds later, and the test records the
 longest silence only.
+
+## 2026-11-15, the check after J4's last change
+
+`docs/design/enrichment-service.md`, S8, *Finished by a second session*. The `kafka3`
+profile's containers removed and started nine seconds before the first test; the build
+is the one in which a heartbeat younger than the takeover timeout is heard when it is
+read.
+
+- `2026-11-15-j4-check.jsonl` — the broker tests of `KafkaServiceProcessTests` once each
+  with their defaults (`--filter-method "*broker*"`: six records; 7 of 7 passed in
+  7 min 27 s), then `*A_takeover_with_one_broker_down*` three times with
+  `INCREMENTAL_KAFKA_FAULT=kill` and `INCREMENTAL_KAFKA_BROKER` 0, 1, 2 (the broker
+  killed was the active controller each time).
+- `2026-11-15-j4-check.measurements.log` — the lines those runs wrote to
+  `measurements.log`.

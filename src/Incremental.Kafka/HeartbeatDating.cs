@@ -36,6 +36,14 @@ namespace Incremental.Kafka;
 /// at the very most) is dated early by that share of ten seconds, a few tenths; one
 /// whose clock is set forward is dated correctly at once.
 /// </para>
+/// <para>
+/// The leadership acts on the date only for a record it puts a takeover timeout or more
+/// before its reading (<see cref="KafkaLeadership"/>, <c>Heard</c>). A younger record is
+/// heard when it is read: a leader whose commits are slow writes every heartbeat one
+/// commit before it is readable, and counted from the writing its silence would be two
+/// commits long with the leader alive throughout — and none of the errors above can
+/// make a prompt record a takeover timeout old.
+/// </para>
 /// Not thread-safe: the leadership calls it under its lock.
 /// </summary>
 internal sealed class HeartbeatDating

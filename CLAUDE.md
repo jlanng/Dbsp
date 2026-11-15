@@ -346,11 +346,17 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   brokers give the broker up, nine seconds on. `KafkaLeadership.Heard` dates each
   record through `HeartbeatDating` (the writer's `At` plus the smallest difference seen
   between this node's clock and it — the clocks are never compared), counts the
-  silence from that date, calls a takeover off only for a record written within the
+  silence from that date when the date is a takeover timeout or more before the
+  reading, calls a takeover off only for a record written within the
   silence it was decided on, and ends the wait after a broker outage only for one
-  written within the takeover timeout. Do not go back to "heard is now"; do not make
-  the dating remember more than its two five-second stretches of the writer's time: an
-  error of the writer's clock lasts as long as what is remembered.
+  written within the takeover timeout. A record younger than the takeover timeout is
+  heard when it is read, and that must stay too: a leader whose commits take over half
+  the takeover timeout writes each heartbeat one commit before it is readable, and
+  counted from the writing it is silent for two commits and taken over from while it
+  commits (`A_leader_whose_commits_are_slow…`, which the first build of the dating
+  failed three runs in three). Do not go back to "heard is now" for a late record; do
+  not make the dating remember more than its two five-second stretches of the writer's
+  time: an error of the writer's clock lasts as long as what is remembered.
 - `CircuitBuilder.Describe` reports a `Lookup`'s table as `Probes`, not among `Inputs`:
   the lookup probes the table and does not consume its changes, so the edge belongs to
   the picture and must never become an execution input.
