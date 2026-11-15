@@ -7541,4 +7541,16 @@ the newest instead of the least — killed by 3, 3 and 6 tests; the rule removed
   are public); the guide's connector section does not show it.
 - The two admin UI tests that need a browser (`AdminUiMorphTests`,
   `AdminUiTablesTests`) were skipped on the machine this step ran on — it has no
-  Chrome — after a change to `views.js` (one helper and two sentences). CI runs them.
+  Chrome — after a change to `views.js` (one helper and two sentences). CI's
+  `build-and-test` ran them green on the commit that made the change and the two after
+  (43768221117, 43770594077, 43771626891); `views.js` has not changed since.
+- *CI.* Of the step's first three pushes, `build-and-test` and `perf-contracts` were
+  green and `connector-stack` red at its Kafka step each time: on the first for two
+  source tests that counted the channel's places (the notes about partitions took
+  two; they are no longer sent to an input without event time), then because the job
+  demands that no Kafka test is skipped and the two broker tests skip on one broker.
+  The workflow now expects exactly those two there and runs them in
+  `broker-failures`. That change has not run: the runs of the last four pushes were
+  not started ("recent account payments have failed or your spending limit needs to
+  be increased"), which is the account's, not the branch's. Everything those jobs
+  run was run here on the last commit's build, the broker tests included.

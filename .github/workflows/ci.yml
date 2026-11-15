@@ -92,7 +92,9 @@ jobs:
           set -o pipefail
           dotnet test --project tests/Incremental.Kafka.Tests -c Release --no-build | tee kafka-tests.log
           # The summary's lines carry colour codes on a runner: taken out before the match.
-          sed 's/\x1b\[[0-9;]*m//g' kafka-tests.log | grep -Eq '^\s*skipped: 0\s*$'
+          # Two, exactly: KafkaPartitionWatermarkTests' two that kill and freeze a broker,
+          # which need three of them (the broker-failures job runs those).
+          sed 's/\x1b\[[0-9;]*m//g' kafka-tests.log | grep -Eq '^\s*skipped: 2\s*$'
       - name: Test Service against the broker
         run: |
           set -o pipefail
@@ -150,11 +152,16 @@ jobs:
           dotnet test --project tests/Incremental.Service.Tests -c Release --no-build -- --filter-method "*broker*" | tee broker-tests.log
           # Here the brokers are there to be stopped: a skip means the run proved nothing.
           sed 's/\x1b\[[0-9;]*m//g' broker-tests.log | grep -Eq '^\s*skipped: 0\s*$'
+          # A broker lost under a topic of several partitions: the watermark waits for
+          # the partitions that have no leader, and their records are not late.
+          dotnet test --project tests/Incremental.Kafka.Tests -c Release --no-build -- --filter-method "*ABrokerLost*" | tee kafka-broker-tests.log
+          sed 's/\x1b\[[0-9;]*m//g' kafka-broker-tests.log | grep -Eq '^\s*skipped: 0\s*$'
       - name: What the runs measured
         if: always()
         run: |
           cat tests/Incremental.Service.Tests/bin/Release/net10.0/measurements.log || true
           cat tests/Incremental.Service.Tests/bin/Release/net10.0/broker-runs.jsonl || true
+          cat tests/Incremental.Kafka.Tests/bin/Release/net10.0/measurements.log || true
       - name: Node logs
         if: failure()
         uses: actions/upload-artifact@v7

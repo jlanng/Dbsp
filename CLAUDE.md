@@ -8,7 +8,8 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
 - Test: `dotnet test --project tests/Incremental.Tests` (xunit v3 on Microsoft.Testing.Platform,
   opted in by `global.json` — hence `--project`; Redis tests skip unless `docker compose up -d` has run)
 - CI (`.github/workflows/ci.yml`): three jobs on every push; a fourth, `broker-failures`
-  (the six broker tests on the `kafka3` profile), only by hand:
+  (the service's six broker tests and `KafkaPartitionWatermarkTests`' two on the `kafka3`
+  profile), only by hand:
   `gh workflow run CI --ref <branch> -f broker_tests=true`.
   A test that reads "the end" of a Kafka partition right after its own commit must wait
   for it (`KafkaEnv.EventuallyAsync`): the marker is written after the commit returns.
@@ -23,7 +24,9 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   `Incremental.Kafka` against the connector stack (start it first, below): the logs,
   leadership, sources, sinks, and CDC from Postgres through Debezium. Tests skip, not fail,
   when what they need is unreachable — the broker for most, Postgres and Kafka Connect
-  too for `DebeziumCdcTests`; a handful need nothing and always run. Each test uses its
+  too for `DebeziumCdcTests`; a handful need nothing and always run. Two
+  (`*ABrokerLost*`) need the three brokers of the `kafka3` profile and skip on the
+  connector stack, which is the count CI's `connector-stack` job holds the project to. Each test uses its
   own topic prefix (and its own Postgres tables, slot and connector). About a minute and a half.
   `INCREMENTAL_KAFKA_BOOTSTRAP` points them at another broker. `KafkaFailoverProcessTests`
   launch `tests/Incremental.Kafka.FailoverApp` as real processes and kill, stop and
