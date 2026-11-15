@@ -1681,7 +1681,7 @@ claims no topic, so two pipelines can overwrite each other's keys (40); a per-pi
 state limit (70); keep-or-reset asked for every change (9).
 
 **Can wait:** 2, 3, 8, 12–19, 23, 24, 26, 27, 29, 35, 38, 41–45, 49, 52, 53, 55–58,
-60, 62, 65, 66, 68, 71, 73, 74, 76, 77, 79, 80.
+60, 62, 65, 66, 68, 71, 73, 74, 76, 77, 79, 80, 81, 82.
 
 **Made moot by later rounds:** 1 (warm standbys built, S6; 30 is the decision as it now stands), 10 (roll-back
 built, S6), 21 (closed by 53 once the successor writes), 28 and 46 (estimates and
@@ -2240,6 +2240,25 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     session*); or a monotonic
     reading of the writer's clock in the heartbeat record, which a clock that is set
     cannot disturb and a suspended host can.
+81. **Nothing guards a pipeline against an event time in the future** (S8, the fourth
+    review). The watermark follows the newest event time read, so one record stamped
+    far ahead makes every record behind it late until the feed's time catches up; the
+    drop is counted and announced (`late_records`), and that is all. *Alternatives:*
+    a bound on how far ahead of the node's clock a record's time may be before it is
+    dead-lettered — which makes what a pipeline does depend on when it runs: the same
+    record replayed a day later passes, so a restored circuit no longer does what the
+    uninterrupted one did; or a bound on how far the watermark may advance in one step,
+    which delays every honest gap in the feed (an overnight quiet) by the same amount.
+82. **Adopting `EvictWhenFinal` or `EvictWhen` on state that exists needs `state=reset`**
+    (S8, the fourth review): the checkpoint's rows and facts have no deadlines and the
+    start is refused. *Alternative:* give them deadlines at the first start, from the
+    rows and facts themselves. It needs the stores to enumerate what they hold, which
+    `IValueStore` and `IIndexedWeightStore` do not offer (the changelog and in-memory
+    stores could; the Redis provider would scan), a marker in the checkpoint that it
+    was done, and one pass over the state by the leader that first runs the new
+    generation. A deadline that is a function of the record itself could instead be an
+    index the store keeps, with no record of its own in the state topic — which would
+    also halve what `EvictWhenFinal` writes there (see *What a deadline costs*).
 
 ## Not verified
 
@@ -6910,3 +6929,78 @@ broker tests, run as above; `Pipelines.Tests` 17/17. Smokes: `--headless` 55 cla
 `--headless --nodes 2` 70, `--headless --kafka` 69 (3.1 s from the kill to b leading),
 `TradeEnrichment` 13; all exit 0. `benchmarks -- --assert` was not run: `src/Incremental`
 is untouched.
+
+#### The fourth review's findings
+
+A review of round four found nine defects, confirmed each, and an early critic pass
+added four more items (E1, E2, E5, E7). They are taken in the review's order; each has
+a test that failed before its fix unless it says otherwise.
+
+**1. A record whose event time cannot be read faulted a keyed input that forgets final
+rows, under the dead-letter policy** (`UpsertOperator`). The input's own state runs the
+event-time selector — a row's deadline is its event time — upstream of the declaration
+whose guarded loop dead-letters such a record. Under `DeadLetter` the deadlines are now
+read by a loop of their own (`DeadlinesGuarded`), chosen once per step: a row whose time
+cannot be read is not held, whatever its key held before goes (its retraction was
+emitted), and nothing is reported there — the declaration downstream runs the same
+selector on the row and reports it once. A later upsert of the key is a new row, as it
+is for a key forgotten as final. Under `Fault` it faults, as before. Test:
+`EvictWhenFinalTests.A_row_whose_event_time_cannot_be_read_is_dead_lettered_and_not_held…`.
+
+**2. Adopting the eviction on state that was written without it left that state for
+good.** A deadline is set when a row or a fact is written, so a checkpoint from the
+unbounded definition has none, and nothing of it would ever fall due under the new
+one. `StateManifest.Problems` now reports it: a `{operator}.deadlines.w{n}` store that
+is new while the checkpoint holds any store of the same operator. So
+`CircuitBuilder.CheckState` says it beforehand, `Circuit.Start` refuses with
+`CircuitStateMismatchException`, and the service refuses the replace with
+`state-incompatible` before anything stops; the answer is `state=reset`, which the
+guide now says (*Adopting it on a pipeline that is running*). It applies to `EvictWhen`
+added to a grouping that has state as well: the keys never touched again had the same
+fate. *Not built:* giving the old state deadlines at the first start — the stores have
+no enumeration in their interface (*Open for James* 82). Test:
+`EvictWhenFinalTests.Adopting_the_eviction_on_a_checkpoint_that_holds_state_without_deadlines_is_refused`.
+
+**3 and 5 (and E1). The growth flag** was one ring of samples of a pipeline's total. It
+flagged a bounded pipeline whose open window was longer than the alarm period — the
+reference definition at its default `openSeconds` among them, seen by the early critic
+at 31 minutes — and it missed a leak beside a store that churns, because any fall of
+the total cleared it. `StateGrowth` now keeps a ring per store and judges each by
+itself. A store that closes on the watermark (every store of an operator that has a
+`.deadlines` store, by name) is not held to the rule while the committed watermark
+moves — it is filling what its definition keeps open — and is flagged only if the
+watermark has not moved in the whole period while it grew, with a text of its own. The
+watermark is read from the last commit's offsets (`$watermark`), once per sample, so a
+standby judges as the leader does. A flag now also clears when its store has not risen
+for a whole period (a count per reference key stops growing and never falls), and for a
+stalled store when the watermark moves. `PipelineStatus.StateGrowth`
+(`PipelineStateGrowth`: store, since, whether the watermark stood still), `stateGrowth`
+in the admin API, and the store's name in the event, the list's badge, the attention
+entry and the state card's notice. Tests: `StateGrowthTests` (12; a definition of the
+reference shape through the harness, open for an hour and fed for 32 sampler minutes;
+and on a node, a pipeline that fills, one that leaks beside churn — its total fell at
+five readings of sixteen — and the two there were). *What it still does not see* is in
+the guide: a leak inside a store that also evicts, and growth slower than a sample
+interval that pauses.
+
+**4. A trade that first arrives behind the watermark is dropped, and nothing said so.**
+That is what event time with a lateness means, and round four's `trade-enrichment` took
+it on without saying it of first-time trades or of what moves the watermark. Now the
+drop is counted: `WatermarkOperator` counts the insertions it drops (per worker, summed
+by `WatermarkClock.LateRecords`; a retraction behind the watermark is not another late
+record), `Circuit.LateRecords` and the counter `incremental.circuit.late_records` carry
+it, and the service adds it up per pipeline: `PipelineStatus.LateRecords` and
+`Watermark`, the counter `incremental.service.pipeline.late_records`, an event when it
+starts and at most every ten minutes while it goes on, a notice on the pipeline's page,
+`PipelineTestHarness.LateRecords`. The definition's comment, its `openSeconds`
+description and the guide say that a trade is late by its time alone, that the
+watermark follows the newest execution time read from any partition, and what a trade
+stamped ahead does. Nothing guards against a time in the future (*Open for James* 81).
+Tests: `EvictWhenFinalTests.A_record_first_seen_behind_the_watermark_is_dropped_and_counted_as_late`,
+`StateGrowthTests.A_pipeline_counts_the_records_it_drops_as_late_and_says_so_once`,
+`TradeEnrichmentTests.A_trade_that_first_arrives_behind_the_watermark_is_dropped_and_counted`.
+
+*Mutations of 1 to 5:* 18, all killed in the end; two survived the first run (the
+supervisor judging the total; the supervisor not reading the watermark) and were killed
+by the node-level test's two new pipelines.
+

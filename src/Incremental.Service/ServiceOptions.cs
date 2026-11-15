@@ -56,14 +56,24 @@ public sealed class ServiceOptions
     public TimeSpan MissingInputGrace { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
-    /// How long a pipeline's state may grow without a pause before the node says so: when
-    /// the entries it holds, sampled every fifteenth of this, have not fallen once in this
-    /// long and rose at no fewer than twelve of the fifteen samples, the pipeline is flagged
-    /// (<see cref="PipelineStatus.StateGrowingSince"/>, an event, the overview's attention
-    /// list, the gauge <c>incremental.service.pipeline.state_growing</c>). A state that is
+    /// How long a store of a pipeline's state may grow without a pause before the node
+    /// says so: when its entries, sampled every fifteenth of this, have not fallen once in
+    /// this long and rose at no fewer than twelve of the fifteen samples, the pipeline is
+    /// flagged (<see cref="PipelineStatus.StateGrowingSince"/> and
+    /// <see cref="PipelineStatus.StateGrowth"/>, an event, the overview's attention list,
+    /// the gauge <c>incremental.service.pipeline.state_growing</c>). A store that is
     /// bounded rises and falls once it is full; one that grows at every sample for half an
-    /// hour is keeping something per record that nothing closes. Read from the counts the
-    /// node already keeps, never by walking a store. Zero turns it off.
+    /// hour is keeping something per record that nothing closes. Each store is judged by
+    /// itself, so a store that churns does not hide one that leaks.
+    /// <para>
+    /// A store that closes on the watermark (an operator with <c>EvictWhenFinal</c>,
+    /// <c>EvictWhen</c> or a window keeps deadlines beside it) is not held to that while
+    /// the watermark moves: it rises until the watermark has passed the first record it
+    /// holds, which takes the lateness or the window its definition declares, however
+    /// long. It is flagged only if the committed watermark has not moved in this long
+    /// while it grew. So this need not be longer than a pipeline's open window.
+    /// </para>
+    /// Read from the counts the node already keeps, never by walking a store. Zero turns it off.
     /// </summary>
     public TimeSpan StateGrowthAlarmAfter { get; set; } = TimeSpan.FromMinutes(30);
 

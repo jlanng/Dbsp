@@ -27,6 +27,10 @@ internal sealed class Generation
     public List<object> OwnedSinks { get; } = [];
     public Task DeadLetters { get; set; } = Task.CompletedTask;
 
+    /// <summary>How many of the circuit's late records the sampler has counted into the
+    /// pipeline's total. Written by the metrics sampler.</summary>
+    public long LateSeen;
+
     /// <summary>The dead-letter sink's counters, when the spec binds one. Apart from the
     /// slots' because what it delivers is not the pipeline's output.</summary>
     public SinkSlotStats? DeadLetterStats { get; set; }
@@ -116,6 +120,12 @@ internal sealed class PipelineRuntime(PipelineSpec spec, ServiceOptions options)
 
     /// <summary>Whether the state has grown without a pause (<see cref="ServiceOptions.StateGrowthAlarmAfter"/>).</summary>
     public StateGrowth Growth { get; } = new();
+
+    /// <summary>Records dropped as late since this node first ran the pipeline, over its
+    /// generations, and when that was last said as an event. Written by the metrics sampler.</summary>
+    public long LateRecords;
+    public long LateAnnouncedTicks;
+    public long LateAnnounced;
 
     /// <summary>The dead-letter sink's last failed write, kept across generations.</summary>
     public volatile Tuple<string, DateTimeOffset>? DeadLetterSinkError;
@@ -249,7 +259,8 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             blockedOn, runtime.Since, runtime.Operation, runtime.Restarts, runtime.DeadLetters.Total,
             generation?.Circuit.CommittedStep, committed, faults, runtime.Shape, sources, sinks, runtime.History.After(),
             runtime.RolledBack, spec.Previous is not null, DeadLetterSink(runtime, spec, generation), runtime.LastStart, stateSize,
-            runtime.Growth.Since);
+            runtime.Growth.Since, runtime.Growth.Current is { } growing ? new PipelineStateGrowth(growing.Store, growing.Since, growing.WatermarkStalled) : null,
+            Volatile.Read(ref runtime.LateRecords), generation?.Circuit.CurrentWatermark);
     }
 
     private DeadLetterSinkStatus? DeadLetterSink(PipelineRuntime runtime, PipelineSpec spec, Generation? generation)
@@ -398,13 +409,15 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                         // A source's stats are its own business.
                     }
                 }
+                NoteLate(runtime, generation, now);
             }
             long stateEntries = 0, stateBytes = 0;
             try
             {
-                var size = context.Storage.Pipeline(runtime.Id).EstimateSize();
+                var provider = context.Storage.Pipeline(runtime.Id);
+                var size = provider.EstimateSize();
                 (stateEntries, stateBytes) = (size.Entries, size.EstimatedBytes);
-                NoteGrowth(runtime, stateEntries, now);
+                NoteGrowth(runtime, provider, size, now);
             }
             catch (ObjectDisposedException)
             {
@@ -412,28 +425,62 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             into.Add(new PipelineSampleInput(
                 runtime.Id, generation?.Number ?? 0, records, lag, runtime.DeadLetters.Total,
                 runtime.State, runtime.Spec.Desired == DesiredState.Running, inFlightSince, stateEntries, stateBytes,
-                runtime.Growth.Since is not null));
+                runtime.Growth.Since is not null, Volatile.Read(ref runtime.LateRecords)));
         }
     }
 
-    /// <summary>A state that has grown without a pause for
-    /// <see cref="ServiceOptions.StateGrowthAlarmAfter"/>: an event when it is flagged and
-    /// when it falls again. From the entry count just read, nothing more.</summary>
-    private void NoteGrowth(PipelineRuntime runtime, long entries, DateTimeOffset now)
+    /// <summary>A store that has grown without a pause for
+    /// <see cref="ServiceOptions.StateGrowthAlarmAfter"/>: an event when the pipeline is
+    /// flagged and when it no longer is. From the counts just read and, once per sample,
+    /// the watermark of the last commit — the leader's own, or the last a standby applied.</summary>
+    private void NoteGrowth(PipelineRuntime runtime, ChangelogStorageProvider provider, StateSizeEstimate size, DateTimeOffset now)
     {
         var period = context.Options.StateGrowthAlarmAfter;
-        switch (runtime.Growth.Observe(now, entries, period))
+        if (!runtime.Growth.Due(now, period))
+            return;
+        var watermark = provider.CommittedOffsets.GetValueOrDefault("$watermark", long.MinValue);
+        switch (runtime.Growth.Observe(now, size.Stores, watermark, period))
         {
-            case 1:
-                _logger.LogWarning("Pipeline {Pipeline}: its state has grown for {Period} without a pause, from {From} to {To} entries",
-                    runtime.Id, period, runtime.Growth.OldestEntries, entries);
-                context.Events.Publish("pipeline", runtime.Id,
-                    $"state growing: {runtime.Growth.OldestEntries:N0} to {entries:N0} entries in {Describe(period)} without falling once; something kept per record is never closed");
+            case 1 when runtime.Growth.Current is { } flag:
+                var to = size.Stores.FirstOrDefault(s => s.Name == flag.Store)?.Entries ?? 0;
+                _logger.LogWarning("Pipeline {Pipeline}: its store {Store} has grown for {Period} without a pause, from {From} to {To} entries",
+                    runtime.Id, flag.Store, period, flag.FromEntries, to);
+                context.Events.Publish("pipeline", runtime.Id, flag.WatermarkStalled
+                    ? $"state growing: store {flag.Store} from {flag.FromEntries:N0} to {to:N0} entries in {Describe(period)} while the watermark has not moved; " +
+                      "what it holds closes on the watermark, which an event-time input with no records holds back"
+                    : $"state growing: store {flag.Store} from {flag.FromEntries:N0} to {to:N0} entries in {Describe(period)} without falling once; " +
+                      "something kept per record is never closed");
                 break;
             case -1:
-                context.Events.Publish("pipeline", runtime.Id, $"state no longer growing: {entries:N0} entries");
+                context.Events.Publish("pipeline", runtime.Id, $"state no longer growing: {size.Entries:N0} entries");
                 break;
         }
+    }
+
+    /// <summary>How often a pipeline that keeps dropping late records says so again.</summary>
+    internal static readonly TimeSpan LateRecordsEventEvery = TimeSpan.FromMinutes(10);
+
+    /// <summary>The records the circuit dropped as late since the last reading, added to
+    /// the pipeline's total: an event the first time, and then at most one every
+    /// <see cref="LateRecordsEventEvery"/> while more are dropped. A late record is not an
+    /// error and is in no dead letter, so this count is the one place it shows.</summary>
+    private void NoteLate(PipelineRuntime runtime, Generation generation, DateTimeOffset now)
+    {
+        var late = generation.Circuit.LateRecords;
+        var more = late - generation.LateSeen;
+        if (more <= 0)
+            return;
+        generation.LateSeen = late;
+        var total = Interlocked.Add(ref runtime.LateRecords, more);
+        if (runtime.LateAnnouncedTicks != 0 && now.UtcTicks - runtime.LateAnnouncedTicks < LateRecordsEventEvery.Ticks)
+            return;
+        var since = total - runtime.LateAnnounced;
+        runtime.LateAnnouncedTicks = now.UtcTicks;
+        runtime.LateAnnounced = total;
+        var watermark = generation.Circuit.CurrentWatermark;
+        context.Events.Publish("pipeline", runtime.Id,
+            $"late records: {since:N0} dropped behind the watermark{(watermark is { } w ? $" ({w.UtcDateTime:yyyy-MM-dd HH:mm:ss}Z)" : "")}, " +
+            $"{total:N0} since this node first ran it; a record is late by its event time alone, whether or not it was seen before");
     }
 
     private static string Describe(TimeSpan period) =>

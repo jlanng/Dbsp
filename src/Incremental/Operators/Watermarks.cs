@@ -30,6 +30,26 @@ internal sealed class WatermarkClock(int workers)
     private readonly List<Tracker> _trackers = [];
     private long _frozenTicks = long.MinValue;
 
+    // Records dropped as late, per worker: each written by its worker only.
+    private readonly long[] _late = new long[workers];
+
+    /// <summary>Counts <paramref name="count"/> records an event-time declaration on
+    /// <paramref name="worker"/> dropped for being behind the watermark.</summary>
+    public void NoteLate(int worker, long count) => Volatile.Write(ref _late[worker], _late[worker] + count);
+
+    /// <summary>Records dropped as late since the circuit was built, over all workers.
+    /// Not part of the checkpoint: a count for people, of this run.</summary>
+    public long LateRecords
+    {
+        get
+        {
+            long total = 0;
+            for (var w = 0; w < _late.Length; w++)
+                total += Volatile.Read(ref _late[w]);
+            return total;
+        }
+    }
+
     /// <summary>Watermark as of the end of the previous step (ticks, UTC);
     /// <see cref="long.MinValue"/> until every source has seen data.</summary>
     public long FrozenTicks => Volatile.Read(ref _frozenTicks);
@@ -140,7 +160,9 @@ internal sealed class WatermarkClock(int workers)
 }
 
 /// <summary>
-/// Observes event times for the clock and drops records older than the current watermark.
+/// Observes event times for the clock and drops records older than the current watermark,
+/// counting the insertions it drops (<see cref="WatermarkClock.LateRecords"/>): a record is
+/// late by its time alone, whether or not the circuit has seen it before.
 /// A negative <c>tracker</c> is a re-declaration (<c>WithEventTime</c> without a lateness):
 /// it drops, and observes nothing.
 /// Dropping here is what makes downstream eviction safe: state for a closed key can never
@@ -163,9 +185,10 @@ internal sealed class WatermarkOperator<T>(
         var watermark = clock.FrozenTicks;
         var output = _output.Next(delta.DistinctCount);
         var maxSeen = long.MinValue;
+        long late = 0;
 
         if (_errors is not null)
-            maxSeen = StepGuarded(delta, output, watermark, _errors);
+            maxSeen = StepGuarded(delta, output, watermark, _errors, ref late);
         else
             foreach (var (value, weight) in delta)
             {
@@ -173,17 +196,23 @@ internal sealed class WatermarkOperator<T>(
                 maxSeen = Math.Max(maxSeen, ticks);
                 if (ticks >= watermark)
                     output.Add(value, weight);
+                else if (weight > 0)
+                    late += weight;
             }
 
         // A re-declaration (no tracker of its own) filters on the watermark and feeds nothing.
         if (maxSeen != long.MinValue && tracker >= 0)
             clock.Observe(tracker, _worker, maxSeen);
+        // What was dropped is counted — insertions only: the retraction of a record that is
+        // final is the other half of an amendment whose insertion is counted, or of a delete.
+        if (late > 0)
+            clock.NoteLate(_worker, late);
         return output;
     }
 
     // The dead-letter policy's loop; see MapOperator.StepGuarded. A record whose event time
     // cannot be read never reaches the clock, so it cannot move the watermark either.
-    private long StepGuarded(ZSet<T> delta, ZSet<T> output, long watermark, RecordErrors errors)
+    private long StepGuarded(ZSet<T> delta, ZSet<T> output, long watermark, RecordErrors errors, ref long late)
     {
         var maxSeen = long.MinValue;
         foreach (var (value, weight) in delta)
@@ -201,6 +230,8 @@ internal sealed class WatermarkOperator<T>(
             maxSeen = Math.Max(maxSeen, ticks);
             if (ticks >= watermark)
                 output.Add(value, weight);
+            else if (weight > 0)
+                late += weight;
         }
         return maxSeen;
     }

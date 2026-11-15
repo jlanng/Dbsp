@@ -23,6 +23,15 @@ namespace Enrichment.Pipelines;
 /// <c>OpenSeconds × trades per second</c> trades, whatever the feed's length. Copy this
 /// shape for any retroactive join over a stream of facts.
 /// </para>
+/// <para>
+/// What that costs: a trade is late by its time alone. One that <em>first</em> arrives
+/// with an execution time behind the watermark is dropped like a late amendment — it never
+/// reaches the sink, and it is no dead letter; the pipeline counts it as a late record.
+/// The watermark follows the newest execution time read from any partition, so
+/// <c>OpenSeconds</c> must cover how far apart in time the feed can arrive (a partition
+/// read behind the others after an outage), and one trade stamped far ahead closes every
+/// trade behind it until the feed's time catches up.
+/// </para>
 /// </summary>
 [Pipeline("trade-enrichment", Description = "Trades with counterparty (on arrival), instrument and desk (retroactive while open), filtered by notional.")]
 public sealed class TradeEnrichment : IPipelineDefinition<TradeEnrichment.Settings>
@@ -32,7 +41,7 @@ public sealed class TradeEnrichment : IPipelineDefinition<TradeEnrichment.Settin
         [Range(0, 1e12), Description("Trades with a notional below this are dropped.")]
         public decimal MinNotional { get; init; }
 
-        [Range(1, 30 * 86_400), Description("How long, in seconds of event time behind the newest trade, a trade stays open to amendments and reference-data corrections. Then it is final and its state goes.")]
+        [Range(1, 30 * 86_400), Description("How long, in seconds of event time behind the newest trade, a trade stays open to amendments and reference-data corrections. Then it is final and its state goes; a trade that arrives later than this behind the newest is dropped as late. The state holds about eight entries per open trade: this many seconds of the feed.")]
         public int OpenSeconds { get; init; } = 3600;
 
         [StateNeutral, Description("A label for operators; it changes no stored row.")]

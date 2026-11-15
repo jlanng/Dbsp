@@ -723,6 +723,9 @@ internal static class AdminApi
             operation = p.Operation,
             restarts = p.Restarts,
             deadLetters = p.DeadLetters,
+            // Insertions dropped behind the watermark since this node first ran it, and the watermark now.
+            lateRecords = p.LateRecords,
+            watermark = p.Watermark,
             deadLetterSink = p.DeadLetterSink is null ? null : new
             {
                 connector = p.DeadLetterSink.Connector,
@@ -757,8 +760,10 @@ internal static class AdminApi
                 bytesHeldTwice = p.StateSize.BytesHeldTwice,
                 stores = p.StateSize.Stores.Count,
             },
-            // Set while the state has grown without a pause for StateGrowthAlarmAfter.
+            // Set while a store of the state has grown without a pause for StateGrowthAlarmAfter:
+            // which store, and whether it is one that closes on a watermark that has not moved.
             stateGrowingSince = p.StateGrowingSince,
+            stateGrowth = p.StateGrowth is null ? null : new { store = p.StateGrowth.Store, since = p.StateGrowth.Since, watermarkStalled = p.StateGrowth.WatermarkStalled },
             // Inputs whose source says that what it reads is not there, and since when.
             waiting = p.Sources.Where(s => s.Stats.WaitingFor is not null)
                 .Select(s => new { slot = s.Slot, waitingFor = s.Stats.WaitingFor, since = s.WaitingSince }).ToList() is { Count: > 0 } w ? w : null,

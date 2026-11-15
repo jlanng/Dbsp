@@ -307,6 +307,199 @@ public class EvictWhenFinalTests
         Assert.Throws<InvalidOperationException>(() => twice.WithEventTime(t => t.At, Lateness, evictWhenFinal: true));
     }
 
+    /// <summary>A deadline is set when a row or a fact is written, so what a checkpoint
+    /// holds from before the definition forgot anything has none and would never go.
+    /// Adopting the eviction on such a checkpoint is refused — beforehand by
+    /// <see cref="CircuitBuilder.CheckState"/> and at <c>Start()</c> — and a circuit that
+    /// only gains state it had none of (a new operator) is not.</summary>
+    [Theory]
+    [InlineData(true, true)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task Adopting_the_eviction_on_a_checkpoint_that_holds_state_without_deadlines_is_refused(bool input, bool join)
+    {
+        var table = NewTable();
+        await Commit(table, new Instrument(1, "ONE"));
+        var storage = new InMemoryCheckpointStorageProvider();
+
+        (CircuitBuilder Builder, KeyedInputStream<int, Trade> Trades) Define(bool forgetRows, bool forgetFacts, bool extra = false)
+        {
+            var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Storage = storage });
+            var instruments = builder.Table(table);
+            var trades = builder.KeyedInput<int, Trade>("trades", t => t.Id);
+            var grouped = (forgetRows ? trades.WithEventTime(t => t.At, Lateness, evictWhenFinal: true) : trades.WithEventTime(t => t.At, Lateness))
+                .GroupBy(t => t.InstrumentId);
+            var priced = forgetFacts
+                ? grouped.EvictWhenFinal().Join(instruments, (_, t, i) => (t.Id, i.Symbol)).Named("priced")
+                : grouped.Join(instruments, (_, t, i) => (t.Id, i.Symbol)).Named("priced");
+            priced.ToOutput();
+            if (extra)
+                priced.WithEventTime(p => T0).GroupBy(p => p.Id).EvictWhenFinal()
+                    .Lookup(instruments, (_, p, i) => p.Symbol + i.Symbol).Named("again").ToOutput();
+            return (builder, trades);
+        }
+
+        // Version one keeps every row and every fact.
+        var (v1, v1Trades) = Define(false, false);
+        Assert.Empty(v1.CheckState(storage));
+        await using (var circuit = v1.Build())
+        {
+            circuit.Start();
+            for (var i = 0; i < 20; i++)
+                await circuit.Handle(v1Trades).UpsertAsync(new Trade(i, 1, At(i)));
+            await circuit.StepAsync();
+        }
+        Assert.Equal(20, Entries(storage, "input.trades.upsert.rows"));
+        Assert.Equal(20, Entries(storage, "named.priced.tableJoin.facts"));
+
+        // Version two forgets, on the state version one left.
+        var (v2, _) = Define(input, join);
+        var problems = v2.CheckState(storage);
+        Assert.Equal((input ? 1 : 0) + (join ? 1 : 0), problems.Count);
+        if (input)
+            Assert.Contains(problems, p => p.StartsWith("'input.trades.upsert' now forgets", StringComparison.Ordinal));
+        if (join)
+            Assert.Contains(problems, p => p.StartsWith("'named.priced.tableJoin' now forgets", StringComparison.Ordinal));
+        Assert.All(problems, p => Assert.Contains("no deadlines", p));
+        var refused = Assert.Throws<CircuitStateMismatchException>(() => v2.Build().Start());
+        Assert.Equal(problems, refused.Problems);
+
+        // The same definition as version one, with an operator it did not have: new state,
+        // deadlines included, beside state that stays as it was.
+        var (v1b, _) = Define(false, false, extra: true);
+        Assert.Empty(v1b.CheckState(storage));
+
+        // And on an empty store the forgetting definition starts, and goes on from its own checkpoint.
+        storage = new InMemoryCheckpointStorageProvider();
+        var (fresh, freshTrades) = Define(input, join);
+        Assert.Empty(fresh.CheckState(storage));
+        await using (var circuit = fresh.Build())
+        {
+            circuit.Start();
+            await circuit.Handle(freshTrades).UpsertAsync(new Trade(1, 1, At(1)));
+            await circuit.StepAsync();
+        }
+        var (again, _) = Define(input, join);
+        Assert.Empty(again.CheckState(storage));
+    }
+
+    private sealed record Stamp(DateTimeOffset At);
+
+    private sealed record Stamped(int Id, Stamp? Stamp);
+
+    /// <summary>The input's own state runs the event-time selector too (a row's deadline is
+    /// its event time), upstream of the declaration that dead-letters a record whose time
+    /// cannot be read. Under the dead-letter policy it must not be what faults: the row is
+    /// handed on to be dead-lettered and nothing is held for it.</summary>
+    [Fact]
+    public async Task A_row_whose_event_time_cannot_be_read_is_dead_lettered_and_not_held_by_an_input_that_forgets_final_rows()
+    {
+        var storage = new InMemoryCheckpointStorageProvider();
+        var builder = new CircuitBuilder(new CircuitOptions
+        {
+            AutoStep = false, Storage = storage, ErrorPolicy = RecordErrorPolicy.DeadLetter,
+        });
+        var inputDef = builder.KeyedInput<int, Stamped>("stamped", s => s.Id);
+        var outDef = inputDef.WithEventTime(s => s.Stamp!.At, Lateness, evictWhenFinal: true).Select(s => s.Id).ToOutput();
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var input = circuit.Handle(inputDef);
+        var output = circuit.Handle(outDef);
+
+        List<DeadLetter> DeadLetters()
+        {
+            var letters = new List<DeadLetter>();
+            while (circuit.DeadLetters.TryRead(out var letter))
+                letters.Add(letter);
+            return letters;
+        }
+
+        await input.UpsertAsync(new Stamped(1, new Stamp(At(1))));
+        await input.UpsertAsync(new Stamped(2, null));
+        await circuit.StepAsync();
+        AssertDelta(Drain(output), (1, 1));
+        var letter = Assert.Single(DeadLetters());
+        Assert.Equal(new Stamped(2, null), letter.Record);
+        Assert.Equal(1, letter.Weight);
+        Assert.IsType<NullReferenceException>(letter.Exception);
+        // Only the row that has a time is held, with its deadline.
+        Assert.Equal(1, Entries(storage, "input.stamped.upsert.rows"));
+        Assert.Equal(1, Entries(storage, "input.stamped.upsert.deadlines"));
+
+        // The key again, readable now: a new row, with nothing owed for the one never held.
+        await input.UpsertAsync(new Stamped(2, new Stamp(At(2))));
+        await circuit.StepAsync();
+        AssertDelta(Drain(output), (2, 1));
+        Assert.Empty(DeadLetters());
+        Assert.Equal(2, Entries(storage, "input.stamped.upsert.rows"));
+
+        // A held row replaced by one with no time: the held row is taken back and
+        // forgotten, the new one dead-lettered, and the key holds nothing.
+        await input.UpsertAsync(new Stamped(1, null));
+        await circuit.StepAsync();
+        AssertDelta(Drain(output), (1, -1));
+        letter = Assert.Single(DeadLetters());
+        Assert.Equal(new Stamped(1, null), letter.Record);
+        Assert.Equal(1, Entries(storage, "input.stamped.upsert.rows"));
+        Assert.Equal(1, Entries(storage, "input.stamped.upsert.deadlines"));
+
+        // Under the default policy the same row faults the step, as any delegate's exception does.
+        var faulting = new CircuitBuilder(new CircuitOptions { AutoStep = false });
+        var faultingDef = faulting.KeyedInput<int, Stamped>("stamped", s => s.Id);
+        faultingDef.WithEventTime(s => s.Stamp!.At, Lateness, evictWhenFinal: true).ToOutput();
+        var strict = faulting.Build();
+        strict.Start();
+        await strict.Handle(faultingDef).UpsertAsync(new Stamped(2, null));
+        await Assert.ThrowsAnyAsync<Exception>(() => strict.StepAsync());
+        try { await strict.DisposeAsync(); } catch { /* it faulted, as asserted */ }
+    }
+
+    /// <summary>A record is late by its time alone: one the circuit has never seen is
+    /// dropped like an amendment of one that is final, and one record stamped far ahead
+    /// makes every record behind it late. Nothing reports the drop but the count.</summary>
+    [Theory]
+    [InlineData(RecordErrorPolicy.Fault, 1)]
+    [InlineData(RecordErrorPolicy.DeadLetter, 1)]
+    [InlineData(RecordErrorPolicy.Fault, 3)]
+    public async Task A_record_first_seen_behind_the_watermark_is_dropped_and_counted_as_late(RecordErrorPolicy policy, int workers)
+    {
+        var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, ErrorPolicy = policy, Workers = workers });
+        var tradesDef = builder.Input<Trade>("trades");
+        var outDef = tradesDef.WithEventTime(t => t.At, Lateness)
+            .Select(t => t with { At = t.At.AddSeconds(-5) })
+            .WithEventTime(t => t.At)                               // a re-declaration drops, and counts, too
+            .Select(t => t.Id).ToOutput();
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var trades = circuit.Handle(tradesDef);
+        var output = circuit.Handle(outDef);
+        Assert.Equal(0, circuit.LateRecords);
+
+        await trades.InsertAsync(new Trade(1, 1, At(1)));
+        await circuit.StepAsync();
+        // One trade stamped far ahead: the watermark is at 90 from the next step on.
+        await trades.InsertAsync(new Trade(2, 1, At(100)));
+        await circuit.StepAsync();
+        AssertDelta(Drain(output), (1, 1), (2, 1));
+        Assert.Equal(0, circuit.LateRecords);
+
+        // Three trades never seen before: two behind the watermark at the declaration, one
+        // that passes it and is behind once its time has been reshaped; and one that is not late.
+        await trades.InsertAsync(new Trade(3, 1, At(50)));
+        await trades.InsertAsync(new Trade(4, 2, At(60)));
+        await trades.InsertAsync(new Trade(5, 3, At(92)));
+        await trades.InsertAsync(new Trade(6, 1, At(96)));
+        await circuit.StepAsync();
+        AssertDelta(Drain(output), (6, 1));
+        Assert.Equal(3, circuit.LateRecords);
+
+        // The retraction of a record that is final is dropped and is not another late record.
+        await trades.RemoveAsync(new Trade(1, 1, At(1)));
+        await circuit.StepAsync();
+        Assert.True(Drain(output).IsEmpty);
+        Assert.Equal(3, circuit.LateRecords);
+    }
+
     [Fact]
     public async Task Event_time_declared_again_after_a_filter_does_not_hold_the_watermark_back()
     {

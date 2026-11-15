@@ -44,6 +44,9 @@ internal sealed class CircuitDiagnostics : IDisposable
     private static readonly Counter<long> DeadLetters = Meter.CreateCounter<long>(
         "incremental.circuit.dead_letters", "{record}",
         "Records dropped under the DeadLetter error policy, by operator.");
+    private static readonly Counter<long> LateRecords = Meter.CreateCounter<long>(
+        "incremental.circuit.late_records", "{record}",
+        "Insertions dropped at an event-time declaration for being behind the watermark.");
     private static readonly Counter<long> ClusterFramesSent = Meter.CreateCounter<long>(
         "incremental.cluster.frames_sent", "{frame}", "Exchange frames handed to the transport.");
     private static readonly Counter<long> ClusterFramesReceived = Meter.CreateCounter<long>(
@@ -119,6 +122,9 @@ internal sealed class CircuitDiagnostics : IDisposable
         if (count > 0)
             Records.Add(count, _tag);
     }
+
+    /// <summary>Called on the coordinator, between steps, when a step dropped late records.</summary>
+    public void RecordsLate(long count) => LateRecords.Add(count, _tag);
 
     public void CircuitFaulted() => Faults.Add(1, _tag);
 

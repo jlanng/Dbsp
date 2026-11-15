@@ -122,6 +122,15 @@ with `Incremental.`: it collides with `Incremental.Tables`.
 /// <c>OpenSeconds × trades per second</c> trades, whatever the feed's length. Copy this
 /// shape for any retroactive join over a stream of facts.
 /// </para>
+/// <para>
+/// What that costs: a trade is late by its time alone. One that <em>first</em> arrives
+/// with an execution time behind the watermark is dropped like a late amendment — it never
+/// reaches the sink, and it is no dead letter; the pipeline counts it as a late record.
+/// The watermark follows the newest execution time read from any partition, so
+/// <c>OpenSeconds</c> must cover how far apart in time the feed can arrive (a partition
+/// read behind the others after an outage), and one trade stamped far ahead closes every
+/// trade behind it until the feed's time catches up.
+/// </para>
 /// </summary>
 [Pipeline("trade-enrichment", Description = "Trades with counterparty (on arrival), instrument and desk (retroactive while open), filtered by notional.")]
 public sealed class TradeEnrichment : IPipelineDefinition<TradeEnrichment.Settings>
@@ -131,7 +140,7 @@ public sealed class TradeEnrichment : IPipelineDefinition<TradeEnrichment.Settin
         [Range(0, 1e12), Description("Trades with a notional below this are dropped.")]
         public decimal MinNotional { get; init; }
 
-        [Range(1, 30 * 86_400), Description("How long, in seconds of event time behind the newest trade, a trade stays open to amendments and reference-data corrections. Then it is final and its state goes.")]
+        [Range(1, 30 * 86_400), Description("How long, in seconds of event time behind the newest trade, a trade stays open to amendments and reference-data corrections. Then it is final and its state goes; a trade that arrives later than this behind the newest is dropped as late. The state holds about eight entries per open trade: this many seconds of the feed.")]
         public int OpenSeconds { get; init; } = 3600;
 
         [StateNeutral, Description("A label for operators; it changes no stored row.")]
@@ -824,6 +833,27 @@ public class TradeEnrichmentTests
         await trades.UpsertAsync(Trade(1, quantity: 500));
         await pipeline.StepAsync();
         Assert.Equal(2000m, rows[1].Notional);
+        Assert.Equal(1, pipeline.LateRecords);
+    }
+
+    [Fact]
+    public async Task A_trade_that_first_arrives_behind_the_watermark_is_dropped_and_counted()
+    {
+        await using var pipeline = await StartAsync("""{ "minNotional": 0, "openSeconds": 60 }""");
+        var trades = pipeline.KeyedInput<long, Trade>("trades");
+        await trades.UpsertAsync(Trade(1, quantity: 100));                                   // at T0
+        // One trade stamped an hour ahead: the watermark is 59 minutes past T0 from here.
+        await trades.UpsertAsync(Trade(2, quantity: 100) with { ExecutedAt = T0.AddHours(1) });
+        await pipeline.StepAsync();
+        Assert.Equal(0, pipeline.LateRecords);
+
+        // Trades with honest times, never seen before: late by their time alone.
+        await trades.UpsertAsync(Trade(3, quantity: 100) with { ExecutedAt = T0.AddMinutes(1) });
+        await trades.UpsertAsync(Trade(4, quantity: 100) with { ExecutedAt = T0.AddMinutes(2) });
+        await pipeline.StepAsync();
+        Assert.Equal([1L, 2L], pipeline.UpsertSink<long, EnrichedTrade>("enriched").Rows.Keys.Order());
+        Assert.Equal(2, pipeline.LateRecords);
+        Assert.Empty(pipeline.DeadLetters);
     }
 
     [Fact]
@@ -866,7 +896,7 @@ public class TradeEnrichmentTests
 | `Table(definition, name)` | `UpsertAsync(rows)`, `DeleteAsync(keys)` — one table version each — and `Rows`, which is also how a derived table (`ToTable`) is read |
 | `StepAsync()` | one step over everything sent and changed since the last. A record that faults the circuit is thrown from here. |
 | `UpsertSink<TKey, TRow>(slot).Rows`, `AppendSink<T>(slot).Records` | what the slot's sink holds |
-| `DeadLetters`, `Watermark`, `Shape` | the records dropped so far; the event-time watermark; the slots and tables `Build` declared |
+| `DeadLetters`, `LateRecords`, `Watermark`, `Shape` | the records dropped so far; how many were dropped as late (behind the watermark: not dead letters); the event-time watermark; the slots and tables `Build` declared |
 | `StateSize` | `Entries` and `Stores` (entries by store name) as of the last step: assert that a definition's state returns to a bound under a long feed, as `The_state_holds_the_open_trades_…` above does |
 
 Settings that would be refused at a deploy are refused by `StartAsync` with the same
@@ -2235,6 +2265,7 @@ Gauges are read from a snapshot each node refreshes once a second (tables every 
 | `incremental.service.pipeline.checkpoint_age` (s) | node, pipeline | since the running generation last committed |
 | `incremental.service.pipeline.sink_ack_wait` (s) | node, pipeline | how long the oldest sink write in flight has waited; 0 with none |
 | `incremental.service.pipeline.dead_letters` (counter) | node, pipeline | records dropped under `errorPolicy: DeadLetter` |
+| `incremental.service.pipeline.late_records` (counter) | node, pipeline | insertions dropped at an event-time declaration for being behind the watermark — not dead letters: a record is late by its event time alone |
 | `incremental.service.pipeline.faults`, `.restarts`, `.rollbacks` (counters) | node, pipeline | faults; restarts scheduled after one; replaces rolled back |
 | `incremental.service.tables` | node, state | tables in each state |
 | `incremental.service.table.rows`, `.version` | node, table | |
@@ -2243,7 +2274,7 @@ Gauges are read from a snapshot each node refreshes once a second (tables every 
 | `incremental.service.table.memory` (bytes) | node, table, part | the table on this node's heap, estimated, by part: `rows` (with the key map), `indexes`, `history` (superseded rows kept for readers) |
 | `incremental.service.pipeline.state_entries` | node, pipeline | entries its state holds on this node, counted — on a standby too |
 | `incremental.service.pipeline.state_memory` (bytes) | node, pipeline | the same state on this node's heap, estimated |
-| `incremental.service.pipeline.state_growing` | node, pipeline | 1 while its state entries have grown without a pause for `ServiceOptions.StateGrowthAlarmAfter` (30 min): not one fall, and a rise at twelve of the fifteen samples |
+| `incremental.service.pipeline.state_growing` | node, pipeline | 1 while one of its stores has grown without a pause for `ServiceOptions.StateGrowthAlarmAfter` (30 min): not one fall, and a rise at twelve of the fifteen samples. A store that closes on the watermark counts only if the watermark has not moved in that time |
 | `incremental.service.process.working_set` (bytes) | node | what the operating system counts for the process: the figure to set against a container's limit |
 | `incremental.service.process.gc.live`, `.gc.committed` (bytes) | node | what the managed heap held at its last collection, and what the collector has committed for it |
 | `incremental.service.process.other` (bytes) | node | resident memory that is not the collector's: the Kafka client, the runtime, stacks (Linux) |
@@ -2273,7 +2304,8 @@ commit every step; a pipeline with `checkpointMaxDelay` or slow sinks needs its 
 | Loader stuck | `tables{state="LoaderFaulted"} > 0` for 5 min, or `table.loader_lag` rising | Readers keep the last version; the data is going stale. |
 | Table faulted | `tables{state="Faulted"} + tables{state="Failed"} > 0` | Pipelines that read it are `Blocked`. |
 | Node near its memory | `process.working_set` above 85 % of the container's limit for 10 min | The next bulk load or restore may not fit (*Sizing a node*). Which table or pipeline grew is in `table.memory` and `pipeline.state_memory`. |
-| State growing without end | `pipeline.state_growing == 1` (ticket) | Something kept per record is never closed: a retroactive join, a remembered lookup or a keyed input over a stream of facts. The definition wants `EvictWhenFinal`, `EvictWhen`, a window or `LookupAppendOnly` (*Bounding a join over a stream of facts*). The node raises it itself after `StateGrowthAlarmAfter` (30 min) of growth with no fall; the same is an event and an entry on the overview's attention list. |
+| State growing without end | `pipeline.state_growing == 1` (ticket) | The event and the pipeline's page name the store. Either something kept per record is never closed — a retroactive join, a remembered lookup, a keyed input or a total per record over a stream of facts — and the definition wants `EvictWhenFinal`, `EvictWhen`, a window or `LookupAppendOnly` (*Bounding a join over a stream of facts*); or the store does close on the watermark and the watermark has not moved in the period, which is an event-time input with no records. The node raises it itself after `StateGrowthAlarmAfter` (30 min) of growth with no fall; a store still filling the window its definition keeps open is not flagged, however long the window. |
+| Records dropped as late | `increase(pipeline.late_records[5m]) > 0`, where none is expected (ticket) | Records whose event time was behind the watermark when they arrived: late amendments, but also records never seen before. A burst after a quiet count is a record stamped far ahead (the watermark jumped, and everything behind it is late until the feed's time catches up) or partitions read far apart in time after an outage. They are in no dead letter and are not delivered. |
 | Collector busy | `process.gc.pause_ratio > 0.1` for 10 min | The node is short of memory for what it allocates, or its collector is not set as *Sizing a node* says. |
 | Takeover slow | on Kafka, `takeover.duration{stage="total"}` above about 3 s, and `{stage="silence"}` above your failover budget | `total` is the takeover from the decision to leading: `fence`, `storage`, `catalog`, `tables`, then `start_leading` (the leader record, seeds, `pipelines`, loaders). It is about a second locally, half of it the `fence`, and does not grow with state when the standby was warm — so a long one is a slow fence (the brokers), or a `pipelines` stage that had to build circuits the standby had not (`standby.pipelines_to_build` was not 0). `silence` is how long the leader had been quiet when the standby went: 3 s for a dead leader, 30 s for one that still answered its probe. `start_leading` alone leaves out the fence and the wait, which is where a slow takeover is slow. |
 
@@ -2547,8 +2579,24 @@ What it means for a trade, with `openSeconds` as the lateness:
   A later trade under the same id is a new trade: nothing is retracted for the old one,
   so an upsert sink overwrites the row — or keeps the old row, if the filter drops the
   new trade.
+- A trade is late by its time alone. One that *first* arrives with an execution time
+  behind the watermark is dropped as an amendment would be: it never reaches the sink,
+  and it is not a dead letter. The watermark follows the newest execution time read —
+  from any partition of the input — so two things make honest trades late: partitions
+  read more than `openSeconds` apart in time (one partition's backlog replayed ahead
+  of another's after an outage), and one trade stamped far ahead, which closes every
+  trade behind it until the feed's time catches up. The pipeline counts what it drops:
+  *late records* on its page, `pipeline.late_records` on the meter, an event when it
+  starts and at most every ten minutes while it goes on (`PipelineTestHarness.LateRecords`
+  in a test). Choose `openSeconds` to cover the disorder the feed can have, not only how
+  late a correction may come. Nothing guards against a time in the future (*Open for
+  James* 81 in the design document).
 - A change of reference data corrects exactly the trades at or after the watermark,
   however the steps fall: a final trade not yet evicted is left alone too.
+- A record whose event time cannot be read — the selector throws on it — is a dead
+  letter under `errorPolicy: DeadLetter` and a fault under `Fault`, like any record a
+  delegate throws on. The keyed input does not hold such a row: it has no time to
+  become final at.
 - `WithEventTime(selector)` without a lateness re-declares the time after a lookup or
   a join has reshaped the record. It drops what is behind the watermark, as the first
   declaration does, and adds no source to the clock: after the filter, a second source
@@ -2579,16 +2627,45 @@ thousand trades a second would be 3.6 million open trades, 29 million entries an
 **Seeing it.** A pipeline's page has its state store by store: `input.trades.upsert.rows`
 and `.deadlines`, `named.booked.tableLookup.remembered`, `named.priced.tableJoin.facts`
 and so on, each with entries and bytes. The list of pipelines has the total as a column,
-and the meter has it as `pipeline.state_entries` and `pipeline.state_memory`. A state
+and the meter has it as `pipeline.state_entries` and `pipeline.state_memory`. A store
 that is bounded rises to its bound and then rises and falls with the feed. One that is
-not is flagged by the node itself: when the entries, sampled every fifteenth of
-`ServiceOptions.StateGrowthAlarmAfter` (30 min), have not fallen once in that time and
-rose at no fewer than twelve of the fifteen samples, the pipeline is marked *growing* on
-its page, in the list and on the overview's attention list, an event says so (`state
-growing: … entries in 30 min without falling once`), and the gauge
-`pipeline.state_growing` is 1. It is read from the counts the node already keeps; a
-state that filled and then went quiet with its input is not flagged, and one flagged
-stays flagged until its entries fall.
+not is flagged by the node itself, store by store: when a store's entries, sampled every
+fifteenth of `ServiceOptions.StateGrowthAlarmAfter` (30 min), have not fallen once in
+that time and rose at no fewer than twelve of the fifteen samples, the pipeline is
+marked *growing* on its page, in the list and on the overview's attention list, an event
+names the store (`state growing: store … from … to … entries in 30 min without falling
+once`), and the gauge `pipeline.state_growing` is 1. Each store is judged by itself
+because a total hides a leak: an evicting join's level moves by more between two samples
+than a slow leak beside it adds.
+
+A store that closes on the watermark — every store of an operator that keeps a
+`.deadlines` store beside it — is held to a different rule, because it rises at every
+sample until the watermark has passed the first record it holds: for `openSeconds` of
+event time, an hour with the definition's default, a day with a day open. While the
+watermark moves, such a store is filling what the definition keeps open, and how much
+that is is the arithmetic above; it is not flagged. It is flagged when the committed
+watermark has not moved in the whole period while the store grew (`… while the
+watermark has not moved`): then nothing it holds can become final, and the cause is an
+event-time input with no records, which holds the watermark back for every input.
+
+The limits of the flag: it is read from the counts the node already keeps, every two
+minutes at the default; a store that filled and then went quiet with its input is not
+flagged; a flag clears when the store falls, when it has not risen for a whole period,
+or when the watermark moves again. A leak inside a store that also evicts — entries
+with a deadline far in the future — is not seen, and neither is growth slower than one
+entry per sample interval that pauses for more than three samples in fifteen.
+
+**Adopting it on a pipeline that is running.** A deadline is set when a row or a fact
+is written. What a pipeline already holds from before its definition forgot anything
+has none, and would stay for good under everything the new definition writes and
+evicts — a state that looks bounded and carries the old leak inside it. So a replace
+that adds `evictWhenFinal`, `EvictWhenFinal()` or `EvictWhen` to an operator that
+already has state is refused with `state=keep` (`state-incompatible`: *'…' now forgets
+what it holds on the watermark, and the checkpoint holds state of it written before it
+did*), at the dry run and before anything stops. Deploy it with `state=reset`: the
+pipeline starts from empty state and from where its inputs' bindings say, so decide
+with the reset what it should read again. Changing `openSeconds` afterwards is a
+setting and keeps the state.
 
 **Testing it.** `PipelineTestHarness.StateSize` is the same count, by store and in all,
 after each step. Feed the definition far more event time than it keeps open and assert

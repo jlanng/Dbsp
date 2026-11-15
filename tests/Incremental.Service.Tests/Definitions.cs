@@ -244,3 +244,32 @@ public sealed class OddlyNamedInput : IPipelineDefinition
         p.UpsertSink("live", totals.Rows().Select(w => new WindowTotal(w.Key, (long)(w.WindowStart - Tick.Epoch).TotalMilliseconds, w.Value)), WindowedTotals.Key);
     }
 }
+
+/// <summary>A trade with a time of its own, for definitions that keep it open by event time.</summary>
+public sealed record TimedTrade(long Id, int InstrumentId, string Trader, DateTimeOffset At);
+
+/// <summary>The reference shape: a keyed input that forgets final rows and a retroactive
+/// join that forgets final facts, both open for <c>OpenSeconds</c> of event time. With
+/// <c>CountPerTrade</c> it also keeps a count per trade id, which nothing ever closes.</summary>
+[Pipeline("open-trades")]
+public sealed class OpenTrades : IPipelineDefinition<OpenTrades.Settings>
+{
+    public sealed record Settings
+    {
+        public int OpenSeconds { get; init; } = 3600;
+        public bool CountPerTrade { get; init; }
+    }
+
+    public void Build(PipelineBuilder p, Settings s)
+    {
+        var instruments = p.Table(AcmeTables.Instruments);
+        var trades = p.KeyedInput<long, TimedTrade>("trades", t => t.Id)
+            .WithEventTime(t => t.At, TimeSpan.FromSeconds(s.OpenSeconds), evictWhenFinal: true);
+        p.UpsertSink("out",
+            trades.GroupBy(t => t.InstrumentId).EvictWhenFinal()
+                .Join(instruments, (_, t, i) => new EnrichedTrade(t.Id, i.Symbol, i.Multiplier)).Named("priced"),
+            e => e.TradeId);
+        if (s.CountPerTrade)
+            p.UpsertSink("seen", trades.GroupBy(t => t.Id).Count().Named("seen"));
+    }
+}

@@ -92,6 +92,27 @@ public class TradeEnrichmentTests
         await trades.UpsertAsync(Trade(1, quantity: 500));
         await pipeline.StepAsync();
         Assert.Equal(2000m, rows[1].Notional);
+        Assert.Equal(1, pipeline.LateRecords);
+    }
+
+    [Fact]
+    public async Task A_trade_that_first_arrives_behind_the_watermark_is_dropped_and_counted()
+    {
+        await using var pipeline = await StartAsync("""{ "minNotional": 0, "openSeconds": 60 }""");
+        var trades = pipeline.KeyedInput<long, Trade>("trades");
+        await trades.UpsertAsync(Trade(1, quantity: 100));                                   // at T0
+        // One trade stamped an hour ahead: the watermark is 59 minutes past T0 from here.
+        await trades.UpsertAsync(Trade(2, quantity: 100) with { ExecutedAt = T0.AddHours(1) });
+        await pipeline.StepAsync();
+        Assert.Equal(0, pipeline.LateRecords);
+
+        // Trades with honest times, never seen before: late by their time alone.
+        await trades.UpsertAsync(Trade(3, quantity: 100) with { ExecutedAt = T0.AddMinutes(1) });
+        await trades.UpsertAsync(Trade(4, quantity: 100) with { ExecutedAt = T0.AddMinutes(2) });
+        await pipeline.StepAsync();
+        Assert.Equal([1L, 2L], pipeline.UpsertSink<long, EnrichedTrade>("enriched").Rows.Keys.Order());
+        Assert.Equal(2, pipeline.LateRecords);
+        Assert.Empty(pipeline.DeadLetters);
     }
 
     [Fact]

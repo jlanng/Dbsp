@@ -92,7 +92,10 @@ For keyed state whose lifecycle isn't window-derived, the escape hatch is
 `.EvictWhen(key => closesAt)` on any grouping. For a table join or lookup over facts whose
 key never closes (trades by instrument), `.EvictWhenFinal()` on an event-time grouping
 forgets each fact once the watermark is past its own time, and a keyed input does the same
-with `WithEventTime(sel, lateness, evictWhenFinal: true)`.
+with `WithEventTime(sel, lateness, evictWhenFinal: true)`. A checkpoint written before a
+definition forgot anything holds state with no deadlines, so adopting either on it is
+refused at `Start()` (`CircuitBuilder.CheckState` says so beforehand): start from an empty
+state store.
 
 The watermark and the deadlines of everything still open are checkpointed with the state
 they bound, so they hold across a restart and a failover: a restored circuit has the
@@ -355,6 +358,7 @@ unlistened.
 | `incremental.circuit.checkpoint_commits`, `.checkpoint_commit_duration` | atomic state+offsets commits |
 | `incremental.circuit.sink_ack_wait` | seconds a commit waited for acknowledged outputs' consumers to confirm delivery, one measurement per commit |
 | `incremental.circuit.dead_letters` | records dropped under the `DeadLetter` error policy, tagged by `operator` |
+| `incremental.circuit.late_records` | insertions dropped at a `WithEventTime` declaration for being behind the watermark (`Circuit.LateRecords`) |
 | `incremental.circuit.input_queue_depth`, `.output_queue_depth` | bounded-channel depths, per port |
 | `incremental.circuit.watermark_lag` | now minus the frozen watermark, seconds |
 | `incremental.circuit.barrier_wait` | cumulative seconds each worker has spent waiting on exchange and loop barriers |

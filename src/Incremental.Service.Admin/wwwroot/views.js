@@ -80,7 +80,10 @@
         if (p.stateGrowingSince)
           attention.push(h('li', { key: 'g' + p.id }, h('span', { class: 'badge warn' }, 'Growing'),
             h('div', { class: 'text' }, pipelineLink(p.id), h('span', { class: 'sub' },
-              `its state has grown without a pause for ${fmtMs(Date.now() - new Date(p.stateGrowingSince).getTime())}, to ${plural(p.stateSize ? p.stateSize.entries : 0, 'entry', 'entries')}: something kept per record is never closed`))));
+              `its store ${p.stateGrowth ? p.stateGrowth.store : ''} has grown without a pause for ${fmtMs(Date.now() - new Date(p.stateGrowingSince).getTime())}: `
+              + (p.stateGrowth && p.stateGrowth.watermarkStalled
+                ? 'it closes on the watermark, and the watermark has not moved'
+                : 'something kept per record is never closed')))));
       }
       for (const p of pipelines.items) {
         if (!lastKnown() && p.waiting)
@@ -247,7 +250,7 @@
               !runsNothing && { label: 'Lag', sort: 'lag', cls: 'r', cell: p => { const r = rowRates(p); return r.lag == null ? '–' : fmtNum(r.lag); } },
               { label: 'State size', sort: 'state-size', cls: 'r', cell: p => (!p.stateSize || !p.stateSize.entries ? h('span', { class: 'muted' }, 'none')
                 : [fmtNum(p.stateSize.entries), h('span', { class: 'sub' }, '≈ ' + fmtBytes(p.stateSize.bytes)),
-                  p.stateGrowingSince && h('span', { class: 'badge warn', title: `Grown without a pause since ${stamp(p.stateGrowingSince)}` }, 'growing')]) },
+                  p.stateGrowingSince && h('span', { class: 'badge warn', title: `${p.stateGrowth ? p.stateGrowth.store : 'A store'} has grown without a pause since ${stamp(p.stateGrowingSince)}` }, 'growing')]) },
               !runsNothing && { label: 'Dead letters', sort: 'dead', cls: 'r', cell: p => (p.deadLetters ? h('a', { href: '#/pipelines/' + enc(p.id) + '/dead-letters' }, fmtNum(p.deadLetters)) : '0') },
               { label: 'In state', sort: 'since', cls: 'r', cell: p => timeEl(p.since) },
             ], shown, { key: p => p.id, cls: 'data cards', sort: (key, label, cls) => sortHeader(ctx, key, label, cls) })),
@@ -352,6 +355,11 @@
       p.waiting && !lastKnown() && notice('warn', h('strong', null, 'Waiting for its input. '),
         p.waiting.map((w, i) => [i > 0 && ' ', `Input ${w.slot} has found nothing to read: it is waiting for ${w.waitingFor}`, w.since ? [' (it began ', timeEl(w.since), ')'] : '', '.']),
         ' A file or topic yet to be delivered looks the same as a name with a mistake in it: check the binding.'),
+      p.lateRecords > 0 && notice('info', h('strong', null, `${plural(p.lateRecords, 'record')} dropped as late. `),
+        'Their event time was behind the watermark when they reached the pipeline',
+        p.watermark ? [' (it is now at ', h('span', { class: 'mono' }, stamp(p.watermark)), ')'] : '',
+        ': an amendment of a record that is final, or a record never seen before — a record is late by its time alone. ',
+        'They are in no dead letter. The watermark follows the newest event time read, less the lateness the definition declares, so one record stamped far ahead makes those behind it late.'),
       p.state === 'Built' && notice('info', 'This node is a standby: it has built this pipeline’s circuit on the state it follows and starts it when it takes over. Rates are on the leader.'),
       p.state === 'Unbuilt' && notice('info', 'This node has not built this pipeline’s circuit: it follows its state as bytes and builds the circuit if it takes over. ' + ((detail.history || []).filter(t => t.state === 'Unbuilt' && t.why).map(t => t.why).pop() || 'A standby builds a pipeline once the leader has run it; one that writes a table is built at takeover.')),
 
@@ -965,9 +973,13 @@
           `The circuit was built on restored state and has not committed since, so the bytes it was built from are still kept beside it — about ${fmtBytes(z.bytesHeldTwice)}. They go at its first commit after a record arrives`,
           detail.pipeline.state === 'Built' ? ' on the leader.' : '.'),
         z.entriesAsBytes > 0 && z.entriesAsBytes === z.entries && notice('info', 'This node follows the state as bytes: it has no circuit built for this pipeline.'),
-        detail.pipeline.stateGrowingSince && notice('warn', h('strong', null, 'The state has grown without a pause since ', timeEl(detail.pipeline.stateGrowingSince), '. '),
-          'A pipeline that keeps something per record — a retroactive join, a remembered lookup, a keyed input — holds it until something closes it. ',
-          'Over a stream of facts, give the input event time and forget each record once it is final (EvictWhenFinal); see the guide, “Bounding a join over a stream of facts”.'),
+        detail.pipeline.stateGrowingSince && notice('warn',
+          h('strong', null, `${detail.pipeline.stateGrowth ? detail.pipeline.stateGrowth.store : 'A store'} has grown without a pause since `, timeEl(detail.pipeline.stateGrowingSince), '. '),
+          ...(detail.pipeline.stateGrowth && detail.pipeline.stateGrowth.watermarkStalled
+            ? ['What it holds closes on the watermark, and the watermark has not moved in that time: nothing it holds can become final. ',
+              'The watermark is the lowest of the event-time inputs’, so an input with no records — or one whose records are stamped far behind the others — holds it back.']
+            : ['A pipeline that keeps something per record — a retroactive join, a remembered lookup, a keyed input, a total per record — holds it until something closes it. ',
+              'Over a stream of facts, give the input event time and forget each record once it is final (EvictWhenFinal); see the guide, “Bounding a join over a stream of facts”.'])),
         h('div', { class: 'table-wrap' }, grid([
           { label: 'Store', cellCls: 'id wrap', cell: st => st.name },
           { label: 'Kind', cell: st => h('span', { class: 'tag', title: STORE_KINDS[st.kind] || '' }, st.kind) },
@@ -980,7 +992,7 @@
         z.stores > stores.length && h('p', { class: 'help' }, `The ${fmtInt(stores.length)} largest of ${fmtInt(z.stores)} stores.`),
         h('p', { class: 'help' },
           'Entries are counted. Memory is estimated: the objects of an entry — sized as entries are written to the changelog or read from it, each of a store’s first 256 and then one in 512 — times the entries, plus the store’s own maps. ',
-          'An object two stores share is counted in both. A state that grows without a pause for half an hour (ServiceOptions.StateGrowthAlarmAfter) is flagged here, on the overview and as the gauge pipeline.state_growing.')),
+          'An object two stores share is counted in both. A store that grows without a pause for half an hour (ServiceOptions.StateGrowthAlarmAfter) is flagged here, on the overview and as the gauge pipeline.state_growing; one that closes on the watermark (it has a deadlines store beside it) is flagged only if the watermark has not moved in that time — while it moves, the store is filling what the definition keeps open.')),
       { flush: false });
   }
 

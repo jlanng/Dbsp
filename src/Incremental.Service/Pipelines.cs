@@ -495,9 +495,13 @@ public sealed record SourceSlotStatus(string Slot, SourceStats Stats, DateTimeOf
 /// <remarks><c>StateSize</c>: what the pipeline's state holds on this node — entries,
 /// counted, and bytes of managed heap, estimated as
 /// <see cref="Incremental.Storage.ChangelogStorageProvider.EstimateSize"/> says — on a
-/// leader and on a standby alike. <c>StateGrowingSince</c>: set while those entries have
+/// leader and on a standby alike. <c>StateGrowingSince</c>: set while a store of it has
 /// grown without a pause for <see cref="ServiceOptions.StateGrowthAlarmAfter"/>, to when
-/// that run began.</remarks>
+/// that run began; <c>StateGrowth</c> says which store and why. <c>LateRecords</c>:
+/// insertions the pipeline's circuits dropped at an event-time declaration for being
+/// behind the watermark, since this node first ran it (<see cref="Circuit.LateRecords"/>,
+/// read once a second) — they are in no dead letter and no fault. <c>Watermark</c>: the
+/// running circuit's event-time watermark; null when it has none or does not run here.</remarks>
 public sealed record PipelineStatus(
     string Id, PipelineState State, DesiredState Desired, long Generation, string Plugin, string Version, string Definition,
     string? BlockedOn, DateTimeOffset? Since, string? Operation, int Restarts, long DeadLetters,
@@ -510,7 +514,15 @@ public sealed record PipelineStatus(
     DeadLetterSinkStatus? DeadLetterSink = null,
     PipelineStartTimings? LastStart = null,
     Incremental.Storage.StateSizeEstimate? StateSize = null,
-    DateTimeOffset? StateGrowingSince = null);
+    DateTimeOffset? StateGrowingSince = null,
+    PipelineStateGrowth? StateGrowth = null,
+    long LateRecords = 0,
+    DateTimeOffset? Watermark = null);
+
+/// <summary>The store that is flagged as growing (<see cref="ServiceOptions.StateGrowthAlarmAfter"/>):
+/// its name, since when, and whether it is a store that closes on the watermark and the
+/// watermark has not moved in that time — as opposed to one that nothing closes.</summary>
+public sealed record PipelineStateGrowth(string Store, DateTimeOffset Since, bool WatermarkStalled);
 
 /// <summary>
 /// Where the last start of a pipeline on this node spent its time. <c>Plugin</c>: getting

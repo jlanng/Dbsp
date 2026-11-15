@@ -370,7 +370,13 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   no queue of its own. An operator whose tracked keys come and go under a grouping's key
   (the remembered `Lookup` tracks facts) calls `EvictionTracker.Forget` for one it holds
   nothing for any more, or every key ever tracked keeps a deadline record until the
-  group closes. A checkpointing `IStorageProvider` must implement
+  group closes. A deadline is set when its key or record is written, so state written
+  before an operator had deadlines never falls due: `StateManifest.Problems` refuses a
+  `{operator}.deadlines.w{n}` store that is new beside committed state of that operator —
+  do not turn that into "new stores are fine". An event-time selector run outside a
+  `WatermarkOperator` (the keyed input's `evictWhenFinal` deadlines) has its own guarded
+  loop under `DeadLetter` and reports nothing: the declaration downstream reports the
+  record once. A checkpointing `IStorageProvider` must implement
   `CreateDeadlineStore`; a changelog follower that holds the store typed keeps its order
   as it applies records, so a takeover rebuilds nothing — and a follower only ever
   writes the store, so a deadline store must bound its own order at `Set` and `Remove`,

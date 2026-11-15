@@ -81,6 +81,11 @@ internal sealed class UpsertOperator<TKey, TValue> : IStepOperator
     private readonly IDeadlineStore<TKey>? _deadlines;
     private readonly List<TKey> _due = [];
 
+    // Non-null under the dead-letter policy: a row whose event time cannot be read is
+    // then not held (see DeadlinesGuarded) where it would otherwise fault the step.
+    private readonly RecordErrors? _errors;
+    private readonly List<long> _closes = [];
+
     public UpsertOperator(OperatorContext context, RecordEviction<TValue>? retention = null)
     {
         _rows = context.Storage.CreateValueStore<TKey, TValue>(context.StateName("rows"));
@@ -88,6 +93,7 @@ internal sealed class UpsertOperator<TKey, TValue> : IStepOperator
         {
             _retention = retention;
             _deadlines = context.Storage.CreateDeadlineStore<TKey>(context.StateName("deadlines"));
+            _errors = context.Errors;
         }
     }
 
@@ -168,17 +174,63 @@ internal sealed class UpsertOperator<TKey, TValue> : IStepOperator
             puts.Add((command.Key, next));
         }
 
+        if (_deadlines is null)
+        {
+            _rows.PutAll(puts);
+            _rows.RemoveAll(removes);
+            return output;
+        }
+
+        // Each row's deadline is its event time, read by the user's selector — here,
+        // upstream of the declaration whose guarded loop dead-letters a record the selector
+        // throws for. So the deadlines are read before anything is stored, and under the
+        // dead-letter policy by a loop of their own.
+        var closes = _closes;
+        closes.Clear();
+        if (_errors is not null)
+            DeadlinesGuarded(puts, removes, closes);
+        else
+            foreach (var (_, row) in puts)
+                closes.Add(_retention!.ClosesAt(row).UtcTicks);
+
         _rows.PutAll(puts);
         _rows.RemoveAll(removes);
-        if (_deadlines is not null)
-        {
-            foreach (var (key, row) in puts)
-                _deadlines.Set(key, _retention!.ClosesAt(row).UtcTicks);
-            foreach (var key in removes)
-                _deadlines.Remove(key);
-            ForgetFinal();
-        }
+        for (var i = 0; i < puts.Count; i++)
+            _deadlines.Set(puts[i].Item1, closes[i]);
+        foreach (var key in removes)
+            _deadlines.Remove(key);
+        ForgetFinal();
         return output;
+    }
+
+    /// <summary>The dead-letter policy's reading of the deadlines. A row whose event time
+    /// cannot be read is not held: it has no deadline, so held it would stay for ever. It
+    /// has already been emitted, and the event-time declaration downstream — the one way
+    /// out of this operator's state — runs the same selector on it, fails the same way and
+    /// reports it; nothing is reported here, or it would be reported twice. Whatever the
+    /// key held before goes, since the row that replaced it is not kept: its retraction was
+    /// emitted above. A later upsert of the key is then a new row, exactly as it is for a
+    /// key whose row was forgotten as final.</summary>
+    private void DeadlinesGuarded(List<(TKey, TValue)> puts, List<TKey> removes, List<long> closes)
+    {
+        var kept = 0;
+        for (var i = 0; i < puts.Count; i++)
+        {
+            long ticks;
+            try
+            {
+                ticks = _retention!.ClosesAt(puts[i].Item2).UtcTicks;
+            }
+            catch (Exception)
+            {
+                if (_rows.TryGet(puts[i].Item1, out _))
+                    removes.Add(puts[i].Item1);
+                continue;
+            }
+            puts[kept++] = puts[i];
+            closes.Add(ticks);
+        }
+        puts.RemoveRange(kept, puts.Count - kept);
     }
 
     /// <summary>Forgets the rows the watermark has passed. Nothing is emitted: the

@@ -163,7 +163,27 @@ internal static class StateManifest
                              $"then, {currentEpoch} now), so the version this circuit committed does not refer to its history " +
                              "(a table this circuit writes needs a log to outlive the process: open it with SharedTable.OpenAsync)");
 
-        // New stores are fine — they start empty. Committed stores this circuit no longer
+        // New stores are fine — they start empty — with one exception: the deadlines of an
+        // operator the checkpoint already holds state of. A deadline is set when a key or a
+        // record is written, so what that operator held before it had deadlines would have
+        // none and would never fall due: resumed, it would keep all of it for good while
+        // everything written from then on comes and goes, which looks bounded and is not.
+        var committedSet = new HashSet<string>(committedStores, StringComparer.Ordinal);
+        var unbounded = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (var store in currentStores)
+        {
+            if (committedSet.Contains(store) || DeadlinesOwner(store) is not { } owner)
+                continue;
+            if (committedStores.Any(c => c.StartsWith(owner, StringComparison.Ordinal) && c.Length > owner.Length && c[owner.Length] == '.'))
+                unbounded.Add(owner);
+        }
+        foreach (var owner in unbounded)
+            problems.Add(
+                $"'{owner}' now forgets what it holds on the watermark (EvictWhenFinal, evictWhenFinal, EvictWhen), and the " +
+                "checkpoint holds state of it written before it did: that state has no deadlines, so resumed it would never be " +
+                "evicted. Start it from an empty state store to adopt the eviction");
+
+        // Committed stores this circuit no longer
         // mints are not: their state would be orphaned, and whatever operator inherited
         // their position would be reading someone else's.
         var currentSet = new HashSet<string>(currentStores, StringComparer.Ordinal);
@@ -176,6 +196,20 @@ internal static class StateManifest
                          (missing.Count > shown ? $"\n      … and {missing.Count - shown} more" : ""));
         }
         return problems;
+    }
+
+    /// <summary>The operator a deadline store belongs to — its state name root, as in
+    /// <c>{root}.deadlines.w{n}</c> — or null for any other store.</summary>
+    private static string? DeadlinesOwner(string store)
+    {
+        const string marker = ".deadlines.w";
+        var at = store.LastIndexOf(marker, StringComparison.Ordinal);
+        if (at <= 0 || at + marker.Length >= store.Length)
+            return null;
+        for (var i = at + marker.Length; i < store.Length; i++)
+            if (!char.IsAsciiDigit(store[i]))
+                return null;
+        return store[..at];
     }
 
     public static CircuitStateMismatchException Mismatch(List<string> problems) => new(

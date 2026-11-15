@@ -309,6 +309,8 @@ public sealed class Circuit : IAsyncDisposable
         }
     }
 
+    private long _lateReported;
+
     private const string RefusedToStart =
         "The circuit refused to start, and is finished: nothing it was given has been processed or committed. " +
         "Dispose it and build a new one once the cause of the refusal is dealt with.";
@@ -433,6 +435,19 @@ public sealed class Circuit : IAsyncDisposable
             return ticks == long.MinValue ? null : new DateTimeOffset(ticks, TimeSpan.Zero);
         }
     }
+
+    /// <summary>
+    /// Records dropped as late since this circuit was built: insertions whose event time
+    /// was behind the watermark when they reached a <c>WithEventTime</c> declaration. A
+    /// record is late by its time alone — one the circuit has never seen is dropped like
+    /// an amendment of one that is final — and nothing else reports it: it is not an error
+    /// and not a dead letter. The watermark follows the newest event time seen, so one
+    /// record stamped far ahead makes every record behind it late; this count rising where
+    /// none is expected is how that shows. Also the counter
+    /// <c>incremental.circuit.late_records</c>. Zero for a circuit with no event time. It
+    /// counts this run: it is not checkpointed.
+    /// </summary>
+    public long LateRecords => _watermarkClock?.LateRecords ?? 0;
 
     /// <summary>Redeems an input definition for its live handle. The definition must come
     /// from the builder that built this circuit.</summary>
@@ -657,6 +672,11 @@ public sealed class Circuit : IAsyncDisposable
 
             // Freeze between steps so every worker sees one consistent watermark per step.
             _watermarkClock?.Freeze();
+            if (_watermarkClock is { } clock && clock.LateRecords is var late && late != _lateReported)
+            {
+                _diag.RecordsLate(late - _lateReported);
+                _lateReported = late;
+            }
 
             // Commit before publishing, unless an acknowledged output turns the order round
             // (see GatesCommits): durability should not wait on a slow output consumer.

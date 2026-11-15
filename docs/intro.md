@@ -181,7 +181,11 @@ lateness, taken as the *minimum across all event-timed inputs* — drives everyt
 time-based:
 
 - a window closes when the watermark passes its end; its state is then evicted;
-- events arriving later than the allowed lateness are dropped (**TODO:** late-event
+- events arriving later than the allowed lateness are dropped, whether or not the circuit
+  has seen them before — a record is late by its time alone — and counted:
+  `circuit.LateRecords` and the counter `incremental.circuit.late_records` (insertions; the
+  retraction of a record that is final is dropped and not counted). One record stamped far
+  ahead moves the watermark and makes everything behind it late (**TODO:** late-event
   side-channel — design pending);
 - `circuit.CurrentWatermark` exposes the current value for monitoring.
 
@@ -343,7 +347,12 @@ var enriched = builder.KeyedInput<long, Trade>("trades", t => t.Id)
 
 The lateness is how long a trade stays open, and the state is that many hours of trades.
 `EvictWhenFinal()` offers only the table `Join`, `LeftJoin` and `Lookup`, the operators
-that honour it.
+that honour it. Two things to know before using it. A deadline is set when a row or a
+fact is written, so a checkpoint from before the definition forgot anything holds state
+that would never go: adopting `EvictWhenFinal`, `evictWhenFinal` or `EvictWhen` on such a
+checkpoint is refused at `Start()` and by `CheckState` — start from an empty state store.
+And under `RecordErrorPolicy.DeadLetter` a row whose event time cannot be read is
+dead-lettered by the declaration and not held by the input.
 
 **Other columns.** To join on something that is not the table's key, ask the table for an
 index. It is maintained with the rows, shared by every circuit that asks for the same name,

@@ -141,6 +141,12 @@ public sealed class PipelineTestHarness : IAsyncDisposable
     /// event time has seen a record.</summary>
     public DateTimeOffset? Watermark => _circuit.CurrentWatermark;
 
+    /// <summary>Records the pipeline has dropped as late so far: insertions whose event
+    /// time was behind the watermark when they reached an event-time declaration — an
+    /// amendment of a record that is final, or a record never seen before. They are not
+    /// dead letters; a node shows the same count on the pipeline's page.</summary>
+    public long LateRecords => _circuit.LateRecords;
+
     /// <summary>
     /// What the pipeline's state holds as of the last step: entries per store and in all,
     /// the same count a node shows as the pipeline's state entries. A store is named after
