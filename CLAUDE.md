@@ -450,7 +450,10 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   never delivered. Whoever steps a circuit by hand steps until `HasPendingInput` is
   false (`PipelineTestHarness.StepAsync` does). Within the lateness an upsert is an
   amendment, and no rule tells a reused key from one there: the guide says ids must
-  not come back within the open window.
+  not come back within the open window. An upsert that is itself behind the watermark
+  is not applied (`UpsertOperator.IsLate`): it is emitted alone, for the declaration to
+  drop and count, and the key's row stays — applied, it would retract a row that may
+  still be open and insert one that is dropped.
 - Per-record eviction (`EvictWhenFinal()` → `FinalizingGroupedStream`; docs/design/shared-tables.md,
   *Per fact*). A record's deadline is one tick after its own event time (the watermark
   keeps ticks ≥ it, `TakeDue` takes ≤ it), tracked by (key, record) in an

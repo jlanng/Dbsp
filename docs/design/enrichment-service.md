@@ -7314,3 +7314,216 @@ in the step's report.
   (E4), a reused trade id (E6) and the size of this document (E8) were not this
   step's.
 
+
+### S9 — round five
+
+The last round: [enrichment-service-next-steps.md](enrichment-service-next-steps.md) is
+its plan. Each step adds its part here.
+
+#### Event time where records enter (K1, K3, K6)
+
+Three things the last critic left, and one place that answers all three: the input's
+port. A record's partition is known only where it enters the circuit; a record refused
+there never enters; and the port is the one place that sees an input's records in the
+order they were sent, before a step makes a set of them.
+
+**The binding.** `WithEventTime(selector, lateness)` called on an input itself — an
+`InputStream<T>` or a `KeyedInputStream<TKey, TValue>`, not a stream derived from one —
+gives the input's registration an `InputEventTime<T>`: the clock, the source's number,
+the selector, the circuit's options. The port calls it for every record it drains
+(`InputPort.DrainInto`, `KeyedInputPort.DrainInto`), on the coordinator, between steps;
+the declaration's `WatermarkOperator` is then built with no source of its own and only
+filters. A declaration anywhere else is what it was. Clustered circuits are not bound:
+their processes share one time per source.
+
+It follows that a definition must declare event time on the input to get any of this.
+The example's `execution-quality` and `desk-exposure` declared it after a
+`LookupAppendOnly`; they now declare on the input and re-declare without a lateness on
+the new shape. That is a rule a tenant has to know, and the guide says it first.
+
+**K1: a time per partition.**
+
+- *The source's part.* `InputHandle.ExpectPartitionAsync(p)` — the source reads this
+  partition and its records may be on their way — and `IdlePartitionAsync(p)` — the
+  source stands at its end. They travel in the input's channel as entries with no
+  offset, so they take effect in order with the records around them, and a run that
+  is fed the same entries in the same steps has the same clock (which is what
+  `EventTimeRestartTests` needs of anything that moves the watermark; an idle timeout
+  in the clock would not have it). They are sent only to an input that keeps time:
+  elsewhere a note would cost a step and a commit for nothing.
+- *The clock's part* (`WatermarkClock`). A source's time is the least over its named
+  partitions that are not idle. A partition named and not yet heard from holds every
+  claim back: the watermark stays where it is. An idle one stops counting until its
+  next record, which counts it again without anything being said. With every
+  partition idle the time is the newest seen anywhere. Records of a partition nobody
+  named, and unstamped records, go to the source's one slot as before, and that slot
+  holds nothing back once partitions are named — which is what lets a format-7
+  checkpoint, whose one time is the newest read from any partition, resume.
+  `Circuit.WatermarkHeldBy` says which source, input and partition the last freeze
+  found lowest; the service puts it in a pipeline's status and on its page.
+- *The checkpoint.* Two marker entries per named partition, `$watermark#s{n}#m{p}`
+  (its max, `long.MinValue` before its first record) and `$watermark#s{n}#i{p}`
+  (1 or 0), restored at `Start()`. State manifest format 8. A format-7 checkpoint is
+  resumed as it is and rewritten as 8 at the next commit; a build that writes 7
+  refuses an 8, as it must — it would restore the newest of the partitions' times as
+  the source's. For a pair of nodes that means the standby is upgraded first, as for
+  any format change; what rolling upgrades do about it is B6's.
+- *The Kafka source* (`KafkaSource.PartitionEnds`). It names every partition at every
+  start, before the first record. It calls a partition idle when an end-of-partition
+  answer from the broker finds that it has stood at the end for `IdlePartitionAfter`
+  (5 s). It asks again every `IdlePartitionConfirmEvery` (1 s) by seeking to where it
+  stands, which makes the client fetch afresh and report the end again — measured,
+  the answer comes about a second after the seek, two of the client's fetch waits.
+  A partition that has not answered for three intervals and two seconds (5 s) is no
+  longer idle: it holds the watermark until it is read to its end and has stood there
+  for `IdlePartitionAfter` again.
+
+Three things the first builds got wrong, each found by a test:
+
+1. *The idle flag in the key's name* (`…#a3` or `…#i3`). Redis keeps the marker with
+   `HSET` and removes nothing, so after a partition's first change both names were
+   there. `EventTimeRestartTests`' new partitioned cases failed on Redis only (three
+   of three). Two keys with fixed names now.
+2. *Idle by the passing of time.* The source called a partition idle when it had
+   stood at the end for five seconds with evidence no older than five seconds — which
+   a partition whose broker had died five seconds ago satisfies exactly. First run of
+   the broker test, broker killed: 130 of 10,002 records late. A partition is called
+   idle only on an answer now, never on a timer.
+3. *Asking again before the answer.* With a confirmation interval shorter than the
+   answer's latency every seek cancelled the fetch before it; the end was never
+   confirmed and an empty partition held the watermark for good (the empty-partition
+   test, 60 s). One question at a time.
+
+*Measured* (records: `docs/design/runs/2026-11-15-k1-partitions.measurements.log`).
+
+| | one time for the input (declared after a `Select`) | a time per partition |
+|---|---|---|
+| A backlog of 3 × 600 records, ten minutes of event time on each partition, lateness 5 s, one local broker; four runs | 1,155, 1,188, 951, 1,188 of 1,800 dropped as late | 0, 0, 0, 0 |
+| A restart onto 3 × 300 records behind partitions the checkpoint called idle; four runs | not run | 0, 0, 0, 0 |
+| Two empty partitions of three: until they stop holding the watermark (`IdlePartitionAfter` 2 s in the test) | — | 2.0, 2.0, 2.1 s |
+| Three brokers, six partitions, 300 records a second stamped as produced, lateness 5 s, the source's defaults; one broker **killed** for 20 s | K1_KILL_BLIND | K1_KILL |
+| …one broker **frozen** (`docker pause`) for 20 s | K1_PAUSE_BLIND | K1_PAUSE |
+
+The example's Kafka topics for trades and quotes have three partitions now, and the
+`--headless --kafka` smoke publishes its takeover's 500 trades while nobody leads: the
+new leader finds a backlog on three partitions and is held to one late record per
+pipeline, the straggler the act plants (a new claim). The smoke's state bound allows
+twenty-five trades for the watermark standing at the slowest partition's newest trade
+(1,988 entries against 1,976 in the first three-partition run).
+
+**K3: a bound on a time in the future.** `CircuitOptions.MaxEventTimeAhead`;
+`ServiceOptions.MaxEventTimeAhead`, a day by default; `circuit.maxEventTimeAhead` in a
+spec. A record whose event time is further ahead than that of the later of the node's
+clock and the newest event time its input has taken is refused at the port as a record
+its source could not read is: its offset consumed, a dead letter
+(`EventTimeAheadException`) or a fault, as the error policy says.
+
+- *Why the node's clock, which item 81 argued against.* The other bound — against the
+  clock's own state only — is deterministic and wedges a pipeline for good after any
+  quiet spell longer than the bound: every record that follows is "too far ahead" of
+  the last. Against the later of the two a quiet feed is taken up again, and a feed
+  whose time runs ahead of the node's (a replay with shifted times, a test) goes on as
+  long as it moves in steps shorter than the bound. What it costs is 81's objection:
+  a record refused and not yet committed may pass when read again later. What a
+  committed step did stays done, and the verdict only ever moves from refused to
+  taken.
+- *Why at the port.* Inside the circuit an insertion and its later retraction could be
+  judged differently (the reference moves towards the record), leaving a retraction
+  with nothing to retract; a stateless operator cannot remember what it refused, and
+  a stateful one would need an exchange. A record refused at the port never enters,
+  and a keyed input's refused upsert never becomes the key's row, so nothing can come
+  after it that takes it back. The one case left is a producer that sends its own
+  retraction (weight −1) of a record that was refused, later, when it would pass;
+  the built-in sources send none.
+- *The default is on, and that changes what a deployed pipeline does* with a record
+  more than a day ahead: a dead letter or a fault where it was a stall. It is what K3
+  asks for; `StateGrowthTests`, which stamps its trades in 2100 on purpose, turns it
+  off, and a pipeline whose event time is rightly in the future sets its own bound.
+- A record less than the bound ahead is still taken and still holds everything behind
+  it late for up to the bound: the harm is bounded, not gone.
+
+**K6: an id that comes back.** A sound rule exists for a key that comes back *after*
+its record's open window, and none within it.
+
+- *The rule* (`RecordEviction.Supersedes`). On a keyed input that forgets its final
+  rows, an upsert whose event time is later than the held row's by more than the
+  lateness begins a new record: the held row is final by the newer one's own time —
+  one step later the watermark will have passed it — so `UpsertOperator` emits no
+  retraction for it. And `KeyedInputPort.DrainInto` looks at each upsert before it
+  takes it and ends the drain before one that supersedes an upsert of the same key
+  already drained, so the two are never in one step. Both halves are needed. A
+  step's commands for a key collapse to the last, so without the cut the earlier
+  record is never delivered (the smoke's finding, item 71); and a delta is a set, so
+  the two rows in one step would reach an upsert sink keyed by the id in no order.
+  Steps are the only order a sink sees.
+- *What it makes independent of the steps.* For a key whose next record is more than
+  the lateness later in event time: the earlier record is delivered, not retracted,
+  and delivered before the later one — read a record a step, as one backlog, or
+  anything between, and whether or not the watermark had passed the earlier one when
+  the later arrived. `PartitionWatermarkTests.An_id_that_comes_back_after_its_window…`
+  (400 trades over 40 ids, amendments among them, five layouts, one and four
+  workers: the same net rows and the same last row per id) and
+  `TradeTimeTests` on the example's definition through the harness (the sink's rows
+  equal one by one and as a backlog). The smoke's act 2 publishes its 2,000 trades at
+  once now, where it waited between two halves; with the rule taken out it fails as
+  item 71 says (1,421 rows of 1,446).
+- *Why there is no rule within the window.* An amendment and a reused id are the same
+  thing to the input: an upsert of a key that has a row. Their times cannot tell
+  them apart either — an amendment may move a record's event time. And what an
+  upsert near the edge of the window does downstream depends on whether the
+  retraction of the row it replaces is still ahead of the watermark, which is frozen
+  between steps: it depends on what was read before, and in which step. That is how
+  lateness works in this engine for every record (a record a step behind the one
+  that moves the watermark is late, the same record in the same step is not), not a
+  property of keys, and making the watermark move within a step would give up what
+  the freeze is for — every worker seeing one watermark for a whole step. So within
+  the window the guide says: an id must not be used for another record within the
+  open window, and why.
+- *A late version of a record is not applied.* Found while reading the upsert for
+  the rule above, and built with it: an upsert whose own event time is behind the
+  watermark was applied like any other — the row the key held was taken back, and if
+  that row was still open its retraction passed the declaration while the late
+  version's insertion was dropped there. One late version of a trade deleted the trade
+  from everything downstream (probed before the fix: trade 7 at 200 s, the watermark
+  at 180 s, a version of it stamped 105 s; afterwards only trade 8 stood). The input
+  now leaves the key's row alone and hands the late version on to be dropped and
+  counted (`A_late_version_of_a_record_does_not_take_back_the_open_row_its_key_holds`).
+  Whether a record is late still depends on the step it is read in, as it does for
+  every record.
+- *What the rule costs.* An amendment that moves a record's event time forward by
+  more than the lateness is now taken for another record, always. Before, it was
+  taken for one unless the watermark had already passed the old row — which in a
+  busy feed it usually had, so the rule makes the common outcome the only one. The
+  guide says it. On the port, a keyed input with `evictWhenFinal` reads the event
+  time of each upsert and keeps the keys of one drain in a dictionary: one selector
+  call and one hash insert per upsert, not measured by itself.
+
+**Tests.** `PartitionWatermarkTests` (17: the clock per partition, idle, restore,
+format 7, the keyed input, the bound under both policies and its two clocks, the
+returning key); three scenarios of `EventTimeRestartTests` fed by partition with idle
+and re-named partitions on every backing (12 cases: killed and restored at random
+steps, outputs, state and the marker equal the uninterrupted run's);
+`KafkaPartitionWatermarkTests` (three on the connector stack, two on three brokers,
+skipped elsewhere); `TradeTimeTests` (3) on the example's definition; one node-level
+test of the bound in `StateGrowthTests`. Mutations, each run against the new tests:
+the operator never beginning a new record, the port never cutting, the source's time
+the newest instead of the least — killed by 3, 3 and 6 tests; the rule removed whole
+— killed by the in-memory smoke.
+
+**Left.**
+
+- A declaration that is not on the input has one time and no bound, and nothing warns
+  the author: the dry run does not say "this input's event time is declared downstream
+  of it". The guide does.
+- A lateness under five seconds is not protected from a broker's loss: the other
+  partitions move the watermark for up to that long before the source knows a
+  partition has stopped answering.
+- A quiet partition delays closes by up to `IdlePartitionAfter`, and a restart or a
+  takeover by at least that: every partition holds the watermark until it has been
+  read to its end.
+- The `files` connector and a tenant's own connectors name no partitions. A connector
+  that reads a partitioned source can (`ExpectPartitionAsync`, `IdlePartitionAsync`
+  are public); the guide's connector section does not show it.
+- The two admin UI tests that need a browser (`AdminUiMorphTests`,
+  `AdminUiTablesTests`) were skipped on the machine this step ran on — it has no
+  Chrome — after a change to `views.js` (one helper and two sentences). CI runs them.

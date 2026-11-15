@@ -567,4 +567,46 @@ public class PartitionWatermarkTests
         await handle.UpsertAsync(new Trade(9, 200_000, 1));
         Assert.Equal(["200000/1 x1"], await StepAsync());
     }
+
+    [Fact]
+    public async Task A_late_version_of_a_record_does_not_take_back_the_open_row_its_key_holds()
+    {
+        var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false });
+        var input = builder.KeyedInput<long, Trade>("trades", t => t.Id);
+        var output = input.WithEventTime(t => t.At, TimeSpan.FromSeconds(30), evictWhenFinal: true).ToOutput();
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var handle = circuit.Handle(input);
+        var net = new Dictionary<Trade, long>();
+
+        async Task StepAsync()
+        {
+            await circuit.StepAsync().WaitAsync(Timeout);
+            while (circuit.Handle(output).Reader.TryRead(out var delta))
+                foreach (var (value, weight) in delta)
+                    net[value] = net.GetValueOrDefault(value) + weight;
+        }
+
+        // Trade 7 at 200 s; the watermark is at 180 s, so it is open.
+        await handle.UpsertAsync(new Trade(7, 200_000, 1));
+        await handle.UpsertAsync(new Trade(8, 210_000, 1));
+        await StepAsync();
+        Assert.Equal(T0.AddSeconds(180), circuit.CurrentWatermark);
+
+        // A version of trade 7 stamped 105 s: behind the watermark, late. Before round
+        // five the input applied it — the open row's retraction passed, the late row's
+        // insertion was dropped, and trade 7 was gone from everything downstream.
+        await handle.UpsertAsync(new Trade(7, 105_000, 9));
+        await StepAsync();
+        Assert.Equal(1, circuit.LateRecords);
+        Assert.Equal([new Trade(7, 200_000, 1), new Trade(8, 210_000, 1)], net.Where(row => row.Value != 0).Select(row => row.Key).OrderBy(t => t.Id));
+
+        // The row it holds is still the one an amendment amends and a delete deletes.
+        await handle.UpsertAsync(new Trade(7, 200_000, 2));
+        await StepAsync();
+        await handle.DeleteAsync(8);
+        await StepAsync();
+        Assert.Equal([new Trade(7, 200_000, 2)], net.Where(row => row.Value != 0).Select(row => row.Key));
+        Assert.All(net.Values, weight => Assert.InRange(weight, 0, 1));
+    }
 }

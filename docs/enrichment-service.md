@@ -2719,6 +2719,10 @@ record is open. For `trade-enrichment`:
   whether or not the watermark had passed the earlier one. (Until round five it
   depended on exactly that: a pipeline that read both in one step took them for one
   trade amended and never delivered the first.)
+- An upsert whose own execution time is behind the watermark is late and changes
+  nothing: it is counted as a late record, and the row its id holds — the trade as
+  last amended in time — stays. (Until round five a late version of an open trade took
+  the trade out of the sink.)
 - So **an id must not be used for another trade within `openSeconds`** of event time:
   the second would amend the first. And an amendment must not move a trade's execution
   time *forward* by more than `openSeconds`: it would be taken for another trade, and

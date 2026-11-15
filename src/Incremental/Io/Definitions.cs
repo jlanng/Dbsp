@@ -52,6 +52,10 @@ public sealed class KeyedInputStream<TKey, TValue> : ZStream<TValue>
     /// the watermark and dropped here either way — and keeps the input from holding one row
     /// for every key it ever had. A later upsert of a forgotten key is a new row.
     /// <para>
+    /// An upsert that is itself behind the watermark changes nothing: it is late, it is
+    /// dropped and counted at the declaration, and the row its key holds stays.
+    /// </para>
+    /// <para>
     /// So that this does not depend on how the records fall into steps, an upsert whose
     /// event time is later than the held row's by more than <paramref name="lateness"/>
     /// is a new row too, whether or not the watermark has passed the held one yet: the

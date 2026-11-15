@@ -164,6 +164,16 @@ internal sealed class UpsertOperator<TKey, TValue> : IStepOperator
             }
 
             var next = command.Value!;
+            // An input that forgets its final rows does not apply an upsert that is
+            // itself behind the watermark: it is late, and the declaration downstream
+            // drops and counts it. Applied, it would take back the row the key holds —
+            // which may be open, so its retraction would pass — and put nothing in its
+            // place: one late version of a record would delete the record.
+            if (_retention is not null && IsLate(next))
+            {
+                output.Add(next, 1);
+                continue;
+            }
             if (found)
             {
                 if (EqualityComparer<TValue>.Default.Equals(previous, next))
@@ -206,6 +216,9 @@ internal sealed class UpsertOperator<TKey, TValue> : IStepOperator
         ForgetFinal();
         return output;
     }
+
+    private bool IsLate(TValue next) =>
+        _errors is null ? _retention!.IsFinal(next) : _retention!.TryEventTicks(next, out var ticks) && ticks < _retention.Clock.FrozenTicks;
 
     private bool BeginsNewRecord(TValue previous, TValue next) =>
         _errors is null ? _retention!.Supersedes(previous, next) : BeginsNewRecordGuarded(previous, next);
