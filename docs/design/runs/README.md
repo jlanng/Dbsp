@@ -214,3 +214,30 @@ that step left it, but for the first three records.
   records; 7 of 7 passed in 7 min 14 s). The profile's containers had been up for an
   hour and a half, through everything above.
 
+## 2026-11-15, round five — a watermark per partition (K1)
+
+`docs/design/enrichment-service.md`, *As built*, S9, *Event time where records enter*.
+
+- `2026-11-15-k1-partitions.measurements.log` — the lines `KafkaPartitionWatermarkTests`
+  wrote to `measurements.log` beside the test assembly, in the order the runs were
+  made, from the first build of the step to the last. A backlog line "declared after a
+  `Select`" is the same backlog read by a circuit with one time for the input, and
+  the line after it the circuit under test. A broker line's figure in brackets is the
+  second circuit of the same run, reading the same topic with one time for the input;
+  the lines without one were written before that circuit was added to the test.
+  The line of 22:34:06 (130 late, a broker killed) is the build whose source called a
+  partition idle when a timer ran out; every later line is after that was mended. The
+  six lines from 23:23 on are the build of commit `905ed06`.
+
+The backlog, empty-partition and restart tests ran on the connector stack's one broker
+(`docker compose --profile connectors up -d`) until 22:56 and on the `kafka3` profile
+after; the broker tests on `kafka3` only:
+
+```
+INCREMENTAL_KAFKA_BOOTSTRAP=localhost:9192,localhost:9292,localhost:9392 \
+INCREMENTAL_KAFKA_REPLICATION=3 \
+INCREMENTAL_KAFKA_BROKERS=incremental-kafka3-1-1,incremental-kafka3-2-1,incremental-kafka3-3-1 \
+  dotnet test --project tests/Incremental.Kafka.Tests -- --filter-class '*KafkaPartitionWatermarkTests'
+```
+
+A 4-processor cloud VM, 15 GB; Kafka 3.9.0 in containers on the same machine.

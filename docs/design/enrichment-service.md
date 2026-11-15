@@ -2154,6 +2154,10 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     and on a runner `large-trades` was still on the first half (19 rows short of the
     model). The smoke now waits for both; what a tenant's pipeline delivers for a
     reused id after a replay is the question this item leaves.
+    *Round five (S9, K6):* an id that comes back more than the open window later, by
+    the two records' own times, is another record however the input is cut into
+    steps; within the window it is an amendment, no rule can tell the two apart there,
+    and the guide says ids must not come back that soon.
 72. **The definition's `openSeconds` defaults to an hour; the example seeds two minutes
     and the smoke test thirty seconds** (S8). An hour is a guess at how late a booking
     correction comes. At 1,000 trades a second it is about 9 GB of state per node for
@@ -2251,6 +2255,9 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     record replayed a day later passes, so a restored circuit no longer does what the
     uninterrupted one did; or a bound on how far the watermark may advance in one step,
     which delays every honest gap in the feed (an overnight quiet) by the same amount.
+    *Round five (S9, K3):* built as a bound from the later of the node's clock and the
+    newest event time the input has taken, a day by default, applied where the record
+    enters; a record beyond it is a record in error.
 82. **Adopting `EvictWhenFinal` or `EvictWhen` on state that exists needs `state=reset`**
     (S8, the fourth review): the checkpoint's rows and facts have no deadlines and the
     start is refused. *Alternative:* give them deadlines at the first start, from the
@@ -7399,10 +7406,18 @@ Three things the first builds got wrong, each found by a test:
 | | one time for the input (declared after a `Select`) | a time per partition |
 |---|---|---|
 | A backlog of 3 × 600 records, ten minutes of event time on each partition, lateness 5 s, one local broker; four runs | 1,155, 1,188, 951, 1,188 of 1,800 dropped as late | 0, 0, 0, 0 |
-| A restart onto 3 × 300 records behind partitions the checkpoint called idle; four runs | not run | 0, 0, 0, 0 |
-| Two empty partitions of three: until they stop holding the watermark (`IdlePartitionAfter` 2 s in the test) | — | 2.0, 2.0, 2.1 s |
-| Three brokers, six partitions, 300 records a second stamped as produced, lateness 5 s, the source's defaults; one broker **killed** for 20 s | K1_KILL_BLIND | K1_KILL |
-| …one broker **frozen** (`docker pause`) for 20 s | K1_PAUSE_BLIND | K1_PAUSE |
+| The same backlog on three brokers, where the client reads the partitions' leaders side by side; three runs | 685, 821, 0 | 0, 0, 0 |
+| A restart onto 3 × 300 records behind partitions the checkpoint called idle; seven runs | not run | 0 in each |
+| Two empty partitions of three: until they stop holding the watermark (`IdlePartitionAfter` 2 s in the test) | — | 2.0, 2.0, 2.1 s; 2.5 s on three brokers |
+| Three brokers, six partitions, 300 records a second stamped as produced, lateness 5 s, the source's defaults; one broker **killed** for 20 s; three runs of the build as committed | 913, 803, 765 of about 10,100 | 0, 0, 0 |
+| …one broker **frozen** (`docker pause`) for 20 s; three runs | 747, 1,223, 822 of about 9,900 | 0, 0, 0 |
+
+The two columns of a broker run are one run: two circuits read the same topic side by
+side. Four earlier runs of each fault are in the record too — two before the baseline
+circuit was added (0 late), two with it (2,074 and 955 killed, 2,174 and 1,092 frozen,
+against 0) — and so is the first run of all, with the source that called a partition
+idle on a timer: 130 late with a broker killed. The service's own six broker tests
+(`KafkaServiceProcessTests`, the `kafka3` profile) ran once on this build: all passed.
 
 The example's Kafka topics for trades and quotes have three partitions now, and the
 `--headless --kafka` smoke publishes its takeover's 500 trades while nobody leads: the

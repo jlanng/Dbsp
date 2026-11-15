@@ -2647,8 +2647,8 @@ read from any of them. A partition that is behind the others — a backlog after
 restart or a takeover, which the client hands over a partition at a time; the
 partitions of a broker that was away — holds the watermark where its own records are,
 and they are not late. Before this they were: with three partitions and ten minutes of
-backlog on each, read with one time for the input, 1,155 and 1,188 of 1,800 records
-were dropped as late in two runs; with a time per partition, none.
+backlog on each, read from one broker with one time for the input, 951 to 1,188 of
+1,800 records were dropped as late in four runs; with a time per partition, none.
 
 - *A quiet partition.* A partition with nothing to read would hold the watermark for
   ever, so one the source has read to its end stops counting once it has stood there
@@ -2666,7 +2666,7 @@ were dropped as late in two runs; with a time per partition, none.
   them meanwhile is not late when it comes. Measured on three brokers, six partitions,
   300 records a second stamped as produced, one broker killed or frozen for 20 s, a
   lateness of 5 s, three runs of each: no record late, where the same topic read with
-  one time for the input lost 955 to 2,174 of about 10,000. A lateness under five
+  one time for the input lost 747 to 1,223 of about 10,000. A lateness under five
   seconds is not covered: the other partitions can move the watermark that far before
   the source knows.
 - *What the watermark waits for* is on the pipeline's page when its state is flagged as
