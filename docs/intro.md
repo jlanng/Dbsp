@@ -814,9 +814,17 @@ circuit.Start();
 - Fencing is Kafka's: `AcquireWriterAsync` initialises the shared `transactional.id`
   (`{prefix}.writer` unless set), after which the previous holder cannot commit. Its next
   checkpoint throws `ChangelogFencedException`, its next table version
-  `TableLogFencedException`, and `log.WhenFenced` completes. A broker that times a
-  transaction out (`TransactionTimeout`, 60 s) looks the same to the client, so an outage
-  longer than that also ends the active.
+  `TableLogFencedException`, and `log.WhenFenced` completes. A transaction that outlives
+  `TransactionTimeout` (five minutes) usually ends the same way — the coordinator times
+  it out and raises the epoch, or the client's abort of it is refused — so that is how
+  long an outage of the brokers a writer rides out, less the brokers' own time to commit
+  again. The brokers refuse a timeout above their `transaction.max.timeout.ms` (fifteen
+  minutes by default), which `AcquireWriterAsync` reports as that.
+- Topics the log creates carry `unclean.leader.election.enable=false`, so that a
+  partition which has lost every replica in sync waits for one instead of going on
+  from a replica that is behind, whatever the cluster's default (Amazon MSK's default
+  configuration allows it on clusters without tiered storage). Topics that existed
+  before are not altered.
 - Every client the package creates starts from `KafkaClientDefaults` — a reconnect delay
   of at most a second, a socket timeout of six, a metadata refresh every two — and
   `ClientConfig` is applied after them. The client's own defaults (ten seconds, sixty,

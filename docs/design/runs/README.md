@@ -91,3 +91,74 @@ processes of a Debug build ran side by side.
   transaction); each node's processor time while one broker of three was down; and
   the two runs of the scale rig. The scripts and the logs behind it were the
   session's scratch directory and are not kept.
+
+## 2026-11-14, what a quorum outage and a broker's loss cost — round four, J4
+
+`docs/design/enrichment-service.md`, *As built*, S8, *What a quorum outage and a
+broker's loss cost, and whose time it is*; `docs/design/durability-and-standby.md`, *A
+leader does not outlive its transaction timeout*. Each `.jsonl` file holds the lines
+`KafkaServiceProcessTests` wrote to `broker-runs.jsonl`, one per run, in the order the
+runs were made; a record's `prefix` is the run's topic prefix, by which the other files
+name it.
+
+- `2026-11-14-j4-traced-60s.jsonl` — eight outages of 70 s (two of three brokers
+  stopped, or killed in one command, turn about) on the 60 s transaction timeout that
+  was then the default, the nodes' Kafka client log at `debug=eos,protocol` (the first
+  two also `broker`). The test did not yet record the timeout. From the second run on
+  the brokers logged to files and `kafka.coordinator.transaction` was at `DEBUG` (an
+  override of the profile, below).
+- `2026-11-14-j4-traces.txt` — the decisive lines of those eight runs: what the
+  writer's client did when its transaction timed out, and what the transaction
+  coordinators logged about the transactional id. The table in the engine design is
+  read from it. The whole logs were up to 4 GB a node and are not kept.
+- `2026-11-14-j4-traced-5min.jsonl` — four outages of 70 s on the five-minute timeout,
+  traced the same way.
+- `2026-11-14-j4-no-quorum.jsonl` — the runs of record, on the `kafka3` profile as it
+  is in the repository, removed and started again before them, no debug logging: six
+  outages of 40 s and six of 70 s on the default timeout, then six of 70 s with
+  `INCREMENTAL_KAFKA_TRANSACTION_TIMEOUT_SECONDS=60`; stopped and killed turn about.
+  Each record carries `transactionTimeoutS`.
+- `2026-11-14-j4-takeover-broker-killed.jsonl` — nine takeovers with a broker killed in
+  the same moment as the leader's process (`INCREMENTAL_KAFKA_FAULT=kill`,
+  `INCREMENTAL_KAFKA_BROKER` 0, 1, 2 in turn), before heartbeats were dated by their
+  writing: three with the nodes' log at debug, six without. The fourth
+  (`s4ec1feb793df4d9a`) is the takeover that was called off for the dead leader's last
+  heartbeat.
+- `2026-11-14-j4-takeover-broker-killed-dated.jsonl` — nine more, on the build that
+  dates heartbeats.
+- `2026-11-14-j4-separate-controllers.jsonl` — on three brokers with three controllers
+  of their own (`docker-compose.kafka3-separate-controllers.yml`, beside this file; not
+  a profile of the repository): three outages of 40 s, two of 70 s, three takeovers
+  with a broker killed.
+- `2026-11-14-j4-check.jsonl` — the broker tests once each with their defaults on the
+  final build, the profile's containers removed and started again a minute before.
+- `2026-11-14-j4-brokers.txt` — the brokers' and controllers' own milestones for these
+  runs: when the returning brokers' processes were up, when a controller was elected,
+  when it fenced the brokers' old registrations (`session has timed out`), when the
+  new ones were accepted and unfenced, and for the four traced runs the leader's last
+  commit before the outage and its first after. The two tables of whose time the
+  seconds are were read from it.
+- `2026-11-14-j4.measurements.log` — the lines of `measurements.log` from the first of
+  these runs to the last, with those of the test-suite runs made in between.
+- `2026-11-14-j4-run.sh` — how a run was made (the scratch paths are the session's),
+  and the override used for the traced runs: the three brokers with
+  `logging: { driver: json-file }` — the default journal dropped lines under the
+  surviving broker's 4,000 a second — and
+  `KAFKA_LOG4J_LOGGERS: "kafka.coordinator.transaction=DEBUG"`.
+
+The machine and the profile are those of the sections above. The runs of record, in
+order (`run.sh <label> <filter> [environment]`):
+
+```
+3 × ( run.sh … '*Seventy_seconds*' INCREMENTAL_KAFKA_OUTAGE_SECONDS=40 ;                            # stopped
+      run.sh … '*Seventy_seconds*' INCREMENTAL_KAFKA_OUTAGE_SECONDS=40 INCREMENTAL_KAFKA_FAULT=kill )
+3 × ( run.sh … '*Seventy_seconds*' ; run.sh … '*Seventy_seconds*' INCREMENTAL_KAFKA_FAULT=kill )
+2 × ( run.sh … '*A_takeover_with_one_broker_down*' INCREMENTAL_KAFKA_FAULT=kill INCREMENTAL_KAFKA_BROKER=0 ; … =1 ; … =2 )
+3 × ( run.sh … '*Seventy_seconds*' INCREMENTAL_KAFKA_TRANSACTION_TIMEOUT_SECONDS=60 ;
+      run.sh … '*Seventy_seconds*' INCREMENTAL_KAFKA_TRANSACTION_TIMEOUT_SECONDS=60 INCREMENTAL_KAFKA_FAULT=kill )
+```
+
+The run with a longest silence of 72.3 s (`sb5cdd318d216404b`, 70 s on the 60 s
+timeout, killed) is not a shorter outage: one record became readable two seconds after
+the brokers were started and the next fourteen seconds later, and the test records the
+longest silence only.

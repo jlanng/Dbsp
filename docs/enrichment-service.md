@@ -2369,8 +2369,11 @@ sink timing what arrives):
 | one of three frozen for 20 s or 60 s: it answers nothing and its connections stay open | 9 | 0 | 11 to 16 s |
 | the same with the Kafka client's own default settings | 6 | 3 | 8 to 61 s |
 | every broker killed in turn, 15 s each | 2 | 0 | 13 to 14 s |
-| two of three stopped, or killed in one moment, for 40 s: no quorum, nothing commits for about a minute | 6 | 0 | 55 to 61 s |
-| the same for 70 s, which is past the leader's transaction timeout | 3 | 2 | 88 to 89 s |
+| two of three stopped, or killed in one moment, for 40 s: no quorum, nothing commits until fourteen to sixteen seconds after they are back | 6 | 0 | 54 to 56 s |
+| the same for 70 s | 6 | 0 | 85 to 86 s |
+| the same for 70 s with the leader's transaction timeout set to 60 s, which the outage then outlasts | 14 | 10: the leader's writer ended, the node exited 3, the standby led | 85 to 89 s (once 72 s and then a second silence) |
+| two of three away for 40 s, and for 70 s, on a cluster whose controllers are not its brokers | 5 | 0 | 42 to 44 s, and 72 to 74 s |
+| one of three killed in the same moment as the leader's process | 21 | yes, as intended: the standby led 8.7 to 10.6 s after the kill, 13.2 to 14.5 s when the broker was also the active controller, and once after 35 s | about as long (these runs time the takeover, not the sink) |
 | one of three gone for ten minutes, the leader's process killed after five | 1 | yes, as intended: the standby led 3.5 s after the kill, on two brokers, and the killed node came back as its standby | 11 s (the broker's loss) |
 
 In every run the sink equalled the model, one node led and the other stood by, warm.
@@ -2413,13 +2416,53 @@ no leader that answers, or fewer replicas in sync that answer than
 leader can be heard first. It asks each broker itself: the cluster's own lists of who
 leads and who is in sync stop changing when the controllers have lost their quorum,
 and go on naming brokers that are gone. What a leader
-cannot count on surviving is `KafkaLogOptions.TransactionTimeout` (60 s) without a
-commit: its open transaction fails, and when the abort of it is refused as well — in
-two of the three 70 s outages above — the node ends with exit code 3 and the standby
-leads; the sink is complete either way. Forty seconds without a quorum is already
-close to it: the brokers took fifteen to twenty seconds more to commit again after
-they were back. Raise that timeout if your brokers may be without a quorum for longer
-and you would rather keep the leader.
+cannot count on surviving is `KafkaLogOptions.TransactionTimeout` without a commit —
+five minutes. Past it the leader's open transaction fails in its client, or is timed
+out by the brokers' transaction coordinator, and more often than not the writer is
+finished with it (in ten of fourteen outages that outlasted a timeout set to 60 s;
+which it is depends on where the commit stood when the brokers went, and is taken
+apart in `docs/design/durability-and-standby.md`, *A leader does not outlive its
+transaction timeout*): the node ends with exit code 3, its supervisor starts it again
+as the standby, and the standby leads. The sink is complete either way and is silent
+no longer for it — what you lose is a warm standby, for as long as the restarted node
+takes to restore.
+
+**The transaction timeout** is therefore the length of broker outage a leader rides
+out, less the time the brokers take to commit again once they are back. Set it on the
+log's options (`KafkaLogOptions.TransactionTimeout`; the admin's cluster page shows
+it). A longer one costs little here: a writer that dies inside a transaction leaves it
+open only until a node initialises the writer again, which every takeover and every
+restart does in seconds, and only if no node runs at all does it stay open for the
+timeout — hiding, from readers at `read_committed`, whatever other producers wrote
+after it into the same partitions of a sink that has `"producer": "log"`. The brokers
+refuse a timeout above their `transaction.max.timeout.ms` (fifteen minutes by default,
+on MSK too unless your configuration sets it); a node then cannot become the leader
+and says so by that name.
+
+**Whose time the minute is.** After two of three brokers come back, nothing commits
+for another fourteen to sixteen seconds on this cluster, and all but the last second
+of that is the brokers': about two for their processes and for the controllers to
+elect a leader, nine (`broker.session.timeout.ms`) in which that new controller will
+not let the returning brokers register because it has not yet given their dead
+predecessors up, and four or five until their next attempt is accepted. The leader's
+transaction commits within a second of a second replica being back in sync. A cluster
+whose controllers are separate from its brokers and keep their quorum — as MSK's
+documentation describes its KRaft clusters — does not pay the middle part: there the same outages cost two to four
+seconds over their own length (the fourth row; five runs on one machine, not MSK).
+
+**A broker lost in the same moment as the leader** — a zone, say — is a failover that
+waits for the brokers. The dead broker was a replica of every partition, so until the
+controller gives it up (the nine seconds again; twelve to fifteen if it was also the
+active controller, which a cluster with controllers of its own does not have) the
+leader topic cannot be read to its end, the dead leader's open transaction cannot be
+aborted, and the partitions it led have no leader. The standby leads one to two and a
+half seconds after that: 8.7 to 10.6 s from the kill in eight takeovers, 13.2 to 14.5 s
+in eleven where the broker was the active controller as well. No setting of the service
+shortens the wait. Once in twenty-one it took 35 s: the broker that took the transaction
+coordinator over spent twenty-two seconds waiting to connect to the dead broker's
+address, which no longer answered at all, before it dealt with the dead leader's
+transaction (`socket.connection.setup.timeout.ms` on the brokers: ten seconds, then
+twenty). A host that vanishes behaves like that; one whose process dies does not.
 
 A standby that does start a takeover stops if the leader is heard again before it has
 taken the log (the transactional id). Once it has, the leader is fenced whatever it
@@ -2439,8 +2482,8 @@ catch it, so its cause inside the brokers is read from their logs and not shown
 other session timeouts, with controllers of its own, or with brokers a network away
 will have other figures, and the two that matter to set against them are
 `TakeoverCeiling` (30 s: longer than your brokers take to give a broker up, with room)
-and `KafkaLogOptions.TransactionTimeout` (60 s: how long a leader survives brokers that
-cannot commit).
+and `KafkaLogOptions.TransactionTimeout` (five minutes: how long a leader survives
+brokers that cannot commit).
 
 ## Bounding a join over a stream of facts
 
@@ -2814,6 +2857,22 @@ it, on local brokers:
   with a broker down; seventy seconds without a quorum; and one broker gone for ten
   minutes with the leader killed half way.
 
+**Two settings of the cluster to look at before the first deployment.**
+
+- `unclean.leader.election.enable`. MSK's default configuration turns it **on** for
+  clusters without tiered storage (its documentation, read 2026-11-14). With it a
+  partition that has lost every replica in sync carries on from one that was behind,
+  and what had been committed beyond that replica is lost — state, table rows, a
+  leader's term. The topics a node creates say `false` for themselves, so a new
+  deployment is covered whatever the cluster says; topics created by a build before
+  round four are not altered (`kafka-configs --alter --entity-type topics
+  --entity-name <topic> --add-config unclean.leader.election.enable=false`, for each
+  of `{prefix}.state`, `{prefix}.leader`, the `{prefix}.table.…` topics and
+  `{prefix}.svc.blobs`), and the topics your sinks write are yours to set.
+- `transaction.max.timeout.ms`. The node asks for `KafkaLogOptions.TransactionTimeout`
+  (five minutes) and the brokers refuse more than this allows; it is fifteen minutes
+  unless your configuration has lowered it.
+
 **The permissions a node needs.** Worked out against the deny-by-default broker — the
 node's principal held exactly this and nothing else
 (`benchmarks/Incremental.Service.Scale/grant-acls.sh`) — and translated to IAM by the
@@ -2849,7 +2908,13 @@ resources are ARNs (`…:topic/<cluster>/<uuid>/{prefix}.*`,
   them also a controller, and the nearest thing to a zone loss was one container
   frozen or killed for ten minutes.
 - What `broker.session.timeout.ms` is on MSK and whether it can be lowered: it is the
-  floor under every broker-loss figure above.
+  floor under every broker-loss figure above. It is not among the properties MSK's
+  documentation lets a cluster configuration set (read 2026-11-14); for a ZooKeeper
+  cluster the corresponding setting is `zookeeper.session.timeout.ms`, eighteen seconds
+  by MSK's default and six at the least.
+- A loss of two brokers at once, and what the brokers then take to commit again: the
+  two to four seconds measured here on brokers with controllers of their own are one
+  machine's.
 - MSK Serverless, whose restrictions on topic configuration and transactions have not
   been compared with what the service asks for.
 - Debezium on MSK Connect: the example registers its connector through Kafka Connect's

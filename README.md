@@ -509,7 +509,13 @@ so implementations never see cross-thread access to one store.
   for a leader whose process is gone; one that is alive and cannot commit still
   answers its peer's probe and is taken over after `TakeoverCeiling`, 30 s. The loss of
   one broker of three is neither: the sink is silent for 8 to 15 s — the brokers' own
-  time to give a broker up — and the same node leads afterwards. A node that does lose
+  time to give a broker up — and the same node leads afterwards. A broker lost in the
+  same moment as the leader is a failover that waits for that: about ten seconds,
+  thirteen to fifteen if the broker was the active controller. Two of three brokers
+  lost stop everything until they are back and for some seconds more (two to four on
+  brokers with controllers of their own, fourteen to sixteen where the brokers are
+  the controllers), and the leader rides it out for as long as its transaction
+  timeout, five minutes. A node that does lose
   the leadership ends its process and must be started again (`NodeSupervisor`, or the
   platform's restart policy); it comes back as the standby. The numbers,
   and what a node needs in memory per million rows, are in the guide (*How large, how

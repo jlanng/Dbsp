@@ -1111,19 +1111,17 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         await Task.Delay(After);
 
         using var stall = Stall(a);
-        await KafkaEnv.EventuallyAsync(() => Task.FromResult(b.Leadership.Status.HeartbeatAge > TimeSpan.FromSeconds(2)), "the leader to have been silent for two seconds");
+        await KafkaEnv.EventuallyAsync(() => Task.FromResult(b.Leadership.Status.HeartbeatAge > TimeSpan.FromSeconds(3.5)), "the leader to have been silent for three and a half seconds");
 
-        // Written a second ago, read now.
-        b.Leadership.Heard(new KafkaLog.LeaderRecord(1, "a", DateTimeOffset.UtcNow - TimeSpan.FromSeconds(1), Sequence: int.MaxValue));
-        Assert.InRange(b.Leadership.Status.HeartbeatAge, TimeSpan.FromMilliseconds(900), TimeSpan.FromMilliseconds(1_700));
-
-        // The one after it in the same batch, written half a second later.
-        b.Leadership.Heard(new KafkaLog.LeaderRecord(1, "a", DateTimeOffset.UtcNow - TimeSpan.FromSeconds(0.5), Sequence: int.MaxValue));
-        Assert.InRange(b.Leadership.Status.HeartbeatAge, TimeSpan.FromMilliseconds(400), TimeSpan.FromMilliseconds(900));
+        // Written two seconds ago, read now: two seconds of silence, less the shortest
+        // time any of the leader's records took to reach this node (what the dating
+        // cannot tell from the clocks' offset; milliseconds here, and given a second).
+        b.Leadership.Heard(new KafkaLog.LeaderRecord(1, "a", DateTimeOffset.UtcNow - TimeSpan.FromSeconds(2), Sequence: int.MaxValue));
+        Assert.InRange(b.Leadership.Status.HeartbeatAge, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2.8));
 
         // Written now.
         b.Leadership.Heard(new KafkaLog.LeaderRecord(1, "a", DateTimeOffset.UtcNow, Sequence: int.MaxValue));
-        Assert.InRange(b.Leadership.Status.HeartbeatAge, TimeSpan.Zero, TimeSpan.FromMilliseconds(300));
+        Assert.InRange(b.Leadership.Status.HeartbeatAge, TimeSpan.Zero, TimeSpan.FromMilliseconds(500));
         Assert.Equal(NodeRole.Standby, b.Role);
         stall.Set();
     }

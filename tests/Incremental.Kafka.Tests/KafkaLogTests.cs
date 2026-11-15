@@ -822,7 +822,11 @@ public class KafkaLogTests(ITestOutputHelper output)
         var written = await writer.OpenTableLogAsync<int, Row>("rows").WaitAsync(Timeout);
         await written.AppendAsync(Version(1, new TableChange<int, Row>(1, null, new Row(1, "one"))));
 
+        // "Fresh" is a second on the clock, so the test must know that its own reads
+        // were made inside one: on a machine too slow for that it holds the half of
+        // the rule that does not depend on it, and says so.
         var standby = await env.ConnectAsync();
+        var sinceFirstAsk = System.Diagnostics.Stopwatch.StartNew();
         var log = await standby.OpenTableLogAsync<int, Row>("rows").WaitAsync(Timeout);
         Assert.Equal(1, await log.LastVersionAsync().AsTask().WaitAsync(Timeout));
         var met = standby.ShortReadLeadersAsked;
@@ -831,17 +835,26 @@ public class KafkaLogTests(ITestOutputHelper output)
         // At once: what it was told is fresh, and nothing is asked.
         Assert.Equal(1, await log.LastVersionAsync().AsTask().WaitAsync(Timeout));
         Assert.Equal(1, await log.LastVersionAsync().AsTask().WaitAsync(Timeout));
-        Assert.Equal(met, standby.ShortReadLeadersAsked);
+        var inTime = sinceFirstAsk.Elapsed < KafkaLog.ShortReadLeadersFor - TimeSpan.FromMilliseconds(100);
+        if (inTime)
+            Assert.Equal(met, standby.ShortReadLeadersAsked);
 
         // Past the age: each topic the read touches is asked about once, and the reads
         // that follow in the same moment ask nothing.
         await Task.Delay(KafkaLog.ShortReadLeadersFor + TimeSpan.FromMilliseconds(200));
+        var before = standby.ShortReadLeadersAsked;
+        var sinceSecondAsk = System.Diagnostics.Stopwatch.StartNew();
         Assert.Equal(1, await log.LastVersionAsync().AsTask().WaitAsync(Timeout));
         var again = standby.ShortReadLeadersAsked;
-        Assert.InRange(again - met, 1, met);
+        Assert.InRange(again - before, 1, met);
         Assert.Equal(1, await log.LastVersionAsync().AsTask().WaitAsync(Timeout));
-        Assert.Equal(again, standby.ShortReadLeadersAsked);
+        if (sinceSecondAsk.Elapsed < KafkaLog.ShortReadLeadersFor - TimeSpan.FromMilliseconds(100))
+            Assert.Equal(again, standby.ShortReadLeadersAsked);
+        else
+            inTime = false;
         Assert.Equal(1, standby.ShortReadersCreated);
         Assert.Equal(1, standby.ShortReadAdminsCreated);
+        if (!inTime)
+            output.WriteLine("This machine took over a second for reads that take milliseconds: 'a fresh answer is not asked for again' was not checked.");
     }
 }

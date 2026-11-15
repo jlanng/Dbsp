@@ -2537,30 +2537,122 @@ worth knowing before believing a number from a container cluster.
   `taking over (ceiling; leader silent for 00:00:00.0200000)` and fenced a leader it
   had heard twenty milliseconds before, in two runs of six. The silence is measured
   again once the answers are in, and a leader heard meanwhile is a leader.
+- **A heartbeat counts from when it was written.** A record of the leader topic says
+  that its writer was alive when it wrote it, and nearly always that is the moment it
+  is read. Not when the brokers could not show it: a record whose partition's high
+  watermark waits on a replica that has died is readable only when the brokers give
+  that replica up — `broker.session.timeout.ms`, nine seconds — and the last heartbeat
+  of a leader that died together with a broker is such a record. Counted from its
+  reading it started the standby's silence again nine seconds into it and called off
+  a takeover nine seconds old ("the leader was heard before this node had taken the
+  log"): once in thirteen takeovers with a broker killed beside the leader, 11.9 s to
+  a new leader where 9.2 were to be had. The leadership dates each record on its own
+  clock from the writer's clock in it (`HeartbeatDating`): it keeps the smallest
+  difference it has seen between its clock at a reading and the writer's `At`, which
+  is the clocks' offset plus the shortest delivery, and a record's `At` plus that is
+  no earlier than its writing and no later than its reading. The clocks themselves
+  are never compared, so it does not matter what they say; it matters that they move
+  at the same pace, and little is remembered so that an error cannot last: two
+  stretches of five seconds of the writer's own time, started again by another term
+  and by an `At` that goes backwards (a clock set back by less than the gap between
+  two heartbeats, or slowed by a time daemon, dates records early by under a second
+  for ten seconds). With the date: the silence counts from the
+  latest record's writing; a record calls a takeover off only if it was written
+  within the silence the takeover was decided on (the takeover timeout, or the
+  ceiling for a takeover at the ceiling; after a resignation any record does); and
+  only a record written within the takeover timeout ends the wait for a leader that
+  the brokers had held up. What it gives up: a leader whose commit took longer than
+  the takeover timeout after its last heartbeat, heard just then by a standby that
+  was already taking over, used to be spared and is not now. A standby takes over
+  only from a leader whose probe does not answer, or at the ceiling.
 
 ### A leader does not outlive its transaction timeout
 
-With no quorum of brokers a leader's open transaction cannot be taken or committed. The
-client gives its records `transaction.timeout.ms` (`KafkaLogOptions.TransactionTimeout`,
-60 s): then they fail, the transaction has to be aborted, and the abort of a
-transaction the coordinator never managed to register is refused
-(`INVALID_TXN_STATE`), which the client counts as fatal. The writer is finished and the
-node ends with exit code 3, with nobody having taken anything over. That is what the
-70-second test shows in two runs of three (the service design, S7, *The third
-review's findings*, series 2): the standby holds at the ceiling while the leader
-answers its probe; the leader's transaction times out at sixty seconds; its abort is
-refused — as `INVALID_TXN_STATE` once the brokers were back in one run, as "fenced by
-a newer instance" from the one broker left in the other, with no node having taken the
-log — and the leader ends; the standby, which no longer has a leader to wait for,
-takes over within a fifth of a second and leads when the brokers let it. In the third
-run the abort was accepted and the leader kept its term; what decides between them was
-not established. An outage shorter than the timeout ends with the same leader — six
-runs of six at forty seconds, one of which ran into the timeout because the brokers
-took twenty seconds to commit again, and had its abort accepted. A deployment that must ride out longer
-ones raises `TransactionTimeout` (the brokers allow up to `transaction.max.timeout.ms`,
-fifteen minutes by default); what it pays is that a writer that died with a transaction
-open blocks readers of its partitions for that long if nobody takes over, which a
-standby does in seconds.
+With no quorum of brokers a leader's open transaction cannot be taken or committed, and
+two clocks run on it. Both are `transaction.timeout.ms`
+(`KafkaLogOptions.TransactionTimeout`: five minutes, and one minute until round four of
+the service, whose runs this section is written from — the service design, S8, *What a
+quorum outage and a broker's loss cost*).
+
+- **The client's.** A transactional producer's records get that long to be delivered
+  (librdkafka holds `message.timeout.ms` to it). Then the client fails the transaction
+  where it stands — `N message(s) timed out … requires epoch bump` — and it has to be
+  aborted before anything else can be written.
+- **The coordinator's.** A transaction the coordinator has registered (`Ongoing`) and
+  that is older than the timeout is aborted by the coordinator itself, on a sweep it
+  makes every ten seconds, and that abort raises the producer's epoch: the writer is
+  fenced by its own transaction, with no other process involved. The epoch is raised in
+  the coordinator's memory before the abort is written, so this happens with the quorum
+  still away. The coordinator also waits no longer than the timeout to write a commit
+  or an abort it has been asked for; when that wait runs out the transaction is
+  `Ongoing` again, and the next sweep takes it.
+
+What happens to the writer when the timeout is reached was not established in round
+three ("what decides between them"). It is decided by where the writer's commit cycle
+stood at the instant the brokers went, and by whether the transaction coordinator was on
+a broker that stayed. Read from the client's log (`debug=eos,protocol`) and the
+coordinators' own (`kafka.coordinator.transaction` at `DEBUG`) in eight outages of 70 s
+on a 60 s timeout:
+
+| where the writer stood when the quorum went | what the timeout does | the writer | seen in |
+|---|---|---|---|
+| a transaction begun and not registered: its `AddPartitionsToTxn` was refused for the whole outage — `CONCURRENT_TRANSACTIONS` while the coordinator could not write the markers of the commit before it, `COORDINATOR_NOT_AVAILABLE` where it knew it had too few replicas | the client fails the transaction and sends `EndTxn(abort)` for a transaction the coordinator never began; the coordinator, whose last word on the id is a completed commit, answers `INVALID_TXN_STATE`, and the client calls that fatal | ends | 4 of 8: at once, with the brokers still away, where the coordinator knew it could not write; 10 and 16 s after the brokers were started where it was still waiting on the commit before |
+| a transaction registered, its commit already with a coordinator that stayed | the coordinator's write of the commit waits for replicas for the timeout and gives up; its sweep, 0.4 s later, aborts the transaction and raises the epoch; the client's next `EndTxn` is answered `PRODUCER_FENCED` ("fenced by a newer instance") 60.8 s into the outage, the brokers still away | ends | 1 of 8 |
+| a transaction registered, its records on their way to brokers that went | the client fails the transaction and its `EndTxn(abort)` reaches the coordinator first; that write waits a second timeout before the coordinator gives up, and the brokers were back before it had: the abort is accepted, the client asks for a new epoch and gets it, and the transaction is made again | goes on | 1 of 8 |
+| a transaction begun with the coordinator on a broker that went: nothing of it was ever sent | the client has nothing to end (`No partitions registered: not sending EndTxn`), asks the coordinator for a new epoch when there is one again, and gets it | goes on | 1 of 8 |
+| any of the first kind, the abort still unanswered six seconds after the brokers could commit again | the standby's hold at the ceiling ends (two takeover timeouts after the brokers last said nobody could commit) and it takes the log: a fence by a newer instance in earnest, 60 ms before the coordinator would have answered `INVALID_TXN_STATE` | ends | 1 of 8 |
+
+So "fenced by a newer instance" with nobody to do it is the coordinator timing the
+transaction out, and `INVALID_TXN_STATE` is the client aborting what was never begun:
+librdkafka 2.16 counts an `AddPartitionsToTxn` that was refused as one that may have
+been registered, sends `EndTxn` on that account, and treats the broker's refusal of it
+as fatal. Neither is a fence by another node, and neither can be told from one by the
+log's code: both arrive as the client's fatal error, the writer is finished
+(`KafkaLogFencedException`), the node exits 3 and its supervisor starts it again as the
+standby, and the standby — which no longer has a leader to wait for — leads 0.2 to
+1.2 s after the brokers have let the returning brokers back in (five runs). Nothing was
+lost in any run.
+Of the fourteen outages of 70 s made on a 60 s timeout in round four, the leader ended
+in ten: seven of seven with the two brokers stopped, three of seven with them killed.
+
+**What is done about it** is the timeout. It is how long a leader rides out brokers
+that cannot commit, less what the brokers need to commit again once they are back
+(15 to 17 s on the three-broker profile; see the service design for whose time that
+is): at one minute an outage of 40 s was already at the edge. At five minutes the
+70-second outage moves nothing — ten runs of ten — and the test of it now asserts that
+(`Seventy_seconds_without_a_quorum…`). What a long timeout costs in this design is
+little. A writer that dies inside a transaction leaves it open until somebody
+initialises the transactional id, which a standby's takeover and the node's own
+restart both do within seconds; only with no node of the deployment running does the
+transaction stay open for the timeout, and what readers at `read_committed` cannot see
+meanwhile is what lies past its first record in the partitions it wrote — the log's own
+topics, which nothing else writes, and the topics of sinks with `"producer": "log"`,
+where another producer's records in the same partitions would wait. The brokers refuse
+a timeout above their `transaction.max.timeout.ms` (fifteen minutes unless the cluster
+says otherwise; Amazon MSK leaves it there and lets a configuration set it). That
+refusal arrives as a fatal error of the client too, and was read as a fence — "another
+process has taken the log over", from a cluster where none can lead; it is now a
+`KafkaLogException` that names the limit, and the log reads on with a new client.
+
+**What is not done** is a leader that takes the log again in place after such an end.
+The client that failed cannot be used again, and a new one can only ask for the
+transactional id the way a standby does, which fences whoever holds it — the leader's
+own dead client, or a standby that took over a moment before. The request that says
+"raise my epoch if it is still mine" exists in the protocol (`InitProducerId` with the
+producer's id and epoch) and is what the client uses inside an abort; it is not
+offered to an application, and not after a fatal error. A second way for a node to
+fence its successor is what *How both nodes ended fenced* is the history of, and
+"`Fenced` is final" is the rule that keeps a node's promoted tables and storage from
+outliving its writer. It is specified in the service design (Open for James 67), not
+built.
+
+One defect came out of the same reading. A client's fatal error reaches the log twice,
+as the exception of the call that failed and as the client's error callback, on two
+threads; the callback marks the log fenced unless the client has been replaced since.
+Whether it has was looked at before the lock that replaces it was taken, so a callback
+that had just passed the check could mark a log fenced after `ResetWriter` had put it
+back to reading — a standby whose lost acquisition would then have been final. The
+check is made under the lock (`KafkaLog.MarkFenced`, `ofGeneration`).
 
 ### How both nodes ended fenced
 

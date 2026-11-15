@@ -93,15 +93,22 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   minutes with the leader killed half way): `-- --filter-method "*broker*"`, about seven
   minutes, on a cluster started a moment ago or an hour ago; skipped everywhere else.
   They run their nodes under `NodeSupervisor`, assert that the sink equals the model,
-  that one node leads and the other stands by, and — for one broker lost — that the
+  that one node leads and the other stands by, and — for one broker lost, and for the
+  70 s without a quorum, which is under the transaction timeout — that the
   leadership did not move; each run's line goes to `measurements.log` and its record to
   `broker-runs.jsonl` beside the test assembly (the sink's longest silence, the longest a
   trade took, who led). `INCREMENTAL_KAFKA_BROKER` (0–2), `INCREMENTAL_KAFKA_FAULT`
   (`kill`, `pause`, `stop`), `INCREMENTAL_KAFKA_AWAY_SECONDS` and
   `INCREMENTAL_KAFKA_ZONE_MINUTES` choose what the one-broker and the minutes-long tests
-  do; `INCREMENTAL_NODE_LOGS=<dir>`, `INCREMENTAL_LOG_LEVEL=Debug` and
-  `INCREMENTAL_KAFKA_CLIENT="debug=eos,broker,protocol"` keep each node's Kafka client
-  log in a file, which is how a stall is read.
+  do; `INCREMENTAL_KAFKA_OUTAGE_SECONDS` and
+  `INCREMENTAL_KAFKA_TRANSACTION_TIMEOUT_SECONDS` set the no-quorum test's outage and
+  the nodes' transaction timeout (60 with the default outage is an outage past the
+  timeout, where the leader usually ends and only "nothing lost" is required);
+  `INCREMENTAL_NODE_LOGS=<dir>`, `INCREMENTAL_LOG_LEVEL=Debug` and
+  `INCREMENTAL_KAFKA_CLIENT="debug=eos,protocol"` keep each node's Kafka client
+  log in a file, which is how a stall is read (add `broker` to the debug list only
+  with brokers that are stopped, not killed: a standby logs every refused connection,
+  gigabytes a minute).
   `docker compose rm -sf kafka3-1 kafka3-2 kafka3-3` when done — not `down`, which
   takes Redis and the rest of the stack with it.
 - A broker that refuses unknown clients: `docker compose --profile kafka-sasl up -d`
@@ -233,6 +240,26 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   A short read its caller calls off (a status that gives a table's lag two seconds)
   keeps that consumer and what it knows of the topics; only a read that failed
   replaces it (`KafkaLogTests`, the short reader's test).
+  `AssignForShortRead` asks for a topic's leaders again when its answer is over a
+  second old (`ShortReadLeadersFor`): the reader is assigned to nothing between reads,
+  what it knows goes stale, and a takeover after a broker's loss otherwise fetches from
+  the dead broker first and waits out the client's half-second pause. Not on every
+  read, and never waited on for long.
+  The writer's transaction timeout (`KafkaLogOptions.TransactionTimeout`, 5 min) is how
+  long a leader rides out brokers that cannot commit: past it the transaction fails in
+  the client or is timed out by the coordinator, and either usually ends the writer
+  (durability-and-standby.md, *A leader does not outlive its transaction timeout*).
+  Do not shorten it to hurry a dead writer's transaction away — a takeover and a
+  restart both abort it at once — and keep it under the brokers'
+  `transaction.max.timeout.ms` (15 min by default); a value above that is refused at
+  acquisition by name, not as a fence.
+  A client's fatal error reaches the log as an exception and as a callback, on two
+  threads: whether the callback's client is still the log's is decided under the lock
+  that replaces it (`MarkFenced(…, ofGeneration)`), or a replaced client marks a log
+  fenced that had gone back to reading.
+  Topics the log creates say `unclean.leader.election.enable=false` themselves
+  (`EnsureTopicAsync`; the service's blob topic too): a cluster's default may allow it
+  (MSK's does without tiered storage), and everything in these topics is committed state.
   Every Kafka client starts from `KafkaClientDefaults` (reconnect delay at most 1 s,
   socket timeout 6 s, a metadata refresh every 2 s), applied before the caller's own
   settings: librdkafka's defaults leave a healthy leader silent for 10 to 60 s after a
@@ -314,6 +341,16 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   believe the metadata's lists of leaders and replicas in sync by themselves: with no
   controller quorum they never change. It asks any broker for the metadata and each
   listed broker directly; keep it so.
+  A heartbeat is a sign of life at the moment it was written, not the moment it is
+  read: the last one of a leader that died with a broker is readable only when the
+  brokers give the broker up, nine seconds on. `KafkaLeadership.Heard` dates each
+  record through `HeartbeatDating` (the writer's `At` plus the smallest difference seen
+  between this node's clock and it — the clocks are never compared), counts the
+  silence from that date, calls a takeover off only for a record written within the
+  silence it was decided on, and ends the wait after a broker outage only for one
+  written within the takeover timeout. Do not go back to "heard is now"; do not make
+  the dating remember more than its two five-second stretches of the writer's time: an
+  error of the writer's clock lasts as long as what is remembered.
 - `CircuitBuilder.Describe` reports a `Lookup`'s table as `Probes`, not among `Inputs`:
   the lookup probes the table and does not consume its changes, so the edge belongs to
   the picture and must never become an execution input.

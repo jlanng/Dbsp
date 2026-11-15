@@ -1,0 +1,177 @@
+# The decisive lines of the eight traced outages (70 s, two of three brokers away, 60 s transaction timeout), round four J4.
+# For each run: what the leader's Kafka client did (node a; the log's transactional producer is rdkafka#producer-2), then what
+# the transaction coordinators logged about the transactional id (P.writer; P is the run's topic prefix). Times are UTC, 2026-11-14.
+# "… ×N until T" stands for N more lines of that shape, the last at T. The first run's brokers logged to the journal, which
+# dropped most of their lines; from the second run on they logged to files with kafka.coordinator.transaction at DEBUG.
+
+== d70stop-1 (topic prefix sf33aacb419f34bf7)
+-- the writer's client (librdkafka, debug=eos,protocol; node a)
+21:46:35.117 ADDPARTS: [thrd:main]: TxnCoordinator/1: AddPartitionsToTxn response: partition "P.leader": [0]: Broker: Producer attempted to update a transaction while another concurrent operation on the same tr
+21:46:42.944 ADDPARTS: [thrd:main]: TxnCoordinator/1: AddPartitionsToTxn response: partition "P.leader": [0]: Broker: Not coordinator
+21:46:43.444 ADDPARTS: [thrd:main]: Not registering partitions: coordinator is not available
+21:47:42.596 TXNERR: [thrd:localhost:9392/3]: Current transaction failed in state InTransaction: 1 message(s) timed out on P.leader [0] (_TIMED_OUT, requires epoch bump)
+21:47:42.600 ENDTXN: [thrd:main]: EndTxn returned CONCURRENT_TRANSACTIONS in state AbortingTransaction (may_retry=true)
+21:48:09.183 ENDTXN: [thrd:main]: EndTxn returned INVALID_TXN_STATE in state AbortingTransaction (may_retry=true)
+21:48:09.183 TXNERR: [thrd:main]: Fatal transaction error: Failed to end transaction: Broker: Producer attempted a transactional operation in an invalid state (INVALID_TXN_STATE)
+21:48:09.183 FATAL: [thrd:main]: Fatal error: Broker: Producer attempted a transactional operation in an invalid state: Failed to end transaction: Broker: Producer attempted a transactional operation in an inva
+    … ×2930 until 21:47:42.581: ADDPARTS: [thrd:main]: TxnCoordinator/#: AddPartitionsToTxn response: partition "P.leader": [#]: Broker: Produ
+    … ×29 until 21:48:08.176: ENDTXN: [thrd:main]: EndTxn returned CONCURRENT_TRANSACTIONS in state AbortingTransaction (may_retry=true)
+-- the coordinators (kafka.coordinator.transaction at DEBUG where the cluster had it; b1..b3 are the brokers)
+21:46:23,975 b1 INFO [TransactionCoordinator id=1] Initialized transactionalId broker-tests-552048c1 with producerId 0 and producer epoch 0 on partition __transaction_state-38 
+21:46:31,096 b1 INFO [TransactionCoordinator id=1] Initialized transactionalId P.writer with producerId 1 and producer epoch 0 on partition __transaction_state-3 
+21:46:42,919 b1 INFO [Transaction State Manager 1]: TransactionalId P.writer append transaction log for [pid 1 epoch 0 CompleteCommit parts()] transition failed due to NOT_COORDINATOR, resetting pending state from Some(CompleteCommit), aborting state transitio
+
+== d70kill-1 (topic prefix s96f61f78b4cd4cb0)
+-- the writer's client (librdkafka, debug=eos,protocol; node a)
+21:48:26.807 ADDPARTS: [thrd:main]: TxnCoordinator/3: AddPartitionsToTxn response: partition "P.leader": [0]: Broker: Producer attempted to update a transaction while another concurrent operation on the same tr
+21:49:35.033 TXNERR: [thrd:localhost:9292/2]: Current transaction failed in state InTransaction: 8 message(s) timed out on P.state [0] (_TIMED_OUT, requires epoch bump)
+21:49:35.033 TXNERR: [thrd:localhost:9292/2]: Ignoring sub-sequent abortable transaction error: 1 message(s) timed out on P.leader [0] (_TIMED_OUT): previous error (_TIMED_OUT) already raised
+21:49:41.040 ENDTXN: [thrd:main]: EndTxn returned _TIMED_OUT in state AbortingTransaction (may_retry=true)
+21:49:41.131 ENDTXN: [thrd:main]: EndTxn returned CONCURRENT_TRANSACTIONS in state AbortingTransaction (may_retry=true)
+21:50:00.771 ENDTXN: [thrd:main]: EndTxn returned NO_ERROR in state AbortingTransaction (may_retry=true)
+21:50:00.772 GETPID: [thrd:main]: TxnCoordinator/3: Requesting ProducerId bump for PID{Id:2002,Epoch:0}
+21:50:00.778 TXNCOMPLETE: [thrd:main]: Transaction successfully aborted
+    … ×24 until 21:50:02.111: ADDPARTS: [thrd:main]: TxnCoordinator/#: AddPartitionsToTxn response: partition "P.leader": [#]: Broker: Produ
+    … ×21 until 21:49:59.766: ENDTXN: [thrd:main]: EndTxn returned CONCURRENT_TRANSACTIONS in state AbortingTransaction (may_retry=true)
+-- the coordinators (kafka.coordinator.transaction at DEBUG where the cluster had it; b1..b3 are the brokers)
+21:48:23,436 b3 INFO [TransactionCoordinator id=3] Initialized transactionalId P.writer with producerId 2002 and producer epoch 0 on partition __transaction_state-39 
+
+== d70kill-2 (topic prefix se57264327dd24d79)
+-- the writer's client (librdkafka, debug=eos,protocol; node a)
+21:55:04.843 ADDPARTS: [thrd:main]: TxnCoordinator/1: AddPartitionsToTxn response: partition "P.leader": [0]: Broker: Producer attempted to update a transaction while another concurrent operation on the same tr
+21:55:10.772 ADDPARTS: [thrd:main]: Not registering partitions: coordinator is not available
+21:56:11.521 TXNERR: [thrd:localhost:9192/1]: Current transaction failed in state InTransaction: 2 message(s) timed out on P.leader [0] (_TIMED_OUT, requires epoch bump)
+21:56:11.523 TXNABORT: [thrd:main]: No partitions registered: not sending EndTxn
+21:56:31.998 GETPID: [thrd:main]: TxnCoordinator/3: Requesting ProducerId bump for PID{Id:2,Epoch:0}
+21:56:32.000 GETPID: [thrd:main]: TxnCoordinator/3: Failed to acquire PID: Broker: Not coordinator
+21:56:32.021 GETPID: [thrd:main]: TxnCoordinator/3: Failed to acquire PID: Broker: Coordinator load in progress
+21:56:32.524 GETPID: [thrd:main]: TxnCoordinator/3: Failed to acquire PID: Broker: Producer attempted to update a transaction while another concurrent operation on the same transaction was ongoing
+    … ×5 until 21:55:09.408: ADDPARTS: [thrd:main]: TxnCoordinator/#: AddPartitionsToTxn response: partition "P.leader": [#]: Broker: Produ
+21:56:36.349 TXNCOMPLETE: [thrd:main]: Transaction successfully aborted
+21:56:36.988 ADDPARTS: [thrd:main]: TxnCoordinator/3: AddPartitionsToTxn response: partition "P.leader": [0]: Broker: Producer attempted to update a transaction while another concurrent operation on the same tr
+    … ×5 until 21:56:31.524: TXNABORT: [thrd:main]: No partitions registered: not sending EndTxn
+    … ×21 until 21:56:36.337: GETPID: [thrd:main]: TxnCoordinator/#: Requesting ProducerId bump for PID{Id:#,Epoch:#}
+    … ×11 until 21:56:32.019: GETPID: [thrd:main]: TxnCoordinator/#: Failed to acquire PID: Broker: Not coordinator
+    … ×8 until 21:56:35.837: GETPID: [thrd:main]: TxnCoordinator/#: Failed to acquire PID: Broker: Producer attempted to update a transacti
+    … ×2 until 21:56:37.091: ADDPARTS: [thrd:main]: TxnCoordinator/#: AddPartitionsToTxn response: partition "P.leader": [#]: Broker: Produ
+-- the coordinators (kafka.coordinator.transaction at DEBUG where the cluster had it; b1..b3 are the brokers)
+21:54:53,485 b1 INFO [TransactionCoordinator id=1] Initialized transactionalId broker-tests-997a1780 with producerId 0 and producer epoch 0 on partition __transaction_state-20 
+21:54:59,553 b1 INFO [TransactionCoordinator id=1] Initialized transactionalId P.writer with producerId 2 and producer epoch 0 on partition __transaction_state-41 
+21:55:04,842 b1 DEBUG [TransactionCoordinator id=1] Returning CONCURRENT_TRANSACTIONS error code to client for P.writer's AddPartitions request 
+    … ×2 until 21:56:36,348: b# INFO [TransactionCoordinator id=#] Initialized transactionalId P.writer with producerId # and producer epoc
+    … ×6 until 21:56:37,091: b# DEBUG [TransactionCoordinator id=#] Returning CONCURRENT_TRANSACTIONS error code to client for P.writer's A
+
+== d70stop-2 (topic prefix s5b4308fdfae841b4)
+-- the writer's client (librdkafka, debug=eos,protocol; node a)
+21:56:54.226 ADDPARTS: [thrd:main]: TxnCoordinator/3: AddPartitionsToTxn response: partition "P.leader": [0]: Broker: Producer attempted to update a transaction while another concurrent operation on the same tr
+21:57:02.498 ADDPARTS: [thrd:main]: TxnCoordinator/3: AddPartitionsToTxn response: partition "P.leader": [0]: Broker: Coordinator not available
+21:57:02.999 ADDPARTS: [thrd:main]: Not registering partitions: coordinator is not available
+21:58:02.634 TXNERR: [thrd:localhost:9392/3]: Current transaction failed in state InTransaction: 1 message(s) timed out on P.leader [0] (_TIMED_OUT, requires epoch bump)
+21:58:02.639 ENDTXN: [thrd:main]: EndTxn returned INVALID_TXN_STATE in state AbortingTransaction (may_retry=true)
+21:58:02.639 TXNERR: [thrd:main]: Fatal transaction error: Failed to end transaction: Broker: Producer attempted a transactional operation in an invalid state (INVALID_TXN_STATE)
+21:58:02.639 FATAL: [thrd:main]: Fatal error: Broker: Producer attempted a transactional operation in an invalid state: Failed to end transaction: Broker: Producer attempted a transactional operation in an inva
+    … ×28 until 21:57:02.473: ADDPARTS: [thrd:main]: TxnCoordinator/#: AddPartitionsToTxn response: partition "P.leader": [#]: Broker: Produ
+    … ×120 until 21:58:02.166: ADDPARTS: [thrd:main]: TxnCoordinator/#: AddPartitionsToTxn response: partition "P.leader": [#]: Broker: Coord
+-- the coordinators (kafka.coordinator.transaction at DEBUG where the cluster had it; b1..b3 are the brokers)
+21:56:43,366 b3 INFO [TransactionCoordinator id=3] Initialized transactionalId broker-tests-c53616de with producerId 2001 and producer epoch 0 on partition __transaction_state-39 
+21:56:50,047 b3 INFO [TransactionCoordinator id=3] Initialized transactionalId P.writer with producerId 2002 and producer epoch 0 on partition __transaction_state-15 
+21:56:54,226 b3 DEBUG [TransactionCoordinator id=3] Returning CONCURRENT_TRANSACTIONS error code to client for P.writer's AddPartitions request 
+21:57:02,496 b3 DEBUG [Transaction State Manager 3]: Appending P.writer's new metadata [pid 2002 epoch 0 Ongoing parts(P.leader-0, P.state-0)] failed due to org.apache.kafka.common.errors.NotEnoughReplicasException 
+21:57:02,498 b3 INFO [Transaction State Manager 3]: TransactionalId P.writer append transaction log for [pid 2002 epoch 0 Ongoing parts(P.leader-0, P.state-0)] transition failed due to COORDINATOR_NOT_AVAILABLE, resetting pending state from Some(Ongoing), abor
+21:58:02,639 b3 DEBUG [TransactionCoordinator id=3] Aborting append of ABORT to transaction log with coordinator and returning INVALID_TXN_STATE error to client for P.writer's EndTransaction request 
+21:58:02,758 b3 INFO [TransactionCoordinator id=3] Returning COORDINATOR_NOT_AVAILABLE error code to client for P.writer's InitProducerId request 
+    … ×2 until 21:58:27,316: b# INFO [TransactionCoordinator id=#] Initialized transactionalId P.writer with producerId # and producer epoc
+    … ×26 until 21:57:02,473: b# DEBUG [TransactionCoordinator id=#] Returning CONCURRENT_TRANSACTIONS error code to client for P.writer's A
+
+== d70kill-3 (topic prefix s7132521b778349fa)
+-- the writer's client (librdkafka, debug=eos,protocol; node a)
+21:58:41.378 ADDPARTS: [thrd:main]: TxnCoordinator/3: AddPartitionsToTxn response: partition "P.leader": [0]: Broker: Producer attempted to update a transaction while another concurrent operation on the same tr
+21:58:58.554 ENDTXN: [thrd:main]: EndTxn returned _TIMED_OUT in state CommittingTransaction (may_retry=true)
+21:58:58.643 ENDTXN: [thrd:main]: EndTxn returned CONCURRENT_TRANSACTIONS in state CommittingTransaction (may_retry=true)
+21:59:53.357 ENDTXN: [thrd:main]: EndTxn returned INVALID_PRODUCER_EPOCH in state CommittingTransaction (may_retry=true)
+21:59:53.357 TXNERR: [thrd:main]: Fatal transaction error: Failed to end transaction: Local: This instance has been fenced by a newer instance (_FENCED)
+21:59:53.357 FATAL: [thrd:main]: Fatal error: Local: This instance has been fenced by a newer instance: Failed to end transaction: Local: This instance has been fenced by a newer instance
+    … ×21 until 21:58:52.340: ADDPARTS: [thrd:main]: TxnCoordinator/#: AddPartitionsToTxn response: partition "P.leader": [#]: Broker: Produ
+    … ×56 until 21:59:52.351: ENDTXN: [thrd:main]: EndTxn returned CONCURRENT_TRANSACTIONS in state CommittingTransaction (may_retry=true)
+-- the coordinators (kafka.coordinator.transaction at DEBUG where the cluster had it; b1..b3 are the brokers)
+21:58:34,667 b3 INFO [TransactionCoordinator id=3] Initialized transactionalId broker-tests-dc241326 with producerId 2005 and producer epoch 0 on partition __transaction_state-33 
+21:58:41,269 b3 INFO [TransactionCoordinator id=3] Initialized transactionalId P.writer with producerId 2006 and producer epoch 0 on partition __transaction_state-36 
+21:58:41,378 b3 DEBUG [TransactionCoordinator id=3] Returning CONCURRENT_TRANSACTIONS error code to client for P.writer's AddPartitions request 
+21:58:58,642 b3 DEBUG [TransactionCoordinator id=3] Aborting append of COMMIT to transaction log with coordinator and returning CONCURRENT_TRANSACTIONS error to client for P.writer's EndTransaction request 
+21:59:52,550 b3 DEBUG [Transaction State Manager 3]: Appending P.writer's new metadata [pid 2006 epoch 0 PrepareCommit parts(P.state-0, P.leader-0)] failed due to org.apache.kafka.common.errors.TimeoutException 
+21:59:52,550 b3 INFO [Transaction State Manager 3]: TransactionalId P.writer append transaction log for [pid 2006 epoch 0 PrepareCommit parts(P.state-0, P.leader-0)] transition failed due to COORDINATOR_NOT_AVAILABLE, resetting pending state from Some(PrepareC
+21:59:52,932 b3 DEBUG TransactionalId P.writer prepare transition from Ongoing to [pid 2006 epoch 1 PrepareEpochFence parts(P.state-0, P.leader-0)] 
+21:59:52,933 b3 DEBUG TransactionalId P.writer prepare transition from Ongoing to [pid 2006 epoch 1 PrepareAbort parts(P.state-0, P.leader-0)] 
+21:59:53,356 b3 DEBUG [TransactionCoordinator id=3] Aborting append of COMMIT to transaction log with coordinator and returning PRODUCER_FENCED error to client for P.writer's EndTransaction request 
+22:00:05,938 b3 DEBUG TransactionalId P.writer complete transition from Ongoing to [pid 2006 epoch 1 PrepareAbort parts(P.state-0, P.leader-0)] 
+    … ×21 until 21:58:52,340: b# DEBUG [TransactionCoordinator id=#] Returning CONCURRENT_TRANSACTIONS error code to client for P.writer's A
+22:00:05,938 b3 DEBUG TransactionalId P.writer prepare transition from PrepareAbort to [pid 2006 epoch 1 CompleteAbort parts()] 
+22:00:05,938 b3 DEBUG [Transaction State Manager 3]: Updating P.writer's transaction state to [pid 2006 epoch 1 PrepareAbort parts(P.state-0, P.leader-0)] with coordinator epoch 0 for P.writer succeeded 
+22:00:05,939 b3 INFO [TransactionCoordinator id=3] Completed rollback of ongoing transaction for transactionalId P.writer due to timeout 
+
+== d70stop-3 (topic prefix s52b1d5b4e70942a4)
+-- the writer's client (librdkafka, debug=eos,protocol; node a)
+22:00:39.468 ADDPARTS: [thrd:main]: TxnCoordinator/3: AddPartitionsToTxn response: partition "P.leader": [0]: Broker: Producer attempted to update a transaction while another concurrent operation on the same tr
+22:00:45.542 ADDPARTS: [thrd:main]: TxnCoordinator/3: AddPartitionsToTxn response: partition "P.leader": [0]: Broker: Coordinator not available
+22:00:46.043 ADDPARTS: [thrd:main]: Not registering partitions: coordinator is not available
+22:01:45.598 TXNERR: [thrd:localhost:9392/3]: Current transaction failed in state InTransaction: 212 message(s) timed out on P.state [0] (_TIMED_OUT, requires epoch bump)
+22:01:45.672 ENDTXN: [thrd:main]: EndTxn returned _TRANSPORT in state AbortingTransaction (may_retry=true)
+22:01:45.776 ENDTXN: [thrd:main]: EndTxn returned INVALID_TXN_STATE in state AbortingTransaction (may_retry=true)
+22:01:45.776 TXNERR: [thrd:main]: Fatal transaction error: Failed to end transaction: Broker: Producer attempted a transactional operation in an invalid state (INVALID_TXN_STATE)
+22:01:45.776 FATAL: [thrd:main]: Fatal error: Broker: Producer attempted a transactional operation in an invalid state: Failed to end transaction: Broker: Producer attempted a transactional operation in an inva
+    … ×75 until 22:00:45.522: ADDPARTS: [thrd:main]: TxnCoordinator/#: AddPartitionsToTxn response: partition "P.leader": [#]: Broker: Produ
+    … ×120 until 22:01:45.209: ADDPARTS: [thrd:main]: TxnCoordinator/#: AddPartitionsToTxn response: partition "P.leader": [#]: Broker: Coord
+    … ×2 until 22:00:46.547: ADDPARTS: [thrd:main]: Not registering partitions: coordinator is not available
+-- the coordinators (kafka.coordinator.transaction at DEBUG where the cluster had it; b1..b3 are the brokers)
+22:00:29,208 b3 INFO [TransactionCoordinator id=3] Initialized transactionalId broker-tests-23144f6c with producerId 2008 and producer epoch 0 on partition __transaction_state-39 
+22:00:35,012 b3 INFO [TransactionCoordinator id=3] Initialized transactionalId P.writer with producerId 2010 and producer epoch 0 on partition __transaction_state-15 
+22:00:39,468 b3 DEBUG [TransactionCoordinator id=3] Returning CONCURRENT_TRANSACTIONS error code to client for P.writer's AddPartitions request 
+22:00:45,542 b3 DEBUG [Transaction State Manager 3]: Appending P.writer's new metadata [pid 2010 epoch 0 Ongoing parts(P.state-0, P.leader-0)] failed due to org.apache.kafka.common.errors.NotEnoughReplicasException 
+22:00:45,542 b3 INFO [Transaction State Manager 3]: TransactionalId P.writer append transaction log for [pid 2010 epoch 0 Ongoing parts(P.state-0, P.leader-0)] transition failed due to COORDINATOR_NOT_AVAILABLE, resetting pending state from Some(Ongoing), abor
+22:01:45,776 b3 DEBUG [TransactionCoordinator id=3] Aborting append of ABORT to transaction log with coordinator and returning INVALID_TXN_STATE error to client for P.writer's EndTransaction request 
+    … ×2 until 22:02:10,374: b# INFO [TransactionCoordinator id=#] Initialized transactionalId P.writer with producerId # and producer epoc
+    … ×24 until 22:00:45,501: b# DEBUG [TransactionCoordinator id=#] Returning CONCURRENT_TRANSACTIONS error code to client for P.writer's A
+
+== d70kill-4 (topic prefix sf3ddbf3dddc84d25)
+-- the writer's client (librdkafka, debug=eos,protocol; node a)
+22:02:30.752 ADDPARTS: [thrd:main]: TxnCoordinator/3: AddPartitionsToTxn response: partition "P.leader": [0]: Broker: Producer attempted to update a transaction while another concurrent operation on the same tr
+22:03:38.396 TXNERR: [thrd:localhost:9292/2]: Current transaction failed in state InTransaction: 1 message(s) timed out on P.leader [0] (_TIMED_OUT, requires epoch bump)
+22:03:38.397 ENDTXN: [thrd:main]: EndTxn returned CONCURRENT_TRANSACTIONS in state AbortingTransaction (may_retry=true)
+22:03:50.859 ENDTXN: [thrd:main]: EndTxn returned INVALID_TXN_STATE in state AbortingTransaction (may_retry=true)
+22:03:50.859 TXNERR: [thrd:main]: Fatal transaction error: Failed to end transaction: Broker: Producer attempted a transactional operation in an invalid state (INVALID_TXN_STATE)
+22:03:50.859 FATAL: [thrd:main]: Fatal error: Broker: Producer attempted a transactional operation in an invalid state: Failed to end transaction: Broker: Producer attempted a transactional operation in an inva
+    … ×2915 until 22:03:38.383: ADDPARTS: [thrd:main]: TxnCoordinator/#: AddPartitionsToTxn response: partition "P.leader": [#]: Broker: Produ
+    … ×15 until 22:03:49.853: ENDTXN: [thrd:main]: EndTxn returned CONCURRENT_TRANSACTIONS in state AbortingTransaction (may_retry=true)
+-- the coordinators (kafka.coordinator.transaction at DEBUG where the cluster had it; b1..b3 are the brokers)
+22:02:19,696 b3 INFO [TransactionCoordinator id=3] Initialized transactionalId broker-tests-89259440 with producerId 2012 and producer epoch 0 on partition __transaction_state-33 
+22:02:26,148 b3 INFO [TransactionCoordinator id=3] Initialized transactionalId P.writer with producerId 2013 and producer epoch 0 on partition __transaction_state-14 
+22:02:30,752 b3 DEBUG [TransactionCoordinator id=3] Returning CONCURRENT_TRANSACTIONS error code to client for P.writer's AddPartitions request 
+22:03:37,407 b3 DEBUG [Transaction State Manager 3]: Appending P.writer's new metadata [pid 2013 epoch 0 CompleteCommit parts()] failed due to org.apache.kafka.common.errors.TimeoutException 
+22:03:37,407 b3 INFO [Transaction State Manager 3]: TransactionalId P.writer append transaction log for [pid 2013 epoch 0 CompleteCommit parts()] transition failed due to COORDINATOR_NOT_AVAILABLE, not resetting pending state Some(CompleteCommit) but just retu
+22:03:38,397 b3 DEBUG [TransactionCoordinator id=3] Aborting append of ABORT to transaction log with coordinator and returning CONCURRENT_TRANSACTIONS error to client for P.writer's EndTransaction request 
+22:03:50,858 b3 DEBUG [TransactionCoordinator id=3] Aborting append of ABORT to transaction log with coordinator and returning INVALID_TXN_STATE error to client for P.writer's EndTransaction request 
+    … ×2 until 22:04:02,925: b# INFO [TransactionCoordinator id=#] Initialized transactionalId P.writer with producerId # and producer epoc
+    … ×11 until 22:02:38,392: b# DEBUG [TransactionCoordinator id=#] Returning CONCURRENT_TRANSACTIONS error code to client for P.writer's A
+
+== d70stop-4 (topic prefix s10cc29d571cf4cc2)
+-- the writer's client (librdkafka, debug=eos,protocol; node a)
+22:04:21.808 ADDPARTS: [thrd:main]: TxnCoordinator/3: AddPartitionsToTxn response: partition "P.leader": [0]: Broker: Producer attempted to update a transaction while another concurrent operation on the same tr
+22:05:32.044 TXNERR: [thrd:localhost:9392/3]: Current transaction failed in state InTransaction: 1 message(s) timed out on P.leader [0] (_TIMED_OUT, requires epoch bump)
+22:05:32.058 ENDTXN: [thrd:main]: EndTxn returned CONCURRENT_TRANSACTIONS in state AbortingTransaction (may_retry=true)
+22:06:03.685 ENDTXN: [thrd:main]: EndTxn returned INVALID_PRODUCER_EPOCH in state AbortingTransaction (may_retry=true)
+22:06:03.685 TXNERR: [thrd:main]: Fatal transaction error: Failed to end transaction: Local: This instance has been fenced by a newer instance (_FENCED)
+22:06:03.685 FATAL: [thrd:main]: Fatal error: Local: This instance has been fenced by a newer instance: Failed to end transaction: Local: This instance has been fenced by a newer instance
+    … ×2942 until 22:05:32.030: ADDPARTS: [thrd:main]: TxnCoordinator/#: AddPartitionsToTxn response: partition "P.leader": [#]: Broker: Produ
+    … ×34 until 22:06:02.680: ENDTXN: [thrd:main]: EndTxn returned CONCURRENT_TRANSACTIONS in state AbortingTransaction (may_retry=true)
+-- the coordinators (kafka.coordinator.transaction at DEBUG where the cluster had it; b1..b3 are the brokers)
+22:04:11,538 b3 INFO [TransactionCoordinator id=3] Initialized transactionalId broker-tests-c1eda309 with producerId 2015 and producer epoch 0 on partition __transaction_state-40 
+22:04:18,438 b3 INFO [TransactionCoordinator id=3] Initialized transactionalId P.writer with producerId 2016 and producer epoch 0 on partition __transaction_state-18 
+22:04:21,807 b3 DEBUG [TransactionCoordinator id=3] Returning CONCURRENT_TRANSACTIONS error code to client for P.writer's AddPartitions request 
+22:05:31,878 b3 DEBUG [Transaction State Manager 3]: Appending P.writer's new metadata [pid 2016 epoch 0 CompleteCommit parts()] failed due to org.apache.kafka.common.errors.TimeoutException 
+22:05:31,878 b3 INFO [Transaction State Manager 3]: TransactionalId P.writer append transaction log for [pid 2016 epoch 0 CompleteCommit parts()] transition failed due to COORDINATOR_NOT_AVAILABLE, not resetting pending state Some(CompleteCommit) but just retu
+22:05:32,057 b3 DEBUG [TransactionCoordinator id=3] Aborting append of ABORT to transaction log with coordinator and returning CONCURRENT_TRANSACTIONS error to client for P.writer's EndTransaction request 
+22:05:32,969 b3 DEBUG [Transaction State Manager 3]: Appending P.writer's new metadata [pid 2016 epoch 0 CompleteCommit parts()] failed due to org.apache.kafka.common.errors.NotEnoughReplicasException 
+22:06:03,685 b3 DEBUG [TransactionCoordinator id=3] Aborting append of ABORT to transaction log with coordinator and returning PRODUCER_FENCED error to client for P.writer's EndTransaction request 
+    … ×2 until 22:06:03,625: b# INFO [TransactionCoordinator id=#] Initialized transactionalId P.writer with producerId # and producer epoc
+    … ×10 until 22:04:31,876: b# DEBUG [TransactionCoordinator id=#] Returning CONCURRENT_TRANSACTIONS error code to client for P.writer's A
+
