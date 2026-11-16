@@ -166,7 +166,23 @@ public sealed record LeadershipStatus(
     /// it again should not start it again at once for ever: the same failure is likely
     /// waiting (the service exits with code 5 for it, not 3).</summary>
     public bool TakeoverFailed { get; init; }
+
+    /// <summary>The term this node led before another node took the log over from it, as
+    /// the leader topic says (the new writer's records name the writer they replaced).
+    /// Known to a process that was replaced and started again — which is what a replaced
+    /// node is, since <see cref="NodeRole.Fenced"/> is final — so that it does not say it
+    /// has never led. Null when the leader topic names no term of this node's as replaced,
+    /// for instance after a node of a build before this member led.</summary>
+    public PreviousLeadership? Previous { get; init; }
 }
+
+/// <summary>A term this node led and lost to another node.</summary>
+/// <param name="Term">The term it led.</param>
+/// <param name="ReplacedBy">The node that took the log over from it.</param>
+/// <param name="ReplacedByTerm">The term that node took.</param>
+/// <param name="Reason">Why that node took over: <c>manual</c> (an operator asked),
+/// <c>silence</c>, <c>ceiling</c> or <c>resigned</c>; null from a writer that did not say.</param>
+public sealed record PreviousLeadership(long Term, string ReplacedBy, long ReplacedByTerm, string? Reason);
 
 /// <summary>How far a standby is behind the logs it follows.</summary>
 /// <param name="StateOffsets">For each partition of the state topic, the offsets between
@@ -284,6 +300,7 @@ public sealed class KafkaLeadership : IAsyncDisposable
     private long _lastHeldLogTicks;
     private FollowerLag? _lag;
     private TakeoverTimings? _lastTakeover;
+    private PreviousLeadership? _previous;
     private Exception? _fault;
     private bool _takeoverFailed;
 
@@ -356,7 +373,11 @@ public sealed class KafkaLeadership : IAsyncDisposable
                     : TimeSpan.FromMilliseconds(Environment.TickCount64 - _heardTicks);
                 return new LeadershipStatus(
                     NodeId, _role, _log.Term, _leaderNode, _leaderTerm, age, _leaderAt, _leaderResigned,
-                    HoldsLease, _role is NodeRole.Standby ? _lag : null, _lastTakeover, _fault) { TakeoverFailed = _takeoverFailed };
+                    HoldsLease, _role is NodeRole.Standby ? _lag : null, _lastTakeover, _fault)
+                {
+                    TakeoverFailed = _takeoverFailed,
+                    Previous = _previous,
+                };
             }
         }
     }
@@ -756,6 +777,9 @@ public sealed class KafkaLeadership : IAsyncDisposable
             _leaderNode = record.Node;
             _leaderAt = record.At;
             _leaderResigned = record.Resigned;
+            if (record.Replaced == NodeId && record.ReplacedTerm > 0 && record.Node != NodeId
+                && (_previous is null || record.ReplacedTerm >= _previous.Term))
+                _previous = new PreviousLeadership(record.ReplacedTerm, record.Node!, record.Term, record.Reason);
 
             // The leader was alive when it wrote this, and that is not always the moment
             // of reading: the last heartbeat of a leader that died with a broker is
@@ -1136,6 +1160,7 @@ public sealed class KafkaLeadership : IAsyncDisposable
                     };
                 }
                 Exception? lost = null;
+                _log.TakeoverReason = reason;
                 try
                 {
                     await _log.AcquireWriterUnlessAsync(abandon.Token, token).WaitAsync(token).ConfigureAwait(false);

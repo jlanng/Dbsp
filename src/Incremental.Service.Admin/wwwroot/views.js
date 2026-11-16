@@ -193,6 +193,12 @@
     },
   };
 
+  // A term this node led before it was replaced and started again (status.leadership.previous).
+  function previousText(p) {
+    const why = { manual: 'an operator asked', silence: 'after a silence', ceiling: 'at the ceiling', resigned: 'after it stepped down' }[p.reason];
+    return `term ${fmtInt(p.term)}, until node ${p.replacedBy} took over under term ${fmtInt(p.replacedByTerm)}${why ? ` (${why})` : ''}`;
+  }
+
   function blockedText(blockedOn) {
     if (!blockedOn) return '';
     if (blockedOn.startsWith('backoff until ')) {
@@ -1361,6 +1367,7 @@
         h('div', { class: 'who' }, roleBadge(role, true), h('span', { class: 'node-name' }, st.nodeId), h('span', { class: 'tag' }, 'this node')),
         kv([
           ['Term', role === 'Standby' ? `${fmtInt(lead.leaderTerm)} (the leader’s)` : fmtInt(lead.term)],
+          lead.previous && role !== 'Leader' && ['Led before', previousText(lead.previous)],
           ['Health', h('span', null, healthBadge(st.health.level), st.health.reasons.length > 0 && h('ul', { class: 'muted' }, st.health.reasons.map(r => h('li', null, reasonText(r)))))],
           ['Ready', st.health.ready ? 'yes' : 'no'],
           ['Admin address', st.advertisedAdminUrl ? h('a', { href: st.advertisedAdminUrl }, st.advertisedAdminUrl) : h('span', { class: 'muted' }, 'not advertised')],
@@ -1474,7 +1481,9 @@
                   h('span', { class: 'sub' }, `the service’s part, and around it fencing the old writer (${fmtMs(kafka.lastTakeover.fence ?? null)}) and promoting the storage (${fmtMs(kafka.lastTakeover.storage ?? null)})`)), h('td', { class: 'r' }, fmtMs(kafka.lastTakeover.total ?? null))),
                 kafka && kafka.lastTakeover && kafka.lastTakeover.silence != null && h('tr', null, h('td', null, 'Before it began',
                   h('span', { class: 'sub' }, kafka.lastTakeover.reason === 'silence' ? 'how long the leader had been silent when this node moved' : `why this node moved: ${kafka.lastTakeover.reason || 'not recorded'}`)), h('td', { class: 'r' }, fmtMs(kafka.lastTakeover.silence))))))
-              : empty('This node has not led', 'Timings of its takeover appear here once it has.'), { flush: !take }),
+              : lead.previous
+                ? empty('This node has not led since it started', `It led before: ${previousText(lead.previous)}. Timings of its takeover appear here once it leads again.`)
+                : empty('This node has not led', 'Timings of its takeover appear here once it has.'), { flush: !take }),
           card('Backend', st.backend.kind, kv([
             ...Object.entries(st.backend.settings).map(([k, v]) => [k, h('span', { class: 'mono' }, v || '–')]),
             ...Object.entries(st.backend.counters).map(([k, v]) => [k, fmtInt(v)]),

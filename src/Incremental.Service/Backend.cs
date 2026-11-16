@@ -132,7 +132,18 @@ public sealed record NodeLeadershipStatus(
     /// when it keeps happening; a node another node replaced ends with 3 and is started
     /// again at once.</summary>
     public bool TakeoverFailed { get; init; }
+
+    /// <summary>The term this node led before another node took over from it, when the
+    /// backend knows: a replaced node ends its process and is started again as a standby,
+    /// and this is how that standby says it led. Null if it has not led, as far as the
+    /// backend can tell.</summary>
+    public PreviousTerm? Previous { get; init; }
 }
+
+/// <summary>A term a node led, and who took over from it, under which term and why
+/// (<c>manual</c>: an operator asked; <c>silence</c>, <c>ceiling</c>, <c>resigned</c>;
+/// null when the new leader did not say).</summary>
+public sealed record PreviousTerm(long Term, string ReplacedBy, long ReplacedByTerm, string? Reason);
 
 /// <summary>What only a Kafka-backed node knows of its leadership. <c>Fault</c> is why the
 /// node is <see cref="NodeRole.Fenced"/>, as text.</summary>

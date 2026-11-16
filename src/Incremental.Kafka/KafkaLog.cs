@@ -542,6 +542,7 @@ public sealed class KafkaLog : IAsyncDisposable
         // standby that has heard pays nothing here.
         if (FormatLevelSeen == 0)
             await ReadLastTermAsync(cancellationToken).ConfigureAwait(false);
+        Volatile.Write(ref _replaced, null);
         Formats.RequireReads(FormatLevelSeen);
         if (!_initialised)
         {
@@ -616,9 +617,10 @@ public sealed class KafkaLog : IAsyncDisposable
         var floor = Interlocked.Read(ref _termSeen);
         var deadline = Environment.TickCount64 + (long)_options.OperationTimeout.TotalMilliseconds;
         long last;
+        string? lastNode;
         while (true)
         {
-            last = await ReadLastTermAsync(cancellationToken).ConfigureAwait(false);
+            (last, lastNode) = await ReadLastTermAndNodeAsync(cancellationToken).ConfigureAwait(false);
             if (last >= floor && (last > 0
                     || await UncommittedEndOffsetAsync(_leaderPartition, cancellationToken).ConfigureAwait(false)
                     == await EndOffsetAsync(_leaderPartition, cancellationToken).ConfigureAwait(false)))
@@ -637,6 +639,12 @@ public sealed class KafkaLog : IAsyncDisposable
         }
         var term = last + 1;
         var termRead = clock.Elapsed;
+
+        // Who this writer replaces, carried in every record it writes to the leader topic:
+        // the one place a node that was replaced and has started again can learn that it
+        // led, and until when (KafkaLeadership.Status.Previous).
+        if (last > 0 && lastNode is not null && lastNode != NodeId)
+            Volatile.Write(ref _replaced, new ReplacedWriter(lastNode, last, TakeoverReason));
 
         // The level the last writer wrote at is this one's to go on from: it is never
         // lowered, and it is raised only by RaiseFormatAsync. A writer that announced none
@@ -657,7 +665,7 @@ public sealed class KafkaLog : IAsyncDisposable
         // to stop and nothing queued.
         var commit = new LogCommit();
         commit.Add(_leaderPartition, TermKey,
-            JsonSerializer.SerializeToUtf8Bytes(new LeaderRecord(term, NodeId, DateTimeOffset.UtcNow, Format: FormatAnnounced)).Prefixed(JsonFormat));
+            JsonSerializer.SerializeToUtf8Bytes(WithReplaced(new LeaderRecord(term, NodeId, DateTimeOffset.UtcNow, Format: FormatAnnounced))).Prefixed(JsonFormat));
         Execute([commit]);
         await commit.Completion.Task.ConfigureAwait(false);
         lock (_gate)
@@ -683,8 +691,32 @@ public sealed class KafkaLog : IAsyncDisposable
     /// <c>Resigned</c>: the writer stepped down after this record and will write no more.
     /// <c>Format</c>: the format level the writer writes (<see cref="PersistedFormat"/>);
     /// 0 from a writer built before levels, which writes <see cref="FormatLevel.Base"/>.
-    /// A build from before levels ignores the member.</summary>
-    internal sealed record LeaderRecord(long Term, string? Node, DateTimeOffset At, long Sequence = 0, bool Resigned = false, int Format = 0);
+    /// A build from before levels ignores the member.
+    /// <c>Replaced</c>, <c>ReplacedTerm</c> and <c>Reason</c>: the writer this one took the
+    /// log over from, the term it led, and why the takeover happened (<c>manual</c>,
+    /// <c>silence</c>, …); absent from a first writer, from a node that took over from
+    /// itself and from a build before them. Members a reader skips, like <c>Format</c>.</summary>
+    internal sealed record LeaderRecord(long Term, string? Node, DateTimeOffset At, long Sequence = 0, bool Resigned = false, int Format = 0)
+    {
+        public string? Replaced { get; init; }
+        public long ReplacedTerm { get; init; }
+        public string? Reason { get; init; }
+    }
+
+    /// <summary>The writer this log's writer replaced, as its term record says.</summary>
+    internal sealed record ReplacedWriter(string Node, long Term, string? Reason);
+
+    private ReplacedWriter? _replaced;
+
+    /// <summary>Why the acquisition under way was begun, set by the leadership before it
+    /// acquires (<c>manual</c>, <c>silence</c>, <c>ceiling</c>, <c>resigned</c>); written
+    /// with the replaced writer into the leader topic.</summary>
+    internal string? TakeoverReason { get; set; }
+
+    private LeaderRecord WithReplaced(LeaderRecord record) =>
+        Volatile.Read(ref _replaced) is { } replaced
+            ? record with { Replaced = replaced.Node, ReplacedTerm = replaced.Term, Reason = replaced.Reason }
+            : record;
 
     /// <summary>Parses a leader-topic record; null for one this version does not know.</summary>
     internal static (LeaderRecord Record, bool IsHeartbeat)? ParseLeaderRecord(ConsumeResult<byte[], byte[]> record)
@@ -700,11 +732,16 @@ public sealed class KafkaLog : IAsyncDisposable
     /// <summary>The last term in the leader topic, 0 when there is none. Terms never fall
     /// and every heartbeat carries one, so the tail of the topic is enough; the window
     /// widens only when the tail holds nothing readable (aborted transactions).</summary>
-    private async Task<long> ReadLastTermAsync(CancellationToken cancellationToken)
+    private async Task<long> ReadLastTermAsync(CancellationToken cancellationToken) =>
+        (await ReadLastTermAndNodeAsync(cancellationToken).ConfigureAwait(false)).Term;
+
+    /// <summary><see cref="ReadLastTermAsync"/>, with the node that wrote the last term's
+    /// records.</summary>
+    private async Task<(long Term, string? Node)> ReadLastTermAndNodeAsync(CancellationToken cancellationToken)
     {
         var end = await EndOffsetAsync(_leaderPartition, cancellationToken).ConfigureAwait(false);
         if (end == 0)
-            return 0;
+            return (0, null);
         var start = await StartOffsetAsync(_leaderPartition, cancellationToken).ConfigureAwait(false);
         return await ShortReadAsync(consumer =>
         {
@@ -712,17 +749,19 @@ public sealed class KafkaLog : IAsyncDisposable
             {
                 var from = Math.Max(start, end - window);
                 var term = 0L;
+                string? node = null;
                 AssignForShortRead(consumer, new TopicPartitionOffset(_leaderPartition, from));
                 ReadTo(consumer, end, record =>
                 {
                     if (ParseLeaderRecord(record) is { } parsed)
                     {
-                        term = Math.Max(term, parsed.Record.Term);
+                        if (parsed.Record.Term >= term)
+                            (term, node) = (parsed.Record.Term, parsed.Record.Node);
                         NoteFormatSeen(parsed.Record.Format);
                     }
                 }, cancellationToken);
                 if (term > 0 || from == start)
-                    return term;
+                    return (term, node);
             }
         }, cancellationToken).ConfigureAwait(false);
     }
@@ -752,7 +791,7 @@ public sealed class KafkaLog : IAsyncDisposable
     internal void Depose(string reason) => MarkFenced(new KafkaLogFencedException(reason), reason);
 
     private byte[] HeartbeatValue(bool resigned) => JsonSerializer.SerializeToUtf8Bytes(
-        new LeaderRecord(Term, NodeId, DateTimeOffset.UtcNow, Interlocked.Increment(ref _heartbeatSequence), resigned, FormatAnnounced)).Prefixed(JsonFormat);
+        WithReplaced(new LeaderRecord(Term, NodeId, DateTimeOffset.UtcNow, Interlocked.Increment(ref _heartbeatSequence), resigned, FormatAnnounced))).Prefixed(JsonFormat);
 
     // ── the writer thread: group commit ────────────────────────────────────────────────
 
@@ -2241,12 +2280,29 @@ public sealed class KafkaLog : IAsyncDisposable
             SyslogLevel.Notice or SyslogLevel.Info => LogLevel.Information,
             _ => LogLevel.Debug,
         };
+        if (level > LogLevel.Information && IsFenceMessage(message.Message))
+            level = LogLevel.Information;
         logger.Log(level, "{Client} {Facility}: {Message}", message.Name, message.Facility, message.Message);
     }
 
     private void LogError(string client, Error error) =>
-        _options.Logger?.Log(error.IsFatal ? LogLevel.Error : LogLevel.Warning,
+        _options.Logger?.Log(
+            error.Code is ErrorCode.Local_Fenced or ErrorCode.ProducerFenced or ErrorCode.InvalidProducerEpoch || IsFenceMessage(error.Reason)
+                ? LogLevel.Information
+                : error.IsFatal ? LogLevel.Error : LogLevel.Warning,
             "Kafka {Client} error {Code}: {Reason}", client, error.Code, error.Reason);
+
+    /// <summary>Whether the client is telling of this writer's fence: another process has
+    /// initialised the transactional id. That is how a leader ends when another node takes
+    /// over — asked for by an operator, or after a silence — and the leadership says it
+    /// once, with who replaced it (KafkaLeadership, the service's node). The client says it
+    /// three to four times as errors and fatal errors; those lines are kept, at
+    /// Information, so that a fence is not read as a failure of the node.</summary>
+    internal static bool IsFenceMessage(string? text) =>
+        text is not null
+        && (text.Contains("fenced by a newer instance", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("_FENCED", StringComparison.Ordinal)
+            || text.Contains("operation with an old epoch", StringComparison.OrdinalIgnoreCase));
 
     public async ValueTask DisposeAsync()
     {

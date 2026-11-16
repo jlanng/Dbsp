@@ -67,6 +67,14 @@ public sealed class InMemoryServiceCluster
     internal InMemoryServiceBackend? Leader;
     internal long Term;
 
+    /// <summary>The last leader a takeover deposed, as the term it led: what a node of that
+    /// name started again reports as <see cref="NodeLeadershipStatus.Previous"/>.</summary>
+    internal (string Node, PreviousTerm Previous)? LastDeposed;
+
+    /// <summary>A leader that stepped down and has no successor yet: the next leader
+    /// records it in <see cref="LastDeposed"/>, as a takeover after a resignation.</summary>
+    internal (string Node, long Term)? Resigned;
+
     public InMemoryServiceCluster(InMemoryBackendOptions? options = null)
     {
         Options = options ?? new InMemoryBackendOptions();
@@ -297,7 +305,11 @@ public sealed class InMemoryServiceBackend : IServiceBackend, ICatalogMirror
                 {
                     var leader = _cluster.Leader;
                     return new NodeLeadershipStatus(
-                        backend.NodeId, _role, _term, leader?.NodeId, leader is null ? 0 : _cluster.Term) { TakeoverFailed = _takeoverFailed };
+                        backend.NodeId, _role, _term, leader?.NodeId, leader is null ? 0 : _cluster.Term)
+                    {
+                        TakeoverFailed = _takeoverFailed,
+                        Previous = _cluster.LastDeposed is { } last && last.Node == backend.NodeId ? last.Previous : null,
+                    };
                 }
             }
         }
@@ -344,6 +356,11 @@ public sealed class InMemoryServiceBackend : IServiceBackend, ICatalogMirror
                 deposed = _cluster.Leader;
                 _cluster.Leader = backend;
                 _term = ++_cluster.Term;
+                if (deposed is not null && deposed.NodeId != backend.NodeId)
+                    _cluster.LastDeposed = (deposed.NodeId, new PreviousTerm(deposed._leadership._term, backend.NodeId, _term, "manual"));
+                else if (deposed is null && _cluster.Resigned is { } resigned && resigned.Node != backend.NodeId)
+                    _cluster.LastDeposed = (resigned.Node, new PreviousTerm(resigned.Term, backend.NodeId, _term, "resigned"));
+                _cluster.Resigned = null;
                 foreach (var takeOver in backend._connections)
                     takeOver();
             }
@@ -392,7 +409,10 @@ public sealed class InMemoryServiceBackend : IServiceBackend, ICatalogMirror
             lock (_cluster.Gate)
             {
                 if (ReferenceEquals(_cluster.Leader, backend))
+                {
                     _cluster.Leader = null;
+                    _cluster.Resigned = (backend.NodeId, _term);
+                }
                 successor = _cluster.Nodes.FirstOrDefault(n => n != backend && n._leadership._role == NodeRole.Standby);
             }
             Finish(NodeRole.Resigned);

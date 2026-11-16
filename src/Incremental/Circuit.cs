@@ -1000,8 +1000,15 @@ public sealed class Circuit : IAsyncDisposable
         if (Interlocked.CompareExchange(ref _fault, exception, null) is null)
         {
             _diag.CircuitFaulted();
-            _log.LogError(exception, "Circuit {Circuit} faulted on step {Step}; terminal — rebuild from the last committed checkpoint to recover",
-                Name, _stepNumber);
+            // A changelog taken over by another writer is how a circuit of a replaced
+            // leader ends: nothing has failed here, and the process that owns the circuit
+            // says once that it was replaced. Said, but not as an error.
+            if (exception is ChangelogFencedException || exception.InnerException is ChangelogFencedException)
+                _log.LogInformation("Circuit {Circuit} stopped on step {Step}: another process has taken its changelog over ({Reason})",
+                    Name, _stepNumber, exception.Message);
+            else
+                _log.LogError(exception, "Circuit {Circuit} faulted on step {Step}; terminal — rebuild from the last committed checkpoint to recover",
+                    Name, _stepNumber);
         }
         var fault = _fault!;
 

@@ -6,6 +6,7 @@ using System.Text.Json;
 using Confluent.Kafka;
 using Incremental.Storage;
 using Incremental.Tables;
+using Microsoft.Extensions.Logging;
 
 namespace Incremental.Kafka.Tests;
 
@@ -45,9 +46,12 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         Func<Node, CancellationToken, Task>? prepare = null,
         Func<Node, long, Task>? start = null,
         bool begin = true,
-        TimeSpan? beat = null)
+        TimeSpan? beat = null,
+        ILogger? logger = null)
     {
-        var node = new Node(await env.ConnectAsync(env.Options(nodeId: id, heartbeat: beat ?? Beat)));
+        var options = env.Options(nodeId: id, heartbeat: beat ?? Beat);
+        options.Logger = logger;
+        var node = new Node(await env.ConnectAsync(options));
         node.Leadership = new KafkaLeadership(node.Log, new KafkaLeadershipOptions
         {
             TakeoverAfter = after ?? After,
@@ -446,6 +450,81 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         await Assert.ThrowsAsync<ChangelogFencedException>(() => CommitStateAsync(a.Log, "p", "x"));
         await Assert.ThrowsAsync<InvalidOperationException>(() => a.Leadership.TakeOverAsync());
         await CommitStateAsync(b.Log, "p", "e");
+    }
+
+    /// <summary>
+    /// K7: a takeover an operator asks for is the expected end of the leader it replaces.
+    /// The replaced node's client reports the fence three or four times as errors and
+    /// fatal errors when its next transaction meets it; none of that is a failure of the
+    /// node, and none of it is logged as one. And the node, started again as it is after
+    /// a fence, says it led and who took over — it used to say it had never led.
+    /// </summary>
+    [Fact]
+    public async Task A_leader_replaced_at_an_operators_word_logs_no_error_and_started_again_says_it_led()
+    {
+        await using var env = KafkaEnv.Create();
+        var log = new ListLogger();
+        await using var a = await StartAsync(env, "a", logger: log);
+        await LeadsAsync(a);
+        await using var b = await StartAsync(env, "b", automatic: false);
+
+        // a's next transaction waits until b has taken the log, so that it meets the fence
+        // in the client, as a busy leader's does.
+        var gate = Stall(a);
+        await b.Leadership.TakeOverAsync().WaitAsync(Timeout);
+        Assert.Equal(2, b.Leadership.Term);
+        gate.Set();
+        await a.Leadership.WhenFinished.WaitAsync(Timeout);
+        await KafkaEnv.EventuallyAsync(() => Task.FromResult(log.Contains("fenced")), "the client to report the fence");
+        await Task.Delay(500);
+        Assert.Empty(log.AtLeast(LogLevel.Error));
+        Assert.Contains(log.Entries, e => e.Level == LogLevel.Information && KafkaLog.IsFenceMessage(e.Message));
+
+        // The replaced node learns who replaced it from the leader topic.
+        await KafkaEnv.EventuallyAsync(() => Task.FromResult(a.Leadership.Status.Previous is not null), "a to read who replaced it");
+        Assert.Equal(new PreviousLeadership(1, "b", 2, "manual"), a.Leadership.Status.Previous);
+
+        // Started again, as its supervisor does after exit code 3: a standby that knows it led.
+        await a.DisposeAsync();
+        await using var again = await StartAsync(env, "a", automatic: false);
+        await KafkaEnv.EventuallyAsync(() => Task.FromResult(again.Leadership.Status.Previous is not null), "the restarted node to read the leader topic");
+        Assert.Equal(NodeRole.Standby, again.Role);
+        Assert.Equal(0, again.Leadership.Term);
+        Assert.Equal(new PreviousLeadership(1, "b", 2, "manual"), again.Leadership.Status.Previous);
+
+        // b knows of no term of its own lost; and a takeover back says the other way round.
+        Assert.Null(b.Leadership.Status.Previous);
+        await again.Leadership.TakeOverAsync().WaitAsync(Timeout);
+        await b.Leadership.WhenFinished.WaitAsync(Timeout);
+        await KafkaEnv.EventuallyAsync(() => Task.FromResult(b.Leadership.Status.Previous is not null), "b to read who replaced it");
+        Assert.Equal(new PreviousLeadership(2, "a", 3, "manual"), b.Leadership.Status.Previous);
+    }
+
+    private sealed class ListLogger : ILogger
+    {
+        public readonly List<(LogLevel Level, string Message)> Entries = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            lock (Entries)
+                Entries.Add((logLevel, formatter(state, exception)));
+        }
+
+        public bool Contains(string text)
+        {
+            lock (Entries)
+                return Entries.Any(e => e.Message.Contains(text, StringComparison.OrdinalIgnoreCase));
+        }
+
+        public List<(LogLevel Level, string Message)> AtLeast(LogLevel level)
+        {
+            lock (Entries)
+                return Entries.Where(e => e.Level >= level).ToList();
+        }
     }
 
     [Fact]

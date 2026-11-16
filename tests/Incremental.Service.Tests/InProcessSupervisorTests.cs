@@ -37,6 +37,14 @@ public class InProcessSupervisorTests
         Assert.Equal(a.Url, a2.Url);
         await LeaderHasAStandbyAsync(admin, b);
 
+        // K7: the node started again says it led, and who replaced it — not that it never led.
+        var previous = (await admin.SendAsync(HttpMethod.Get, "node", baseUrl: a2.Url + "/admin/api/")).Body
+            .GetProperty("status").GetProperty("leadership").GetProperty("previous");
+        Assert.Equal(1, previous.GetProperty("term").GetInt64());
+        Assert.Equal(b.Node.NodeId, previous.GetProperty("replacedBy").GetString());
+        Assert.Equal(2, previous.GetProperty("replacedByTerm").GetInt64());
+        Assert.Equal("manual", previous.GetProperty("reason").GetString());
+
         // b steps down: it hands over to a, ends with 4, and comes back as the standby.
         var stepped = await admin.SendAsync(HttpMethod.Post, $"node/stepdown?confirm={b.Node.NodeId}", baseUrl: b.Url + "/admin/api/");
         Assert.Equal(200, stepped.Code);
@@ -46,6 +54,8 @@ public class InProcessSupervisorTests
         Assert.NotSame(b.Node, b2.Node);
         await LeaderHasAStandbyAsync(admin, a2);
         Assert.False(a2.Node.Ended.IsCompleted);
+        Assert.Equal(new PreviousTerm(2, a2.Node.NodeId, 3, "resigned"), b2.Node.Backend.Leadership.Status.Previous);
+        Assert.Equal(new PreviousTerm(1, b.Node.NodeId, 2, "manual"), a2.Node.Backend.Leadership.Status.Previous);
     }
 
     private static async Task<DemoNode> ReadyStandbyAsync(AdminFixture admin, int index, DemoNode leader)

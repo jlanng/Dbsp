@@ -1101,9 +1101,6 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         var finished = _context.Backend.Leadership.Status;
         var role = finished.Role;
         _context.Leading = false;
-        _logger.LogWarning(
-            "Service node {Node} is {Role}{Why}; it will not lead again in this process",
-            NodeId, role, finished.TakeoverFailed ? " (its takeover failed: it could not lead)" : "");
         try
         {
             await _context.Tables.StopLoadersAsync().ConfigureAwait(false);
@@ -1113,6 +1110,30 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         {
             _logger.LogError(ex, "Service node {Node}: abandoning its circuits failed", NodeId);
         }
+
+        // Who replaced it, and why, is in the new leader's records in the leader topic;
+        // a fence met in a transaction comes before they are read. A moment for them,
+        // after the circuits are down and before the process ends.
+        if (role == NodeRole.Fenced && !finished.TakeoverFailed)
+        {
+            var until = Environment.TickCount64 + 2_000;
+            while (finished.Previous?.Term != finished.Term && Environment.TickCount64 < until && !_stopping.IsCancellationRequested)
+            {
+                await Task.Delay(50).ConfigureAwait(false);
+                finished = _context.Backend.Leadership.Status;
+            }
+        }
+
+        // Replaced at an operator's word, or stepped down: the expected ends of a healthy
+        // node, said once and not as a warning. A replacement after a silence, or a
+        // takeover of its own that failed, is worth one.
+        var replacedBy = finished.Previous is { } previous && previous.Term == finished.Term
+            ? $" (node '{previous.ReplacedBy}' took over under term {previous.ReplacedByTerm}{(previous.Reason is { } reason ? $", {reason}" : "")})"
+            : "";
+        var expected = role == NodeRole.Resigned || (!finished.TakeoverFailed && finished.Previous is { Reason: "manual" } asked && asked.Term == finished.Term);
+        _logger.Log(expected ? LogLevel.Information : LogLevel.Warning,
+            "Service node {Node} is {Role}{Why}; it will not lead again in this process",
+            NodeId, role, finished.TakeoverFailed ? " (its takeover failed: it could not lead)" : replacedBy);
         _ended.TrySetResult(ExitCodeFor(finished));
         if (_lifetime is not null && _context.Options.ExitOnLeadershipLoss && Volatile.Read(ref _disposed) == 0 && !_stopping.IsCancellationRequested)
         {
