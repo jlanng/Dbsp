@@ -36,11 +36,15 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         /// (<see cref="NodeSupervisor"/>): the node is its child, started again whenever it
         /// ends fenced, resigned or killed. The events are then those of every incarnation
         /// in turn, so ask <see cref="StatusAsync"/> for what is true now.</param>
-        public AppNode(KafkaTestEnv env, string id, int probePort, int peerPort, bool plugins = false, int tables = 0, bool supervised = false)
+        /// <param name="appDll">Another build's failover app, for the tests that run two
+        /// builds against each other; null is this build's.</param>
+        public AppNode(
+            KafkaTestEnv env, string id, int probePort, int peerPort, bool plugins = false, int tables = 0, bool supervised = false,
+            string? appDll = null)
         {
             Id = id;
             Supervised = supervised;
-            var dll = AppDllPath();
+            var dll = appDll ?? AppDllPath();
             var info = new ProcessStartInfo("dotnet")
             {
                 RedirectStandardInput = true,
@@ -303,6 +307,158 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
             Assert.True(File.Exists(dll), $"Service failover app not found at {dll} — build tests/Incremental.Service.FailoverApp.");
             return dll;
         }
+    }
+
+    /// <summary>
+    /// The rolling upgrade with the build from before format levels as the older node: a
+    /// real process of that build (<c>INCREMENTAL_OLDER_BUILD</c>, the path of its
+    /// <c>Incremental.Service.FailoverApp.dll</c>; commit 9de8da9, the last before state
+    /// manifest format 8) and real processes of this one take turns leading one
+    /// deployment. What the pinned nodes of <see cref="RollingUpgradeTests"/> stand for
+    /// is here the thing itself: the older build reads everything this build writes
+    /// until both nodes are this build, and leads again on it.
+    /// </summary>
+    [Fact]
+    public async Task The_build_from_before_format_levels_and_this_one_take_turns_until_both_are_this_one()
+    {
+        if (Environment.GetEnvironmentVariable("INCREMENTAL_OLDER_BUILD") is not { Length: > 0 } older)
+        {
+            Assert.Skip(
+                "INCREMENTAL_OLDER_BUILD is not set: build tests/Incremental.Service.FailoverApp at commit 9de8da9 in a worktree and give the path of its Incremental.Service.FailoverApp.dll.");
+            return;
+        }
+        Assert.True(File.Exists(older), $"INCREMENTAL_OLDER_BUILD names {older}, which is not there.");
+        await using var env = KafkaTestEnv.Create();
+        var tradesTopic = await env.CreateTopicAsync("trades", partitions: 2);
+        var instrumentsTopic = await env.CreateTopicAsync("instruments", compacted: true);
+        var enrichedTopic = await env.CreateTopicAsync("enriched", compacted: true);
+        var countsTopic = await env.CreateTopicAsync("counts", compacted: true);
+        var ports = KafkaTestEnv.FreePorts(2);
+        var instruments = Instruments(10);
+        var trades = new List<Trade>();
+        foreach (var instrument in instruments)
+            env.ProduceJson(instrumentsTopic, instrument.Id, instrument);
+
+        async Task FeedAsync(string what)
+        {
+            var more = Trades(trades.Count, 400);
+            trades.AddRange(more);
+            foreach (var trade in more)
+                env.ProduceJson(tradesTopic, trade.Id, trade);
+            var changed = trades.Count / 400 % 10;
+            instruments[changed] = instruments[changed] with { Symbol = "S" + trades.Count };
+            env.ProduceJson(instrumentsTopic, instruments[changed].Id, instruments[changed]);
+            await env.FlushAsync();
+            await KafkaTestEnv.TopicEqualsAsync(enrichedTopic, Enrich.Model(trades, instruments), $"the enriched sink, {what}");
+            await KafkaTestEnv.TopicEqualsAsync(
+                countsTopic, trades.GroupBy(t => t.Trader).ToDictionary(g => g.Key, g => $"v1:{g.Key}={g.Count()}"), $"the counts sink, {what}");
+        }
+
+        AppNode Node(string id, bool thisBuild) =>
+            new(env, id, ports[id == "a" ? 0 : 1], ports[id == "a" ? 1 : 0], plugins: true, appDll: thisBuild ? null : older);
+        static long Level(JsonElement status) =>
+            status.GetProperty("counters").TryGetProperty("formatLevelWritten", out var level) ? level.GetInt64() : -1;
+        Task<JsonElement> WarmAsync(AppNode standby, string leader) => standby.StatusWhenAsync(
+            s => s.GetProperty("warm").GetBoolean() && State(s, "main") == "Built" && State(s, "counts") == "Built"
+                && s.GetProperty("stateLag").GetInt64() == 0 && s.GetProperty("leader").GetString() == leader,
+            $"the standby to be warm behind '{leader}'");
+        async Task TakeOverAsync(AppNode standby, AppNode leader)
+        {
+            await standby.RunAsync("takeover", "tookover");
+            Assert.Equal(3, await leader.ExitCodeAsync());
+            leader.Dispose();
+            await standby.StatusWhenAsync(s => State(s, "main") == "Running" && State(s, "counts") == "Running", "both pipelines to run on the new leader");
+        }
+
+        // Both nodes are the older build.
+        var a = Node("a", thisBuild: false);
+        await a.WaitForRoleAsync("Leader");
+        await a.RunAsync("declare " + JsonSerializer.Serialize(new TableSpec
+        {
+            Name = "instruments",
+            Definition = typeof(InstrumentsTable).FullName!,
+            Loader = new TableLoaderSpec("kafka", "log", TestService.Json($$"""{ "topic": "{{instrumentsTopic}}" }""")),
+        }, Json), "declared");
+        await a.RunAsync("deploy " + JsonSerializer.Serialize(new PipelineSpec
+        {
+            Id = "main", Plugin = "acme.pipelines", Definition = "trade-enrichment",
+            Inputs = new Dictionary<string, JsonElement> { ["trades"] = Binding(tradesTopic) },
+            Sinks = new Dictionary<string, JsonElement> { ["enriched"] = Binding(enrichedTopic) },
+        }, Json), "deployed");
+        await a.RunAsync("deploy " + JsonSerializer.Serialize(new PipelineSpec
+        {
+            Id = "counts", Plugin = "acme.pipelines", Definition = "trader-counts",
+            Inputs = new Dictionary<string, JsonElement> { ["trades"] = Binding(tradesTopic) },
+            Sinks = new Dictionary<string, JsonElement> { ["counts"] = Binding(countsTopic) },
+        }, Json), "deployed");
+        var b = Node("b", thisBuild: false);
+        await WarmAsync(b, "a");
+        await FeedAsync("both nodes the older build");
+
+        // 1. The standby is upgraded: this build follows what the older one writes.
+        b.Kill();
+        b.Dispose();
+        b = Node("b", thisBuild: true);
+        var followed = await WarmAsync(b, "a");
+        Assert.Equal(1, Level(followed)); // the older leader announces no level; what it wrote is the base level
+        await FeedAsync("the standby upgraded");
+        await WarmAsync(b, "a");
+
+        // 2. Takeover. This build leads at the base level, and the older build — back as
+        // the standby — reads all of it: the catalog, the table, the state.
+        await TakeOverAsync(b, a);
+        await FeedAsync("this build leading alone");
+        a = Node("a", thisBuild: false);
+        await WarmAsync(a, "b");
+        await FeedAsync("this build leading, the older build standing by");
+        await WarmAsync(a, "b");
+        await Task.Delay(TimeSpan.FromSeconds(3)); // three probes of a standby that says nothing of levels
+        Assert.Equal(1, Level(await b.StatusAsync()));
+
+        // The older build leads again, on state this build wrote.
+        await TakeOverAsync(a, b);
+        await FeedAsync("the older build leading again");
+        b = Node("b", thisBuild: true);
+        await WarmAsync(b, "a");
+        await TakeOverAsync(b, a);
+        await FeedAsync("this build leading again");
+
+        // 3. The old leader is upgraded: the leader hears a standby that reads its level
+        // and raises what it writes.
+        a = Node("a", thisBuild: true);
+        var raised = await b.StatusWhenAsync(s => Level(s) == Incremental.Storage.FormatLevel.Current, "the leader to raise the format level");
+        await FeedAsync("the level raised");
+        await WarmAsync(a, "b");
+
+        // 4. Leadership moves at the new level.
+        await TakeOverAsync(a, b);
+        Assert.Equal(Incremental.Storage.FormatLevel.Current, Level(await a.StatusAsync()));
+        await FeedAsync("after the takeover at the new level");
+        Measured($"rolling upgrade from the build before format levels: {trades.Count} trades through 4 takeovers between the two builds, sinks equal to the model at each of 8 stages; level raised to {Level(raised)} only with both nodes this build");
+
+        // 5. What the level protects against, shown on the build that has no levels: the
+        // older build started now follows the logs and calls itself a warm standby — it
+        // cannot know — and when it takes over, it leads with every pipeline stopped on
+        // a checkpoint it refuses. Nothing is lost by that: the state is as it was, and
+        // this build, taking over again, goes on from it at the level it finds there,
+        // though the older leader in between announced none.
+        b = Node("b", thisBuild: false);
+        await WarmAsync(b, "a");
+        await b.RunAsync("takeover", "tookover");
+        Assert.Equal(3, await a.ExitCodeAsync());
+        a.Dispose();
+        var stopped = await b.StatusWhenAsync(s => State(s, "main") == "NeedsReset" && State(s, "counts") == "NeedsReset", "the older build to refuse both checkpoints");
+        Assert.Contains("format=8", stopped.GetProperty("pipelines")[0].GetProperty("fault").GetString());
+        a = Node("a", thisBuild: true);
+        await a.StatusWhenAsync(s => s.GetProperty("role").GetString() == "Standby" && s.GetProperty("leader").GetString() == "b", "this build to stand by behind the older one");
+        await a.RunAsync("takeover force", "tookover");
+        Assert.Equal(3, await b.ExitCodeAsync());
+        b.Dispose();
+        var back = await a.StatusWhenAsync(s => State(s, "main") == "Running" && State(s, "counts") == "Running", "both pipelines to run again on this build");
+        Assert.Equal(Incremental.Storage.FormatLevel.Current, Level(back));
+        await FeedAsync("after the older build led for a moment at the new level");
+        Measured("rolling upgrade: the older build started after the raise called itself warm, took over and stopped both pipelines as NeedsReset (format=8 refused); this build took over again and the sinks equal the model");
+        a.Dispose();
     }
 
     private static long T(JsonElement e) => e.GetProperty("t").GetInt64();

@@ -80,6 +80,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+        with:
+          # The rolling-upgrade test runs this build against the one from before format
+          # levels, which is built from history below.
+          fetch-depth: 0
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
@@ -95,7 +99,16 @@ jobs:
           # Two, exactly: KafkaPartitionWatermarkTests' two that kill and freeze a broker,
           # which need three of them (the broker-failures job runs those).
           sed 's/\x1b\[[0-9;]*m//g' kafka-tests.log | grep -Eq '^\s*skipped: 2\s*$'
+      # The last commit before state manifest format 8 and format levels: the "older
+      # build" of KafkaServiceProcessTests' rolling upgrade (docs/enrichment-service.md,
+      # Upgrading the nodes).
+      - name: Build the node from before format levels
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/older" 9de8da9
+          dotnet build "$RUNNER_TEMP/older/tests/Incremental.Service.FailoverApp"
       - name: Test Service against the broker
+        env:
+          INCREMENTAL_OLDER_BUILD: ${{ runner.temp }}/older/tests/Incremental.Service.FailoverApp/bin/Debug/net10.0/Incremental.Service.FailoverApp.dll
         run: |
           set -o pipefail
           dotnet test --project tests/Incremental.Service.Tests -c Release --no-build | tee service-tests.log
