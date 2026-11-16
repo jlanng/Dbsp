@@ -499,7 +499,10 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   not come back within the open window. An upsert that is itself behind the watermark
   is not applied (`UpsertOperator.IsLate`): it is emitted alone, for the declaration to
   drop and count, and the key's row stays — applied, it would retract a row that may
-  still be open and insert one that is dropped.
+  still be open and insert one that is dropped. For the same reason the port ends a
+  drain before a late upsert of a key the drain already holds an on-time upsert or a
+  delete of: as the step's last command for the key it would stand in for the one
+  before it, which would never be applied.
 - Per-record eviction (`EvictWhenFinal()` → `FinalizingGroupedStream`; docs/design/shared-tables.md,
   *Per fact*). A record's deadline is one tick after its own event time (the watermark
   keeps ticks ≥ it, `TakeDue` takes ≤ it), tracked by (key, record) in an

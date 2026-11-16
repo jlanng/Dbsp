@@ -568,8 +568,10 @@ public class PartitionWatermarkTests
         Assert.Equal(["200000/1 x1"], await StepAsync());
     }
 
-    [Fact]
-    public async Task A_late_version_of_a_record_does_not_take_back_the_open_row_its_key_holds()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_late_version_of_a_record_does_not_take_back_the_open_row_its_key_holds(bool inOneDrain)
     {
         var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false });
         var input = builder.KeyedInput<long, Trade>("trades", t => t.Id);
@@ -579,33 +581,50 @@ public class PartitionWatermarkTests
         var handle = circuit.Handle(input);
         var net = new Dictionary<Trade, long>();
 
+        // As whoever steps by hand must: until nothing is pending (the port may end a
+        // drain early).
         async Task StepAsync()
         {
-            await circuit.StepAsync().WaitAsync(Timeout);
-            while (circuit.Handle(output).Reader.TryRead(out var delta))
-                foreach (var (value, weight) in delta)
-                    net[value] = net.GetValueOrDefault(value) + weight;
+            do
+            {
+                await circuit.StepAsync().WaitAsync(Timeout);
+                while (circuit.Handle(output).Reader.TryRead(out var delta))
+                    foreach (var (value, weight) in delta)
+                        net[value] = net.GetValueOrDefault(value) + weight;
+            }
+            while (circuit.HasPendingInput);
         }
 
-        // Trade 7 at 200 s; the watermark is at 180 s, so it is open.
-        await handle.UpsertAsync(new Trade(7, 200_000, 1));
+        // Trade 8 at 210 s puts the watermark at 180 s; trade 7 at 200 s is open. It is
+        // read in a step before its late version, or — a backlog after a takeover — in
+        // the same drain of the channel.
         await handle.UpsertAsync(new Trade(8, 210_000, 1));
         await StepAsync();
         Assert.Equal(T0.AddSeconds(180), circuit.CurrentWatermark);
+        await handle.UpsertAsync(new Trade(7, 200_000, 1));
+        if (!inOneDrain)
+            await StepAsync();
 
         // A version of trade 7 stamped 105 s: behind the watermark, late. Before round
         // five the input applied it — the open row's retraction passed, the late row's
-        // insertion was dropped, and trade 7 was gone from everything downstream.
+        // insertion was dropped, and trade 7 was gone from everything downstream. And
+        // where the two met in one step only the late one, the last command of its key,
+        // reached the input's operator: the open row was never delivered.
         await handle.UpsertAsync(new Trade(7, 105_000, 9));
         await StepAsync();
         Assert.Equal(1, circuit.LateRecords);
         Assert.Equal([new Trade(7, 200_000, 1), new Trade(8, 210_000, 1)], net.Where(row => row.Value != 0).Select(row => row.Key).OrderBy(t => t.Id));
 
-        // The row it holds is still the one an amendment amends and a delete deletes.
+        // The row it holds is still the one an amendment amends and a delete deletes —
+        // a delete followed in the same drain by a late version of the key included.
         await handle.UpsertAsync(new Trade(7, 200_000, 2));
         await StepAsync();
         await handle.DeleteAsync(8);
+        if (!inOneDrain)
+            await StepAsync();
+        await handle.UpsertAsync(new Trade(8, 110_000, 5));
         await StepAsync();
+        Assert.Equal(2, circuit.LateRecords);
         Assert.Equal([new Trade(7, 200_000, 2)], net.Where(row => row.Value != 0).Select(row => row.Key));
         Assert.All(net.Values, weight => Assert.InRange(weight, 0, 1));
     }

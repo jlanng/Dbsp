@@ -399,9 +399,12 @@ internal sealed class KeyedInputPort<TKey, TValue> : IInputPort, IDeadLetteringI
     private readonly InputEventTime<TValue>? _eventTime;
 
     // Under evictWhenFinal: the event time of the last upsert drained for each key in
-    // this drain, so that the drain can stop before one that begins a new record of a key
-    // (RecordEviction.Supersedes) — the two then never share a step, which is the only
-    // order a delta has. Cleared per drain.
+    // this drain (long.MaxValue for a delete or an upsert whose time could not be read,
+    // long.MinValue for an upsert that is late),
+    // so that the drain can stop before an upsert that must not share a step with what
+    // the key already has in it — one that begins a new record of the key
+    // (RecordEviction.Supersedes), and one that is itself late. A step's commands come to
+    // the last per key, which is the only order a delta has. Cleared per drain.
     private readonly RecordEviction<TValue>? _retention;
     private readonly Dictionary<TKey, long>? _upserted;
 
@@ -452,7 +455,12 @@ internal sealed class KeyedInputPort<TKey, TValue> : IInputPort, IDeadLetteringI
         {
             // An input that forgets its final rows looks at an upsert before it takes it:
             // one that begins a new record of a key this drain has already upserted stays
-            // in the channel for the next step.
+            // in the channel for the next step. So does a late one — behind the watermark,
+            // which does not move within a drain and never falls, so the next step finds
+            // it late too — of a key this drain already has a command for: the input's
+            // operator does not apply a late upsert, and as the last command of its key
+            // in the step it would stand in for the on-time upsert or the delete before
+            // it, which would then never be applied.
             var time = long.MinValue;
             if (_upserted is not null)
             {
@@ -461,7 +469,8 @@ internal sealed class KeyedInputPort<TKey, TValue> : IInputPort, IDeadLetteringI
                 if (next is { IsDelete: false, Error: null, Rejection: null }
                     && _retention!.TryEventTicks(next.Value!, out time)
                     && _upserted.TryGetValue(next.Key, out var before)
-                    && _retention.Supersedes(before, time))
+                    && before != long.MinValue
+                    && (_retention.Supersedes(before, time) || time < _retention.Clock.FrozenTicks))
                     break;
             }
             if (!_channel.Reader.TryRead(out var entry))
@@ -510,10 +519,14 @@ internal sealed class KeyedInputPort<TKey, TValue> : IInputPort, IDeadLetteringI
 
             if (_upserted is not null)
             {
-                if (entry.IsDelete)
-                    _upserted.Remove(entry.Key);
-                else if (time != long.MinValue)
-                    _upserted[entry.Key] = time;
+                // Nothing supersedes long.MaxValue: after a delete, or an upsert with no
+                // time, the next upsert of the key is cut off only if it is late.
+                // A late upsert is marked long.MinValue: it is applied nowhere, so whatever
+                // follows it in the drain may replace it (a run of late versions of one
+                // key is then one step, not a step each; it is counted late once).
+                _upserted[entry.Key] = entry.IsDelete || time == long.MinValue ? long.MaxValue
+                    : time < _retention!.Clock.FrozenTicks ? long.MinValue
+                    : time;
             }
 
             var target = _routingHash is null ? 0 : (int)(_routingHash(entry.Key) % (uint)workers.Length);
