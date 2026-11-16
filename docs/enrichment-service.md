@@ -697,7 +697,9 @@ and gives it its config:
 The first two are connectors the example's host registers; the third is built in, as
 are `files` and `memory` ([below](#the-built-in-connectors)). A spec may also carry
 `tables` (table slot → declared table, so one definition can read `sanctions` here and
-`credit-watch` there), `circuit` (workers, checkpoint interval, `errorPolicy`),
+`credit-watch` there), `circuit` (workers, checkpoint interval, `errorPolicy`,
+`maxEventTimeAhead`, and `maxStateEntries`: the most state the pipeline may hold, see
+*A limit on a pipeline's state* under [*Bounding a join over a stream of facts*](#bounding-a-join-over-a-stream-of-facts)),
 `deadLetters` (a connector config: where dropped records are kept) and `restart` (how
 many faults in how long before the pipeline is `Failed`).
 
@@ -909,10 +911,10 @@ public class TradeEnrichmentTests
 
 | | |
 |---|---|
-| `PipelineTestHarness.For<TDefinition>()` | then `.Settings(json)`, `.Table(definition, rows, name)`, `.BindTable(slot, table)`, `.ErrorPolicy(…)`, `.Workers(n)`, `.Services(provider)`, and `.StartAsync()` |
+| `PipelineTestHarness.For<TDefinition>()` | then `.Settings(json)`, `.Table(definition, rows, name)`, `.BindTable(slot, table)`, `.ErrorPolicy(…)`, `.Workers(n)`, `.MaxStateEntries(n)`, `.Services(provider)`, and `.StartAsync()` |
 | `Input<T>(slot)`, `KeyedInput<TKey, TValue>(slot)` | the core's input handles: `InsertAsync`, `RemoveAsync`, `UpsertAsync`, `DeleteAsync` |
 | `Table(definition, name)` | `UpsertAsync(rows)`, `DeleteAsync(keys)` — one table version each — and `Rows`, which is also how a derived table (`ToTable`) is read |
-| `StepAsync()` | one step over everything sent and changed since the last. A record that faults the circuit is thrown from here. |
+| `StepAsync()` | one step over everything sent and changed since the last. A record that faults the circuit is thrown from here, and so is `StateLimitExceededException` once the state passes `.MaxStateEntries(n)`. |
 | `UpsertSink<TKey, TRow>(slot).Rows`, `AppendSink<T>(slot).Records` | what the slot's sink holds |
 | `DeadLetters`, `LateRecords`, `Watermark`, `Shape` | the records dropped so far; how many were dropped as late (behind the watermark: not dead letters); the event-time watermark; the slots and tables `Build` declared |
 | `StateSize` | `Entries` and `Stores` (entries by store name) as of the last step: assert that a definition's state returns to a bound under a long feed, as `The_state_holds_the_open_trades_…` above does |
@@ -2884,11 +2886,40 @@ pipeline starts from empty state and from where its inputs' bindings say, so dec
 with the reset what it should read again. Changing `openSeconds` afterwards is a
 setting and keeps the state.
 
+**A limit on a pipeline's state.** The flag says; it stops nothing. A spec that wants a pipeline stopped before it takes
+the node's memory sets `circuit.maxStateEntries` — the deploy form's *Running it* has
+the field:
+
+```json
+"circuit": { "workers": 1, "maxStateEntries": 5000000 }
+```
+
+The count is the pipeline's state entries, all stores together, as its page and
+`pipeline.state_entries` show them — the node reads it once a second for those, and
+the limit is judged on that reading, never by walking the state. When a reading is
+above the limit the pipeline is `Failed`, with the reason *holds N state entries, more
+than its limit of M (circuit.maxStateEntries)*, a fault of type
+`StateLimitExceededException` on its page, and the usual `pipeline.faults` count.
+Nothing else on the node is touched: its neighbours, the tables and the node's health
+go on as they were. It is not retried, because a restart resumes the same state and
+would pass the limit again at once. To go on: replace the spec with a higher limit
+and `state=keep` (it starts on its state), or reset it (`state=reset`), or fix the
+definition — what the flag above says is usually the reason.
+
+How to choose the number: the arithmetic above (entries per open record × records
+kept open), with room for a backlog; *Sizing a node* has bytes per entry. The limit is
+on entries, not bytes, so a pipeline whose records grow wider holds more memory under
+the same limit. A limit is judged once a second, so a pipeline can pass it by a
+second's worth of state before it is stopped. On a standby nothing is judged: the
+standby follows what the leader decided.
+
 **Testing it.** `PipelineTestHarness.StateSize` is the same count, by store and in all,
 after each step. Feed the definition far more event time than it keeps open and assert
 that the state comes back to the bound the arithmetic gives — the example's tests do
 that for every definition (`The_state_holds_the_open_trades_and_no_more_however_long_the_feed`
-above, and one per definition in `Pipelines.Tests`).
+above, and one per definition in `Pipelines.Tests`). `.MaxStateEntries(n)` holds a
+test to the limit a spec will set: a step after which the state holds more throws
+`StateLimitExceededException`, as the node would fail the pipeline.
 
 **What it does not cover.** `EvictWhenFinal` is offered on an event-time grouping and
 only for the table `Join`, `LeftJoin` and `Lookup`; an aggregate over facts keeps a
@@ -3028,12 +3059,24 @@ file or its four settings:
 | `System.GC.HeapCount` | `8`, or the node's cores if fewer | Each heap keeps memory ready of its own, and a heap per core on a large machine is more than twenty one-worker circuits fill. Four heaps held 0.3 GB less than eight and paused nearly three times as long |
 | `System.GC.ConserveMemory` | not set | It has the old generation compacted once that much of it is free space (at `5` a half, at `7` three tenths). It took a tenth off the leader's working set at a million rows — 3.1 GB at `5` and 3.0 GB at `7` for 3.4 GB, and 6.0 and about 5.2 GB for 6.7 GB at the peak — and nothing at five million in the steady state. The state fill, a backlog of a million orders through four stateful pipelines, took a sixth longer in some runs of every setting, more of them the more was conserved (one of seven without, three of seven at `5`, seven of nine at `7`); the slower runs also tended to follow the largest ones, so the setting's part in it is not established. A setting that asks for full blocking collections was not taken on that evidence; a node that wants the memory sets it |
 
-Two things about pauses. A full blocking collection takes 0.1 to 0.15 s per gigabyte of
-heap on eight heaps, and a bulk load is where they happen: loading five million rows
-into an empty node, the leader stood still for 1.7 to 2.2 s at a time — with these
-settings and without them. It leads nothing that anybody waits for at that moment, but
-`TakeoverAfter` (3 s) is not far off: load tables of that size before the standby is
-started, or raise it for the load. `ConserveMemory`, where it is set, asks for such
+Two things about pauses. A bulk load is where the long ones happen, and there are two
+kinds. The young generations fill with rows that survive, and one collection copies
+them all: on four cores, gigabytes copied at about a millisecond a megabyte, 1.4 to
+2.4 s at four and five million rows. A table's writer paces a large load so that this
+does not happen (`SharedTableOptions.LoadPacing`, on unless a table's options set it to
+null): once a run of commits has written 100,000 changes it asks for a young collection
+every 128 MB the process allocates, so each copy is a step's worth. Measured on four
+cores, loading three million rows the leader's longest stop went from 0.55–0.81 s to
+0.19–0.20 s and the load took 5 % longer; four million, from 1.5–1.9 s to 0.3–0.8 s.
+The other kind it does not touch: a full blocking collection, 0.1 to 0.15 s per
+gigabyte of heap on eight heaps and longer on fewer cores, which the collector makes
+when the process's memory stands near its high-load threshold — 90 % of the machine's
+or the container's memory. Loading five million rows (6.5 GB) where that left about a
+gigabyte spare, the leader stood still for 3.1 to 3.8 s with pacing and without it,
+past `TakeoverAfter` (3 s). Above 85 % of the threshold the writer asks for nothing,
+because a collection asked for there is the collector's cue for the full one. That is
+the node's size, not the load's speed: give it the memory *The arithmetic* asks for,
+or load a table of that size before the standby is started. `ConserveMemory`, where it is set, asks for such
 collections when the heap is fragmented; none was seen in two minutes of steady load
 with a twentieth of the rows rewritten, and a node with tens of gigabytes that churns
 should measure its longest pause before setting it (`GC.GetGCMemoryInfo(GCKind.FullBlocking)`,

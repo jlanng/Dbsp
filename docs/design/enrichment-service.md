@@ -1639,7 +1639,10 @@ numbers are the items' own, from the runs they cite.
    minutes by default, MSK's too). Decide the value, and with it whether a leader that
    takes the log again in place — specified in 67, not built — is wanted at all.
 4. **Failover timing: `TakeoverAfter` 3 s, the ceiling 30 s** (32, 61, 75). A bulk
-   load of five million rows stops a leader for about 2 s (61), close to the 3 s; a
+   load is paced since round five (61), so its young collections stop a leader for a
+   fifth of a second; a node loaded close to its memory still gets a full blocking
+   collection of seconds — measured at 3.1 to 3.8 s for five million rows on four
+   cores with a gigabyte spare — which the 3 s does not cover; a
    standby takes more than a processor for about ten seconds per broker lost (75: see
    the item for what the fourth review's step found and did). A broker lost in the same
    moment as the leader is a failover of ten seconds, thirteen to fifteen if it was the
@@ -2058,10 +2061,15 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     wherever a row's size goes with its key — or needs a full scan to avoid that.
 61. **A bulk load can stop the leader for two seconds** (S7, measured at five million
     rows: a full blocking collection of a heap growing through 7 to 13 GB; the same
-    with the settings before this step). `TakeoverAfter` is 3 s. Nothing was done
-    about it. *Alternatives:* load a large table before the standby is started;
-    raise `TakeoverAfter` for the load; or have the table writer pace a bulk load —
-    which is the one that needs building.
+    with the settings before this step). `TakeoverAfter` is 3 s. *Alternatives:* load
+    a large table before the standby is started; raise `TakeoverAfter` for the load;
+    or have the table writer pace a bulk load. **Built in round five (B2, S9):** the
+    writer paces a large load (`SharedTableOptions.LoadPacing`), which takes the
+    long young collections away (three million rows: the longest stop 0.55–0.81 s →
+    0.19–0.20 s, the load 5 % longer). It does not take away a full blocking
+    collection the collector makes because the process is near its memory threshold,
+    which is what five million rows on this round's machine measured (3.1–3.8 s
+    either way): that is sizing, and stays a limit. `TakeoverAfter` was not raised.
 62. **Eight heaps, fixed in the node's settings** (S7), four in the example.
     *Alternative:* leave the count to the runtime (a heap per core): on this machine's
     twenty cores that was not run with the rest of the settings, and the adaptive mode
@@ -2155,7 +2163,8 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     then always be degraded, and the readiness probe is not the place); a per-spec
     limit on state entries (`circuit.maxStateEntries`) that faults the pipeline when
     passed — a tenant's choice, cheap to add on the same counts, not built for want of
-    a number anybody has asked for.
+    a number anybody has asked for. **Built in round five (B3, S9):**
+    `circuit.maxStateEntries`; the flag stays as it was.
 71. **A trade id reused after its trade is final is a new trade** (S8): nothing is
     retracted for the old one, so an upsert sink keyed by the id overwrites the old row,
     or keeps it if the new trade is filtered out. *Alternative:* an id that must stay
@@ -7736,3 +7745,107 @@ builds.
   admin UI tests (no Chrome on this machine; `app.js` gained one line of text, the
   reason `format-level`). CI has not run since the account's billing stopped it, so
   the workflow's new step (build the older node from history) has never run.
+
+#### Paced bulk loads and a limit on a pipeline's state (B2, B3)
+
+**B2, what a large load stops.** The scale rig gained `--load-only` (one node, the
+table loaded through its writer, nothing after) and `--no-pacing`, and its nodes log
+the collector's own account: each gen2 with the runtime's reason and kind, each pause
+over 200 ms with its generation and the memory load. On this round's machine (four
+cores, its memory moving between 15.6 and 11.6 GB while the runs were made, about
+3 GB of it the connector stack) that account said two things about the stops
+(`runs/2026-11-16-b2-exploration.txt`):
+
+- *Young collections that copy gigabytes.* Under eight server heaps the young
+  generations fill with rows that survive, and one collection copies them into the
+  old generation: a gen1 holding 3.4 GB took 2.4 s at five million rows, one took
+  1.4 s at four. That is the load's to fix. Waiting between commits does nothing (the
+  collector runs on bytes allocated, not on time: a load at half speed stopped as
+  long); asking for a young collection every step of allocation bounds each copy.
+- *Full blocking collections under memory pressure.* The multi-second stops at five
+  million were compacting gen2s the collector chose because the memory load stood at
+  its high-load threshold (reason AllocSmall, blocking, at 11,321 of 11,321 MB). The
+  table is 6.5 GB live; on a machine of 12 GB with 3 GB taken there is no pace at
+  which it fits beneath the threshold, and a collection asked for there is the
+  collector's cue for the full one (an induced gen1 became a 3.5 s gen2).
+
+**Built.** `SharedTableOptions.LoadPacing` (`Tables/TableLoadPacing.cs`), on by
+default, null for off. Once a run of commits — commits with no gap of more than
+`QuietGap` (2 s) between them — has written `LargeAfterChanges` (100,000) changes,
+the writer calls `GC.Collect(1, Forced, blocking, not compacting)` after a commit
+whenever the process has allocated `StepBytes` (128 MB) since the last; above
+`MemoryLoadCeiling` (85 %) of the collector's high-load threshold it asks for nothing
+and counts the step as skipped. It runs inside the commit, after the version is
+published, under the commit gate, so it covers `CommitAsync`, `ReplaceAllAsync` and a
+derived table's writes alike, and never delays what readers see. A follower (a
+standby applying the log) is not paced: its stops move no leadership. What it did is
+`TableWriter.Pacing` (steps, skipped, time in them), which the rig reports.
+`TableLoadPacingTests` (5) hold when it acts and when it does not.
+
+**Measured** (`runs/2026-11-16-b2-paced-load.tsv`, its collector log beside it):
+before and after alternated, `--load-only`, the leader's longest stall during the load.
+
+| rows | before (no pacing) | after | load before → after |
+|---|---|---|---|
+| 3,000,000 (three runs each) | 554 / 742 / 810 ms | 190 / 192 / 200 ms | 36.5–36.6 s → 38.2–39.1 s |
+| 4,000,000 (two each) | 1,533 / 1,891 ms | 308 / 775 ms | 47.9–49.8 s → 51.5–51.6 s |
+| 5,000,000 (two each) | 3,061 / 3,502 ms | 3,299 / 3,759 ms | 63.8–64.6 s → 66.1–66.7 s |
+
+Three million is the largest this machine held without the collector's high-load
+mode: there the stops are young collections, and pacing takes the longest from about
+0.7 s to 0.2 s for 5 % on the load's time (73 steps, about 100 ms each). At four
+million the machine had shrunk to 12.3–13.5 GB: one run reached the ceiling for 18
+of its steps and kept a 0.78 s stop, the other 0.31 s. At five million every run,
+with or without pacing, had a full blocking collection of 3.1 to 3.8 s when the
+memory load reached the threshold (45 steps skipped in each paced run) — past
+`TakeoverAfter`. So the plan's "done when" — five million rows with the leader's
+longest stop well under the timeout — is **not shown**: this machine cannot hold five
+million rows without memory pressure, and under memory pressure pacing changes
+nothing. `TakeoverAfter` was not raised (decision 11's spirit; the plan said so).
+
+**Left (B2).**
+
+- *Five million rows on a machine that holds them.* The S7 machine (20 cores, enough
+  memory for two such nodes) stopped for 1.7 to 2.2 s in a full blocking collection
+  that was not memory pressure; what reason the collector gave there was not logged,
+  and whether pacing takes it away is not known. The run to make: `--load-only --rows
+  5000000` with and without `--no-pacing` where 9 GB are free for the node, and the
+  `gc` lines of its stderr for the reason of any blocking gen2.
+- *Near the threshold a node stops for seconds whatever the pace.* A container sized
+  at 1.35 times what the node holds (the guide's arithmetic) has its threshold at
+  90 % of the limit; a load that takes it there gets a full blocking collection,
+  measured here at 3.1–3.8 s for 6.5 GB on four cores — 0.1 to 0.15 s a gigabyte on
+  the S7 machine. The guide says so under *The collector's settings*: it is sizing.
+- *Large-object garbage from the table log.* Each version's change records are
+  copied into arrays of up to `MaxRecordBytes` (~900 KB) and the chunk buffer grows
+  afresh per version: about 84 MB/s of large-object garbage during a load, collected
+  only by gen2s, and part of what brings the memory load to the threshold. Changing
+  the chunk size changes no format (the reader takes any number of chunks) but was
+  not done or measured.
+- *The steps are a collector's knob in a library.* They are the only collections the
+  engine itself asks for; `MemoryKeeper` is the service's. A host that wants none sets
+  `LoadPacing = null` on its tables' options.
+
+**B3, a limit on a pipeline's state.** `PipelineCircuitOptions.MaxStateEntries`
+(`circuit.maxStateEntries`, null for none, below 1 refused at the dry run). The
+supervisor's sampler already reads every pipeline's `EstimateSize()` once a second for
+the status and the growth flag; on the leader, a running generation whose reading is
+above its spec's limit is faulted there (`Generation.Faulted` with
+`StateLimitExceededException`), its watcher tears it down, and `HandleFault` makes the
+pipeline `Failed` with the exception's text as the reason (*holds N state entries,
+more than its limit of M (circuit.maxStateEntries) …*) — not `Backoff`, because a
+restart resumes the same state and would pass at once. A replace with a higher limit
+and `state=keep` runs it on its state. Nothing else is touched: the growth flag is
+unchanged and still flags; health, tables and other pipelines are not involved. A
+standby judges nothing. The deploy form's *Running it* has the field; the harness has
+`.MaxStateEntries(n)`, judged on `StateSize` after each step, throwing the same
+exception from that step and every later one. `StateLimitTests` (4): three pipelines
+of one definition on one node, one with a limit it passes — it is `Failed` with the
+reason and one fault, not retried two seconds on — and its two neighbours (no limit,
+a limit far off) run on, unrestarted, without a fault, delivering every trade sent
+after; a raised limit with `state=keep` runs it again; a limit of 0 refused at the
+dry run; the harness.
+
+**Left (B3).** The limit is on entries, not bytes, and judged once a second, so a
+pipeline can pass it by a second's growth before it is stopped. The admin UI tests
+were not run (no Chrome here); `forms.js` gained one field.

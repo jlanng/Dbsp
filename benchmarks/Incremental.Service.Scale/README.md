@@ -55,7 +55,13 @@ Then, in order:
     follow — time to lead and to the first record in every sink.
 
 `--single` stops after step 4, kills the node and does step 10: for a table this
-machine cannot hold twice.
+machine cannot hold twice. `--load-only` stops after step 2: one node and the table's
+load, what item 61 of the design is about — five million rows need about 9 GB free
+for the node alone (6.5 GB live, 8 to 9 GB of working set at the end of the load), and
+a machine with less than that over the collector's high-load threshold (90 % of its
+memory) measures the collector's answer to memory pressure, not the load.
+`--no-pacing` loads the table without the writer's load pacing
+(`SharedTableOptions.LoadPacing`): the "before".
 
 ## Reading the numbers
 
@@ -73,6 +79,16 @@ machine cannot hold twice.
   node stood still (a thread that asks every 5 ms), whatever stopped it;
   `full-blocking-collections` are the collections that stop a node for as long as its
   heap is large.
+- `leader.load.longest-stall` is the longest the leader stood still while the table was
+  loaded (the stall meter marked at the load's start), beside `leader.load.gc-pause-total`,
+  `leader.load.gen2-collections`, `leader.load.last-full-blocking-pause` (0 when none ran
+  in the load) and `leader.load.paced`: the young collections the table's writer asked
+  for, the time in them, and the steps it did not take because memory was above the
+  pacing's ceiling. Each node's stderr log has the collector's own lines (`gc …`): every
+  gen2 with the runtime's reason and kind (0 blocking, 1 background), every pause over
+  200 ms with its generation and the memory load against the high-load threshold.
+  `SCALE_GC_EVERY=1` in the rig's environment logs every collection, and the large
+  objects allocated by type.
 - `table.estimated-by-the-node` and `state.estimated-by-the-node` are what the node
   itself reports that it holds (`TableStats.Memory`, `PipelineStatus.StateSize`),
   beside what the heap grew by: `leader.heap-after-load` and

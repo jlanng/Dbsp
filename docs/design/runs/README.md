@@ -267,3 +267,24 @@ INCREMENTAL_OLDER_BUILD=<dir>/tests/Incremental.Service.FailoverApp/bin/Debug/ne
 
 Without the variable the test skips. A 4-processor cloud VM, 15 GB; Kafka 3.9.0 in a
 container on the same machine.
+
+## 2026-11-16, paced bulk loads (B2)
+
+`docs/design/enrichment-service.md`, *As built*, S9, *Paced bulk loads*.
+
+- `2026-11-16-b2-paced-load.tsv` — the measured series: the scale rig's `--load-only`
+  at three, four and five million rows, `--no-pacing` (before) and without (after),
+  alternated, on the build of the B2 commit. One line per run: the load's time, the
+  leader's longest stall during the load (`leader.load.longest-stall`), the collector's
+  pauses, the young collections the writer asked for and those it did not ask for
+  because memory was above the ceiling, and the machine's total memory at the end of
+  the run (it moved: 14.7 to 11.6 GB).
+- `2026-11-16-b2-paced-load.gc.log` — those runs' collector lines (the rig's `GcLog`):
+  each gen2 with its reason and kind, each pause over 200 ms. The last two pauses of a
+  run are the rig's own forced collections after the load.
+- `2026-11-16-b2-exploration.txt` — the runs before the pacing was built, what was
+  tried, and what the collector said the stops were.
+
+Each run: from `benchmarks/Incremental.Service.Scale/bin/Release/net10.0`,
+`dotnet Incremental.Service.Scale.dll run --rows <N> --load-only [--no-pacing] --out <file>`,
+on a 4-core machine with the connector stack up.

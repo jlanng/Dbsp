@@ -1,0 +1,55 @@
+B2, paced bulk loads: the runs made before the pacing was built, to find what stops a
+leader during a large load (docs/design/enrichment-service.md, S9, "Paced bulk loads").
+The scale rig with --load-only (one node, the table loaded through its writer in
+versions of 20,000 rows, nothing after), on this machine: 4 cores, its memory moving
+between 15.6 and 11.6 GB total while the runs were made, the connector stack up (about
+3 GB of it). Made with the rig's load loop changed by hand for each experiment
+(SCALE_LOAD_EXPERIMENT; not committed); "none" is the code before pacing.
+
+run           rows  experiment                                        load ms  longest stall ms  full blocking in the load
+base-5m-1     5M    none                                               68229   3465.5            3465 ms
+base-5m-2     5M    none                                               61221    921.3            none
+base-5m-3     5M    none                                               64277   3772.5            3775 ms
+d5m-none      5M    none (every collection logged)                     64485   3768.9            3772 ms
+e-sleep1      5M    sleep as long as each commit took, after it       112667   3604.8            3608 ms
+e-gc1-256     5M    a gen1 collection every 256 MB allocated           67646   3520.5            3524 ms (induced, escalated)
+e-bgc512      5M    a background gen2 asked for and waited on
+                    whenever the heap had grown 512 MB since the last  81425   3933.2            3936 ms
+b3m-1         3M    none                                               35898    441.6            none
+b3m-2         3M    none                                               35969    557.4            none
+x3m-sleep-1   3M    sleep as long as each commit took                  65031    551.2            none
+x3m-gc0-128   3M    a gen0 collection every 128 MB                     38483    362.6            none
+x3m-bgc-256   3M    background gen2 waited on every 256 MB of growth   45474    625.3            none
+y3m-gc1-256   3M    a gen1 collection every 256 MB                     38386    294.7            none
+b4m-1         4M    none                                               48165   1369.8            none
+y4m-none      4M    none                                               50815    789.4            none
+y4m-gc1-256   4M    a gen1 collection every 256 MB                     51006    472.3            none
+
+What the collector logged (the rig's GcLog: every gen2 with the runtime's reason and
+kind, every pause over 200 ms; d5m-none every collection):
+
+- The long young pauses are copies. Under eight server heaps the young generations
+  filled to gigabytes of rows that survive, and one collection copied them: in d5m-none
+  a gen1 with 3,376 MB in it took 2,444 ms; in b4m-1 a gen1 took 1,374 ms. Waiting
+  between commits (sleep) changes nothing: the collector runs on bytes allocated, not
+  on time. Asking for a young collection every step of allocation bounds the copy, and
+  gen1 rather than gen0 (with gen0 the survivors piled up in gen1 instead).
+- The multi-second stops at five million are blocking compacting gen2s the collector
+  chose because the machine's memory load stood at its high-load threshold (reason 0,
+  AllocSmall, kind 0: d5m-none at load 11,321 of 11,321 MB, 3,772 ms; e-gc1-256's own
+  induced gen1 turned into a 3,524 ms gen2 at 10,768 of 11,140 MB). The table is
+  6.5 GB live; the machine had about 3 GB in other processes and 11 to 12 GB in all
+  while these ran. No pace changes what the table needs, and a collection asked for
+  there is the collector's cue to make the full one.
+- A full compacting collection of the loaded 5M table costs 2.1 to 2.3 s on these four
+  cores whenever it happens (the rig's own forced collections after each load).
+- The large-object heap gains ~84 MB/s of garbage during the load: the table log's
+  change records (each chunk up to MaxRecordBytes, copied to an array of its own,
+  ~900 KB) and the chunk buffer's growth. It is collected by the background gen2s
+  (reason 4) and reached 933 MB before the full collection in d5m-none. Not changed
+  in this step.
+
+The pacing that was built (TableLoadPacing: a gen1 every 128 MB once a run passes
+100,000 changes, nothing above 85 % of the high-load threshold) was then measured
+before and after: 2026-11-16-b2-paced-load.tsv, its collector log
+2026-11-16-b2-paced-load.gc.log.

@@ -150,7 +150,9 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   minutes at a million rows, and it needs the memory (its README says how much). Run it
   after changing anything a takeover or a standby does; the numbers of record are in
   docs/design/enrichment-service.md (S6, *Scale*; S7, *Memory*). `--memory-only` stops
-  after the steady load (memory figures, no failover); `--gc` overrides the nodes'
+  after the steady load (memory figures, no failover); `--load-only` after the table's
+  load (one node: the load's time and the leader's longest stall, `--no-pacing` for
+  the writer without load pacing); `--gc` overrides the nodes'
   collector settings (`node`, the default, is `src/Incremental.Service/Node.Gc.props`;
   `round2`, `stock`, or `name=value` pairs); the working set over time is in
   `<out>.timeline.tsv`. Run it after changing what a node holds or how it gives memory
@@ -295,6 +297,16 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   young-generation collections. The keeper never asks for a full blocking collection
   (seconds on a leader with a large heap), and `MALLOC_ARENA_MAX` is not the fix (it
   more than doubled a state fill).
+- A table's writer paces a large load (`SharedTableOptions.LoadPacing`,
+  `Tables/TableLoadPacing.cs`; docs/design/enrichment-service.md, S9, B2): past
+  100,000 changes in a run it asks for a young (gen1, not compacting) collection every
+  128 MB allocated, so no young collection copies gigabytes of rows at once (measured:
+  1.4–2.4 s stops at four and five million rows without it). Two things must stay: it
+  never asks for a gen2, and it asks for nothing above its memory ceiling — near the
+  collector's high-load threshold any collection asked for becomes a full blocking
+  one (seen: an induced gen1 turned into a 3.5 s gen2). It runs after the version is
+  published, never before. A stop that remains near the threshold is the node's size,
+  not the writer's to fix. The scale rig's `--load-only [--no-pacing]` measures it.
 - What a node says it holds is estimated from samples taken as rows and entries are
   written or read, never by walking a table or a store: `SharedTable.EstimateMemory`,
   `ChangelogStorageProvider.EstimateSize` (`Diagnostics/ObjectSize.cs`). A sampler and
@@ -621,7 +633,13 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   - A pipeline whose state only grows is flagged (`StateGrowth`,
     `ServiceOptions.StateGrowthAlarmAfter`): from the entry count the sampler already
     reads, a fixed ring per pipeline — never by walking a store. It flags; it does not
-    change health or stop anything (Open for James 70).
+    change health or stop anything (Open for James 70). The one thing that stops a
+    pipeline for its size is the spec's own `circuit.maxStateEntries`, judged on the
+    same reading (`NoteLimit`), on the leader, against a running generation: past it
+    that generation is faulted with `StateLimitExceededException` and the pipeline is
+    `Failed`, never retried (a restart resumes the same state), and nothing else is
+    touched. `PipelineTestHarness.MaxStateEntries` judges `StateSize` the same way.
+    `StateLimitTests` is the check.
   - A table, plugin or pipeline that fails is that thing's failure: shown, retried, never
     thrown out of a takeover callback. Only the catalog and the storage may fail a node.
   - Nothing waits without a bound, and nothing holds another pipeline's queue: teardown is
