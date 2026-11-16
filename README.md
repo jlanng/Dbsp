@@ -450,7 +450,12 @@ so implementations never see cross-thread access to one store.
   `Incremental.Service.Testing`) tests a definition with no node. A plugin compiles
   against `Incremental.Service.Abstractions` and the core only — nothing of hosting or
   Kafka — and a host can give the `kafka` connector a record format of its own (Avro,
-  a schema registry's framing) through `IRecordFormat`. See *Running many pipelines* in
+  a schema registry's framing) through `IRecordFormat`. Nodes are upgraded one at a
+  time, even across a change of a persisted format (format levels: the leader writes
+  what its standby reads until both read the newer); event time declared on an input
+  is kept per partition of a topic, and a record stamped beyond a bound in the future
+  is a record in error; a spec can cap a pipeline's state entries; and the guide has
+  the recipe for the two nodes on Kubernetes. See *Running many pipelines* in
   [docs/intro.md](docs/intro.md) and
   [docs/design/enrichment-service.md](docs/design/enrichment-service.md), *As built*.
 

@@ -1613,83 +1613,114 @@ Everything else they raised is in the text above.
 
 Each has a default this design is built on.
 
-### Decide before production
+### Decided
 
-Chosen from the numbered items below by what a wrong default costs once something is deployed:
-persisted formats, upgrade rules, availability and data-loss trade-offs, exposure, and
-claims only AWS can check. Each was checked against the code in round four (S8); the
-numbers are the items' own, from the runs they cite.
+James's decisions, recorded in `enrichment-service-next-steps.md` and not reopened.
+The items they settle say so in place (*Decided, D…*). Decision 10 makes every built
+default the decision for the items it does not name.
+
+Decided 2026-11-14:
+
+- **D1.** The standby stays warm: a plugin's `Build` runs on both nodes (1, 30).
+- **D2.** The durable Kafka logs stay JSON with zstd, not the dense codec.
+- **D3.** The admin defaults stay: row data off, code upload off, a caller on loopback
+  may name itself (4, 5, 25).
+- **D4.** Keyed inputs expire by event time only: no processing-time expiry, no cap on
+  keys (69).
+- **D5.** A `files` input onto what a `files` sink writes stays refused (63).
+- **D6.** Plugins are written by James's own teams: trusted code in the service's
+  process is the model, and there is no sandboxing (*Trust*, under *Plugins*; *Out of
+  scope*).
+- **D7.** MSK authentication will be IAM. Checking anything on AWS (MSK, IAM, real S3)
+  is put off: it stays a stated limit, and no script or checklist is built for it now
+  (33, 47, 48, 51, 59; *Before production* 7).
+- **D8.** The work stays a branch. No pull request; James merges.
+- **D9.** Round five is the last: build and review what its plan lists, report, stop.
+- **D10.** For every open item not named here, the built default stands.
+
+Decided 2026-11-15:
+
+- **D11.** The writer's transaction timeout stays five minutes (67). Measured with two
+  of three brokers away for 70 s: at 60 s the leadership moved in 4 runs of 6, at five
+  minutes in none of 6.
+- **D12.** A record that arrives behind the watermark is dropped and counted, as built:
+  not dead-lettered, not a fault.
+- **D13.** Production runs on Kubernetes (EKS) (50; *Before production* 5). The guide
+  has the recipe (*Operating it*, *On Kubernetes (EKS)*), not yet run on EKS (D7).
+
+### Before production
+
+What each item that a wrong default would make costly once deployed came to. Round five
+settled them (*Decided*, above); what still has to be done before production is in bold
+at the end of each.
 
 1. **Upgrades roll, one node at a time, and a format level once raised is not
    lowered** (31; built in round five, S9). A node reads every persisted format up to
    its build's level and writes the level its deployment is at; the leader raises it
    when its standby says it reads the higher one. Until then the older build can lead
-   again; afterwards it cannot. Decide how long a new build is on probation before the
-   raise (`ServiceOptions.HoldFormatLevel`; the default is no time at all: the raise
-   follows the second node's upgrade by a second), and never run two nodes without
-   probe addresses through an upgrade without it. The cost that stays: every format a
-   build has shipped needs its reader kept for ever.
-2. **The `files` connector's formats are persisted** (22, 54, 63). Object names
-   (`{step:D19}-{term:D6}-{base:D19}.jsonl`) and the source's position packed into the
-   checkpoint's partition → offset map are what deployed pipelines resume from; changing
-   either later means a new connector name and moving every spec to it. A `files` input
-   on a `files` sink's prefix is refused, so pipelines are chained through Kafka or a
-   table until the sink gets a commit marker.
-3. **The writer's transaction timeout is five minutes** (67;
-   `KafkaLogOptions.TransactionTimeout`; 60 s until S8). It is how long an outage of the
-   brokers a leader rides out; past it the leader's writer usually ends and the standby
-   leads, nothing lost (ten of fourteen runs at 60 s, and what decides is established:
-   S8). A longer timeout costs a transaction left open for that long only when no node
-   of the deployment runs; the brokers cap it (`transaction.max.timeout.ms`, fifteen
-   minutes by default, MSK's too). Decide the value, and with it whether a leader that
-   takes the log again in place — specified in 67, not built — is wanted at all.
-4. **Failover timing: `TakeoverAfter` 3 s, the ceiling 30 s** (32, 61, 75). A bulk
+   again; afterwards it cannot. The default is no probation (the raise follows the
+   second node's upgrade by a second; D10); `ServiceOptions.HoldFormatLevel` holds it.
+   The cost that stays: every format a build has shipped needs its reader kept for
+   ever. **To do: choose per release whether a new build is held, and give every node
+   its probe address.**
+2. **The `files` connector's formats are persisted** (22, 54, 63; D5, D10). Object
+   names (`{step:D19}-{term:D6}-{base:D19}.jsonl`) and the source's position packed into
+   the checkpoint's partition → offset map are what deployed pipelines resume from;
+   changing either later means a new connector name and moving every spec to it. A
+   `files` input on a `files` sink's prefix stays refused, so pipelines are chained
+   through Kafka or a table. **Nothing to do.**
+3. **The writer's transaction timeout is five minutes** (67; D11). It is how long an
+   outage of the brokers a leader rides out; past it the leader's writer usually ends
+   and the standby leads, nothing lost. The brokers cap it
+   (`transaction.max.timeout.ms`, fifteen minutes by default, MSK's too). A leader that
+   takes the log again in place (specified in 67) is not built (D10). **Nothing to do,
+   unless the production cluster's cap is below five minutes.**
+4. **Failover timing: `TakeoverAfter` 3 s, the ceiling 30 s** (32, 61, 75; D10). A bulk
    load is paced since round five (61), so its young collections stop a leader for a
    fifth of a second; a node loaded close to its memory still gets a full blocking
    collection of seconds — measured at 3.1 to 3.8 s for five million rows on four
-   cores with a gigabyte spare — which the 3 s does not cover; a
-   standby takes more than a processor for about ten seconds per broker lost (75: see
-   the item for what the fourth review's step found and did). A broker lost in the same
-   moment as the leader is a failover of ten seconds, thirteen to fifteen if it was the
-   active controller as well: the brokers' session timeout, which no setting of the
-   service shortens (S8). Decide the two timeouts for the production cluster, and
-   whether 75 must be fixed first.
-5. **Something must restart a node after exit codes 3, 4 and 5** (50). Without it a
-   deployment is one node after its first takeover; `NodeSupervisor` does it for a
-   process and, since S8, `NodeSupervisor.RunInProcessAsync` for the in-memory backend's
-   two nodes. Decide what does it in production (ECS, Kubernetes, systemd) with "start
-   again at once after 3 and 4, with a growing delay after 5".
-6. **The admin surface's exposure** (4, 5, 25, 30). With no authorization policy the API
-   answers loopback only; rows and exception messages are off; upload and rescan are
-   off; but a caller nobody authenticated may name itself (`AcceptOperatorHeader` is on),
-   and the audit then records `name (self-declared)`. Audit entries written under that
-   rule cannot be re-attributed later: decide the authorization policy, and whether the
-   header stays on, before the first operator uses it. Plugin code runs on both nodes
-   (warm standby builds).
-7. **What only AWS can verify** (33, 47, 48, 51, 59; the critic's J5). `UseMsk` is example
-   code that nothing calls; the IAM action table is translated from the ACLs tested on
-   `kafka-sasl`; the probe's broker question behind ACLs, token refresh over hours, a
-   zone loss has not been run; the S3 `IObjectStore` (round five, B5) has run against
-   MinIO only, never against S3 or with IAM. Controllers separate from
-   the brokers were run here in S8 (eight runs, one machine), not on MSK. MSK's default
-   configuration allows unclean leader election on clusters without tiered storage: the
-   log's own topics now refuse it for themselves (78), the cluster's default and the
-   sinks' topics are the operator's.
-   Decide who runs that check, on what cluster, and what has to pass.
-8. **Bounded state per tenant** (69, 70, 72). A keyed input without event time never
-   expires a row; a state that only grows is flagged and nothing more; the reference
-   definition's `openSeconds` defaults to an hour, about 9 GB of state per node at 1,000
-   trades a second. A per-spec limit on state entries is cheap to add on the existing
-   counts; decide whether production needs one, and the default window.
+   cores with a gigabyte spare — which the 3 s does not cover. A broker lost in the
+   same moment as the leader is a failover of ten seconds, thirteen to fifteen if it
+   was the active controller as well: the brokers' session timeout, which no setting
+   of the service shortens (S8). **To do: size nodes by the guide's arithmetic, so that
+   a load does not stand near the memory threshold.**
+5. **Something must restart a node after exit codes 3, 4 and 5** (50; D13). On EKS:
+   the host under `NodeSupervisor.RunAsync` as the container's entry point (the
+   kubelet's back-off does not tell the codes apart), a `StatefulSet` whose rollout
+   waits for `/health/ready?warm=true`, a disruption budget of one; the guide's
+   *On Kubernetes (EKS)*. **To do: run the recipe on EKS (D7 puts that off).**
+6. **The admin surface's exposure** (4, 5, 25, 30; D1, D3). With no authorization
+   policy the API answers loopback only; rows and exception messages are off; upload
+   and rescan are off; a caller nobody authenticated may name itself, and the audit
+   records `name (self-declared)`. Plugin code runs on both nodes (warm standby
+   builds). **To do: set the authorization policy before the admin API is published
+   beyond loopback.**
+7. **What only AWS can verify** (33, 47, 48, 51, 59; the critic's J5; D7). `UseMsk` is
+   example code that nothing calls; the IAM action table is translated from the ACLs
+   tested on `kafka-sasl`; the probe's broker question behind ACLs, token refresh over
+   hours, a zone loss have not been run; the S3 `IObjectStore` (round five, B5) has run
+   against MinIO only, never against S3 or with IAM; the Kubernetes recipe has not run
+   on EKS. Controllers separate from the brokers were run here in S8 (eight runs, one
+   machine), not on MSK. MSK's default configuration allows unclean leader election on
+   clusters without tiered storage: the log's own topics refuse it for themselves (78),
+   the cluster's default and the sinks' topics are the operator's. **To do, and put off
+   by D7: a run on MSK with IAM, S3 and EKS.**
+8. **Bounded state per tenant** (69, 70, 72; D4, D10). A keyed input without event time
+   never expires a row (D4); a state that only grows is flagged; a spec may set
+   `circuit.maxStateEntries` (built in round five, B3), and none is set by default; the
+   reference definition's `openSeconds` defaults to an hour, about 9 GB of state per
+   node at 1,000 trades a second. **To do: give tenants' specs a limit.**
 9. **Event-time state from before manifest format 7 is refused, not migrated** (36).
    *Moot for a first deployment:* only state committed by a build before format 7
-   (round three) is affected, and it needs `state=reset`. What remains is the precedent
-   for the next format change: refuse and reset, or migrate.
+   (round three) is affected, and it needs `state=reset`. Round five's format levels
+   (B6) answer the precedent: a later format change keeps a reader for the older
+   format and is rolled through an upgrade; a format that does not hold what the newer
+   one needs stays refused. **Nothing to do.**
 
-**Decide before a second tenant:** a failing pipeline never moves the leadership and
-`Failed` is not durable (6, 7); a `kafka` sink
-claims no topic, so two pipelines can overwrite each other's keys (40); a per-pipeline
-state limit (70); keep-or-reset asked for every change (9).
+**Before a second tenant** (the built defaults stand, D10): a failing pipeline never
+moves the leadership and `Failed` is not durable (6, 7); a `kafka` sink claims no topic,
+so two pipelines can overwrite each other's keys (40); keep-or-reset asked for every
+change (9). The per-pipeline state limit (70) is built.
 
 **Can wait:** 2, 3, 8, 12–19, 23, 24, 26, 27, 29, 35, 38, 41–45, 49, 52, 53, 55–58,
 60, 62, 65, 66, 68, 71, 73, 74, 76, 77, 79, 80, 81, 82.
@@ -1702,7 +1733,7 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
 
 ### The items
 
-1. *Moot (built, S6).* **Warm circuits on the standby** (default; built in S6 after S1 had taken the
+1. *Decided 2026-11-14 (D1): the standby stays warm.* *Moot (built, S6).* **Warm circuits on the standby** (default; built in S6 after S1 had taken the
    alternative — see item 30) — the standby loads plugin code and builds
    every confirmed circuit, as durability-and-standby.md specifies. It is what C1's
    layout marker and follower halves exist for. *Alternative:* the standby holds pipeline
@@ -1720,11 +1751,11 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
    *Alternative:* store a location (S3, a shared volume) and a hash. No plugin bytes in
    Kafka at all; the cost is a second storage system whose outage blocks a failover that
    needs a plugin the standby has not cached.
-4. **Row data, and exception messages, off in the admin API by default.** *Alternative:*
+4. *Decided 2026-11-14 (D3): stays.* **Row data, and exception messages, off in the admin API by default.** *Alternative:*
    on by default, which makes the first run friendlier and makes a host that enables
    remote access expose tenant rows unless someone remembers the switch. The example
    turns it on.
-5. **Loading code over the API off by default** (upload and rescan), with the plugin
+5. *Decided 2026-11-14 (D3): stays.* **Loading code over the API off by default** (upload and rescan), with the plugin
    directory at first lead as the ordinary route. *Alternative:* on whenever a
    `PluginPolicy` is set.
 6. **Pipelines failing never move leadership**; only a dead catalog writer does.
@@ -1814,7 +1845,7 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     *Alternative:* the incarnation in the object name. Dead letters would then survive
     a reset, and a reader would have to know which incarnation is the live one.
 
-25. **A caller nobody authenticated may name itself** (S6: `AcceptOperatorHeader`, on
+25. *Decided 2026-11-14 (D3): stays.* **A caller nobody authenticated may name itself** (S6: `AcceptOperatorHeader`, on
     by default; the audit records `name (self-declared)`). It makes the default,
     loopback configuration's audit tell operators apart, on their word.
     *Alternative:* off by default, so the audit says `local` until the host
@@ -1838,7 +1869,7 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
 29. **A file loader without a `path` is refused when the table is declared** (S6); it
     used to be accepted and fault the loader at its first run. *Alternative:* as
     before, which lets a table be declared ahead of knowing its file.
-30. **A standby builds every pipeline's circuit, so plugin code runs on it** (S6: the
+30. *Decided 2026-11-14 (D1, D6): stays; plugins are trusted code.* **A standby builds every pipeline's circuit, so plugin code runs on it** (S6: the
     definition's `Build` and the operators' constructors; never a step). It is this
     list's first item decided by measurement: without it a takeover decodes every
     pipeline's state, 2.7 s per million orders in the largest join. *Alternative:*
@@ -1863,7 +1894,7 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     one — which shortens the outage when a leader really is alive and stuck and leaves
     less room for a slow cluster; or a lower `broker.session.timeout.ms` on the
     brokers, which is the cluster's to set and is the floor under every figure here.
-33. **A refused group lookup is passed over, and no permission on a group is asked
+33. *Decided 2026-11-14 (D7): checked on AWS later, if at all.* **A refused group lookup is passed over, and no permission on a group is asked
     for** (S6). The broker's authorizer logs each refusal, about one a second per
     consumer. *Alternative:* require `Describe` on the three group names
     (`{prefix}.reader`, `{prefix}.svc.blobs.{node}`, `incremental.source`): a quiet
@@ -1967,7 +1998,7 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     ever (the second review's `execution-quality`). *Later in S7:* built — the stores
     count their entries, `EstimateSize()` reads the counts, and the pipeline's page, the
     pipelines list and two instruments show them.
-47. **Every Kafka client starts from the service's settings, not the client
+47. *Decided 2026-11-14 (D7, D10): stays; MSK unverified.* **Every Kafka client starts from the service's settings, not the client
     library's** (S7, `KafkaClientDefaults`): a reconnect delay of at most 1 s, a socket
     timeout of 6 s, a metadata refresh every 2 s. They are what keeps the loss of a
     broker under the takeover ceiling. *Alternative:* leave the library's defaults and
@@ -1976,7 +2007,7 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     longer than six seconds for a good reason is made again (the producers are
     idempotent), and each client asks for metadata every two seconds — a node with
     thirty clients sends fifteen small requests a second.
-48. **At the ceiling a standby asks each broker the metadata names whether it is
+48. *Decided 2026-11-14 (D7, D10): stays; MSK unverified.* **At the ceiling a standby asks each broker the metadata names whether it is
     there, and does not take the metadata's word** (S7, as changed by the third
     review: the controller's lists never change once the controller quorum is gone, and
     read "writable" through three of four two-broker outages). The question is a
@@ -1996,11 +2027,11 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     client fewer to recover, and a sink write that commits with its checkpoint; a sink
     on another cluster cannot use it, and a large step's sink records then ride in the
     writer's transaction.
-50. **`NodeSupervisor` is in `Incremental.Service` and the example uses it by default
+50. *Decided 2026-11-15 (D13): production is EKS; the guide has the recipe.* **`NodeSupervisor` is in `Incremental.Service` and the example uses it by default
     on Kafka** (S7). *Alternative:* document the contract only and leave restarting to
     the platform, as before; then the example, the rig and the tests each need
     something that restarts a node, which is how round two came to run without one.
-51. **The `kafka3` profile's brokers are also its controllers** (unchanged). It makes
+51. *Decided 2026-11-14 (D7, D10): stays; MSK unverified.* **The `kafka3` profile's brokers are also its controllers** (unchanged). It makes
     the loss of the active controller part of every broker test, which a cluster with
     separate controllers (MSK) does not have. *Alternative:* a controller container
     of its own and three plain brokers: the broker-loss figure is then the 9 s case
@@ -2055,7 +2086,7 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     was the slower of its two speeds more often the more was conserved — which the
     order of the runs may explain instead. *Alternative:* set it to 7 for the memory;
     the numbers are in S7.
-59. **A Kafka source's fetch queue is 2 MB per partition** (S7), down from 16:
+59. *Decided 2026-11-14 (D7, D10): stays; MSK unverified.* **A Kafka source's fetch queue is 2 MB per partition** (S7), down from 16:
     0.8 GB of client memory at the end of a state fill instead of 2 GB, with no time
     lost in the fill or the steady state on one local broker. *Alternative:* keep the
     larger queue where the brokers are a network away and a refill costs a round trip
@@ -2083,7 +2114,7 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     *Alternative:* leave the count to the runtime (a heap per core): on this machine's
     twenty cores that was not run with the rest of the settings, and the adaptive mode
     that chooses the count by itself paused three times as long.
-63. **A `files` input onto what a `files` sink writes is refused** (S7, the third
+63. *Decided 2026-11-14 (D5): stays refused.* **A `files` input onto what a `files` sink writes is refused** (S7, the third
     review; it was allowed and documented as "one pipeline feeding another"). A sink's
     objects are rewritten under their names when a step runs again, folded away by
     `compactAfter` with the deleted keys left out, pruned by `retain`; a source that
@@ -2114,7 +2145,7 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     (`docs/design/runs/`, S7): the third review found S7's tables citing a scratch
     directory that no longer existed. *Alternative:* keep citing nothing and say so; a
     table nobody can check is then all there is.
-67. **`KafkaLogOptions.TransactionTimeout` is five minutes, and a leader whose
+67. *Decided 2026-11-15 (D11): five minutes stays.* **`KafkaLogOptions.TransactionTimeout` is five minutes, and a leader whose
     transaction ran into it is not saved** (S7 left it at 60 s without knowing what the
     timeout did; S8 established it and raised it). Past the timeout the transaction
     fails in the client or is aborted by the coordinator, and in ten of fourteen runs
@@ -2153,7 +2184,7 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     *Alternative:* the last lag that was measured, with its age; it would be a figure
     on a page that is wrong exactly while it matters.
 
-69. **A keyed input with no event time has no expiry** (S8). Its rows go when the
+69. *Decided 2026-11-14 (D4): event time only, no cap on keys.* **A keyed input with no event time has no expiry** (S8). Its rows go when the
     source deletes them, and a retroactive join over it keeps every record; the way to
     bound either is event time (`WithEventTime(…, evictWhenFinal: true)`,
     `EvictWhenFinal()`). *Alternatives:* an expiry by processing time — the age of the
@@ -2279,7 +2310,7 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     session*); or a monotonic
     reading of the writer's clock in the heartbeat record, which a clock that is set
     cannot disturb and a suspended host can.
-81. **Nothing guards a pipeline against an event time in the future** (S8, the fourth
+81. *Decided 2026-11-15 (D12): a record behind the watermark is dropped and counted, as built; one beyond the bound (K3) is a record in error.* **Nothing guards a pipeline against an event time in the future** (S8, the fourth
     review). The watermark follows the newest event time read, so one record stamped
     far ahead makes every record behind it late until the feed's time catches up; the
     drop is counted and announced (`late_records`), and that is all. *Alternatives:*

@@ -1391,8 +1391,9 @@ Sinks  = { ["enriched"] = Json("""{ "connector": "kafka", "connection": "msk-mai
 What to know:
 
 - **The connection is the host's; the spec is the tenant's.** A `kafka` config accepts
-  `connection`, `topic`, `startFrom` (`earliest`/`latest`), `format` (`json`, or
-  `debezium` on a keyed input), and on a sink `producer` (`own`, or `log` for the
+  `connection`, `topic`, `startFrom` (`earliest`/`latest`), `format` (`json`, a record
+  format the host registered with `AddRecordFormat` — Avro, a schema registry's framing —
+  or `debezium` on a keyed input), and on a sink `producer` (`own`, or `log` for the
   backend's transactional producer, on the connection `log` only). Bootstrap servers or
   client properties in a spec are refused, as is a topic outside the connection's
   `AllowedTopicPrefixes`. The backend's own cluster is registered as the connection `log`.
@@ -1427,8 +1428,22 @@ What to know:
   first leader that finds them not yet applied, and the catalog records it: a seeded
   pipeline or table that is removed stays removed.
 - `node.Status` has what a status page needs: role and terms, heartbeat age, whether the
-  delivery lease is held, how the last takeover's time was spent, the peer's answer, and
-  on a standby how far its catalog, tables and state are behind.
+  delivery lease is held, how the last takeover's time was spent, the term it led before
+  it was replaced and started again, the peer's answer, and on a standby how far its
+  catalog, tables and state are behind.
+- **Nodes are upgraded one at a time**, even across a change of a persisted format: a
+  node reads every format up to its build's *format level*, and the leader writes the
+  level its standby reads until both read a higher one
+  ([Upgrading the nodes](enrichment-service.md#operating-it)). On Kubernetes the guide
+  has the recipe: the host under `NodeSupervisor.RunAsync` as the container's entry
+  point, and a rollout gated on `/health/ready?warm=true`.
+- **Event time on a topic is kept per partition**, where a definition declares it on
+  the input itself: the watermark is the least of the partitions' times, a partition the
+  source has read to its end stops counting after five seconds, and a record stamped
+  further ahead than `circuit.maxEventTimeAhead` (a day by default) is a record in
+  error, not a jump of the watermark.
+- **A spec can cap a pipeline's state**: `circuit.maxStateEntries` fails that pipeline,
+  and only it, when its state entries pass the number.
 - **For a monitoring system there is a meter**, `Incremental.Service`
   (`ServiceMeter.Name`), beside the core's `Incremental`: pipelines by state, per
   pipeline whether it is up, its source lag, checkpoint age, sink-ack wait, dead letters,
@@ -1513,8 +1528,9 @@ embedded in the package: nothing to build, nothing fetched from elsewhere.
 
 **Files, dead letters, and a test harness.** Besides `kafka` and `memory` a slot can be
 bound to the built-in `files` connector: JSON-lines objects under a prefix of an
-`IObjectStore` the host registered (a local directory is built in; S3 is five methods to
-write, a sixth to page its listing). As a source it reads objects in name order with
+`IObjectStore` the host registered (a local directory is built in; an S3 bucket is the
+optional package `Incremental.Service.S3`, `AddS3ObjectStore`, tested against MinIO and
+not against Amazon S3). As a source it reads objects in name order with
 the object and line in the checkpoint, asks only for names after its position, and
 waits `settle` for an object to be left alone so that one arriving a little late is
 still read in its place (by the store's own times, or by how long the source has seen
@@ -1638,7 +1654,8 @@ Implementation notes (not consumer-facing):
   (aggregate-of-aggregates — window-sticky `GroupBy` to a unit key works but is ugly;
   `TopK` doesn't need it, it ranks per window natively); keyed-input snapshot sync (retract
   keys a full-table re-feed omits); watermark
-  idleness handling; whether required input names can go too — today they are the durable
+  idleness for a circuit's own inputs (the service's Kafka sources have it per
+  partition, `Runtime/InputEventTime.cs`); whether required input names can go too — today they are the durable
   key for checkpointed source offsets (a reference dies with the process, positional
   identity would re-bind offsets across topology edits), but a derived-with-optional-pin
   scheme like store naming may be possible.

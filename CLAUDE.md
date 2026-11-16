@@ -378,7 +378,19 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   (replaced, resigned) and are answered at once; 5 is a node that could not lead —
   including a takeover of its own that failed after it had taken the log
   (`LeadershipStatus.TakeoverFailed`) — and is answered with a growing delay. Do not
-  map a failure of the node's own to 3. Nodes that share a process (the in-memory
+  map a failure of the node's own to 3. On Kubernetes the kubelet cannot tell the codes
+  apart, so the guide's recipe runs the host under `NodeSupervisor.RunAsync` as the
+  container's entry point and gates a rollout on `/health/ready?warm=true`
+  (a standby is ready there only once a takeover would be warm).
+  A fence is how a replaced leader ends, not a failure: the client's lines about it
+  (`KafkaLog.IsFenceMessage`) and a circuit stopped by `ChangelogFencedException` are
+  logged at Information, and the node says once who took over (a warning unless an
+  operator asked). Do not raise them back to errors. A new writer's records in the
+  leader topic name the writer they replaced (`LeaderRecord.Replaced`, `ReplacedTerm`,
+  `Reason`: members a reader skips), which is how a node started again knows the term
+  it led (`LeadershipStatus.Previous`, `NodeLeadershipStatus.Previous`;
+  `InMemoryServiceCluster.LastDeposed` in memory); never infer it from a node's own
+  memory, which a restart has lost. Nodes that share a process (the in-memory
   backend's two) cannot exit for it: their `ExitOnLeadershipLoss` is off and
   `NodeSupervisor.RunInProcessAsync` starts one again on `ServiceNode.Ended`.
   At the ceiling a standby is held by brokers that say nothing can be committed and by
@@ -713,7 +725,9 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     touch a circuit, a table or the backend.
   - Discovery (`IServiceDiscovery`, the admin's `connectors`, `connections`,
     `table-sources`, definition and template endpoints) returns names, kinds and config
-    schemas, never a connection's settings. Describing a definition runs its `Build`
+    schemas, never a connection's settings. A template binds no input to the `memory`
+    connector on a backend that is not `InProcess` (Kafka): nothing in another process
+    writes that log, and a pipeline deployed so reads nothing. Describing a definition runs its `Build`
     against stand-in tables (`PipelineBuilder` detached) and is leader-only.
   - The in-memory backend's fencing reaches the sinks: a leased sink begins no write
     unless its node is the cluster's leader, decided under the cluster's gate, and a

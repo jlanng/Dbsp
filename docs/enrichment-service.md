@@ -2005,7 +2005,12 @@ with the silence it waited out, is the last row.
 ![After a takeover](images/enrichment-service/takeover.png)
 
 A node that has been fenced or has resigned still shows the pipelines as it last saw
-them, each marked *last known*, with a link to the leader.
+them, each marked *last known*, with a link to the leader. Started again, it says the
+term it led and who took over and why (*Led before*; `previous` in `GET node`'s
+`status.leadership`, from the new leader's records in the leader topic), not that it
+has never led. A replaced node's log says it once, at Information when an operator
+asked for the takeover and as a warning otherwise; the Kafka client's own lines about
+the fence, and its circuits stopping on the fenced log, are at Information.
 
 **Audit.** Every change to the catalog with who made it. *Who* is the identity the host
 authenticated (`AuthorizationPolicy`), or what `ServiceAdminOptions.CallerName` returns
@@ -3479,8 +3484,11 @@ resources are ARNs (`…:topic/<cluster>/<uuid>/{prefix}.*`,
 - **Tenancy is the host's.** The service has no notion of a tenant: no quotas, no
   isolation between plugins, no per-tenant authorization beyond the four policies.
 - **Sink topics and source topics are not created**, and removing a table keeps its log.
-- **Windows:** an idle input stalls the watermark, and events later than the allowed
-  lateness are dropped without a record ([intro.md](intro.md#event-time-watermarks-and-lateness)).
+- **Windows:** an input with no records at all holds the watermark back (a partition
+  its source has read to its end stops counting after five seconds: *Event time on a
+  topic of several partitions*), and a record later than the allowed lateness is
+  dropped and counted (*late records*), not kept or dead-lettered
+  ([intro.md](intro.md#event-time-watermarks-and-lateness)).
 - **A checkpoint written before event-time state was kept does not resume a pipeline
   that uses event time.** State manifests are format 7 or later (8 once the format
   level is 2): the watermark and the deadlines of open windows and keys are checkpointed
