@@ -325,3 +325,13 @@ documentation*.
   a given prefix and refused on one in use, CI's refusal of the broker-failure job and
   that job emulated on the `kafka3` profile, and the suites' counts at the end of the
   round.
+
+## 2026-11-16, round five — the review's findings
+
+`docs/design/enrichment-service.md`, *As built*, S9, *The review's findings*.
+
+- `2026-11-16-review-fixes.txt` — for each of the seven findings the test written for
+  it, its failure on the code before the fix as printed and its result after; the burst
+  test and the broker tests on the `kafka3` profile; the scale rig's `--load-only` at
+  three million rows after the pacing change; and the suites run whole and timed on the
+  code after the fixes, with what the earlier record's service row could not have been.

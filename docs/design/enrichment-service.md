@@ -7669,11 +7669,14 @@ refuses it) and formats 6 (without event time) and 7 are read by every node; wha
 circuit *writes* is no longer the build's constant but `Writes` at each commit
 (`Circuit.CommitCheckpoint` restages the manifest when the level has moved, and
 `WatermarkClock.AppendCheckpoint` writes the partitions' keys or not by the same
-level). At level 1 the marker has one time per source — the newest across its
-partitions, which is what the older build would have written there and what it takes
-it for. A level-2 node resuming such a checkpoint holds the watermark where it was
-committed until its source has named its partitions again and each has brought a
-record or is idle: it never regresses and makes nothing late that was not.
+level). At level 1 the marker has one time per source — as first built, the newest
+across its partitions, which is what the older build would have written there; the
+review found that this loses a partition's backlog (E1 in *The review's findings*,
+below), and it is now the *least* over the partitions that count, the time the
+committed watermark was made from. A level-2 node resuming such a checkpoint holds the
+watermark where it was committed until its source has named its partitions again and
+each has brought a record or is idle: it never regresses and makes nothing late that
+was not.
 
 **The proving level.** A real change of a *format byte* — of the state log's values or
 the table logs' records — has not happened since layouts, and the mechanism would be
@@ -7780,7 +7783,8 @@ builds.
   records were late (the first build of `RollingUpgradeTests`' feed, twice in two
   runs; the feed now stays inside the lateness). It is K1's idle rule working as
   written, and the same as before K1 — but K1's "a backlog is not late" does not cover
-  a backlog that begins after five quiet seconds.
+  a backlog that begins after five quiet seconds. (Fixed after the review: E3 in *The
+  review's findings*, below.)
 - *Not run:* the scale rig and the torture rig; the three-broker profile; the two
   admin UI tests (no Chrome on this machine; `app.js` gained one line of text, the
   reason `format-level`). CI has not run since the account's billing stopped it, so
@@ -7820,7 +7824,9 @@ published, under the commit gate, so it covers `CommitAsync`, `ReplaceAllAsync` 
 derived table's writes alike, and never delays what readers see. A follower (a
 standby applying the log) is not paced: its stops move no leadership. What it did is
 `TableWriter.Pacing` (steps, skipped, time in them), which the rig reports.
-`TableLoadPacingTests` (5) hold when it acts and when it does not.
+`TableLoadPacingTests` (5) hold when it acts and when it does not. (As built here a
+run never ended on a table that commits steadily, and each table paced by itself: S1
+in *The review's findings*, below, changed both.)
 
 **Measured** (`runs/2026-11-16-b2-paced-load.tsv`, its collector log beside it):
 before and after alternated, `--load-only`, the leader's longest stall during the load.
@@ -8211,9 +8217,139 @@ the runs are in `runs/2026-11-16-k-small-items.txt`.
 | `dotnet build` | 0 warnings, 0 errors |
 | `tests/Incremental.Tests` | 761 total, 760 passed, 1 skipped (the opt-in soak) |
 | `tests/Incremental.Kafka.Tests` | 165 total, 163 passed, 2 skipped (the two `*ABrokerLost*`, which need `kafka3`) |
-| `tests/Incremental.Service.Tests` | 337 total, 329 passed, 8 skipped (the six broker tests; the two admin UI tests, no Chrome here); the two-build test ran against 9de8da9 |
+| `tests/Incremental.Service.Tests` | 337 total, 8 skipped (the six broker tests; the two admin UI tests, no Chrome here); the two-build test ran against 9de8da9. **Not a whole passing run:** the suite run of this step had one failure, an `InProcessSupervisorTests` assertion added in the step that was wrong; it was removed (5eb5ca0) and only that class run again, 1 of 1, twice. This row first read "329 passed", which with 8 skipped leaves no room for the failure the run record reports (C2 below). The suite was run whole after the review's fixes: 329 passed, none failed |
 | `examples/…/Pipelines.Tests` | 21 of 21 |
 | Example smokes | in memory 54 claims, two nodes 69, Kafka with a `kill -9` 69, trade enrichment 13: all hold |
 | `benchmarks -- --assert` | all 10 performance contracts hold |
 | The broker-failure job, emulated on `kafka3` | the service's broker tests 7 of 7, `*ABrokerLost*` 2 of 2 |
 | CI | not run: every push of round five and the broker-failure job started by hand (run 43801138956) were refused for the account's billing |
+
+#### The review's findings
+
+Three lenses reviewed the round's work (event time and upgrades; the service and the
+connectors; claims and records), a verifier tried to refute each finding, and seven
+stood. Each was fixed with a test that failed on the code before the fix; the runs are
+in `runs/2026-11-16-review-fixes.txt`.
+
+**E1: a level-1 checkpoint lost the hold of a partition that was behind.** Below
+format level 2 the checkpoint has one time per source, and `AppendCheckpoint` wrote the
+*newest* across the source's partitions there. A node of this build resuming it puts
+that time in the tracker's one slot, with no partitions until the source names them —
+and `Freeze` runs after every step. A step that came first (another input's record, a
+shared table's change: the supervisor starts the circuit before the edges, and
+`KafkaSource` names its partitions only once it has connected) froze the watermark at
+the newest partition's time less the lateness, and the backlog of a partition behind it
+was dropped as late: in the verifier's run 98 s became 598 s and both of partition 0's
+next records were lost. The existing tests had one input and named the partitions
+before the first step. A node writes level 1 from its start until the raise, so every
+upgrade had the window. Fixed in `WatermarkClock.AppendCheckpoint`: at level 1 the one
+time is the tracker's own time as `Freeze` uses it (`TimeOf`: the least over the
+partitions that count, nothing while a named partition has brought no record). No
+build resuming it can then claim more than was committed, whatever steps first; the
+build from before levels, which takes the key for the newest time, also resumes at the
+committed watermark instead of jumping.
+Test: `FormatLevelTests.A_level_1_checkpoint_resumed_holds_its_watermark_through_a_step_that_comes_before_the_partitions_are_named`.
+*What it costs, and stays:* the bound on a time in the future (K3) is measured from
+the later of the node's clock and the newest time the input has brought, and after a
+resume of a level-1 checkpoint "the newest" is that least. Where event times run ahead
+of the node's clock (a replay with synthetic times) and the partitions differ by more
+than `MaxEventTimeAhead`, records of the partitions that are ahead are refused as too
+far ahead after such a resume. At level 2 the newest is restored from the partitions'
+own keys and nothing changes.
+
+**E3 and C1: a burst after every partition was idle.** Recorded by B6 as found and
+left; the review took it for what it is, records lost in an ordinary case (on a
+low-volume topic five quiet seconds are the normal state), and the guide and
+`docs/intro.md` said the opposite. An idle partition holds nothing back, the client
+hands records over a partition at a time, and `PartitionEnds.Read` took idle back only
+from the partition read: the first partition of a burst set the input's time, and what
+the same burst had put on the other partitions was late. Fixed in
+`KafkaSource.PartitionEnds`: a record on any partition takes idle back from every
+partition the source had called idle (`ExpectPartitionAsync`, sent before the record
+itself, so the port applies it first), and each is idle again on the answer to a
+question asked one `IdlePartitionConfirmEvery` (1 s) after that record — no new
+`IdlePartitionAfter`, and never on an answer that was already on its way when the
+record came, which says what was true before it. The interval is there because a
+producer's burst is not one write: with the question asked at once, a partition whose
+batch landed a few milliseconds after the first one's would answer "at my end" and be
+idle again before its records arrived.
+Test: `KafkaPartitionWatermarkTests.ABurstAfterEveryPartitionWasIdle_DropsNothingAsLate`
+(588 of 1,800 late before, three runs of three; none after), also on three brokers
+with the two broker-loss tests and the service's seven broker tests.
+*What it costs:* on a topic that is mostly quiet, each record after a quiet spell
+holds the watermark at the other partitions' last records for one to two seconds (the
+interval and the answer), and the circuit runs a step for each partition's two notes.
+*What stays a limit,* now in the guide (*A burst after a quiet spell*) and the intro:
+records that reach an idle partition more than about a second after the same burst
+reached another one are late if they are behind the watermark that partition has made.
+The source cannot tell them from records that are simply late; a producer that sends
+old event times partition by partition, seconds apart, needs a lateness as wide as
+what it sends. The guide's "as it would be on a topic of one partition" is gone: it
+was not true. A source that is not `KafkaSource` and names partitions must do the same
+itself; the intro says so.
+
+**E2: a late version of a key in the step that holds its open version.** The round's
+fix for late upserts (an upsert behind the watermark is not applied) worked only when
+the late version and the open one fell into different steps. In one drain the input's
+operator keeps the last command per key — the late one — finds it late, stores
+nothing, and the open version was never delivered: `{8@210 s}` where two steps give
+`{7@200 s, 8@210 s}`, with the same watermark in both layouts. Fixed in
+`KeyedInputPort.DrainInto`, under `evictWhenFinal`, beside the cut it already made
+before an upsert that begins a new record: the drain also ends before a late upsert of
+a key it already holds an on-time upsert or a delete of (the watermark does not move
+within a drain and never falls, so the next step judges the upsert the same). A run of
+late versions of one key is still one step: a late upsert replaces only a late one.
+Test: the late-version test of `PartitionWatermarkTests`, now in both layouts and with
+a delete followed by a late version. As for the other cut, clustered circuits are not
+covered (two processes' commands for a key can meet in a step whatever one port does).
+
+**S1: load pacing that never stopped.** A run ended only at a two-second pause, so a
+table that commits steadily — a CDC table on a busy topic, a pipeline's `ToTable`
+output — passed `LargeAfterChanges` after a while and was "a large load" from then on:
+a blocking gen1 collection from inside its commit gate at every 128 MB the *whole
+process* allocated, with no load running. And each table's pacer kept its own mark
+against that one process counter, so N tables loading at once asked for N collections
+a step. Fixed in `LoadPacer`: a run also ends when its pace over a stretch of
+`QuietGap` has been under `TableLoadPacing.MinChangesPerSecond` (5,000; the loads
+measured ran at 70,000 to 80,000), and the mark of the last collection asked for is
+one per process, taken by compare-and-swap. Tests:
+`TableLoadPacingTests.A_table_that_changes_steadily_is_never_a_large_load` (71 forced
+collections before, none after, and a load straight after the trickle is paced) and
+`Tables_loading_at_once_share_one_pace` (85 collections over 105 MB at a 4 MB step
+before). The scale rig's `--load-only` at three million rows after the change: 73
+steps and a longest stall of 141 ms, against 73 and 190 to 200 ms in B2's runs — a
+real load is paced as it was. *Stays a limit:* a load slower than 5,000 changes a
+second is not paced; the collector runs on bytes allocated and not on time, so such a
+load can still end in one long young collection. Not measured.
+
+**C2: S9's table hid a failure.** The table of checks above gave the service suite as
+329 passed and 8 skipped of 337 — no failure — for a run whose record says it had
+one, with only the failing class re-run after the fix. The row now says so, and the
+suite was run whole on the code after these fixes: 337 total, 329 passed, none failed,
+8 skipped.
+
+**C3: the time the suites take.** CLAUDE.md said about a minute and a half for the
+Kafka tests and for the service tests. Measured whole on the connector stack: 4 min
+58 s and 4 min 40 s. CLAUDE.md says about five minutes for each.
+
+**Not explained.** In the first whole run of `tests/Incremental.Tests` after the fixes,
+`TableJoinTests.Completing_every_input_ends_an_auto_stepping_circuit_though_its_table_never_completes`
+timed out (its consumer waited 20 s for the output to end). It passed alone three
+times of three and in every whole run after (the count is in the run record). Nothing
+in this step touches how a circuit completes, and it was not reproduced; it is
+recorded here as seen, not as fixed.
+
+#### Where the branch stands after the review's fixes
+
+| Check | Result |
+|---|---|
+| `dotnet build` | 0 warnings, 0 errors |
+| `tests/Incremental.Tests` | 765 total, 764 passed, 1 skipped (the opt-in soak); one earlier run had the failure under *Not explained* |
+| `tests/Incremental.Kafka.Tests` | 166 total, 164 passed, 2 skipped (the two `*ABrokerLost*`, which need `kafka3`); 4 min 58 s |
+| `tests/Incremental.Service.Tests` | 337 total, 329 passed, none failed, 8 skipped (the six broker tests; the two admin UI tests, no Chrome here), in one run; the two-build test ran against 9de8da9; 4 min 40 s |
+| `examples/…/Pipelines.Tests` | 21 of 21 |
+| Example smokes | in memory 54 claims, two nodes 69, Kafka with a `kill -9` 69, trade enrichment 13: all hold |
+| `benchmarks -- --assert` | all 10 performance contracts hold |
+| On `kafka3` | `KafkaPartitionWatermarkTests` 6 of 6 (the burst test and `*ABrokerLost*`), the service's broker tests 7 of 7 |
+| Scale rig, `--load-only`, 3,000,000 rows | 73 steps, longest stall 141 ms, load 41.9 s (one run) |
+| CI | not run: the account's billing, as before |

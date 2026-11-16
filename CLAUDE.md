@@ -27,14 +27,15 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   too for `DebeziumCdcTests`; a handful need nothing and always run. Two
   (`*ABrokerLost*`) need the three brokers of the `kafka3` profile and skip on the
   connector stack, which is the count CI's `connector-stack` job holds the project to. Each test uses its
-  own topic prefix (and its own Postgres tables, slot and connector). About a minute and a half.
+  own topic prefix (and its own Postgres tables, slot and connector). About five minutes
+  (measured 4 min 58 s for its 166 tests): size a timeout to that.
   `INCREMENTAL_KAFKA_BOOTSTRAP` points them at another broker. `KafkaFailoverProcessTests`
   launch `tests/Incremental.Kafka.FailoverApp` as real processes and kill, stop and
   command them; measured numbers go to `measurements.log` beside the test assembly.
 - After a mutation script has restored a source file, touch it (or the next build keeps
   the mutated binary: the restored file is older than the output it produced).
-- Service tests: `dotnet test --project tests/Incremental.Service.Tests` — about a minute
-  and a half with the connector stack up, a few seconds without it: the Kafka-backed classes
+- Service tests: `dotnet test --project tests/Incremental.Service.Tests` — about five
+  minutes with the connector stack up (measured 4 min 40 s), far less without it: the Kafka-backed classes
   (`KafkaService*Tests`) skip when the broker is unreachable, the CDC one also without
   Postgres and Connect. They load real plugin assemblies from
   `tests/Incremental.Service.TestPlugins/*/bin` and launch
@@ -468,7 +469,12 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     names never change, because a provider may keep the marker by setting keys and
     removing none (Redis does): do not put a flag in a key's name. State manifest
     format 8, which is format level 2 (below): a format-7 checkpoint resumes as it is,
-    and a node writes these keys only once its deployment is at that level. Never make a partition idle on
+    and a node writes these keys only once its deployment is at that level. Below it
+    the one key per source (`$watermark#s{n}`) holds the *least* over the source's
+    partitions that count (`TimeOf`), never the newest: whoever resumes it may freeze
+    on that one time before the source has named a partition (a step for another
+    input or a table comes first), and the newest would put the watermark past a
+    partition that is behind (`FormatLevelTests.A_level_1_checkpoint_resumed…`). Never make a partition idle on
     the passing of time: a source says so only on evidence that it is at the end
     (`KafkaSource.PartitionEnds`: on an end-of-partition answer, after
     `IdlePartitionAfter`), takes it back when the evidence stops coming and — from
