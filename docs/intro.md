@@ -1313,7 +1313,9 @@ What to know before relying on it:
 - **The dead-letter output is always read**, into a ring of the newest records per
   pipeline, so a circuit under `RecordErrorPolicy.DeadLetter` cannot stall on it.
 - **Plugins are trusted code** loaded into a collectible `AssemblyLoadContext` per
-  version. A plugin gets the host's copy of `Incremental*` and of any contract assembly,
+  version. A plugin compiles against `Incremental` and `Incremental.Service.Abstractions`
+  (definitions, `PipelineBuilder`, table definitions) and nothing of hosting or Kafka.
+  It gets the host's copy of `Incremental*` and of any contract assembly,
   even if it ships its own, which is what lets two plugins join one table. Hold nothing
   of a plugin's in a static, and never serialize a plugin's type with a process-wide
   `JsonSerializerOptions` — use the one the slot context gives you — or its version can
@@ -1527,8 +1529,8 @@ is a warning at the dry run and a visible *waiting* state, and after a grace per
 `Degraded` node. A spec's `deadLetters` binds any append sink
 connector as the pipeline's dead-letter sink: dropped records are delivered there, at
 least once, before the checkpoint that passes them, and a sink that will not take them
-stops the pipeline and says why. And `Incremental.Service.Testing.PipelineTestHarness`
-runs one definition in a test — settings bound as the service binds them, tables the
+stops the pipeline and says why. And `PipelineTestHarness` (the
+`Incremental.Service.Testing` package) runs one definition in a test — settings bound as the service binds them, tables the
 test fills, inputs it feeds, steps it takes, sinks and dead letters it reads — with no
 node and no HTTP.
 

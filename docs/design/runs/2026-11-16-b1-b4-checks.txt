@@ -1,0 +1,39 @@
+Round five, packages-and-format step (B1, B4): the checks that the new tests can fail.
+Build of commit 17ed25c plus the change named in each case, reverted after it. A 4-core
+cloud VM, the connector stack up (Kafka 3.9.0 in a container on the same machine).
+
+1. A plugin-facing type that names Kafka.
+   Change: Incremental.Service.Abstractions gains a ProjectReference to Incremental.Kafka
+   and `public static class Mutant { public static Incremental.Kafka.KafkaRecord? Last { get; set; } }`.
+   dotnet test --project tests/Incremental.Service.Tests -- --filter-class "*PluginBoundaryTests"
+     failed ...The_abstractions_load_nothing_of_the_services_runtime_its_hosting_or_kafka
+       The abstractions load Incremental.Kafka (Incremental.Service.Abstractions, System.Runtime, Incremental.Kafka)
+     failed ...Nothing_the_abstractions_or_the_harness_show_names_the_services_runtime_its_hosting_or_kafka
+       Incremental.Service.Mutant.get_Last names Incremental.Kafka.KafkaRecord from Incremental.Kafka
+       Incremental.Service.Mutant.set_Last names Incremental.Kafka.KafkaRecord from Incremental.Kafka
+       Incremental.Service.Mutant.Last names Incremental.Kafka.KafkaRecord from Incremental.Kafka
+     total 16, failed 2
+   Reverted: 16 of 16.
+
+2. The service's type forwards removed (src/Incremental.Service/TypeForwards.cs moved out).
+   INCREMENTAL_OLDER_BUILD=<worktree of 9de8da9>/tests/Incremental.Service.FailoverApp/bin/Debug/net10.0/Incremental.Service.FailoverApp.dll
+   dotnet test ... --filter-method "*A_plugin_compiled_against_the_service_before*"
+     failed: Incremental.Service.ServiceException : The plugin's types could not be loaded:
+       Could not load type 'Incremental.Service.IPipelineDefinition`1' from assembly
+       'Incremental.Service, Version=0.1.0.0, Culture=neutral, PublicKeyToken=null'.
+   Restored: passed (the older build's Acme.Pipelines imported, counted 60 trades, unloaded).
+
+3. A codec held by a static (the record format seam).
+   Change: KafkaSlotConfig.Writer adds each codec it makes to a `static List<object>`.
+   dotnet test ... --filter-method "*its_load_context_still_unloads"
+     failed: Assert.Equal() Failure: Values differ (Plugins.LiveContexts 1, expected 0)
+   Reverted: passed.
+
+The suites at the end of the step, on the final code:
+  Incremental.Service.Tests  289: 281 passed, 8 skipped (six broker tests: one broker;
+                             two admin UI tests: no Chrome). The two-build test ran
+                             (INCREMENTAL_OLDER_BUILD set) and passed with the older
+                             build's own plugin on both builds.
+  Incremental.Kafka.Tests    158: 156 passed, 2 skipped (*ABrokerLost*, one broker)
+  Pipelines.Tests            21 of 21
+  smokes                     in memory 54 claims, two nodes 69, Kafka 69: all hold

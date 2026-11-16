@@ -43,8 +43,11 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   one non-parallel collection; measured failover times go to `measurements.log` beside
   the test assembly. One test runs this build against the build from before format
   levels and skips without it: `git worktree add --detach <dir> 9de8da9`, build
-  `<dir>/tests/Incremental.Service.FailoverApp`, and set `INCREMENTAL_OLDER_BUILD` to
-  its `Incremental.Service.FailoverApp.dll` (CI's `connector-stack` does). Run it, and
+  `<dir>/tests/Incremental.Service.FailoverApp` and
+  `<dir>/tests/Incremental.Service.TestPlugins/Acme.Pipelines` (the plugin both builds
+  run, compiled before the abstractions package; `PluginTests` loads it too), and set
+  `INCREMENTAL_OLDER_BUILD` to its `Incremental.Service.FailoverApp.dll` (CI's
+  `connector-stack` does). Run it, and
   `RollingUpgradeTests`, after changing anything a node persists.
 - Admin UI: `dotnet run --project tests/Incremental.Service.AdminHost` serves a node with
   tables, pipelines and a generator at http://127.0.0.1:5180/admin/ (`-- --nodes 2` adds a
@@ -626,9 +629,9 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   - Dead letters with a sink bound (`PipelineSpec.DeadLetters`) are an acknowledged
     output: nothing acknowledges a batch before the sink has it, and a sink that fails
     faults the pipeline — never drop to the ring and carry on.
-  - `PipelineTestHarness` builds a definition through the same `DefinitionBinding` and
-    `PipelineBuilder` as the supervisor; keep it so, or its tests stop meaning what a
-    deploy would do. Its `StateSize` is the checkpoint store's committed count, by store;
+  - `PipelineTestHarness` (package `Incremental.Service.Testing`) builds a definition
+    through the same `DefinitionBinding` and `PipelineBinding` as the supervisor; keep
+    it so, or its tests stop meaning what a deploy would do. Its `StateSize` is the checkpoint store's committed count, by store;
     every example definition has a test that its state returns to a bound under a long feed.
   - A pipeline whose state only grows is flagged (`StateGrowth`,
     `ServiceOptions.StateGrowthAlarmAfter`): from the entry count the sampler already
@@ -666,7 +669,27 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   - A manifest's `MainAssembly` is a file within the package and `AssemblyName` the
     assembly's simple name; they differ, so never derive one from the other. Which
     reference goes to the host is `HostAssemblies.Provides`: contracts first, then the
-    assemblies whose types cross the boundary, then by version.
+    assemblies whose types cross the boundary (`Incremental*`, `Microsoft.Extensions.*`,
+    the framework — not the Kafka client, whose types reach no plugin), then by version.
+  - What a plugin compiles against is `Incremental` and `Incremental.Service.Abstractions`
+    (the definition interfaces, `PipelineBuilder`, table definitions, `IRecordFormat`),
+    and its tests `Incremental.Service.Testing`. The abstractions reference only the
+    core, and nothing public in them or in the harness names a type of the service's
+    runtime, `Incremental.Hosting`, `Incremental.Kafka` or `Confluent.Kafka`:
+    `PluginBoundaryTests` walks both surfaces and every plugin's references. The
+    service's half of a builder is internal (`IPipelineBinder`, implemented by
+    `PipelineBinding`); a new builder method goes on the facade and the binder, never
+    exposes a service type. A type moved out of `Incremental.Service` keeps a
+    `TypeForwardedTo` there for good (`TypeForwards.cs`): a stored plugin compiled
+    before the move finds it only through the forward.
+  - A record format (`IRecordFormat`, `AddRecordFormat`) is made once per service by
+    `KafkaConnections.Format`, never held in a static, and asked for codecs only when
+    a slot's connector starts or a loader runs; a codec belongs to the source or sink
+    it is given to and goes with the generation. A record a codec cannot read takes
+    JSON's path — `InputHandle.RejectAsync` at a source, `context.Unreadable` at a
+    loader — never a fault of its own. `json` and `debezium` are the built-in names;
+    a name nobody registered is refused at the dry run. `KafkaRecordFormatTests` is the
+    check, including that a plugin's own row type through a format still unloads.
   - A replace that keeps state across a change records the spec it replaced
     (`PipelineSpec.Previous`) until its first generation runs. A generation that cannot
     start on the state (`CircuitStateMismatchException`, from the store that could not be

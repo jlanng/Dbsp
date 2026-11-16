@@ -215,6 +215,7 @@ public class KafkaRecordFormatTests
     }
 }
 
+// <snippet:framed-format>
 /// <summary>
 /// A test host's record format: JSON behind the framing a schema registry puts in front of
 /// a value — a zero byte, then a four-byte big-endian schema id (1 for keys, 2 for values
@@ -261,3 +262,4 @@ internal sealed class FramedFormat : IRecordFormat
         public byte[] Write(T value) => Frame(value, part, json);
     }
 }
+// </snippet:framed-format>

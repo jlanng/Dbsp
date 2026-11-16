@@ -445,7 +445,11 @@ so implementations never see cross-thread access to one store.
   plug in), with a paged listing, a settle time for late objects, deletes, retention
   and compaction; an input that is not there is a dry-run warning and a *waiting*
   state; a spec's `deadLetters` keeps dropped records in any append sink, at least
-  once and across a takeover, and `PipelineTestHarness` tests a definition with no node. See *Running many pipelines* in
+  once and across a takeover, and `PipelineTestHarness` (package
+  `Incremental.Service.Testing`) tests a definition with no node. A plugin compiles
+  against `Incremental.Service.Abstractions` and the core only — nothing of hosting or
+  Kafka — and a host can give the `kafka` connector a record format of its own (Avro,
+  a schema registry's framing) through `IRecordFormat`. See *Running many pipelines* in
   [docs/intro.md](docs/intro.md) and
   [docs/design/enrichment-service.md](docs/design/enrichment-service.md), *As built*.
 
@@ -764,7 +768,11 @@ src/Incremental.Service            the generic parts of an enrichment service: t
                                        `Incremental.Service`, discovery; an in-memory backend
                                        (bounded) and a Kafka one; the `kafka`, `files` and
                                        `memory` connectors; a durable dead-letter sink per
-                                       pipeline; PipelineTestHarness for plugin authors
+                                       pipeline; record formats for the kafka connector
+src/Incremental.Service.Abstractions  what a plugin compiles against: IPipelineDefinition,
+                                       PipelineBuilder, TableDefinition, IRecordFormat; the
+                                       core is its only reference
+src/Incremental.Service.Testing    PipelineTestHarness for plugin authors
 src/Incremental.Service.Admin      the admin JSON API and web UI for a service node (ASP.NET
                                        Core; the UI is embedded, hand-written, no build step)
 tests/Incremental.Tests            xunit: Z-set algebra, per-step delta semantics, multi-worker runs,

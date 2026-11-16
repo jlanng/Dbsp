@@ -288,3 +288,15 @@ container on the same machine.
 Each run: from `benchmarks/Incremental.Service.Scale/bin/Release/net10.0`,
 `dotnet Incremental.Service.Scale.dll run --rows <N> --load-only [--no-pacing] --out <file>`,
 on a 4-core machine with the connector stack up.
+
+## 2026-11-16, round five — packages and the record format (B1, B4)
+
+`docs/design/enrichment-service.md`, *As built*, S9, *Packages for plugin authors and a
+record format seam*.
+
+- `2026-11-16-b1-b4-checks.txt` — each new test made to fail by the change it guards
+  against (a plugin-facing type naming Kafka; the type forwards removed; a codec held by
+  a static), the failures as printed, and the suites' counts at the end of the step.
+  Case 2 and the two-build test need the build from before format levels and its own
+  plugin, as CLAUDE.md says (`git worktree add --detach <dir> 9de8da9`, build its
+  `tests/Incremental.Service.FailoverApp` and `tests/Incremental.Service.TestPlugins/Acme.Pipelines`).

@@ -1375,6 +1375,87 @@ and a dead letter then carries its wording (`afterAt`).
 
 and the table loaders `file`, `kafka` and `debezium`.
 
+**`kafka`** binds a topic on a connection the host registered
+(`AddKafkaConnection(name, …)`, or `log`, the backend's own):
+
+```json
+{ "connector": "kafka", "connection": "msk-main", "topic": "trades", "startFrom": "earliest" }
+{ "connector": "kafka", "connection": "msk-main", "topic": "instruments.cdc", "format": "debezium" }
+{ "connector": "kafka", "connection": "log", "topic": "enrich.alerts", "producer": "log", "format": "avro" }
+```
+
+`startFrom` is a source's, `producer` a sink's. `format` says what the topic's keys and
+values are: `json` (the default), `debezium` (change events, on a keyed input only), or a
+**record format the host registered** — the seam for what your own topics carry, Avro,
+Protobuf or JSON behind a schema registry's framing. A `kafka` table loader takes the
+same `format` (the `debezium` loader takes none: it is the format).
+
+A record format is an `IRecordFormat` (in `Incremental.Service.Abstractions`), registered
+under a name with `AddRecordFormat("avro", services => new MyAvroFormat(…))`. The service
+asks it for one `IRecordCodec<T>` per slot, per key or value, each time a pipeline's
+generation starts its connectors (and each time a table loader runs): `Read` turns bytes
+into a `T`, `Write` a `T` into bytes. A record `Read` throws on is unreadable, exactly as
+a record of broken JSON is — a source rejects it (its offset is consumed; a dead letter
+under `DeadLetter`, a fault under `Fault`) and a loader reports it and follows its
+table's `onUnreadable`. A name nobody registered is refused at the dry run.
+
+The `T` a codec is made for is often the plugin's own type — a sink's row, an input's
+record — and a plugin's version unloads only when nothing holds its types. So a format
+keeps nothing typed: no cache by `Type`, no codec or schema derived from a type in a
+static or in the format object. The codec is the generation's and may keep what it
+likes; whatever must outlive it (a schema registry's client, a cache of schemas by id)
+keeps text. This one, from the service's tests, frames JSON as a registry does:
+
+<!-- snippet: tests/Incremental.Service.Tests/KafkaRecordFormatTests.cs#framed-format -->
+```csharp
+/// <summary>
+/// A test host's record format: JSON behind the framing a schema registry puts in front of
+/// a value — a zero byte, then a four-byte big-endian schema id (1 for keys, 2 for values
+/// here) — so a plain JSON record is one it cannot read. It keeps nothing per type: each
+/// codec is its own object, and the format counts them with a number.
+/// </summary>
+internal sealed class FramedFormat : IRecordFormat
+{
+    private int _codecs;
+
+    public int Codecs => Volatile.Read(ref _codecs);
+
+    public IRecordCodec<T> CreateCodec<T>(RecordFormatContext context)
+    {
+        Interlocked.Increment(ref _codecs);
+        return new Codec<T>(context.Json, context.Part);
+    }
+
+    private static int Schema(RecordPart part) => part == RecordPart.Key ? 1 : 2;
+
+    public static byte[] Frame<T>(T value, RecordPart part, JsonSerializerOptions? json = null)
+    {
+        var body = JsonSerializer.SerializeToUtf8Bytes(value, json ?? JsonSerializerOptions.Web);
+        var framed = new byte[5 + body.Length];
+        BinaryPrimitives.WriteInt32BigEndian(framed.AsSpan(1), Schema(part));
+        body.CopyTo(framed, 5);
+        return framed;
+    }
+
+    public static T Unframe<T>(ReadOnlySpan<byte> data, RecordPart part, JsonSerializerOptions? json = null)
+    {
+        if (data.Length < 5 || data[0] != 0)
+            throw new FormatException("The record is not framed: it does not start with the magic byte.");
+        if (BinaryPrimitives.ReadInt32BigEndian(data[1..]) != Schema(part))
+            throw new FormatException($"The record's schema is {BinaryPrimitives.ReadInt32BigEndian(data[1..])}, not {Schema(part)}.");
+        return JsonSerializer.Deserialize<T>(data[5..], json ?? JsonSerializerOptions.Web)
+            ?? throw new FormatException("The framed JSON is null.");
+    }
+
+    private sealed class Codec<T>(JsonSerializerOptions json, RecordPart part) : IRecordCodec<T>
+    {
+        public T Read(ReadOnlySpan<byte> data, in RecordOrigin origin) => Unframe<T>(data, part, json);
+
+        public byte[] Write(T value) => Frame(value, part, json);
+    }
+}
+```
+
 **`files`** reads and writes JSON-lines objects under a prefix of an object store the
 host registered (`AddObjectStore(name, …)`: `LocalObjectStore` for a directory; S3 or
 anything else is an `IObjectStore` you write — five methods, and a sixth,
@@ -2057,6 +2138,17 @@ Three cases outside the four steps:
   by a pipeline that uses event time, at any level: it holds no watermark and no
   deadlines, and no reader can supply what was never written. That pipeline needs
   `state=reset`, as before; see the limits.
+
+- *Plugins built against the version before this one.* They compiled against
+  `Incremental.Service`, where the definition interfaces, `PipelineBuilder` and the
+  table definitions lived; those are in `Incremental.Service.Abstractions` now, and
+  the service forwards each type there, so a stored plugin version loads and runs on
+  the new build unchanged (the two-build test runs the older build's own plugin on
+  both builds). The reverse does not hold: a plugin compiled against the abstractions
+  does not load on a build from before them. Upgrade the nodes first; rebuild plugins
+  against the abstractions after. A test project compiled against the old harness
+  (`Incremental.Service.Testing` inside `Incremental.Service`) is rebuilt against the
+  `Incremental.Service.Testing` package; its source does not change.
 
 What an upgrade does not cover is what a format level does not name: a new build's
 *definitions* (a plugin version is deployed, not rolled), and behaviour that differs

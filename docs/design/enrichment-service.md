@@ -70,7 +70,9 @@ Two rules run through the whole design and are stated once here:
 
 | Project | Targets | Depends on | Holds |
 |---|---|---|---|
-| `src/Incremental.Service` | net8.0; net10.0 | Incremental, Incremental.Hosting, Incremental.Kafka | everything below except HTTP |
+| `src/Incremental.Service.Abstractions` | net8.0; net10.0 | Incremental | what a plugin compiles against: the definition interfaces, `PipelineBuilder`, table definitions, the record format seam (round five, B1) |
+| `src/Incremental.Service` | net8.0; net10.0 | Incremental, Incremental.Hosting, Incremental.Kafka, the abstractions | everything below except HTTP |
+| `src/Incremental.Service.Testing` | net8.0; net10.0 | Incremental.Service | `PipelineTestHarness` |
 | `src/Incremental.Service.Admin` | net8.0; net10.0 | Incremental.Service, `FrameworkReference Microsoft.AspNetCore.App` | JSON API, health endpoints, embedded UI |
 | `tests/Incremental.Service.Tests` | net10.0 | both, xunit v3 | Kafka tests skip like `tests/Incremental.Kafka.Tests/KafkaEnv.cs` |
 
@@ -1075,7 +1077,8 @@ h.Table(Tables.Instruments).Upsert(renamed); await h.CommitTablesAsync();
 h.DeadLetters; h.Shape;
 ```
 
-The harness is in `Incremental.Service`, runs one definition on an in-memory provider
+The harness is in `Incremental.Service.Testing` (in `Incremental.Service` until round
+five's B1), runs one definition on an in-memory provider
 with the `memory` connector on every slot, and is built on the same dry run and
 generation code the supervisor uses, so a definition that passes it binds the way it
 will when deployed. `RestartAsync()` builds a new generation on the same state, which is
@@ -1681,8 +1684,7 @@ numbers are the items' own, from the runs they cite.
    for the next format change: refuse and reset, or migrate.
 
 **Decide before a second tenant:** a failing pipeline never moves the leadership and
-`Failed` is not durable (6, 7); plugins compile against `Incremental.Service` rather
-than an abstractions package (11), and the harness ships inside it (20); a `kafka` sink
+`Failed` is not durable (6, 7); a `kafka` sink
 claims no topic, so two pipelines can overwrite each other's keys (40); a per-pipeline
 state limit (70); keep-or-reset asked for every change (9).
 
@@ -1692,7 +1694,8 @@ state limit (70); keep-or-reset asked for every change (9).
 **Made moot by later rounds:** 1 (warm standbys built, S6; 30 is the decision as it now stands), 10 (roll-back
 built, S6), 21 (closed by 53 once the successor writes), 28 and 46 (estimates and
 counts built, S7), 34 (the broker tests are a CI job started by hand, 74; the SASL run
-is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by 52).
+is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by 52), 11 and 20
+(the abstractions and testing packages built, S9).
 
 ### The items
 
@@ -1739,10 +1742,12 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
 10. *Moot (built, S6).* **An incompatible `keep` rolls back and reports.** *Alternative:* leave the pipeline
     stopped in `NeedsReset` — simpler, and a tenant's mistaken deploy takes their
     pipeline down until someone chooses. (Built in S6.)
-11. **Plugin authors reference `Incremental.Service`** (compile time only).
+11. *Built in round five (B1, S9).* **Plugin authors reference `Incremental.Service`** (compile time only).
     *Alternative:* a third package, `Incremental.Service.Abstractions`, holding the
     definition interfaces, `PipelineBuilder`'s surface, `TableDefinition` and the test
-    harness's surface, so plugin projects do not see Kafka or hosting types.
+    harness's surface, so plugin projects do not see Kafka or hosting types. The
+    alternative is what is built: plugins compile against the core and the abstractions
+    only, and the service forwards the moved types so that plugins built before still load.
 12. **Followers are protected by a time margin** (`FollowerRetention`, 10 min of history
     kept whatever the readers have committed). *Alternative:* the standby reports its
     positions to the leader through the probe and the floor uses them exactly; less
@@ -1778,7 +1783,8 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     *Alternative:* a reserved slot name under `sinks`. One list fewer in the spec; a
     definition could then never name a slot `deadLetters`, and every place that walks a
     definition's sinks would have to step over one that is not the definition's.
-20. **`PipelineTestHarness` ships inside `Incremental.Service`**, namespace
+20. *Built in round five (B1, S9): the harness is the package `Incremental.Service.Testing`.*
+    **`PipelineTestHarness` ships inside `Incremental.Service`**, namespace
     `Incremental.Service.Testing` (S6). *Alternative:* a package
     `Incremental.Service.Testing`. It would keep about 350 lines of test-only surface
     out of the service's assembly, at the cost of one more package to version and of
@@ -7857,3 +7863,107 @@ warnings, 0 errors; `Incremental.Tests` 760 (759 passed, the soak skipped);
 admin UI tests without Chrome, the two-build test without `INCREMENTAL_OLDER_BUILD` —
 nothing persisted changed); `Pipelines.Tests` 21 of 21; smokes in memory 54 claims,
 two nodes 69, Kafka 69; trade enrichment 13; `benchmarks -- --assert` all 10 hold.
+
+#### Packages for plugin authors and a record format seam (B1, B4)
+
+**B1, what a plugin compiles against.** Two new packages. `Incremental.Service.Abstractions`
+references the core and nothing else, and holds the definition interfaces and
+`PipelineAttribute`, `PipelineBuilder`, `TableDefinition`/`ITableDefinition`/
+`IndexDefinition`/`TableBuilder`, the two marker attributes, `ServiceException` and
+`StateLimitExceededException` (the harness throws both), the slot and shape records
+(`PipelineShape` and its parts), and B4's `IRecordFormat`. The namespace stays
+`Incremental.Service`, so no plugin source changed: only project files.
+`Incremental.Service.Testing` holds `PipelineTestHarness`; it references the service,
+because it runs the service's own binding code, but what it hands a test is the core's,
+the abstractions' and its own.
+
+`PipelineBuilder` is now a facade: its public methods check their arguments and call an
+internal `IPipelineBinder`, which the service implements as `PipelineBinding` — the old
+builder's body, unchanged, that the supervisor, the dry run, discovery and the harness
+all build through (`binding.Builder` is what `Build` is given). The table definition's
+two service-typed hooks became one visitor (`ITableDefinitionInternal.Accept`), which
+the registry uses to open a handle and to ask a loader for a source.
+
+The example's three plugin projects, the six test plugins and the scale rig's two
+reference `Incremental` and the abstractions only (`Plugin.props`, the test plugins'
+`Directory.Build.props`); `Pipelines.Tests` references `Incremental.Service.Testing`
+and the plugin's own projects. `PluginBoundaryTests` (16) is the check: every type a
+public or protected member of the two packages names comes from the core, the two
+packages, the logging abstractions or the framework; everything the abstractions load,
+all the way down, is none of `Incremental.Service`, `.Admin`, `.Kafka`, `.Hosting`,
+`Confluent.Kafka`, `Microsoft.Extensions.Hosting*`, ASP.NET; each plugin assembly's
+metadata references (and `Enrichment.Pipelines.Tests.dll`'s) are none of those; and the
+project files say so. Made to fail by a public property of type `KafkaRecord` in the
+abstractions (`runs/2026-11-16-b1-b4-checks.txt`, case 1).
+
+*The boundary.* `HostAssemblies.AlwaysShared` no longer lists `Confluent.Kafka`: no
+plugin-facing type names it, so a plugin that ships a newer Kafka client of its own for a
+client of its own gets its copy, by the version rule. `Incremental*` stays always the
+host's — a plugin that loaded its own copy of the service would hold a second service's
+types and statics — and the unload test passes alone as before.
+
+*Plugins built before.* A stored plugin version compiled against the old
+`Incremental.Service` names `IPipelineDefinition` and the rest in that assembly. The
+service now carries a `TypeForwardedTo` for each moved type (`TypeForwards.cs`), so such
+a plugin loads and runs unchanged. Shown by a new `PluginTests` test that imports the
+build-before-levels' own `Acme.Pipelines` (`INCREMENTAL_OLDER_BUILD`), runs it and sees
+it unload, and that fails without the forwards (case 2); and by the two-build test,
+which now runs that older plugin on both builds — the realistic case, since a
+deployment's plugins predate its upgrade. CI builds the older plugin in its worktree.
+The reverse cannot work and is stated in the guide: a plugin compiled against the
+abstractions does not load on a build from before them, so nodes are upgraded before
+plugins are rebuilt.
+
+**B4, a record format on the Kafka connectors.** The Kafka layer already took any
+deserializer and serializer; the seam is the service's. `IRecordFormat.CreateCodec<T>(RecordFormatContext)`
+returns an `IRecordCodec<T>` (`Read(bytes, origin)`, `Write(value)`); the context
+carries the topic, key or value, the owner and slot, the generation's JSON options and
+the host's services. A host registers one with `AddRecordFormat(name, factory)` (`json`
+and `debezium` cannot be taken); a slot of any kind, and a `kafka` table loader, choose
+it with `"format": "name"`. `KafkaConnections.Format` makes each format once per
+service, never in a static; the connector asks for codecs when a slot's source or sink
+is made, per part, so a codec is the generation's and goes with it; a loader asks each
+run. A record a codec cannot read is thrown on inside the deserializer, so it takes
+JSON's path: `KafkaSource` hands it to `InputHandle.RejectAsync` (offset consumed, dead
+letter or fault), and a loader to `context.Unreadable` and the table's `onUnreadable`.
+A name nobody registered is refused at the dry run with the registered names; a format
+on the `debezium` loader is refused. The connector's config schema offers the
+registered names.
+
+`KafkaRecordFormatTests` (3), against the broker, with a test host's format — JSON behind
+a schema registry's framing (zero byte, four-byte schema id), so plain JSON is
+unreadable to it: one test has a table loader, an append source on two partitions, a
+keyed source with tombstones, both upsert sinks and an append sink all on it, each sink
+read back through the framing and equal to its model (keys framed too), a plain JSON
+record on each input rejected as a `FormatException` dead letter with the pipelines
+still running, the loader's one counted and skipped under `Skip`, eleven codecs made
+in all (not one per record), and the refusals. The second runs a plugin's private row
+type (`Note`, a new `trade-notes` definition in `Acme.Pipelines`) through both sink kinds
+and then requires its load context to be collected: with a codec kept in a static it
+is not (case 3). The third checks the names `AddRecordFormat` refuses.
+
+**Left.**
+
+- *Headers.* A codec is given the topic, partition, offset and timestamp, not the
+  record's headers: the abstractions cannot name Confluent's `Headers`, and a schema
+  registry's framing is in the value. A format that needs a header (some Protobuf
+  setups put the message type there) needs a member added to `RecordOrigin`.
+- *Other connectors.* The `files` connector keeps JSON lines; its formats are
+  persisted and a format there would be a new connector name, as CLAUDE.md says.
+- *The format's discipline is the format's.* Nothing stops a format from caching by
+  `Type`; the service only never holds a codec past its generation. The interface's
+  documentation and the guide say what a format may keep; the unload test proves the
+  service's half with a format that obeys.
+- *The harness's old home.* A test project compiled against the harness inside
+  `Incremental.Service` must be rebuilt against `Incremental.Service.Testing` (no source
+  change): the service cannot forward to a package that depends on it.
+- *Admin UI.* Not touched; the two UI tests were skipped (no Chrome), as before.
+
+**Checks at the end of the step** (commit of this part): `dotnet build` 0 warnings,
+0 errors; `Incremental.Service.Tests` 289 (281 passed; skipped: the six broker tests on
+one broker, the two admin UI tests without Chrome — the two-build test ran, with the
+older build's plugin); `Incremental.Kafka.Tests` 158 (156, the two `*ABrokerLost*`
+skipped on one broker); `Pipelines.Tests` 21 of 21; smokes in memory 54 claims, two nodes
+69, Kafka 69. `Incremental.Tests` and `benchmarks -- --assert` were not run: nothing in
+`src/Incremental` changed. The three packages pack (`dotnet pack`, CI's packaging step
+now packs the two new ones).
