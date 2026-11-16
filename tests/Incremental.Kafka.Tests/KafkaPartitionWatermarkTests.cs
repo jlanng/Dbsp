@@ -200,6 +200,69 @@ public class KafkaPartitionWatermarkTests(ITestOutputHelper output)
         KafkaEnv.Measured(output, $"a restart onto a backlog of {Partitions} x {While} readings behind partitions the checkpoint called idle: 0 dropped as late");
     }
 
+    /// <summary>
+    /// A burst after a quiet spell. Every partition is idle; then a minute of event time
+    /// is produced at once across all three. The client hands it over a partition at a
+    /// time. Idle partitions hold nothing back, so the first partition read would move
+    /// the watermark to its own newest reading and the others' readings — produced in the
+    /// same instant — would be late. A record takes idle back from the partitions the
+    /// source had called idle, until each has answered again that it is at its end.
+    /// </summary>
+    [Fact]
+    public async Task ABurstAfterEveryPartitionWasIdle_DropsNothingAsLate()
+    {
+        const int Partitions = 3, Burst = 300, Rounds = 6;
+        await using var env = KafkaEnv.Create();
+        var topic = await env.CreateTopicAsync("readings", partitions: Partitions);
+        for (var partition = 0; partition < Partitions; partition++)
+            env.ProduceJson(topic, partition, 0, new Reading(partition, partition, T0.AddSeconds(100)));
+        await env.FlushAsync();
+
+        await using var readings = Circuit();
+        var options = new KafkaSourceOptions
+        {
+            BootstrapServers = KafkaEnv.Bootstrap, Topic = topic, IdlePartitionAfter = TimeSpan.FromMilliseconds(500),
+        };
+        await using var source = await KafkaSource.StartAsync(readings.Circuit, readings.Input, options).WaitAsync(Timeout);
+        await KafkaEnv.EventuallyAsync(
+            () => Task.FromResult(readings.Passed == Partitions && AllIdle(T0.AddSeconds(100))), "all three partitions idle");
+
+        // Every partition has the same newest time, so the watermark alone does not say
+        // they are idle: no partition holds it once they are.
+        bool AllIdle(DateTimeOffset newest) =>
+            readings.Circuit.CurrentWatermark == newest - Lateness && readings.Circuit.WatermarkHeldBy is { Partition: null };
+
+        for (var round = 0; round < Rounds; round++)
+        {
+            // Five minutes of event time on each partition, twelve times the lateness.
+            var from = 200 + round * 1000;
+            for (var partition = 0; partition < Partitions; partition++)
+            {
+                for (var i = 0; i < Burst; i++)
+                    env.ProduceJson(topic, partition, i, new Reading((round + 1) * 10_000 + partition * 1000 + i, partition, T0.AddSeconds(from + i)));
+
+                // A producer's burst is not one write: a partition's batch lands a moment
+                // before the next one's, and the source may fetch in between (after an
+                // end of partition the client fetches again within half a second).
+                await env.FlushAsync();
+                await Task.Delay(200);
+            }
+
+            var expected = Partitions * (1 + (round + 1) * Burst);
+            await KafkaEnv.EventuallyAsync(
+                () => Task.FromResult(readings.Passed + readings.Circuit.LateRecords == expected), "the burst read");
+            Assert.Equal(0, readings.Circuit.LateRecords);
+
+            // And the partitions are idle again, without a new wait: the watermark goes to
+            // the newest reading.
+            await KafkaEnv.EventuallyAsync(
+                () => Task.FromResult(AllIdle(T0.AddSeconds(from + Burst - 1))), "all three idle again");
+        }
+        Assert.Equal(0, readings.Twice);
+        KafkaEnv.Measured(output,
+            $"{Rounds} bursts of {Partitions} x {Burst} readings (five minutes of event time each, a partition 200 ms after the last), each after every partition was idle: 0 dropped as late");
+    }
+
     // ── a broker's loss ────────────────────────────────────────────────────────────────
     //
     // On the kafka3 profile, by hand, as KafkaServiceProcessTests' broker tests are:

@@ -2898,9 +2898,22 @@ and they are not late.
   ever, so one the source has read to its end stops counting once it has stood there
   for five seconds (`KafkaSourceOptions.IdlePartitionAfter`). Until then it holds the
   watermark at its own last record: on a topic where one partition goes quiet, windows
-  close up to five seconds later than they would on one partition. A record that
-  arrives on an idle partition behind the watermark the others have made is late, as
-  it would be on a topic of one partition.
+  close up to five seconds later than they would on one partition.
+- *A burst after a quiet spell.* When every partition is idle and records then arrive
+  — an upstream that stalled and flushes, a batch producer — the client hands them
+  over a partition at a time, and an idle partition holds nothing back. So a record on
+  any partition makes the partitions the source had called idle count again, each
+  until it has answered once more that it is at its end (a question asked a second
+  after the record, `IdlePartitionConfirmEvery`; no new five seconds). What was
+  produced to the other partitions in the same second is therefore not late, however
+  much event time the burst spans. The price: on a topic that is mostly quiet, each
+  record after a quiet spell holds the watermark at the other partitions' last records
+  for one to two seconds. What is not covered: records that reach an idle partition
+  more than about a second after the same burst reached another partition are late if
+  they are behind the watermark that partition has made by then — a topic of several
+  partitions is not a topic of one, where the same records in time order lose
+  nothing. A producer that sends old event times partition by partition, seconds
+  apart, needs a lateness as wide as what it sends.
 - *A partition that cannot be read.* The source asks each partition it stands at the
   end of, once a second, whether it is still at its end; a partition whose leader is
   away does not answer, and after five seconds without an answer it holds the

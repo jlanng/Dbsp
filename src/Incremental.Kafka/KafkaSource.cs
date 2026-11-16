@@ -102,9 +102,12 @@ public sealed class KafkaSourceOptions
     /// to its end stops counting — after this long, so that a pause between two records
     /// is not taken for the end and the price is paid once per quiet spell: the circuit
     /// runs a step for it. Until then a quiet partition holds the watermark at its own
-    /// last record, and windows close this much later than they would. A record that
-    /// arrives on an idle partition is late if it is behind the watermark the others
-    /// have made: the same as on a topic of one partition. Default 5 s.</summary>
+    /// last record, and windows close this much later than they would. A record on any
+    /// partition takes idle back from the others until each has confirmed its end once
+    /// more (one <see cref="IdlePartitionConfirmEvery"/> and the answer, no new wait of
+    /// this length), so that a burst after a quiet spell, read a partition at a time,
+    /// is not late; a record that reaches an idle partition later than that is late if
+    /// it is behind the watermark the others have made. Default 5 s.</summary>
     public TimeSpan IdlePartitionAfter { get; init; } = TimeSpan.FromSeconds(5);
 
     /// <summary>Circuit inputs only: how often the source asks again whether a partition
@@ -772,32 +775,81 @@ public sealed class KafkaSource : IAsyncDisposable
         // counts as gone.
         private readonly long _staleAfter = 3 * Math.Max(1, (long)source._options.IdlePartitionConfirmEvery.TotalMilliseconds) + 2000;
 
+        // Idle was taken back from the partition because a record came on another one:
+        // it is idle again only on the answer to a question asked an interval after that.
+        private readonly bool[] _held = new bool[partitions];
+        private int _idleCount;
+
         /// <summary>The client's end-of-partition event: the leader has just said there
         /// is nothing more. Only here — on evidence of this instant — is a partition
         /// called idle, once it has stood at its end for long enough.</summary>
         public void AtEnd(int partition)
         {
             var now = Environment.TickCount64;
+            var answer = _asked[partition];
             _atEnd[partition] = true;
             _asked[partition] = false;
             _confirmedAt[partition] = now;
             if (_since[partition] == 0)
                 _since[partition] = now;
+            if (_held[partition])
+            {
+                // Only the answer to the question Check asks once the hold is an interval
+                // old says anything about now: an event that was already on its way when
+                // the other partition's record came says what was true before it.
+                if (!answer)
+                    return;
+                _held[partition] = false;
+            }
             if (!_idle[partition] && now - _since[partition] >= _idleAfter)
             {
                 source.Await(consumer, source._target.IdlePartitionAsync(partition, source._stop.Token));
                 _idle[partition] = true;
+                _idleCount++;
             }
         }
 
         /// <summary>A record: the partition is not at its end, and the input counts it
-        /// again by itself.</summary>
+        /// again by itself. And the partitions the source has called idle count again
+        /// too, before the record is handed on: what was produced with this record to
+        /// another partition — a burst after a quiet spell, sent a partition at a time —
+        /// has times this record's partition is about to pass, and an idle partition
+        /// holds nothing back. Each is idle again when it has answered, to a question
+        /// asked one confirm interval from now, that it is still at its end: no new
+        /// <see cref="KafkaSourceOptions.IdlePartitionAfter"/>, the answer is the
+        /// evidence. A record on a topic that is otherwise quiet so holds the watermark
+        /// at the other partitions' last records for that interval and the answer.</summary>
         public void Read(int partition)
         {
             _atEnd[partition] = false;
             _asked[partition] = false;
-            _idle[partition] = false;
+            _held[partition] = false;
             _since[partition] = 0;
+            if (_idle[partition])
+            {
+                _idle[partition] = false;
+                _idleCount--;
+            }
+            if (_idleCount == 0)
+                return;
+
+            var now = Environment.TickCount64;
+            for (var p = 0; p < _idle.Length; p++)
+            {
+                if (!_idle[p])
+                    continue;
+                source.Await(consumer, source._target.ExpectPartitionAsync(p, source._stop.Token));
+                _idle[p] = false;
+                _held[p] = true;
+
+                // A question that is out was asked before this record: its answer does
+                // not count, and the next is asked an interval from now. The partition
+                // has that long, and the time an answer takes, before its evidence is
+                // stale.
+                _asked[p] = false;
+                _confirmedAt[p] = now;
+            }
+            _idleCount = 0;
         }
 
         /// <summary>Asks the partitions the source stands at the end of whether they are
@@ -833,10 +885,12 @@ public sealed class KafkaSource : IAsyncDisposable
                 // partition meanwhile will come when it is back. The partition has to be
                 // seen at its end again, and for as long again, before it is idle.
                 _since[p] = 0;
+                _held[p] = false;
                 if (!_idle[p])
                     continue;
                 source.Await(consumer, source._target.ExpectPartitionAsync(p, source._stop.Token));
                 _idle[p] = false;
+                _idleCount--;
                 source._options.Logger?.LogInformation(
                     "Kafka source {Topic}: partition {Partition} has not confirmed its end for {Silence} ms and holds the watermark again",
                     source._options.Topic, p, now - _confirmedAt[p]);

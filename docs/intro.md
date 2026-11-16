@@ -205,8 +205,14 @@ the *least* over its partitions that are not idle, so a partition that is behind
 others — a backlog read one partition at a time, a broker that was away — holds the
 watermark where its own records are and they are not dropped as late. A partition named
 and not yet heard from holds every claim back; an idle one stops counting until its next
-record; with all of them idle the time is the newest seen anywhere. `KafkaSource` does
-this by itself. Records of partitions nobody named, and unstamped records, are timed
+record; with all of them idle the time is the newest seen anywhere. An idle partition
+holds nothing back, so a source must not leave one idle past the moment a record arrives
+on another: records that come after a quiet spell are read a partition at a time, and the
+first partition read would make the others' late. `KafkaSource` does all of this by
+itself — a record takes idle back from the other partitions (`ExpectPartitionAsync`
+again) until each has confirmed its end once more, which covers what reaches the
+partitions within about a second of each other; what reaches an idle partition later
+than that, behind the watermark the others have made, is late. Records of partitions nobody named, and unstamped records, are timed
 together as before. `circuit.WatermarkHeldBy` says which input and partition the
 watermark waits for.
 

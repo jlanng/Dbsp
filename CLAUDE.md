@@ -465,7 +465,12 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     and a node writes these keys only once its deployment is at that level. Never make a partition idle on
     the passing of time: a source says so only on evidence that it is at the end
     (`KafkaSource.PartitionEnds`: on an end-of-partition answer, after
-    `IdlePartitionAfter`), takes it back when the evidence stops coming, and names
+    `IdlePartitionAfter`), takes it back when the evidence stops coming and — from
+    every partition it has called idle — when a record arrives on another one (an idle
+    partition holds nothing back, and a burst after a quiet spell is read a partition
+    at a time: `PartitionEnds.Read`; each is idle again only on the answer to a
+    question asked a confirm interval after that record, never on an answer that was
+    already on its way), and names
     every partition again at every start — what a checkpoint says of a partition's end
     was true when it was written. Clustered circuits are not bound (one time per
     source, shared between processes).
