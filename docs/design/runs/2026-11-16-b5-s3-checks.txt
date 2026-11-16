@@ -1,0 +1,54 @@
+Round five, B5: the S3 object store for the files connector. 2026-11-16, this machine
+(4 cores), connector stack up (docker compose --profile connectors up -d), MinIO
+pgsty/minio:RELEASE.2026-08-04T00-00-00Z on localhost:9000.
+
+1. The files connector's tests on both stores
+   dotnet test --project tests/Incremental.Service.Tests -- --filter-class "*FileConnectorTests"
+   Two runs, Debug, before the two registration tests were added:
+     total: 90  succeeded: 90  skipped: 0   (each run)
+   At the end of the step, Release:
+     total: 92  succeeded: 92  skipped: 0
+     LocalFileConnectorTests 46 = 39 shared cases + 6 that need no store + 1 directory-only
+     S3FileConnectorTests    46 = the same 39 shared cases + 7 of S3's own
+   MinIO stamps to the millisecond:
+     mc ls --json -> "lastModified":"2026-11-16T03:01:46.976Z"
+
+2. Each S3 check made to fail by the change it guards against
+
+   Case 1: S3ObjectStore.UploadStream.AbortAsync returns before aborting.
+     failed S3FileConnectorTests.A_write_of_several_parts_that_fails_leaves_the_name_as_it_was_and_no_upload_behind
+       Expected: ["out/a.jsonl"]
+       Actual:   ["out/a.jsonl", "out/a.jsonl (upload not completed)", "out/b.jsonl (upload not completed)"]
+     Restored: passed.
+
+   Case 2: the listing's stamp replaced by the node's clock
+     (Info(entry) => new(..., DateTimeOffset.UtcNow, entry.ETag)).
+     failed ...A_backlog_that_is_old_by_the_stores_own_stamps_is_read_at_once_by_a_reader_that_has_only_just_seen_it(skewSeconds: 0)
+     failed ...A_backlog_that_is_old_by_the_stores_own_stamps_is_read_at_once_by_a_reader_that_has_only_just_seen_it(skewSeconds: -3600)
+       total: 44  succeeded: 42   (before the two registration tests were added)
+     Restored: passed.
+
+   Case 3: MinIO unreachable (INCREMENTAL_S3_ENDPOINT=http://localhost:9).
+       total: 44  succeeded: 0  skipped: 44
+     (CI's connector-stack job holds the service tests to six skips, so this fails it.)
+
+3. CI's connector-stack job, emulated (CI's runs were refused by the account's billing)
+   docker compose --profile connectors up -d --wait   (kafka, postgres, debezium, minio healthy)
+   dotnet build -c Release                             0 Warning(s), 0 Error(s)
+   git worktree add --detach <dir> 9de8da9; built its FailoverApp and Acme.Pipelines (Debug)
+   INCREMENTAL_OLDER_BUILD=<dir>/.../Incremental.Service.FailoverApp.dll \
+     dotnet test --project tests/Incremental.Service.Tests -c Release --no-build
+       total: 336  failed: 0  succeeded: 328  skipped: 8  (4m 40s)
+       skipped: the six KafkaServiceProcessTests broker tests (need kafka3) and
+       AdminUiTablesTests, AdminUiMorphTests (no Chrome on this machine; a runner has one,
+       so CI's count is the six it expects)
+   dotnet test --project tests/Incremental.Kafka.Tests -c Release --no-build
+       total: 158  failed: 0  succeeded: 156  skipped: 2  (the two *ABrokerLost*)
+   dotnet run -c Release --no-build --project examples/Incremental.EnrichmentService -- --headless --kafka
+       69 claims checked, all hold (26 s)
+
+4. The rest
+   --headless              54 claims checked, all hold
+   --headless --nodes 2    69 claims checked, all hold
+   Pipelines.Tests         21 of 21
+   dotnet pack src/Incremental.Service.S3 -c Release   Incremental.Service.S3.0.1.0.nupkg, .snupkg

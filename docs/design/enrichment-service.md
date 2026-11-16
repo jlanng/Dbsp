@@ -1557,7 +1557,8 @@ same files.
 - Clustered circuits: they cannot use shared tables or the changelog provider.
 - Sandboxing plugins, or stopping a wedged delegate (it is bounded and shown, not
   stopped).
-- An S3 `IObjectStore`, a gRPC adapter: the seams are here, the adapters are the owner's.
+- A gRPC adapter: the seam is here, the adapter is the owner's. (An S3 `IObjectStore`
+  was out of scope too; round five built one as an optional package, S9, B5.)
 - Per-operator record counts and latency; telling a looping delegate from a stalled table
   commit.
 - Deleting a removed table's topics, or a removed pipeline's last commit record.
@@ -1668,7 +1669,8 @@ numbers are the items' own, from the runs they cite.
 7. **What only AWS can verify** (33, 47, 48, 51, 59; the critic's J5). `UseMsk` is example
    code that nothing calls; the IAM action table is translated from the ACLs tested on
    `kafka-sasl`; the probe's broker question behind ACLs, token refresh over hours, a
-   zone loss has not been run; there is no S3 `IObjectStore`. Controllers separate from
+   zone loss has not been run; the S3 `IObjectStore` (round five, B5) has run against
+   MinIO only, never against S3 or with IAM. Controllers separate from
    the brokers were run here in S8 (eight runs, one machine), not on MSK. MSK's default
    configuration allows unclean leader election on clusters without tiered storage: the
    log's own topics now refuse it for themselves (78), the cluster's default and the
@@ -7968,3 +7970,97 @@ skipped on one broker); `Pipelines.Tests` 21 of 21; smokes in memory 54 claims, 
 69, Kafka 69. `Incremental.Tests` and `benchmarks -- --assert` were not run: nothing in
 `src/Incremental` changed. The three packages pack (`dotnet pack`, CI's packaging step
 now packs the two new ones).
+
+#### An S3 object store for the files connector (B5)
+
+**What was built.** `src/Incremental.Service.S3`, an optional package: `S3ObjectStore`
+(an `IObjectStore` over a bucket and a key prefix that is the store's root) and
+`AddS3ObjectStore(name, S3ObjectStoreOptions)` on the service builder. It references the
+service and `AWSSDK.S3` (4.0.104.4); the service references neither, so the AWS SDK
+reaches only a host that asks for it. The options name the bucket, the prefix, the
+region, an endpoint for an S3-compatible store (`ServiceUrl`, `ForcePathStyle`), the
+part size, and credentials — left out, the SDK's default chain, which on EKS is the
+pod's role (decisions 7 and 13). A host may also hand the store an `IAmazonS3` it keeps.
+
+What the connector asks of a store, and what the store does for it:
+
+- *A page of names after a name.* `ListPageAsync` is one `ListObjectsV2` with `Prefix`,
+  `StartAfter` and `MaxKeys` (at most 1,000, S3's page); `More` is S3's `IsTruncated`.
+  S3 lists in the order of the keys' UTF-8 bytes; that is ordinal UTF-16 order unless a
+  name mixes characters beyond U+FFFF with ones from U+E000 to U+FFFF, and the page is
+  sorted ordinally whatever comes back. `ListAsync` follows continuation tokens.
+- *A write that is whole or absent.* The write's callback fills a stream that holds up
+  to a part (8 MiB; 5 MiB at least). An object no larger is one `PutObject`, sent only
+  after the callback returns. A larger one becomes a multipart upload whose parts go as
+  they fill, completed only after the callback returns; S3 shows neither object before
+  its last request. A callback that throws or is cancelled sends no put, and an upload
+  begun for it is aborted (an abort that fails leaves an incomplete upload, which no
+  listing shows; the guide asks for a lifecycle rule). A synchronous `Write` that fills
+  a part waits for it.
+- *The settle rule on the store's own stamps.* `Modified` is the listing's
+  `LastModified`, `Identity` the ETag. The connector's rule is unchanged: it compares
+  stamps with stamps, or counts its own time since it first saw an object, never the
+  node's clock against the store's. An object written again with the same length is
+  another object by its ETag (where a directory's identity is length and time).
+- A missing object read throws `FileNotFoundException`, which the connector already
+  takes for "gone since it was listed"; a path that is absolute or climbs (`..`) is
+  refused as the local store refuses it.
+
+**The tests.** `FileConnectorTests` is now abstract, and every test in it runs on two
+stores: `LocalFileConnectorTests` (a directory, as before) and `S3FileConnectorTests`
+(MinIO, a key prefix per test in one bucket). The tests reach the store only through
+`IObjectStore` and three members a store's class gives: open an empty store,
+`NamesUnderAsync` (every name the store holds, a temporary file or an upload not
+completed included), and `AgeAsync` (make objects older by the store's own stamps — a
+directory sets its files' times back, a bucket waits). What touched the directory
+directly became one of those: the 40 MB line goes through `WriteAsync` (on S3 a
+multipart upload of nine parts), the "no temporary left" checks ask `NamesUnderAsync`,
+and the two settle tests that dated an object a minute back wait out the settle time on
+S3. What is a directory's alone (the symbolic link outside the prefix) and the tests
+that need no store (the position's encoding, the line reader, the sink's names) are in
+`LocalFileConnectorTests` only. The S3 class adds seven: a write of several parts is one
+object when it returns and none while it runs (stat, listing and the upload seen
+mid-write); one that fails or is cancelled leaves the name as it was and no upload; a
+page after a name with `More` right at the end and past S3's 1,000; an object rewritten
+with the same length has a new identity; two stores on one bucket see only their own
+prefix; a store registered by its options (its own client) feeds a pipeline; and the
+guide's production registration, which makes a store without asking AWS anything (the
+guide quotes it as a region, under `DocSnippetTests`).
+
+MinIO is in the `connectors` compose profile (`localhost:9000`), so CI's
+`connector-stack` job starts it with the rest, and its count of skipped service tests
+(six, the broker tests) fails if the S3 tests skip. MinIO's own images are no longer on
+Docker Hub or Quay (both refused the pull here); the compose file uses Pigsty's build of
+the MinIO server, pinned to `RELEASE.2026-08-04T00-00-00Z`. MinIO stamps to the
+millisecond.
+
+Each check was made to fail by the change it guards against
+(`runs/2026-11-16-b5-s3-checks.txt`): with the abort removed, the failing-write test
+finds two uploads left; with the node's clock as the listing's stamp, both backlog tests
+fail (a backlog old by the store's stamps was not read at once); with MinIO unreachable
+all 44 S3 tests skip.
+
+**Left.**
+
+- *Real S3 is unverified* (decision 7), and the package's documentation, the guide and
+  the README say so: IAM authentication, S3's listing order and consistency, and its
+  stamps' precision (S3 is understood to stamp to the second, and a multipart upload
+  with its start) have not been run.
+- *A stamp is when an upload began.* If S3 stamps a multipart upload with its start, an
+  object uploaded slowly by another writer settles sooner after it appears than its
+  `settle` says. The guide tells such writers to set `settle` over their upload time;
+  nothing measures it.
+- *CI has not run.* The account's billing refused the runs of this step's pushes, as it
+  has every push of this round. CI's `connector-stack` job was emulated on this machine
+  (the same compose profile, Release build, the older build from 9de8da9 for the
+  two-build test): see the checks below.
+- *Admin UI.* Not touched; its two tests skip without Chrome, as before.
+
+**Checks at the end of the step** (`runs/2026-11-16-b5-s3-checks.txt`): `dotnet build`
+0 warnings, 0 errors (Debug and Release); the files connector's tests 92 of 92 (46 on
+each store); CI's `connector-stack` job emulated here — `Incremental.Service.Tests` 336
+(328 passed; skipped the six broker tests on one broker and the two admin UI tests
+without Chrome; the two-build test ran against 9de8da9), `Incremental.Kafka.Tests` 158
+(156, the two `*ABrokerLost*` skipped), the Kafka smoke 69 claims; smokes in memory 54
+and two nodes 69; `Pipelines.Tests` 21 of 21; the package packs. `Incremental.Tests` and
+`benchmarks -- --assert` were not run: nothing in `src/Incremental` changed.

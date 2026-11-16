@@ -300,3 +300,17 @@ record format seam*.
   Case 2 and the two-build test need the build from before format levels and its own
   plugin, as CLAUDE.md says (`git worktree add --detach <dir> 9de8da9`, build its
   `tests/Incremental.Service.FailoverApp` and `tests/Incremental.Service.TestPlugins/Acme.Pipelines`).
+
+## 2026-11-16, round five — the S3 store (B5)
+
+`docs/design/enrichment-service.md`, *As built*, S9, *An S3 object store for the files
+connector*.
+
+- `2026-11-16-b5-s3-checks.txt` — the files connector's tests on both stores, each S3
+  check made to fail by the change it guards against (the abort of a failed multipart
+  write removed; the node's clock in place of the listing's stamps; MinIO unreachable),
+  the failures as printed, and the suites' counts at the end of the step, with CI's
+  `connector-stack` job emulated here because CI's runs were refused.
+  Run with the connector stack up (`docker compose --profile connectors up -d`, which
+  now starts MinIO on `localhost:9000`):
+  `dotnet test --project tests/Incremental.Service.Tests -- --filter-class "*FileConnectorTests"`.
