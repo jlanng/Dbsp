@@ -7849,3 +7849,11 @@ dry run; the harness.
 **Left (B3).** The limit is on entries, not bytes, and judged once a second, so a
 pipeline can pass it by a second's growth before it is stopped. The admin UI tests
 were not run (no Chrome here); `forms.js` gained one field.
+
+**Checks at the end of the step** (commit `2e9f326` plus docs): `dotnet build` 0
+warnings, 0 errors; `Incremental.Tests` 760 (759 passed, the soak skipped);
+`Incremental.Kafka.Tests` 158 (156, the two `*ABrokerLost*` skipped on one broker);
+`Incremental.Service.Tests` 269 (260 passed; skipped: the six broker tests, the two
+admin UI tests without Chrome, the two-build test without `INCREMENTAL_OLDER_BUILD` —
+nothing persisted changed); `Pipelines.Tests` 21 of 21; smokes in memory 54 claims,
+two nodes 69, Kafka 69; trade enrichment 13; `benchmarks -- --assert` all 10 hold.
