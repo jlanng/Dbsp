@@ -1457,9 +1457,10 @@ internal sealed class FramedFormat : IRecordFormat
 ```
 
 **`files`** reads and writes JSON-lines objects under a prefix of an object store the
-host registered (`AddObjectStore(name, …)`: `LocalObjectStore` for a directory; S3 or
-anything else is an `IObjectStore` you write — five methods, and a sixth,
-`ListPageAsync`, worth writing; see below):
+host registered (`AddObjectStore(name, …)`: `LocalObjectStore` for a directory; an S3
+bucket through the optional package `Incremental.Service.S3`, below; anything else is an
+`IObjectStore` you write — five methods, and a sixth, `ListPageAsync`, worth writing;
+see below):
 
 ```json
 { "connector": "files", "store": "lake", "prefix": "quotes/", "pollInterval": "00:00:05", "suffix": ".jsonl" }
@@ -1514,6 +1515,42 @@ What reading in name order asks of whoever writes the objects:
   appeared: a file written an hour ago and moved into the prefix now carries the hour,
   and is read at once when a newer object is listed;
 - old objects can be deleted. The position does not need the object it names.
+
+**An S3 bucket** is the optional package `Incremental.Service.S3`, which a host
+references when it wants one (the service itself does not, so the AWS SDK reaches no
+host that has not asked for it):
+
+<!-- snippet: tests/Incremental.Service.Tests/S3FileConnectorTests.cs#s3-store -->
+```csharp
+builder.AddS3ObjectStore("lake", new S3ObjectStoreOptions
+{
+    Bucket = "acme-lake",
+    Prefix = "enrichment/",        // the store's root: a spec's "quotes/" is the key enrichment/quotes/…
+    Region = "eu-west-2",
+    // Credentials left out: the SDK's default chain, which on EKS is the pod's role.
+});
+```
+
+What the connector asks of a store, the S3 store does with S3's own means: a poll's page
+is one `ListObjectsV2` after the position (`StartAfter`, `MaxKeys`); a sink's object is
+one `PutObject`, or past `PartSize` (8 MiB) a multipart upload that is completed only
+when the step's write has returned and aborted when it fails, so an object is there whole
+or not at all; `settle` compares the listing's `LastModified` stamps with each other and
+an object changed under its name is told by its ETag. Two things are S3's to know: S3 is
+understood to stamp an object with the time its upload began, so a writer whose uploads
+take long needs a `settle` that covers them; and S3 lists in the order of the keys'
+UTF-8 bytes, which is the connector's order for every name unless it mixes characters
+beyond U+FFFF with ones from U+E000 to U+FFFF. Give the node's role `s3:ListBucket`,
+`s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on the prefix, and give the bucket
+a lifecycle rule that removes incomplete multipart uploads (an abort that fails leaves
+one, which no listing shows). `ServiceUrl` and `ForcePathStyle` point it at an
+S3-compatible store instead.
+
+**It is tested against MinIO only, never against Amazon S3.** The files connector's
+tests run against it as they run against a directory, on the connector stack's MinIO
+(`docker compose --profile connectors up -d`), and CI runs them. Authentication by IAM,
+S3's own listing and stamps (MinIO stamps to the millisecond; S3 is not checked), and a
+bucket's policies are unverified: checking anything on AWS is put off.
 
 A line that is not a record is rejected in its place: it faults the pipeline under the
 default error policy and is a dead letter — with its object and line — under

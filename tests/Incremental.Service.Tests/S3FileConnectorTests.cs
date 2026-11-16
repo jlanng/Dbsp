@@ -3,7 +3,9 @@ using System.Text;
 using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
+using Acme.Contracts;
 using Incremental.Service.S3;
+using static Incremental.Service.Tests.SupervisorTests;
 
 namespace Incremental.Service.Tests;
 
@@ -225,5 +227,56 @@ public sealed class S3FileConnectorTests : FileConnectorTests
         Assert.Equal(["in/a.jsonl"], (await other.ListPageAsync("", null, 10, default)).Objects.Select(o => o.Path));
         Assert.Throws<ArgumentException>(() => new S3ObjectStore(_client!, new S3ObjectStoreOptions { Bucket = Bucket, Prefix = "no-slash" }));
         await Assert.ThrowsAsync<FileNotFoundException>(async () => await Store.OpenReadAsync("in/missing.jsonl", default));
+    }
+
+    // ── the host's registration ────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task A_store_registered_by_its_options_is_what_a_files_slot_reads_from()
+    {
+        // The registration a host writes, pointed at MinIO: the client is the store's own.
+        await PutAsync("in/0001.jsonl", Trades(0, 50));
+        await using var service = await TestService.StartAsync(configure: b => b.AddS3ObjectStore("bucket", new S3ObjectStoreOptions
+        {
+            Bucket = Bucket,
+            Prefix = _prefix,
+            ServiceUrl = Endpoint,
+            ForcePathStyle = true,
+            Credentials = new BasicAWSCredentials(
+                Environment.GetEnvironmentVariable("INCREMENTAL_S3_ACCESS_KEY") ?? "incremental",
+                Environment.GetEnvironmentVariable("INCREMENTAL_S3_SECRET_KEY") ?? "incremental-secret"),
+        }));
+        await service.DeployAsync(TestService.Spec("counts", "counts", null, "counts") with
+        {
+            Inputs = new Dictionary<string, System.Text.Json.JsonElement>
+            {
+                ["trades"] = TestService.Json("""{ "connector": "files", "store": "bucket", "prefix": "in/", "pollInterval": "00:00:00.05", "settle": "00:00:00" }"""),
+            },
+        });
+        var sink = service.Memory.UpsertSink<string, long>("counts");
+        var expected = Counts.Model(Trades(0, 50));
+        await TestService.Eventually(() => sink.Rows.Count == expected.Count && expected.All(e => sink.Rows.TryGetValue(e.Key, out var n) && n == e.Value), "the object counted");
+        Assert.Contains(service.Node.Discovery.Connections, c => c is { Name: "bucket", Kind: "object-store" });
+    }
+
+    [Fact]
+    public async Task The_guide_s_registration_makes_a_store_without_asking_AWS_anything()
+    {
+        // What the guide shows for production. Nothing here reaches AWS: the store and its
+        // client are made when a slot first names the store, and making them sends nothing.
+        await using var service = await TestService.StartAsync(configure: builder =>
+        {
+            // <snippet:s3-store>
+            builder.AddS3ObjectStore("lake", new S3ObjectStoreOptions
+            {
+                Bucket = "acme-lake",
+                Prefix = "enrichment/",        // the store's root: a spec's "quotes/" is the key enrichment/quotes/…
+                Region = "eu-west-2",
+                // Credentials left out: the SDK's default chain, which on EKS is the pod's role.
+            });
+            // </snippet:s3-store>
+        });
+        var store = Assert.IsType<S3ObjectStore>(service.Node.Context.ObjectStore("lake"));
+        Assert.Equal(("acme-lake", "enrichment/"), (store.Bucket, store.Prefix));
     }
 }

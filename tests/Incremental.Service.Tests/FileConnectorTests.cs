@@ -67,7 +67,7 @@ public abstract class FileConnectorTests : IAsyncLifetime
         await _store.WriteAsync(name, (stream, ct) => stream.WriteAsync(bytes, ct), default);
     }
 
-    private Task PutAsync(string name, IEnumerable<Trade> trades) => PutAsync(name, trades.Select(t => JsonSerializer.Serialize(t, Web)));
+    protected Task PutAsync(string name, IEnumerable<Trade> trades) => PutAsync(name, trades.Select(t => JsonSerializer.Serialize(t, Web)));
 
     private static bool Same<TKey, TRow>(IReadOnlyDictionary<TKey, TRow> actual, IReadOnlyDictionary<TKey, TRow> expected) where TKey : notnull =>
         actual.Count == expected.Count && expected.All(e => actual.TryGetValue(e.Key, out var row) && Equals(row, e.Value));
