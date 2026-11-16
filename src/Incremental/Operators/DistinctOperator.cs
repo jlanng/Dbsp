@@ -63,7 +63,7 @@ internal sealed class KeyedDistinctOperator<TKey, TValue> : IStepOperator
     public KeyedDistinctOperator(OperatorContext context, KeyEviction<TKey>? eviction)
     {
         _integrated = context.Storage.CreateIndexedWeightStore<TKey, TValue>(context.StateName("integrated"));
-        _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
+        _eviction = eviction is null ? null : new EvictionTracker<TKey>(context, eviction);
     }
 
     private readonly ZSet<KeyedValue<TKey, TValue>> _empty = new();

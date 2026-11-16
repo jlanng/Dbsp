@@ -1,0 +1,73 @@
+Round five, the review's findings (E1, E2, E3, S1, C1, C2, C3), 2026-11-16.
+docs/design/enrichment-service.md, As built, S9, "The review's findings".
+Machine: 4 cores, 15 GB, the connector stack up (docker compose --profile connectors up -d). Debug builds
+unless said. Each test below was written first and run on the code before its fix.
+
+== E1: a level-1 checkpoint and a step before the partitions are named ==
+FormatLevelTests.A_level_1_checkpoint_resumed_holds_its_watermark_through_a_step_that_comes_before_the_partitions_are_named
+  before the fix (commit 113e42c + the test):  failed: $watermark#s0 expected 100 s (the least), was 600 s (the newest)
+  (the verifier's run of the same order on that code: watermark 98 s -> 598 s after the other input's step, 2 records late)
+  after: passed. FormatLevelTests, PartitionWatermarkTests, EventTimeRestartTests, RollingUpgradeTests: 123 of 123.
+FormatLevelTests.A_leader_that_does_not_raise_writes_what_a_build_from_before_partition_times_reads asserted the newest
+  across partitions under $watermark#s0; it now asserts the least.
+
+== E3 / C1: a burst after every partition was idle ==
+KafkaPartitionWatermarkTests.ABurstAfterEveryPartitionWasIdle_DropsNothingAsLate: three partitions idle, then six
+bursts of 3 x 300 readings, five minutes of event time each (lateness 5 s), a partition's batch flushed 200 ms after
+the last one's, each burst after all three were idle again (IdlePartitionAfter 500 ms, IdlePartitionConfirmEvery 1 s).
+  before the fix:  failed 3 runs of 3, each "Expected: 0, Actual: 588" late (2 x 294: all but the newest six of
+                   partitions 1 and 2 in the first burst)
+  after:           passed 3 runs of 3 alone, and in the suite; 0 late
+  two shapes of the same test that did NOT fail before the fix, and why: all three partitions flushed in one go (after
+  an end of partition the client fetches again only after fetch.error.backoff.ms, so the whole burst was in one
+  fetch), and bursts begun when the watermark stood at the newest reading but the partitions were not yet idle (all
+  three had the same newest time; the test now waits for WatermarkHeldBy to name no partition).
+On the kafka3 profile (three brokers, replication 3; INCREMENTAL_KAFKA_BOOTSTRAP, _REPLICATION, _BROKERS as in CLAUDE.md):
+  dotnet test --project tests/Incremental.Kafka.Tests -- --filter-class '*KafkaPartitionWatermarkTests'
+      total 6, passed 6, skipped 0 (1 min 44 s): the burst test and the two *ABrokerLost* included
+  dotnet test --project tests/Incremental.Service.Tests -- --filter-method '*broker*'
+      total 7, passed 7, skipped 0 (8 min 46 s)
+
+== E2: a late version of a key in the drain that holds its open version ==
+PartitionWatermarkTests.A_late_version_of_a_record_does_not_take_back_the_open_row_its_key_holds, now a theory
+(the two in separate steps; the two in one drain), and with a delete followed by a late version of the key.
+  before the fix:  (inOneDrain: False) passed; (inOneDrain: True) failed: rows expected {7@200 s, 8@210 s}, were {8@210 s}
+  after:           2 of 2. PartitionWatermarkTests, EventTimeRestartTests, *Keyed*: 128 of 128.
+
+== S1: load pacing on a table that commits steadily; tables loading at once ==
+TableLoadPacingTests.A_table_that_changes_steadily_is_never_a_large_load: 120 commits of 20 changes 20 ms apart
+(LargeAfterChanges 1,000, StepBytes 1 MB, QuietGap 200 ms), 2 MB allocated beside each.
+  before the fix:  failed: Steps expected 0, was 71
+  after:           0, and a load of 20,000 rows straight after it is paced
+TableLoadPacingTests.Tables_loading_at_once_share_one_pace: four tables loaded together, StepBytes 4 MB.
+  before the fix:  failed: "85 young collections asked for over 105 MB allocated, at a step of 4 MB"
+  after:           passed (at most allocated / StepBytes + 1)
+TableLoadPacingTests: 7 of 7, three runs of three.
+The scale rig, Release, to see that a real load is paced as it was (docs/design/runs/2026-11-16-b2-paced-load.tsv:
+73 steps, longest stall 190 / 192 / 200 ms, load 38.2-39.1 s at three million rows):
+  dotnet Incremental.Service.Scale.dll run --rows 3000000 --state-keys 1000 --load-only --broker-container incremental-kafka-1
+      table.load: 41914 ms (71,574 rows a second)
+      leader.load.longest-stall: 141.4 ms
+      leader.load.paced: 73 young collections asked for, 7763 ms in them, 0 not asked for (memory above the ceiling)
+  one run; the load's time is within what this machine's runs of the day differ by and is not claimed as a change.
+
+== C2, C3: the suites run whole on the code after the fixes, timed ==
+dotnet build                                    0 warnings, 0 errors
+tests/Incremental.Tests                         765 total, 764 passed, 1 skipped (the opt-in soak); 1 min 38 s to 1 min 51 s
+    seven whole runs. The first had one failure: TableJoinTests.Completing_every_input_ends_an_auto_stepping_circuit_though_its_table_never_completes
+    (its consumer waited 20 s for the output to end). It passed alone 3 times of 3 and in the six whole runs after.
+    Not reproduced and not explained; nothing in this step touches a circuit's completion.
+tests/Incremental.Kafka.Tests                   166 total, 164 passed, 2 skipped (*ABrokerLost*, kafka3 only); 4 min 58 s
+tests/Incremental.Service.Tests                 337 total, 329 passed, 0 failed, 8 skipped (six broker tests; two admin UI
+                                                tests: no Chrome); 4 min 40 s; the two-build test ran against 9de8da9
+                                                (INCREMENTAL_OLDER_BUILD, built in a worktree as CLAUDE.md says)
+Pipelines.Tests                                 21 of 21 (2 s)
+smokes: --headless 54 claims (5 s); --headless --nodes 2 69 (5 s); --headless --kafka 69, with a kill -9 (26 s);
+        TradeEnrichment 13: all hold
+benchmarks -- --assert                          all 10 performance contracts hold
+CI                                              not run (the account's billing, as before)
+
+On the earlier record (2026-11-16-k-small-items.txt, "Checks at the end of the step"): its service row gives 337 total,
+329 passed, 8 skipped and says in the same entry that the suite run had one failure. The two cannot both be that run's
+count (329 + 8 = 337). The failing assertion was removed in 5eb5ca0 and its class re-run; the suite was not run whole
+after that until the run above.

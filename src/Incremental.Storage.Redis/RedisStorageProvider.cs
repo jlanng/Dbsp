@@ -32,6 +32,8 @@ public sealed class RedisStorageOptions
 ///   weight store       {prefix}:{store}            hash: serialized value → weight
 ///   indexed store      {prefix}:{store}:{key}      hash: serialized value → weight, one hash per group
 ///   value store        {prefix}:{store}            hash: serialized key → serialized value
+///   deadline store     {prefix}:{store}            hash: serialized key → deadline (UTC ticks)
+///                      {prefix}:{store}:due        sorted set: serialized key, scored by deadline / 1024
 ///   checkpoint         {prefix}:checkpoint         hash: input name → committed offset
 ///   manifest           {prefix}:manifest           hash: scope (process) → committed state manifest
 ///
@@ -73,6 +75,9 @@ public sealed class RedisStorageProvider : ICheckpointStorageProvider
     public IValueStore<TKey, TValue> CreateValueStore<TKey, TValue>(string name) where TKey : notnull =>
         GetOrCreate(name, () => new RedisValueStore<TKey, TValue>(_db, $"{_options.KeyPrefix}:{name}", _options.Serializer));
 
+    public IDeadlineStore<TKey> CreateDeadlineStore<TKey>(string name) where TKey : notnull =>
+        GetOrCreate(name, () => new RedisDeadlineStore<TKey>(_db, $"{_options.KeyPrefix}:{name}", _options.Serializer));
+
     public IReadOnlyDictionary<string, long> Recover()
     {
         lock (_stores)
@@ -93,31 +98,12 @@ public sealed class RedisStorageProvider : ICheckpointStorageProvider
     {
         lock (_stores)
         {
-            var transaction = _db.CreateTransaction();
-            var pending = new List<Task>();
-            foreach (var store in _stores.Values)
-                store.Flush(transaction, pending);
-
-            if (inputOffsets.Count > 0)
-            {
-                var marker = new HashEntry[inputOffsets.Count];
-                var i = 0;
-                foreach (var (input, offset) in inputOffsets)
-                    marker[i++] = new HashEntry(input, offset);
-                pending.Add(transaction.HashSetAsync(_checkpointKey, marker));
-            }
-
-            // The staged manifests ride the same transaction, so a committed manifest always
-            // describes committed state; once landed they need no rewriting (cleared below).
-            foreach (var (scope, manifest) in _stagedManifests)
-                pending.Add(transaction.HashSetAsync(_manifestKey, scope, manifest));
+            var (transaction, pending) = BuildCommit(inputOffsets);
 
             // MULTI/EXEC: the commands travel as one unit and Redis applies them on EXEC,
             // so a crash anywhere before that leaves the previous checkpoint fully intact.
             if (!transaction.Execute())
-                throw new InvalidOperationException(
-                    "The checkpoint commit transaction was rejected by Redis; nothing was applied, " +
-                    "so the previous checkpoint is intact.");
+                throw CommitRejected();
 
             // EXEC does not roll back on per-command errors (e.g. WRONGTYPE against a
             // colliding key), so a true Execute() is not enough: every queued command must
@@ -128,17 +114,85 @@ public sealed class RedisStorageProvider : ICheckpointStorageProvider
             }
             catch (AggregateException ex)
             {
-                throw new InvalidOperationException(
-                    "The checkpoint commit transaction executed, but one or more of its commands failed; " +
-                    "the committed checkpoint may be incomplete and must not be trusted.",
-                    ex.InnerExceptions.Count == 1 ? ex.InnerException : ex);
+                throw CommandsFailed(ex.InnerExceptions.Count == 1 ? ex.InnerException! : ex);
             }
 
-            foreach (var store in _stores.Values)
-                store.Discard(); // the overlays' content is now the committed state
-            _stagedManifests.Clear();
+            CompleteCommit();
         }
     }
+
+    /// <summary>The same commit without holding a thread across the round trip. The circuit
+    /// runs no step while a commit is pending, so nothing stages into the stores between
+    /// building the transaction and discarding the overlays; the lock is taken only around
+    /// those two ends (a monitor cannot be held across an await).</summary>
+    public async ValueTask CommitAsync(IReadOnlyDictionary<string, long> inputOffsets, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        ITransaction transaction;
+        List<Task> pending;
+        lock (_stores)
+            (transaction, pending) = BuildCommit(inputOffsets);
+
+        // Not cancellable from here: once EXEC is on the wire the outcome is Redis's, and
+        // abandoning the wait would leave the overlays out of step with what was committed.
+        if (!await transaction.ExecuteAsync().ConfigureAwait(false))
+            throw CommitRejected();
+
+        try
+        {
+            await Task.WhenAll(pending).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            throw CommandsFailed(ex);
+        }
+
+        lock (_stores)
+            CompleteCommit();
+    }
+
+    /// <summary>Queues every staged write, the offsets marker and the staged manifests into
+    /// one transaction. Caller holds the lock.</summary>
+    private (ITransaction Transaction, List<Task> Pending) BuildCommit(IReadOnlyDictionary<string, long> inputOffsets)
+    {
+        var transaction = _db.CreateTransaction();
+        var pending = new List<Task>();
+        foreach (var store in _stores.Values)
+            store.Flush(transaction, pending);
+
+        if (inputOffsets.Count > 0)
+        {
+            var marker = new HashEntry[inputOffsets.Count];
+            var i = 0;
+            foreach (var (input, offset) in inputOffsets)
+                marker[i++] = new HashEntry(input, offset);
+            pending.Add(transaction.HashSetAsync(_checkpointKey, marker));
+        }
+
+        // The staged manifests ride the same transaction, so a committed manifest always
+        // describes committed state; once landed they need no rewriting (cleared after).
+        foreach (var (scope, manifest) in _stagedManifests)
+            pending.Add(transaction.HashSetAsync(_manifestKey, scope, manifest));
+        return (transaction, pending);
+    }
+
+    /// <summary>The overlays' content is now the committed state. Caller holds the lock.</summary>
+    private void CompleteCommit()
+    {
+        foreach (var store in _stores.Values)
+            store.Discard();
+        _stagedManifests.Clear();
+    }
+
+    private static InvalidOperationException CommitRejected() => new(
+        "The checkpoint commit transaction was rejected by Redis; nothing was applied, " +
+        "so the previous checkpoint is intact.");
+
+    private static InvalidOperationException CommandsFailed(Exception inner) => new(
+        "The checkpoint commit transaction executed, but one or more of its commands failed; " +
+        "the committed checkpoint may be incomplete and must not be trusted.",
+        inner);
 
     public string? CommittedManifest(string scope)
     {
@@ -603,5 +657,176 @@ public sealed class RedisStorageProvider : ICheckpointStorageProvider
         }
 
         private RedisValue Field(TKey k) => serializer.Serialize(k);
+    }
+
+    /// <summary>
+    /// Deadlines in Redis: the hash holds each key's exact deadline, the sorted set their
+    /// order. A sorted set's score is a double, which cannot hold every tick count, so the
+    /// score is the deadline in units of 1,024 ticks (exact in a double for any date) and a
+    /// range read is a superset the hash then decides — due means the exact deadline.
+    /// <para>
+    /// Nothing is read at start, whatever the store holds. <see cref="TakeDue"/> asks Redis
+    /// only when the watermark has reached <c>_floor</c>, a lower bound on the committed
+    /// scores still to be taken, so a step in which nothing closes costs no round trip.
+    /// The floor never passes an entry whose removal is still staged: after a rollback
+    /// that entry is due again.
+    /// </para>
+    /// </summary>
+    private sealed class RedisDeadlineStore<TKey>(IDatabase db, string key, IStateSerializer serializer)
+        : IDeadlineStore<TKey>, IStagedStore where TKey : notnull
+    {
+        private const int ScoreShift = 10;
+        private const long FloorUnknown = long.MinValue;
+
+        private readonly RedisKey _dueKey = key + ":due";
+
+        // Deadlines staged since the last commit (not held = remove at flush), and committed
+        // ones read from Redis this interval (not held = known absent).
+        private readonly Dictionary<RedisValue, (bool Held, long Deadline)> _staged = [];
+        private readonly Dictionary<RedisValue, (bool Held, long Deadline)> _cache = [];
+
+        // At or below every staged deadline that is held: no scan of the overlay below it.
+        private long _stagedMin = long.MaxValue;
+        private long _floor = FloorUnknown;
+        private readonly List<RedisValue> _scratch = [];
+
+        public void AddAll(IReadOnlyList<TKey> keys, Func<TKey, long> deadlineOf)
+        {
+            if (keys.Count == 0)
+                return;
+
+            var fields = new RedisValue[keys.Count];
+            for (var i = 0; i < keys.Count; i++)
+                fields[i] = Field(keys[i]);
+            Prefetch(fields);
+
+            for (var i = 0; i < keys.Count; i++)
+            {
+                if (!_staged.TryGetValue(fields[i], out var current))
+                    current = _cache[fields[i]];
+                if (!current.Held)
+                    Stage(fields[i], deadlineOf(keys[i]));
+            }
+        }
+
+        public void Set(TKey k, long deadline) => Stage(Field(k), deadline);
+
+        public void Remove(TKey k) => _staged[Field(k)] = (false, 0);
+
+        public void TakeDue(long upTo, List<TKey> into)
+        {
+            if (upTo >= _stagedMin)
+            {
+                _scratch.Clear();
+                var min = long.MaxValue;
+                foreach (var (field, (held, deadline)) in _staged)
+                {
+                    if (!held)
+                        continue;
+                    if (deadline <= upTo)
+                        _scratch.Add(field);
+                    else
+                        min = Math.Min(min, deadline);
+                }
+                _stagedMin = min;
+                foreach (var field in _scratch)
+                    Take(field, into);
+            }
+
+            var bucket = upTo >> ScoreShift;
+            if (_floor != FloorUnknown && bucket < _floor)
+                return;
+
+            var candidates = db.SortedSetRangeByScoreWithScores(_dueKey, double.NegativeInfinity, bucket);
+            if (candidates.Length == 0)
+            {
+                // Nothing at or below the watermark: the floor is the next score above it.
+                var next = db.SortedSetRangeByScoreWithScores(_dueKey, bucket, double.PositiveInfinity, Exclude.Start, take: 1);
+                _floor = next.Length == 0 ? long.MaxValue : (long)next[0].Score;
+                return;
+            }
+
+            // Every candidate stays in the sorted set until the next commit, taken or not,
+            // so the floor stays at the lowest of them.
+            _floor = (long)candidates[0].Score;
+            _scratch.Clear();
+            foreach (var candidate in candidates)
+                if (!_staged.ContainsKey(candidate.Element)) // else the overlay has decided it
+                    _scratch.Add(candidate.Element);
+            if (_scratch.Count == 0)
+                return;
+
+            Prefetch([.. _scratch]);
+            foreach (var field in _scratch)
+                if (_cache[field] is { Held: true, Deadline: var deadline } && deadline <= upTo)
+                    Take(field, into);
+        }
+
+        private void Take(RedisValue field, List<TKey> into)
+        {
+            _staged[field] = (false, 0);
+            into.Add(serializer.Deserialize<TKey>(field!));
+        }
+
+        private void Stage(RedisValue field, long deadline)
+        {
+            _staged[field] = (true, deadline);
+            if (deadline < _stagedMin)
+                _stagedMin = deadline;
+        }
+
+        public void Flush(ITransaction transaction, List<Task> pending)
+        {
+            List<RedisValue>? deletes = null;
+            List<HashEntry>? sets = null;
+            List<SortedSetEntry>? scores = null;
+            foreach (var (field, (held, deadline)) in _staged)
+            {
+                if (!held)
+                {
+                    (deletes ??= []).Add(field);
+                    continue;
+                }
+                (sets ??= []).Add(new HashEntry(field, deadline));
+                (scores ??= []).Add(new SortedSetEntry(field, deadline >> ScoreShift));
+                if (_floor != FloorUnknown && deadline >> ScoreShift < _floor)
+                    _floor = deadline >> ScoreShift;
+            }
+            if (deletes is not null)
+            {
+                pending.Add(transaction.HashDeleteAsync(key, [.. deletes]));
+                pending.Add(transaction.SortedSetRemoveAsync(_dueKey, [.. deletes]));
+            }
+            if (sets is not null)
+            {
+                pending.Add(transaction.HashSetAsync(key, [.. sets]));
+                pending.Add(transaction.SortedSetAddAsync(_dueKey, [.. scores!]));
+            }
+        }
+
+        public void Discard()
+        {
+            _staged.Clear();
+            _cache.Clear();
+            _stagedMin = long.MaxValue;
+        }
+
+        private RedisValue Field(TKey k) => serializer.Serialize(k);
+
+        /// <summary>One HMGET round trip for the fields whose committed deadline is unknown.</summary>
+        private void Prefetch(RedisValue[] fields)
+        {
+            HashSet<RedisValue>? seen = null;
+            List<RedisValue>? missing = null;
+            foreach (var field in fields)
+                if (!_staged.ContainsKey(field) && !_cache.ContainsKey(field) && (seen ??= []).Add(field))
+                    (missing ??= []).Add(field);
+            if (missing is null)
+                return;
+
+            var stored = db.HashGet(key, [.. missing]);
+            for (var i = 0; i < missing.Count; i++)
+                _cache[missing[i]] = stored[i].IsNull ? (false, 0) : (true, (long)stored[i]);
+        }
     }
 }

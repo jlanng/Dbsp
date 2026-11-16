@@ -22,7 +22,7 @@ internal sealed class AntiJoinOperator<TKey, TLeft, TRight> : IStepOperator
     {
         _left = context.Storage.CreateIndexedWeightStore<TKey, TLeft>(context.StateName("left"));
         _rightRowCount = context.Storage.CreateWeightStore<TKey>(context.StateName("rightRows"));
-        _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
+        _eviction = eviction is null ? null : new EvictionTracker<TKey>(context, eviction);
     }
 
     private readonly ZSet<KeyedValue<TKey, TLeft>> _empty = new();

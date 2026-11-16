@@ -68,7 +68,7 @@ public class StateManifestTests
         // positional store name no longer matches the committed one — silent corruption
         // territory, refused loudly at Start instead.
         await using var evolved = Pipeline(storage, extraFilter: true).Builder.Build();
-        var error = Assert.Throws<InvalidOperationException>(evolved.Start);
+        var error = Assert.Throws<CircuitStateMismatchException>(evolved.Start);
         Assert.Contains("does not match the checkpoint", error.Message);
         Assert.Contains(".Named", error.Message);
         Assert.Contains("aggregateLinear", error.Message); // names the orphaned store
@@ -100,7 +100,7 @@ public class StateManifestTests
         var storage = await CommittedRun(workers: 2);
 
         await using var evolved = Pipeline(storage, workers: 1).Builder.Build();
-        var error = Assert.Throws<InvalidOperationException>(evolved.Start);
+        var error = Assert.Throws<CircuitStateMismatchException>(evolved.Start);
         Assert.Contains("workers", error.Message);
         Assert.Contains("workers=2", error.Message);
         Assert.Contains("workers=1", error.Message);
@@ -177,8 +177,59 @@ public class StateManifestTests
 
         var evolvedStorage = new RedisStorageProvider(redis, new RedisStorageOptions { KeyPrefix = prefix });
         await using var evolved = Pipeline(evolvedStorage, extraFilter: true).Builder.Build();
-        var error = Assert.Throws<InvalidOperationException>(evolved.Start);
+        var error = Assert.Throws<CircuitStateMismatchException>(evolved.Start);
         Assert.Contains("does not match the checkpoint", error.Message);
+    }
+
+    // ── asked beforehand: DescribeState and CheckState ─────────────────────────────────
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    public async Task Described_state_is_exactly_what_a_built_circuit_commits(int workers)
+    {
+        var storage = await CommittedRun(workers: workers);
+
+        // The same pipeline, never built: its described manifest is the committed one.
+        var same = Pipeline(new InMemoryStorageProvider(), workers: workers).Builder;
+        Assert.Equal(storage.CommittedManifest("local"), same.DescribeStateManifest());
+        Assert.Empty(same.CheckState(storage));
+
+        var stores = same.DescribeState();
+        Assert.Equal(stores.Count, stores.Select(s => s.Name).Distinct().Count());
+        Assert.All(stores, s => Assert.Matches(@"\.w\d+$", s.Name));
+        Assert.Equal(workers, stores.Count(s => s.Name.Contains("aggregateLinear")));
+        var count = stores.First(s => s.Name.Contains("aggregateLinear"));
+        Assert.Equal(typeof(string), count.KeyType);
+
+        // Describing builds nothing: the builder can still be built, and resumes.
+        var pipeline = Pipeline(storage, workers: workers);
+        Assert.Empty(pipeline.Builder.CheckState(storage));
+        await using var resumed = pipeline.Builder.Build();
+        resumed.Start();
+        Assert.Equal(11L, resumed.CommittedOffset("orders"));
+    }
+
+    [Fact]
+    public async Task CheckState_finds_beforehand_what_Start_would_refuse()
+    {
+        var storage = await CommittedRun(workers: 1);
+
+        var moreWorkers = Pipeline(storage, workers: 2).Builder;
+        var problems = moreWorkers.CheckState(storage);
+        Assert.Contains(problems, p => p.Contains("workers=1") && p.Contains("workers=2"));
+        await using (var circuit = moreWorkers.Build())
+            Assert.Equal(problems, Assert.Throws<CircuitStateMismatchException>(circuit.Start).Problems);
+
+        var renumbered = Pipeline(storage, extraFilter: true).Builder;
+        problems = renumbered.CheckState(storage);
+        Assert.Contains(problems, p => p.Contains("no home") && p.Contains("aggregateLinear"));
+        await using (var circuit = renumbered.Build())
+            Assert.Equal(problems, Assert.Throws<CircuitStateMismatchException>(circuit.Start).Problems);
+
+        // Additions are not a problem, and neither is a provider that has committed nothing.
+        Assert.Empty(Pipeline(storage, extraBranch: true).Builder.CheckState(storage));
+        Assert.Empty(Pipeline(storage, workers: 5).Builder.CheckState(new InMemoryCheckpointStorageProvider()));
     }
 
     private static ConnectionMultiplexer ConnectOrSkip()

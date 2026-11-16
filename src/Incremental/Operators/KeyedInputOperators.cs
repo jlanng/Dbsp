@@ -74,13 +74,34 @@ internal sealed class UpsertOperator<TKey, TValue> : IStepOperator
 {
     private readonly IValueStore<TKey, TValue> _rows;
 
-    public UpsertOperator(OperatorContext context) =>
+    // Under evictWhenFinal: each key's deadline, from its row's event time, and the keys
+    // that fell due this step. Set and removed with the row, so a key amended to a later
+    // time moves its deadline with it.
+    private readonly RecordEviction<TValue>? _retention;
+    private readonly IDeadlineStore<TKey>? _deadlines;
+    private readonly List<TKey> _due = [];
+
+    // Non-null under the dead-letter policy: a row whose event time cannot be read is
+    // then not held (see DeadlinesGuarded) where it would otherwise fault the step.
+    private readonly RecordErrors? _errors;
+    private readonly List<long> _closes = [];
+
+    public UpsertOperator(OperatorContext context, RecordEviction<TValue>? retention = null)
+    {
         _rows = context.Storage.CreateValueStore<TKey, TValue>(context.StateName("rows"));
+        if (retention is not null)
+        {
+            _retention = retention;
+            _deadlines = context.Storage.CreateDeadlineStore<TKey>(context.StateName("deadlines"));
+            _errors = context.Errors;
+        }
+    }
 
     private readonly ZSet<TValue> _empty = new();
 
-    // All state change is driven by commands, so an all-empty step is a no-op.
-    public object? EmptyStepResult => _empty;
+    // All state change is driven by commands, so an all-empty step is a no-op — unless the
+    // input forgets final rows, which happens off the watermark, data or not.
+    public object? EmptyStepResult => _retention is null ? _empty : null;
 
     // Per-step scratch, reused across steps (single-threaded per worker).
     private readonly Dictionary<TKey, int> _index = [];
@@ -93,6 +114,11 @@ internal sealed class UpsertOperator<TKey, TValue> : IStepOperator
     public object Step(object?[] inputs)
     {
         var delta = (ZSet<KeyedCommand<TKey, TValue>>)inputs[0]!;
+        if (delta.IsEmpty && _deadlines is not null)
+        {
+            ForgetFinal();
+            return _output.Next(0);
+        }
 
         // The source resolved each process's commands to one per key; only a clustered
         // circuit can deliver two for a key here (two processes, one step), and then which
@@ -138,18 +164,109 @@ internal sealed class UpsertOperator<TKey, TValue> : IStepOperator
             }
 
             var next = command.Value!;
+            // An input that forgets its final rows does not apply an upsert that is
+            // itself behind the watermark: it is late, and the declaration downstream
+            // drops and counts it. Applied, it would take back the row the key holds —
+            // which may be open, so its retraction would pass — and put nothing in its
+            // place: one late version of a record would delete the record.
+            if (_retention is not null && IsLate(next))
+            {
+                output.Add(next, 1);
+                continue;
+            }
             if (found)
             {
                 if (EqualityComparer<TValue>.Default.Equals(previous, next))
                     continue;
-                output.Add(previous!, -1);
+                // An input that forgets its final rows does not take back a row that the
+                // new one's own time has made final: that is a new record of the key,
+                // not an amendment (RecordEviction.Supersedes).
+                if (_retention is null || !BeginsNewRecord(previous!, next))
+                    output.Add(previous!, -1);
             }
             output.Add(next, 1);
             puts.Add((command.Key, next));
         }
 
+        if (_deadlines is null)
+        {
+            _rows.PutAll(puts);
+            _rows.RemoveAll(removes);
+            return output;
+        }
+
+        // Each row's deadline is its event time, read by the user's selector — here,
+        // upstream of the declaration whose guarded loop dead-letters a record the selector
+        // throws for. So the deadlines are read before anything is stored, and under the
+        // dead-letter policy by a loop of their own.
+        var closes = _closes;
+        closes.Clear();
+        if (_errors is not null)
+            DeadlinesGuarded(puts, removes, closes);
+        else
+            foreach (var (_, row) in puts)
+                closes.Add(_retention!.ClosesAt(row).UtcTicks);
+
         _rows.PutAll(puts);
         _rows.RemoveAll(removes);
+        for (var i = 0; i < puts.Count; i++)
+            _deadlines.Set(puts[i].Item1, closes[i]);
+        foreach (var key in removes)
+            _deadlines.Remove(key);
+        ForgetFinal();
         return output;
+    }
+
+    private bool IsLate(TValue next) =>
+        _errors is null ? _retention!.IsFinal(next) : _retention!.TryEventTicks(next, out var ticks) && ticks < _retention.Clock.FrozenTicks;
+
+    private bool BeginsNewRecord(TValue previous, TValue next) =>
+        _errors is null ? _retention!.Supersedes(previous, next) : BeginsNewRecordGuarded(previous, next);
+
+    // Under the dead-letter policy a row whose time cannot be read amends, as it always
+    // did; DeadlinesGuarded deals with it next.
+    private bool BeginsNewRecordGuarded(TValue previous, TValue next) =>
+        _retention!.TryEventTicks(previous, out var before) && _retention.TryEventTicks(next, out var after)
+        && _retention.Supersedes(before, after);
+
+    /// <summary>The dead-letter policy's reading of the deadlines. A row whose event time
+    /// cannot be read is not held: it has no deadline, so held it would stay for ever. It
+    /// has already been emitted, and the event-time declaration downstream — the one way
+    /// out of this operator's state — runs the same selector on it, fails the same way and
+    /// reports it; nothing is reported here, or it would be reported twice. Whatever the
+    /// key held before goes, since the row that replaced it is not kept: its retraction was
+    /// emitted above. A later upsert of the key is then a new row, exactly as it is for a
+    /// key whose row was forgotten as final.</summary>
+    private void DeadlinesGuarded(List<(TKey, TValue)> puts, List<TKey> removes, List<long> closes)
+    {
+        var kept = 0;
+        for (var i = 0; i < puts.Count; i++)
+        {
+            long ticks;
+            try
+            {
+                ticks = _retention!.ClosesAt(puts[i].Item2).UtcTicks;
+            }
+            catch (Exception)
+            {
+                if (_rows.TryGet(puts[i].Item1, out _))
+                    removes.Add(puts[i].Item1);
+                continue;
+            }
+            puts[kept++] = puts[i];
+            closes.Add(ticks);
+        }
+        puts.RemoveRange(kept, puts.Count - kept);
+    }
+
+    /// <summary>Forgets the rows the watermark has passed. Nothing is emitted: the
+    /// retraction each would owe is behind the watermark, where the event-time
+    /// declaration drops it.</summary>
+    private void ForgetFinal()
+    {
+        _due.Clear();
+        _deadlines!.TakeDue(_retention!.Clock.FrozenTicks, _due);
+        if (_due.Count > 0)
+            _rows.RemoveAll(_due);
     }
 }

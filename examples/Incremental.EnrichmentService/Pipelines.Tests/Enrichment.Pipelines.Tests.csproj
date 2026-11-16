@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Tests of the plugin's definitions, as a plugin author would write them: each
+       definition is run by Incremental.Service.Testing.PipelineTestHarness — no node, no
+       catalog, no HTTP. The project references the testing package and the plugin's own
+       projects and nothing else of the service. `dotnet test` on this project (the repository's global.json selects
+       Microsoft.Testing.Platform, hence xunit v3 and an Exe). Outside this repository the
+       project references are package references. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <OutputType>Exe</OutputType>
+    <NoWarn>$(NoWarn);xUnit1051</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" Version="4.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\src\Incremental.Service.Testing\Incremental.Service.Testing.csproj" />
+    <ProjectReference Include="..\Contracts\Enrichment.Contracts.csproj" />
+    <ProjectReference Include="..\Pipelines\Enrichment.Pipelines.csproj" />
+  </ItemGroup>
+
+</Project>

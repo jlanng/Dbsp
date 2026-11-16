@@ -8,3 +8,4 @@ artifacts/
 TestResults/
 data/
 BenchmarkDotNet.Artifacts/
+.playwright-mcp/

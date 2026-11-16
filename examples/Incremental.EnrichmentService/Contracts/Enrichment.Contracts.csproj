@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The contract assembly: row types and table definitions that the host and every
+       plugin share. The host compiles it in (AddContracts); plugins reference it and get
+       the host's copy at runtime. -->
+  <Import Project="..\Plugin.props" />
+
+</Project>

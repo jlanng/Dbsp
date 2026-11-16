@@ -38,6 +38,15 @@ internal sealed class CircuitDiagnostics : IDisposable
         "incremental.circuit.checkpoint_commits", "{commit}", "Checkpoint commits (state + input offsets, atomic).");
     private static readonly Histogram<double> CheckpointCommitDuration = Meter.CreateHistogram<double>(
         "incremental.circuit.checkpoint_commit_duration", "s", "Wall-clock duration of a checkpoint commit.");
+    private static readonly Histogram<double> SinkAckWait = Meter.CreateHistogram<double>(
+        "incremental.circuit.sink_ack_wait", "s",
+        "Time a checkpoint commit waited for acknowledged outputs' consumers to confirm delivery (commit after delivery).");
+    private static readonly Counter<long> DeadLetters = Meter.CreateCounter<long>(
+        "incremental.circuit.dead_letters", "{record}",
+        "Records dropped under the DeadLetter error policy, by operator.");
+    private static readonly Counter<long> LateRecords = Meter.CreateCounter<long>(
+        "incremental.circuit.late_records", "{record}",
+        "Insertions dropped at an event-time declaration for being behind the watermark.");
     private static readonly Counter<long> ClusterFramesSent = Meter.CreateCounter<long>(
         "incremental.cluster.frames_sent", "{frame}", "Exchange frames handed to the transport.");
     private static readonly Counter<long> ClusterFramesReceived = Meter.CreateCounter<long>(
@@ -114,6 +123,9 @@ internal sealed class CircuitDiagnostics : IDisposable
             Records.Add(count, _tag);
     }
 
+    /// <summary>Called on the coordinator, between steps, when a step dropped late records.</summary>
+    public void RecordsLate(long count) => LateRecords.Add(count, _tag);
+
     public void CircuitFaulted() => Faults.Add(1, _tag);
 
     public void CheckpointCommitted(double seconds)
@@ -121,6 +133,13 @@ internal sealed class CircuitDiagnostics : IDisposable
         CheckpointCommits.Add(1, _tag);
         CheckpointCommitDuration.Record(seconds, _tag);
     }
+
+    public void SinkAcknowledgementAwaited(double seconds) => SinkAckWait.Record(seconds, _tag);
+
+    /// <summary>Called per dropped record, on the coordinator, between steps: never on a
+    /// path a healthy record takes.</summary>
+    public void RecordDeadLettered(string operatorName) =>
+        DeadLetters.Add(1, _tag, new KeyValuePair<string, object?>("operator", operatorName));
 
     public void FrameSent(int peer, int payloadBytes)
     {

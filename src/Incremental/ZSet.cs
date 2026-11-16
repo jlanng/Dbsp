@@ -95,8 +95,40 @@ public sealed class ZSet<T> : IZSet, IEnumerable<WeightedValue<T>> where T : not
     /// every step stops re-growing after the first few. Only for Z-sets whose owner knows no
     /// one else still holds them — operators treat their inputs as read-only, which is what
     /// makes reuse safe where it is used (see <c>ExchangeOperator.Partition</c> and
-    /// <c>OutputBuffer</c>, which extends the argument to every operator's output).</summary>
-    internal void Clear() => _weights.Clear();
+    /// <c>OutputBuffer</c>, which extends the argument to every operator's output).
+    /// <para>
+    /// Capacity that has gone unused for a while is given back. Emptying a dictionary costs
+    /// time proportional to its capacity, not its count, so a buffer that one enormous delta
+    /// once passed through — a table's bootstrap, the catch-up after a long stop — would
+    /// otherwise charge every later step for it, and hold the memory for good. Only after
+    /// <see cref="SlackLimit"/> uses in a row at a small fraction of the capacity, though: a
+    /// bursty workload keeps its buffers, which is the point of reusing them.
+    /// </para></summary>
+    internal void Clear()
+    {
+        var capacity = Capacity;
+        if (capacity < ShrinkFloor || _weights.Count >= capacity / SlackRatio)
+            _slack = 0;
+        else if (++_slack == SlackLimit)
+        {
+            _slack = 0;
+            _weights.Clear();
+            _weights.TrimExcess();
+            return;
+        }
+        _weights.Clear();
+    }
+
+    /// <summary>Entries the Z-set has room for without growing.</summary>
+    internal int Capacity => _weights.EnsureCapacity(0);
+
+    // Below the floor a clear is too cheap to be worth a reallocation.
+    private const int ShrinkFloor = 1024;
+    private const int SlackRatio = 16;
+    private const int SlackLimit = 64;
+
+    // Consecutive clears that found the set filled to less than 1/SlackRatio of its capacity.
+    private int _slack;
 
     /// <summary>Returns a new Z-set with every weight negated (turns insertions into retractions).</summary>
     public ZSet<T> Negated()

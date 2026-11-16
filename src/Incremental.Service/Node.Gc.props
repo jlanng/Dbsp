@@ -1,0 +1,44 @@
+<Project>
+
+  <!--
+    The collector's settings for a process that is a service node. Import this into the
+    host's project file, or copy the four settings: they are startup configuration, so they
+    belong to the executable and not to a library. docs/enrichment-service.md, "Sizing a
+    node", has the measurements behind each (benchmarks/Incremental.Service.Scale, a
+    million wide rows and a million orders of state, per node):
+
+    Server, concurrent, not adaptive (DATAS off). A node holds gigabytes that stay and
+    allocates steadily on top of them. Workstation collection spent 17 % of a leader's
+    steady state paused and could not keep up with its inputs; the adaptive mode held the
+    same memory as the fixed settings below and paused longer.
+
+    Heap count 8, or the cores the node is given if that is fewer. Every heap has its own
+    budget of memory to allocate into before a collection, so a heap per core on a large
+    machine holds a great deal ready that twenty one-worker circuits never fill; four
+    heaps held a little less than eight and paused three times as long. Set NodeGcHeaps
+    before the import for another count.
+
+    Not set: System.GC.ConserveMemory. At 5 and at 7 the leader's working set was 0.3
+    to 0.4 GB lower in the steady state at a million rows (3.1 and 3.0 GB for 3.4) and
+    no lower at five million. A backlog was worked through a sixth more slowly in some
+    runs of every setting, and in more of them the more was conserved (one of seven,
+    three of seven, seven of nine) — though the order the runs were made in may account
+    for that. A setting that asks for full blocking collections is not taken on that
+    evidence; a host that wants the memory adds
+    <RuntimeHostConfigurationOption Include="System.GC.ConserveMemory" Value="7" />.
+
+    Not set: System.GC.HeapHardLimit. It is how a container's limit is kept: see the
+    guide for what a limit of 1.35 times what the node holds cost.
+  -->
+  <PropertyGroup>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <GarbageCollectionAdaptationMode>0</GarbageCollectionAdaptationMode>
+    <NodeGcHeaps Condition="'$(NodeGcHeaps)' == ''">8</NodeGcHeaps>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="System.GC.HeapCount" Value="$(NodeGcHeaps)" Trim="false" />
+  </ItemGroup>
+
+</Project>

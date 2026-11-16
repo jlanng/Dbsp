@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>Incremental.Service.Scale</RootNamespace>
+    <DefaultItemExcludes>$(DefaultItemExcludes);Contracts/**;Pipelines/**</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <!-- A node's collector settings: what the guide recommends, and what "gc node" (the
+       rig's default) therefore runs. The rig's other settings override them through the
+       nodes' environment. -->
+  <Import Project="..\..\src\Incremental.Service\Node.Gc.props" />
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Incremental.Service\Incremental.Service.csproj" />
+    <ProjectReference Include="Contracts\Scale.Contracts.csproj" />
+    <!-- Built, never referenced: the first leader imports it from plugins/ and the other
+         node gets it from the blob topic. -->
+    <ProjectReference Include="Pipelines\Scale.Pipelines.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <Target Name="PlacePlugin" AfterTargets="Build">
+    <ItemGroup>
+      <_Plugin Include="Pipelines\bin\$(Configuration)\net10.0\Scale.Pipelines.*" />
+    </ItemGroup>
+    <RemoveDir Directories="$(OutDir)plugins" />
+    <Copy SourceFiles="@(_Plugin)" DestinationFolder="$(OutDir)plugins\scale.pipelines" />
+  </Target>
+
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)../../tests/Shared/CommandLine.cs" Link="CommandLine.cs" />
+  </ItemGroup>
+
+</Project>

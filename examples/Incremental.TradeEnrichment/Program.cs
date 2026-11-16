@@ -1,561 +1,336 @@
 using System.Diagnostics;
-using Spectre.Console;
-using Spectre.Console.Rendering;
 using Incremental;
+using Incremental.Tables;
 
-// Trade enrichment: a stream of trades joined against reference ("master") data — the
-// classic finance pipeline. You pick which enrichment COLUMNS to join (grouped by table)
-// and which dimensions to group by; the circuit is composed from those choices at runtime.
+// Trade enrichment on shared tables: reference data held once per process, joined by
+// circuits that keep none of it.
 //
-//   trades ⋈ instruments ⋈ traders ⋈ desks ⋈ counterparties ─▶ group by <your dims> ─▶ top N
+//   traders ──Changes()──▶ ⋈ desks ──ToTable──▶ trader-desks              (a small circuit)
 //
-// The part most streaming systems get wrong: reference data is a stream too. Every input
-// here is a keyed input — UpsertAsync replaces a row and the circuit retracts the old
-// version automatically. When a trader moves desks mid-run, one upsert re-attributes all
-// of their historical trades; trade amendments are just upserts on the trade stream.
+//   trades ──Lookup(instruments)──▶ ⋈ trader-desks ──▶ ⋈ counterparties ──▶ blotter sink
+//            on arrival             retroactive        retroactive      └─▶ Σ per desk ──▶ sink
+//
+// The join kind is chosen per column. A trade's symbol is looked up when the trade arrives
+// and then left alone; its desk and its counterparty's rating are joined, so a trader who
+// moves desk takes every trade they ever did with them. Both sinks are fed through the
+// acknowledged-output path (DeliverToAsync), as a database or a topic would be.
+//
+// The trade circuit's state is the live book: every trade not yet cancelled is held by both
+// joins and the lookup, so it is bounded by what the source deletes — a cancellation, a
+// settlement — and by nothing else. That suits a book of positions. A feed of trades that
+// are never deleted needs event time and EvictWhenFinal instead (the enrichment service's
+// trade-enrichment definition, and docs/enrichment-service.md, "Bounding a join over a
+// stream of facts"). Act 7 settles the whole book and the state goes with it.
+//
+// The program narrates what it does and checks every claim against a model kept beside the
+// circuits; a claim that does not hold ends the run with exit code 1.
+//
+//   dotnet run --project examples/Incremental.TradeEnrichment [-- --trades 5000]
 
-const int MaxGroupRows = 14;
-const int MaxBlotterRows = 12;
+var tradeCount = 2000;
+if (Array.IndexOf(args, "--trades") is >= 0 and var at && at + 1 < args.Length)
+    tradeCount = int.Parse(args[at + 1]);
 
-var interactive = !Console.IsInputRedirected && AnsiConsole.Profile.Capabilities.Interactive;
+// ── reference data: four shared tables, loaded before any circuit exists ────────────────
 
-// Non-interactive knobs (CI / soak testing): --ticks N to run longer, --blotter to skip
-// dimensions and exercise the top-trades blotter.
-var tickIndex = Array.IndexOf(args, "--ticks");
-var maxTicks = tickIndex >= 0 && tickIndex + 1 < args.Length && int.TryParse(args[tickIndex + 1], out var parsedTicks)
-    ? parsedTicks
-    : 120;
-var forceBlotter = args.Contains("--blotter");
+var desks = new SharedTable<int, Desk>("desks", d => d.Id);
+var traders = new SharedTable<int, Trader>("traders", t => t.Id);
+var instruments = new SharedTable<int, Instrument>("instruments", i => i.Id);
+var counterparties = new SharedTable<int, Counterparty>("counterparties", c => c.Id);
+var traderDesks = new SharedTable<int, TraderDesk>("trader-desks", td => td.TraderId);   // derived, below
 
-AnsiConsole.Write(new Panel(new Rows(
-        new Markup("A live trade stream is enriched by joining the reference [bold]columns[/] you choose, then grouped by dimensions you choose — the circuit is composed from your selections."),
-        new Markup("[green]▪[/] Every input is a keyed input: amendments and reference changes are [bold]UpsertAsync[/] calls, and the circuit emits the retraction of the old row itself."),
-        new Markup("[green]▪[/] Reference data is a stream too: desk moves and rating changes re-attribute [italic]historical[/] trades instantly — watch the notices."),
-        new Markup("[green]▪[/] With no dimensions selected you get a live top-trades blotter instead.")))
-    .Header("[bold] trade enrichment [/]")
-    .Padding(1, 0)
-    .BorderColor(Color.Grey));
+// The model: plain dictionaries of what the tables should hold.
+var deskRows = new Dictionary<int, Desk>();
+var traderRows = new Dictionary<int, Trader>();
+var instrumentRows = new Dictionary<int, Instrument>();
+var counterpartyRows = new Dictionary<int, Counterparty>();
 
-// ── master data ─────────────────────────────────────────────────────────────────
-
-var desks = new List<Desk>
-{
-    new(1, "Equity Cash", "EMEA"), new(2, "Equity Derivs", "AMER"), new(3, "Macro", "EMEA"),
-    new(4, "Credit", "AMER"), new(5, "Rates", "APAC"), new(6, "FX Spot", "EMEA"),
-    new(7, "Commodities", "AMER"), new(8, "Convertibles", "APAC"),
-};
-string[] firstNames = ["Ada", "Grace", "Alan", "Edsger", "Barbara", "Donald", "Tony", "Leslie", "Radia", "Ken", "Dennis", "Margaret"];
-var traders = Enumerable.Range(1, 24)
-    .Select(i => new TraderRow(i, $"{firstNames[i % firstNames.Length]} {(char)('A' + i % 26)}.", desks[i % desks.Count].Id))
-    .ToList();
-(string Symbol, string AssetClass, string Currency, double Price)[] instrumentSeed =
+(string Name, string Region)[] deskSeed =
 [
-    ("AAPL", "Equity", "USD", 230), ("MSFT", "Equity", "USD", 420), ("VOD.L", "Equity", "GBP", 0.7),
-    ("SIE.DE", "Equity", "EUR", 180), ("7203.T", "Equity", "JPY", 2800), ("SPY", "ETF", "USD", 560),
-    ("US10Y", "Govt Bond", "USD", 98.5), ("DE10Y", "Govt Bond", "EUR", 97.2), ("GB10Y", "Govt Bond", "GBP", 96.8),
-    ("XS-CRD1", "Corp Bond", "USD", 101.2), ("XS-CRD2", "Corp Bond", "EUR", 99.4),
-    ("EURUSD", "FX", "USD", 1.08), ("GBPUSD", "FX", "USD", 1.27), ("USDJPY", "FX", "JPY", 148),
-    ("BRN-F", "Commodity", "USD", 82), ("GLD-F", "Commodity", "USD", 2350),
+    ("Equity Cash", "EMEA"), ("Equity Derivs", "AMER"), ("Macro", "EMEA"), ("Credit", "AMER"),
+    ("Rates", "APAC"), ("FX Spot", "EMEA"), ("Commodities", "AMER"), ("Convertibles", "APAC"),
 ];
-var instruments = instrumentSeed.Select((s, i) => new Instrument(i + 1, s.Symbol, s.AssetClass, s.Currency, s.Price)).ToList();
+string[] firstNames = ["Ada", "Grace", "Alan", "Edsger", "Barbara", "Donald", "Tony", "Leslie", "Radia", "Ken", "Dennis", "Margaret"];
+(string Symbol, string AssetClass, decimal Price)[] instrumentSeed =
+[
+    ("AAPL", "Equity", 230m), ("MSFT", "Equity", 420m), ("VOD.L", "Equity", 0.70m), ("SIE.DE", "Equity", 180m),
+    ("SPY", "ETF", 560m), ("US10Y", "Govt Bond", 98.50m), ("DE10Y", "Govt Bond", 97.20m), ("XS-CRD1", "Corp Bond", 101.20m),
+    ("EURUSD", "FX", 1.08m), ("GBPUSD", "FX", 1.27m), ("BRN-F", "Commodity", 82m), ("GLD-F", "Commodity", 2350m),
+];
 string[] ratings = ["AAA", "AA", "A", "BBB", "BB"];
-string[] cptyNames = ["Meridian AM", "Blue Harbor", "Northlake Capital", "Osprey Funds", "Cinder Rock", "Halcyon Partners", "Verdant Global", "Quarry Point", "Silvergate Macro", "Aldgate Securities"];
-var counterparties = cptyNames.Select((n, i) => new Counterparty(i + 1, n, ratings[i % ratings.Length])).ToList();
+string[] counterpartyNames = ["Meridian AM", "Blue Harbor", "Northlake Capital", "Osprey Funds", "Cinder Rock", "Halcyon Partners", "Verdant Global", "Quarry Point"];
 
-// ── setup: choose enrichment columns, then dimensions ───────────────────────────
+for (var i = 0; i < deskSeed.Length; i++)
+    deskRows[i + 1] = new Desk(i + 1, deskSeed[i].Name, deskSeed[i].Region);
+for (var i = 1; i <= 24; i++)
+    traderRows[i] = new Trader(i, $"{firstNames[i % firstNames.Length]} {(char)('A' + i % 26)}.", 1 + i % deskSeed.Length);
+for (var i = 0; i < instrumentSeed.Length; i++)
+    instrumentRows[i + 1] = new Instrument(i + 1, instrumentSeed[i].Symbol, instrumentSeed[i].AssetClass, instrumentSeed[i].Price);
+for (var i = 0; i < counterpartyNames.Length; i++)
+    counterpartyRows[i + 1] = new Counterparty(i + 1, counterpartyNames[i], ratings[i % ratings.Length]);
 
-const string ColSymbol = "Symbol";
-const string ColAssetClass = "Asset class";
-const string ColCurrency = "Currency";
-const string ColTrader = "Trader";
-const string ColDesk = "Desk";
-const string ColRegion = "Region";
-const string ColCptyName = "Counterparty";
-const string ColRating = "Rating";
-string[] allColumns = [ColSymbol, ColAssetClass, ColCurrency, ColTrader, ColDesk, ColRegion, ColCptyName, ColRating];
+// One writer per table; ReplaceAllAsync is a snapshot load, committed as one version.
+await desks.Writer.ReplaceAllAsync(deskRows.Values);
+await traders.Writer.ReplaceAllAsync(traderRows.Values);
+await instruments.Writer.ReplaceAllAsync(instrumentRows.Values);
+await counterparties.Writer.ReplaceAllAsync(counterpartyRows.Values);
 
-HashSet<string> cols;
-if (interactive)
-{
-    var picked = AnsiConsole.Prompt(new MultiSelectionPrompt<string>()
-        .Title("Which [bold]enrichment columns[/] should be joined onto trades? [grey](grouped by reference table — selecting a table toggles all its columns)[/]")
-        .InstructionsText("[grey](space to toggle, enter to accept — none is allowed)[/]")
-        .NotRequired()
-        .PageSize(13)
-        .AddChoiceGroup("Instrument table", ColSymbol, ColAssetClass, ColCurrency)
-        .AddChoiceGroup("Desk table (trader ⋈ desk, a two-hop join)", ColTrader, ColDesk, ColRegion)
-        .AddChoiceGroup("Counterparty table", ColCptyName, ColRating));
-    cols = picked.Where(allColumns.Contains).ToHashSet();
-}
-else
-{
-    cols = [.. allColumns];
-    AnsiConsole.MarkupLine("[grey]non-interactive input: enabling every enrichment column[/]");
-}
+// ── a derived table: traders ⋈ desks, computed once, written with ToTable ───────────────
 
-var useInstrument = cols.Contains(ColSymbol) || cols.Contains(ColAssetClass) || cols.Contains(ColCurrency);
-var useDesk = cols.Contains(ColTrader) || cols.Contains(ColDesk) || cols.Contains(ColRegion);
-var useCpty = cols.Contains(ColCptyName) || cols.Contains(ColRating);
+var deriving = new CircuitBuilder(new CircuitOptions { Workers = 1 });
+deriving.Table(traders).Changes()                       // the table's rows as a stream
+    .GroupBy(t => t.DeskId)
+    .Join(deriving.Table(desks), (_, trader, desk) => new TraderDesk(trader.Id, trader.Name, desk.Name, desk.Region))
+    .ToTable(traderDesks);                              // this circuit is now the table's one writer
+await using var derivingCircuit = deriving.Build();
+derivingCircuit.Start();
 
-var dimensionCatalog = new List<(string Name, Func<EnrichedTrade, string> Select)> { ("Side", e => e.Side) };
-if (cols.Contains(ColSymbol)) dimensionCatalog.Add((ColSymbol, e => e.Symbol));
-if (cols.Contains(ColAssetClass)) dimensionCatalog.Add((ColAssetClass, e => e.AssetClass));
-if (cols.Contains(ColCurrency)) dimensionCatalog.Add((ColCurrency, e => e.Currency));
-if (cols.Contains(ColTrader)) dimensionCatalog.Add((ColTrader, e => e.Trader));
-if (cols.Contains(ColDesk)) dimensionCatalog.Add((ColDesk, e => e.Desk));
-if (cols.Contains(ColRegion)) dimensionCatalog.Add((ColRegion, e => e.Region));
-if (cols.Contains(ColCptyName)) dimensionCatalog.Add((ColCptyName, e => e.Counterparty));
-if (cols.Contains(ColRating)) dimensionCatalog.Add((ColRating, e => e.Rating));
+// ── the trade circuit: it stores trades, and no reference row ───────────────────────────
 
-List<string> chosenDims;
-if (interactive)
-{
-    chosenDims = AnsiConsole.Prompt(new MultiSelectionPrompt<string>()
-        .Title($"Group by which [bold]dimensions[/]? [grey](pick none for a top-{MaxBlotterRows} trade blotter)[/]")
-        .InstructionsText("[grey](space to toggle, enter to accept)[/]")
-        .NotRequired()
-        .PageSize(11)
-        .AddChoices(dimensionCatalog.Select(d => d.Name)));
-}
-else
-{
-    chosenDims = forceBlotter ? [] : [ColDesk, ColAssetClass];
-    AnsiConsole.MarkupLine(forceBlotter
-        ? "[grey]non-interactive input: blotter mode[/]"
-        : $"[grey]non-interactive input: grouping by {string.Join(" · ", chosenDims)}[/]");
-}
-var dims = dimensionCatalog.Where(d => chosenDims.Contains(d.Name)).ToList();
-var blotterMode = dims.Count == 0;
-
-var tableSummary = string.Join("", new[]
-{
-    useInstrument ? $" ⋈ instruments[{string.Join(",", new[] { ColSymbol, ColAssetClass, ColCurrency }.Where(cols.Contains))}]" : "",
-    useDesk ? $" ⋈ traders ⋈ desks[{string.Join(",", new[] { ColTrader, ColDesk, ColRegion }.Where(cols.Contains))}]" : "",
-    useCpty ? $" ⋈ counterparties[{string.Join(",", new[] { ColCptyName, ColRating }.Where(cols.Contains))}]" : "",
-});
-AnsiConsole.MarkupLine(
-    $"[grey]circuit:[/] trades{Markup.Escape(tableSummary)} " +
-    (blotterMode
-        ? $"→ top {MaxBlotterRows} trades by notional"
-        : $"→ group by [bold]{string.Join(" · ", dims.Select(d => d.Name))}[/] → count + notional → top {MaxGroupRows} groups"));
-AnsiConsole.WriteLine();
-
-// ── build the circuit from the selections ───────────────────────────────────────
-
-// Single worker: the per-step work here is tiny, so multi-worker exchange barriers would
-// only add thread-handoff latency (TaxiAnalytics is the parallelism showcase).
-var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Workers = 1 });
-
+// A checkpointing store, for one reason: it can say how many entries the state holds.
+var storage = new Incremental.Storage.InMemoryCheckpointStorageProvider();
+var builder = new CircuitBuilder(new CircuitOptions { Workers = 1, Storage = storage });
 var tradeStream = builder.KeyedInput<long, Trade>("trades", t => t.Id);
-var enriched = tradeStream.Select(t => new EnrichedTrade(
-    t.Id, t.Side, t.InstrumentId, t.TraderId, t.CounterpartyId, t.Quantity, t.Price, t.Quantity * t.Price,
-    "—", "—", "—", "—", "—", "—", "—", "—"));
 
-// Input definitions are redeemed with circuit.Handle(...) after Build(), so the ones the
-// column selections bring into the circuit are kept in variables here.
-KeyedInputStream<int, Instrument>? instrumentInput = null;
-KeyedInputStream<int, TraderRow>? traderInput = null;
-KeyedInputStream<int, Desk>? deskInput = null;
-KeyedInputStream<int, Counterparty>? cptyInput = null;
+var enriched = tradeStream
+    // Enrich on arrival: the symbol a trade was done under is a fact about the trade.
+    .Lookup(
+        builder.Table(instruments), t => t.InstrumentId,
+        (t, i) => new Priced(t, i.Symbol, i.AssetClass),
+        t => new Priced(t, "?", "?"))
+    // Retroactive: the desk is where the trader sits now, for every trade they ever did.
+    .GroupBy(p => p.Trade.TraderId)
+    .Join(builder.Table(traderDesks), (_, p, td) => (Priced: p, Desk: td))
+    // Retroactive: a re-rating applies to the counterparty's whole book.
+    .GroupBy(x => x.Priced.Trade.CounterpartyId)
+    .Join(builder.Table(counterparties), (_, x, c) => new EnrichedTrade(
+        x.Priced.Trade.Id, x.Priced.Symbol, x.Priced.AssetClass, x.Desk.Trader, x.Desk.Desk, x.Desk.Region,
+        c.Name, c.Rating, x.Priced.Trade.Quantity * x.Priced.Trade.Price));               // a computed column
 
-if (useInstrument)
-{
-    var wantSymbol = cols.Contains(ColSymbol);
-    var wantAssetClass = cols.Contains(ColAssetClass);
-    var wantCurrency = cols.Contains(ColCurrency);
-    instrumentInput = builder.KeyedInput<int, Instrument>("instruments", i => i.Id);
-    enriched = enriched.GroupBy(e => e.InstrumentId)
-        .Join(instrumentInput.GroupBy(i => i.Id), (_, e, i) => e with
-        {
-            Symbol = wantSymbol ? i.Symbol : e.Symbol,
-            AssetClass = wantAssetClass ? i.AssetClass : e.AssetClass,
-            Currency = wantCurrency ? i.Currency : e.Currency,
-        });
-}
-if (useDesk)
-{
-    var wantTrader = cols.Contains(ColTrader);
-    var wantDesk = cols.Contains(ColDesk);
-    var wantRegion = cols.Contains(ColRegion);
-    traderInput = builder.KeyedInput<int, TraderRow>("traders", t => t.Id);
-    deskInput = builder.KeyedInput<int, Desk>("desks", d => d.Id);
-    enriched = enriched.GroupBy(e => e.TraderId)
-        .Join(traderInput.GroupBy(t => t.Id), (_, e, t) => (Trade: e, t.DeskId, t.Name))
-        .GroupBy(x => x.DeskId)
-        .Join(deskInput.GroupBy(d => d.Id), (_, x, d) => x.Trade with
-        {
-            Trader = wantTrader ? x.Name : x.Trade.Trader,
-            Desk = wantDesk ? d.Name : x.Trade.Desk,
-            Region = wantRegion ? d.Region : x.Trade.Region,
-        });
-}
-if (useCpty)
-{
-    var wantName = cols.Contains(ColCptyName);
-    var wantRating = cols.Contains(ColRating);
-    cptyInput = builder.KeyedInput<int, Counterparty>("counterparties", c => c.Id);
-    enriched = enriched.GroupBy(e => e.CounterpartyId)
-        .Join(cptyInput.GroupBy(c => c.Id), (_, e, c) => e with
-        {
-            Counterparty = wantName ? c.Name : e.Counterparty,
-            Rating = wantRating ? c.Rating : e.Rating,
-        });
-}
-
-const char KeySep = ''; // unit separator: cannot occur in any dimension value
-// A global ranking needs all rows in one group, so both shapes funnel through a unit key.
-// bootstrap: false — the step loop below drains and integrates the raw changefeed itself
-// and counts each step's delta rows, so no resync batch (or snapshot state) is wanted.
-Output<KeyedValue<int, EnrichedTrade>>? blotterDef = null;
-Output<KeyedValue<int, KeyedValue<string, (long Trades, double Notional)>>>? groupsDef = null;
-if (blotterMode)
-{
-    blotterDef = enriched.GroupBy(_ => 0).TopK(MaxBlotterRows, e => e.Notional).ToOutput(bootstrap: false);
-}
-else
-{
-    var selectors = dims.Select(d => d.Select).ToArray();
-    groupsDef = enriched
-        .GroupBy(e => string.Join(KeySep, selectors.Select(s => s(e))))
-        .AggregateLinear(new TradeStatsAggregate())
-        .GroupBy(_ => 0)
-        .TopK(MaxGroupRows, s => s.Value.Notional)
-        .ToOutput(bootstrap: false);
-}
+var blotterOutput = enriched.ToAcknowledgedOutput();
+var deskOutput = enriched.GroupBy(e => e.Desk).Sum(e => e.Notional).ToAcknowledgedOutput();
 
 await using var circuit = builder.Build();
 circuit.Start();
+var trades = circuit.Handle(tradeStream);
 
-var tradeInput = circuit.Handle(tradeStream);
-KeyedInputHandle<int, TraderRow>? traderHandle = null;
-KeyedInputHandle<int, Counterparty>? cptyHandle = null;
-if (instrumentInput is not null)
-{
-    var handle = circuit.Handle(instrumentInput);
-    foreach (var row in instruments)
-        await handle.UpsertAsync(row);
-}
-if (traderInput is not null && deskInput is not null)
-{
-    traderHandle = circuit.Handle(traderInput);
-    foreach (var row in traders)
-        await traderHandle.UpsertAsync(row);
-    var deskHandle = circuit.Handle(deskInput);
-    foreach (var row in desks)
-        await deskHandle.UpsertAsync(row);
-}
-if (cptyInput is not null)
-{
-    cptyHandle = circuit.Handle(cptyInput);
-    foreach (var row in counterparties)
-        await cptyHandle.UpsertAsync(row);
-}
-await circuit.StepAsync();
+// Sinks on the acknowledged-output path: a step is committed only after its batch is
+// written, and a batch is at most one upsert or delete per key.
+var blotter = new InMemoryUpsertSink<long, EnrichedTrade>();
+var deskTotals = new InMemoryUpsertSink<string, decimal>();
+var blotterDelivery = circuit.Handle(blotterOutput).DeliverToAsync(blotter, e => e.Id);
+var deskDelivery = circuit.Handle(deskOutput).DeliverToAsync(deskTotals);
 
-// Step-level output consumption: publishing happens inside StepAsync, so draining the
-// raw Reader right after a step deterministically yields exactly that step's batch —
-// integrated into the live view, with the delta-row count each step reports.
-var blotterView = new ZSet<KeyedValue<int, EnrichedTrade>>();
-var groupsView = new ZSet<KeyedValue<int, KeyedValue<string, (long Trades, double Notional)>>>();
-var blotterHandle = blotterMode ? circuit.Handle(blotterDef!) : null;
-var groupsHandle = blotterMode ? null : circuit.Handle(groupsDef!);
+// ── the model of the trade side ─────────────────────────────────────────────────────────
 
-long DrainOutputs()
+var book = new Dictionary<long, Trade>();
+var arrival = new Dictionary<long, Instrument>();        // the instrument row each trade met when it arrived
+var failures = 0;
+var claims = 0;
+
+EnrichedTrade Expected(Trade t)
 {
-    long deltaRows = 0;
-    if (blotterHandle is not null)
-        while (blotterHandle.Reader.TryRead(out var batch))
-        {
-            blotterView.AddAll(batch);
-            deltaRows += batch.DistinctCount;
-        }
-    if (groupsHandle is not null)
-        while (groupsHandle.Reader.TryRead(out var batch))
-        {
-            groupsView.AddAll(batch);
-            deltaRows += batch.DistinctCount;
-        }
-    return deltaRows;
+    var trader = traderRows[t.TraderId];
+    var desk = deskRows[trader.DeskId];
+    var counterparty = counterpartyRows[t.CounterpartyId];
+    var instrument = arrival[t.Id];
+    return new EnrichedTrade(t.Id, instrument.Symbol, instrument.AssetClass, trader.Name, desk.Name, desk.Region,
+        counterparty.Name, counterparty.Rating, t.Quantity * t.Price);
 }
 
-DrainOutputs(); // absorb the reference-data preload step's batch before the timed loop
-
-// ── run: trades churn until keypress, master data shifts underneath ─────────────
-
-AnsiConsole.MarkupLine(interactive
-    ? "[bold]Streaming — press any key to stop.[/]"
-    : $"[grey]non-interactive input: stopping after {maxTicks} ticks[/]");
-
-var rng = new Random(11);
-long nextTradeId = 1;
-var liveIds = new List<long>();
-// The trade source's own book: the circuit keeps each key's current row for retraction,
-// but a producer that amends or tallies trades tracks what it sent itself.
-var liveTrades = new Dictionary<long, Trade>();
-// Live-trade counts per trader/counterparty, so master-data notices can report how many
-// historical trades one upsert re-attributed (the group-level delta count hides this).
-var tradesByTrader = new Dictionary<int, int>();
-var tradesByCpty = new Dictionary<int, int>();
-long tradesInserted = 0, tradesCancelled = 0, tradesAmended = 0;
-long stepCount = 0, stepTicks = 0;
-double lastStepMicros = 0;
-// Rolling window of recent step times: the display shows p50/p99, which stays legible
-// where a raw "last step" readout makes every GC or scheduler blip jarring.
-var recentStepMicros = new double[512];
-var notices = new Queue<string>();
-void Notice(string text)
+bool BlotterMatches()
 {
-    notices.Enqueue(text);
-    while (notices.Count > 3)
-        notices.Dequeue();
+    var rows = blotter.Rows;
+    return rows.Count == book.Count && book.Values.All(t => rows.TryGetValue(t.Id, out var row) && row == Expected(t));
 }
 
-async Task<(double Micros, long DeltaRows)> StepTimedAsync()
+bool DeskTotalsMatch()
 {
-    var timer = Stopwatch.StartNew();
-    await circuit.StepAsync();
-    timer.Stop();
-    var deltaRows = DrainOutputs(); // outside the timed section
-    stepCount++;
-    stepTicks += timer.Elapsed.Ticks;
-    lastStepMicros = timer.Elapsed.TotalMicroseconds;
-    recentStepMicros[(stepCount - 1) % recentStepMicros.Length] = lastStepMicros;
-    return (timer.Elapsed.TotalMicroseconds, deltaRows);
+    var expected = book.Values.Select(Expected).GroupBy(e => e.Desk).ToDictionary(g => g.Key, g => g.Sum(e => e.Notional));
+    var rows = deskTotals.Rows;
+    return rows.Count == expected.Count && expected.All(e => rows.TryGetValue(e.Key, out var total) && total == e.Value);
 }
 
-Trade RandomTrade()
+// The circuits step by themselves, so a claim is checked by waiting — with a bound — for
+// the sinks to say what the model says.
+async Task Claim(string text, Func<bool> holds)
 {
-    var instrument = instruments[rng.Next(instruments.Count)];
-    var qty = (long)Math.Pow(10, 2 + 3 * rng.NextDouble());
-    var price = instrument.BasePrice * (1 + (rng.NextDouble() - 0.5) * 0.02);
-    return new Trade(nextTradeId++, rng.NextDouble() < 0.5 ? "BUY" : "SELL",
-        instrument.Id, traders[rng.Next(traders.Count)].Id, counterparties[rng.Next(counterparties.Count)].Id,
-        qty, Math.Round(price, 4));
-}
-
-var ticks = 0;
-await AnsiConsole.Live(BuildLiveView()).AutoClear(false).StartAsync(async ctx =>
-{
-    while (interactive || ticks < maxTicks)
+    claims++;
+    var waited = Stopwatch.StartNew();
+    while (!holds() && waited.Elapsed < TimeSpan.FromSeconds(15))
+        await Task.Delay(5);
+    if (holds())
+        Console.WriteLine($"  ok    {text}");
+    else
     {
-        if (interactive && Console.KeyAvailable)
-        {
-            Console.ReadKey(intercept: true);
-            break;
-        }
-        ticks++;
-
-        // A burst of new trades, the odd amendment, the odd cancellation — the keyed
-        // trade input makes both a single call.
-        for (var i = 0; i < 25; i++)
-        {
-            var trade = RandomTrade();
-            liveIds.Add(trade.Id);
-            liveTrades[trade.Id] = trade;
-            tradesByTrader[trade.TraderId] = tradesByTrader.GetValueOrDefault(trade.TraderId) + 1;
-            tradesByCpty[trade.CounterpartyId] = tradesByCpty.GetValueOrDefault(trade.CounterpartyId) + 1;
-            tradesInserted++;
-            await tradeInput.UpsertAsync(trade);
-        }
-        if (liveIds.Count > 50 && rng.NextDouble() < 0.35)
-        {
-            var victimIndex = rng.Next(liveIds.Count);
-            var victimId = liveIds[victimIndex];
-            if (rng.NextDouble() < 0.5)
-            {
-                if (liveTrades.Remove(victimId, out var cancelled))
-                {
-                    tradesByTrader[cancelled.TraderId]--;
-                    tradesByCpty[cancelled.CounterpartyId]--;
-                }
-                await tradeInput.DeleteAsync(victimId);
-                // Swap-remove: List.Remove would be a linear scan and liveIds keeps growing.
-                liveIds[victimIndex] = liveIds[^1];
-                liveIds.RemoveAt(liveIds.Count - 1);
-                tradesCancelled++;
-            }
-            else if (liveTrades.TryGetValue(victimId, out var victim))
-            {
-                var amended = victim with { Quantity = Math.Max(1, victim.Quantity / 2) };
-                liveTrades[victimId] = amended;
-                await tradeInput.UpsertAsync(amended);
-                tradesAmended++;
-            }
-        }
-        await StepTimedAsync();
-
-        // Roughly every 8 seconds, reference data itself changes: one upsert.
-        if (ticks % 40 == 0)
-        {
-            if (useDesk && (cols.Contains(ColDesk) || cols.Contains(ColRegion)) && (!useCpty || rng.NextDouble() < 0.6))
-            {
-                var trader = traders[rng.Next(traders.Count)];
-                var newDesk = desks[rng.Next(desks.Count)];
-                if (newDesk.Id != trader.DeskId)
-                {
-                    var oldDesk = desks.First(d => d.Id == trader.DeskId).Name;
-                    var moved = trader with { DeskId = newDesk.Id };
-                    traders[traders.IndexOf(trader)] = moved;
-                    await traderHandle!.UpsertAsync(moved);
-                    var (micros, deltaRows) = await StepTimedAsync();
-                    var affected = tradesByTrader.GetValueOrDefault(trader.Id);
-                    Notice($"[yellow]master data:[/] {trader.Name} moved {oldDesk} → {newDesk.Name} — one upsert " +
-                           $"re-attributed [bold]{affected:N0} historical trades[/] in [bold green]{micros:N0} µs[/] " +
-                           $"(collapsing to {deltaRows} group-level delta rows)");
-                }
-            }
-            else if (useCpty && cols.Contains(ColRating))
-            {
-                var cpty = counterparties[rng.Next(counterparties.Count)];
-                var newRating = ratings[rng.Next(ratings.Length)];
-                if (newRating != cpty.Rating)
-                {
-                    var changed = cpty with { Rating = newRating };
-                    counterparties[counterparties.IndexOf(cpty)] = changed;
-                    await cptyHandle!.UpsertAsync(changed);
-                    var (micros, deltaRows) = await StepTimedAsync();
-                    var affected = tradesByCpty.GetValueOrDefault(cpty.Id);
-                    Notice($"[yellow]master data:[/] {cpty.Name} re-rated {cpty.Rating} → {newRating} — one upsert " +
-                           $"re-attributed [bold]{affected:N0} historical trades[/] in [bold green]{micros:N0} µs[/] " +
-                           $"(collapsing to {deltaRows} group-level delta rows)");
-                }
-            }
-        }
-
-        ctx.UpdateTarget(BuildLiveView());
-        await Task.Delay(100);
+        failures++;
+        Console.WriteLine($"  WRONG {text}");
     }
+}
+
+async Task Send(Trade trade)
+{
+    book[trade.Id] = trade;
+    arrival[trade.Id] = instrumentRows[trade.InstrumentId];
+    await trades.UpsertAsync(trade);
+}
+
+// ── act 1: the reference data is there before the trades ────────────────────────────────
+
+Console.WriteLine("Trade enrichment on shared tables");
+Console.WriteLine();
+Console.WriteLine($"1. Four reference tables are loaded ({deskRows.Count} desks, {traderRows.Count} traders, {instrumentRows.Count} instruments, " +
+                  $"{counterpartyRows.Count} counterparties); a small circuit derives trader-desks from two of them.");
+await Claim("the derived table holds one row per trader, each with its desk's name and region", () =>
+{
+    using var snapshot = traderDesks.Snapshot();
+    return traderDesks.Count == traderRows.Count && traderRows.Values.All(t =>
+        snapshot.TryGet(t.Id, out var row) && row == new TraderDesk(t.Id, t.Name, deskRows[t.DeskId].Name, deskRows[t.DeskId].Region));
 });
 
+// ── act 2: trades, amendments, cancellations ────────────────────────────────────────────
+
+var random = new Random(11);
+Trade RandomTrade(long id)
+{
+    var instrument = instrumentRows[1 + random.Next(instrumentRows.Count)];
+    return new Trade(id, instrument.Id, 1 + random.Next(traderRows.Count), 1 + random.Next(counterpartyRows.Count),
+        10 * (1 + random.Next(500)), Math.Round(instrument.BasePrice * (0.99m + random.Next(200) / 10_000m), 2));
+}
+
+int amended = 0, cancelled = 0;
+for (long id = 1; id <= tradeCount; id++)
+{
+    await Send(RandomTrade(id));
+    if (id % 10 == 0)
+    {
+        // An amendment is an upsert of the same id; the circuit retracts the old row itself.
+        var victim = book.Values.ElementAt(random.Next(book.Count));
+        await Send(victim with { Quantity = victim.Quantity + 10 });
+        amended++;
+    }
+    if (id % 25 == 0)
+    {
+        var victim = book.Keys.ElementAt(random.Next(book.Count));
+        book.Remove(victim);
+        arrival.Remove(victim);
+        await trades.DeleteAsync(victim);
+        cancelled++;
+    }
+}
+Console.WriteLine();
+Console.WriteLine($"2. {tradeCount:N0} trades arrive, {amended:N0} are amended and {cancelled:N0} cancelled.");
+await Claim($"the blotter sink holds exactly the {book.Count:N0} live trades, each enriched from all four tables", BlotterMatches);
+await Claim("the per-desk totals in the second sink equal the sums over the model", DeskTotalsMatch);
+
+// ── act 3: a retroactive join — a trader moves desk ─────────────────────────────────────
+
+var mover = traderRows.Values.OrderByDescending(t => book.Values.Count(b => b.TraderId == t.Id)).First();
+var fromDesk = deskRows[mover.DeskId];
+var toDesk = deskRows[1 + mover.DeskId % deskRows.Count];
+var moved = book.Values.Count(t => t.TraderId == mover.Id);
+var batchesBefore = blotter.Batches;
+traderRows[mover.Id] = mover with { DeskId = toDesk.Id };
+await traders.Writer.UpsertAsync(traderRows[mover.Id]);
+await traders.Writer.CommitAsync();
+Console.WriteLine();
+Console.WriteLine($"3. {mover.Name} moves from {fromDesk.Name} to {toDesk.Name}: one row of one table changes.");
+await Claim($"all {moved:N0} of their historical trades now carry {toDesk.Name} — through the derived table and the join, with no trade re-sent",
+    () => blotter.Rows.Values.Count(e => e.Trader == mover.Name && e.Desk == toDesk.Name) == moved && BlotterMatches());
+await Claim($"both desks' totals moved by the same amount, and every other total is unchanged", DeskTotalsMatch);
+Console.WriteLine($"        ({blotter.Batches - batchesBefore} batch(es) reached the blotter sink for it)");
+
+// ── act 4: a lookup — an instrument is renamed ──────────────────────────────────────────
+
+var renamed = instrumentRows.Values.OrderByDescending(i => book.Values.Count(b => b.InstrumentId == i.Id)).First();
+var oldSymbol = renamed.Symbol;
+var newSymbol = oldSymbol + ".N";
+var before = book.Values.Where(t => t.InstrumentId == renamed.Id).Select(t => t.Id).ToHashSet();
+instrumentRows[renamed.Id] = renamed with { Symbol = newSymbol };
+await instruments.Writer.UpsertAsync(instrumentRows[renamed.Id]);
+await instruments.Writer.CommitAsync();
+var after = RandomTrade(tradeCount + 1) with { InstrumentId = renamed.Id };
+await Send(after);
+Console.WriteLine();
+Console.WriteLine($"4. {oldSymbol} is renamed {newSymbol}, and one more trade in it arrives.");
+await Claim($"the new trade carries {newSymbol}", () => blotter.Rows.TryGetValue(after.Id, out var row) && row.Symbol == newSymbol);
+await Claim($"the {before.Count:N0} trades done before the rename still say {oldSymbol}: a lookup enriches once",
+    () => BlotterMatches() && before.All(id => blotter.Rows[id].Symbol == oldSymbol));
+
+// ── act 5: an amendment is a new arrival ────────────────────────────────────────────────
+
+var amendedId = before.First();
+await Send(book[amendedId] with { Quantity = book[amendedId].Quantity + 100 });
+Console.WriteLine();
+Console.WriteLine($"5. Trade {amendedId}, one of those, is amended.");
+await Claim($"the row it produced is taken back and the amended trade is enriched afresh, with {newSymbol}",
+    () => blotter.Rows.TryGetValue(amendedId, out var row) && row.Symbol == newSymbol && row == Expected(book[amendedId]) && BlotterMatches());
+
+// ── act 6: a re-rating, and a cancellation ──────────────────────────────────────────────
+
+var rerated = counterpartyRows[1];
+var newRating = rerated.Rating == "BB" ? "AAA" : "BB";
+var book1 = book.Values.Count(t => t.CounterpartyId == rerated.Id);
+counterpartyRows[rerated.Id] = rerated with { Rating = newRating };
+await counterparties.Writer.UpsertAsync(counterpartyRows[rerated.Id]);
+await counterparties.Writer.CommitAsync();
+var gone = book.Keys.Max();
+book.Remove(gone);
+arrival.Remove(gone);
+await trades.DeleteAsync(gone);
+Console.WriteLine();
+Console.WriteLine($"6. {rerated.Name} is re-rated {rerated.Rating} → {newRating}, and trade {gone} is cancelled.");
+await Claim($"every one of its {book.Values.Count(t => t.CounterpartyId == rerated.Id):N0} trades carries {newRating}",
+    () => BlotterMatches() && blotter.Rows.Values.Where(e => e.Counterparty == rerated.Name).All(e => e.Rating == newRating));
+await Claim($"trade {gone} is gone from the blotter and from its desk's total", () => !blotter.Rows.ContainsKey(gone) && BlotterMatches() && DeskTotalsMatch());
+
+// ── act 7: the book is settled ──────────────────────────────────────────────────────────
+
+long StateEntries() => storage.CommittedEntriesByStore().Values.Sum();
+var held = StateEntries();
+var live = book.Count;
+foreach (var id in book.Keys.ToList())
+{
+    book.Remove(id);
+    arrival.Remove(id);
+    await trades.DeleteAsync(id);
+}
+Console.WriteLine();
+Console.WriteLine($"7. Every one of the {live:N0} live trades is settled: deleted at the source.");
+await Claim($"the circuit's state, {held:N0} entries for {live:N0} live trades, returns to nothing with the book: what bounds it is the source's deletes",
+    () => StateEntries() == 0 && blotter.Rows.Count == 0 && DeskTotalsMatch());
+
+// ── the end: drain, and look once more ──────────────────────────────────────────────────
+
 await circuit.DisposeAsync();
-DrainOutputs(); // any batches the final flush steps published
-AnsiConsole.MarkupLine(
-    $"[grey]processed[/] {tradesInserted:N0} trades ({tradesAmended:N0} amended, {tradesCancelled:N0} cancelled) " +
-    $"in {stepCount:N0} steps, avg [bold]{TimeSpan.FromTicks(stepTicks / Math.Max(1, stepCount)).TotalMicroseconds:N0} µs[/] per step");
-return;
+await Task.WhenAll(blotterDelivery, deskDelivery);
+await derivingCircuit.DisposeAsync();
+Console.WriteLine();
+Console.WriteLine("8. Both circuits are drained and disposed.");
+await Claim("the sinks, read after the last acknowledgement, still equal the model", () => BlotterMatches() && DeskTotalsMatch());
+await Claim("no batch was delivered twice", () => blotter.Redeliveries == 0 && deskTotals.Redeliveries == 0);
 
-// ────────────────────────────────────────────────────────────────────────────────
+Console.WriteLine();
+Console.WriteLine(failures == 0
+    ? $"{claims} claims checked, all hold. The trade circuit kept {live:N0} trades at most and not one reference row."
+    : $"{failures} of {claims} claims did NOT hold.");
+return failures == 0 ? 0 : 1;
 
-IRenderable BuildLiveView()
-{
-    var avgMicros = stepCount == 0 ? 0 : TimeSpan.FromTicks(stepTicks / stepCount).TotalMicroseconds;
-    var renderables = new List<IRenderable>
-    {
-        new Markup(
-            $"[grey]trades[/] [bold]{tradesInserted,8:N0}[/]   [grey]live[/] {liveTrades.Count,7:N0}   " +
-            $"[grey]amended[/] {tradesAmended,5:N0}   [grey]cancelled[/] {tradesCancelled,5:N0}   " +
-            $"[grey]step p50[/] [bold green]{StepPercentile(0.50),7:N0} µs[/]   [grey]p99[/] {StepPercentile(0.99),7:N0} µs   [grey]avg[/] {avgMicros,7:N0} µs"),
-    };
-    foreach (var notice in notices.Reverse())
-        renderables.Add(new Markup(notice));
-    renderables.Add(blotterMode ? BuildBlotterTable() : BuildGroupTable());
-    return new Rows(renderables);
-}
-
-IRenderable BuildGroupTable()
-{
-    var table = new Table().Border(TableBorder.Rounded);
-    foreach (var (name, _) in dims)
-        table.AddColumn(new TableColumn(name.ToLowerInvariant()).Width(16));
-    table.AddColumn(new TableColumn("trades").RightAligned().Width(8));
-    table.AddColumn(new TableColumn("notional").RightAligned().Width(10));
-    table.AddColumn(new TableColumn("avg size").RightAligned().Width(10));
-
-    var rows = groupsView.OrderByDescending(e => e.Value.Value.Value.Notional).Take(MaxGroupRows).ToList();
-    foreach (var entry in rows)
-    {
-        var (trades, notional) = entry.Value.Value.Value;
-        var parts = entry.Value.Value.Key.Split(KeySep);
-        var cells = parts.Select(p => Markup.Escape(Truncate(p, 16))).ToList();
-        cells.Add($"{trades:N0}");
-        cells.Add(Money(notional));
-        cells.Add(Money(trades == 0 ? 0 : notional / trades));
-        table.AddRow(cells.ToArray());
-    }
-    return table;
-}
-
-IRenderable BuildBlotterTable()
-{
-    var table = new Table().Border(TableBorder.Rounded).Title($"[bold]top {MaxBlotterRows} trades by notional[/]");
-    table.AddColumn(new TableColumn("id").RightAligned().Width(7));
-    table.AddColumn(new TableColumn("side").Width(4));
-    if (cols.Contains(ColSymbol)) table.AddColumn(new TableColumn("symbol").Width(8));
-    table.AddColumn(new TableColumn("qty").RightAligned().Width(9));
-    table.AddColumn(new TableColumn("price").RightAligned().Width(10));
-    table.AddColumn(new TableColumn("notional").RightAligned().Width(10));
-    if (cols.Contains(ColTrader)) table.AddColumn(new TableColumn("trader").Width(11));
-    if (cols.Contains(ColDesk)) table.AddColumn(new TableColumn("desk").Width(14));
-    if (cols.Contains(ColRegion)) table.AddColumn(new TableColumn("region").Width(6));
-    if (cols.Contains(ColCptyName)) table.AddColumn(new TableColumn("counterparty").Width(17));
-    if (cols.Contains(ColRating)) table.AddColumn(new TableColumn("rating").Width(6));
-
-    var rows = blotterView.OrderByDescending(e => e.Value.Value.Notional).Take(MaxBlotterRows).ToList();
-    foreach (var entry in rows)
-    {
-        var t = entry.Value.Value;
-        var cells = new List<string> { $"{t.Id:N0}", t.Side };
-        if (cols.Contains(ColSymbol)) cells.Add(Markup.Escape(t.Symbol));
-        cells.Add($"{t.Quantity:N0}");
-        cells.Add($"{t.Price:N4}");
-        cells.Add(Money(t.Notional));
-        if (cols.Contains(ColTrader)) cells.Add(Markup.Escape(Truncate(t.Trader, 11)));
-        if (cols.Contains(ColDesk)) cells.Add(Markup.Escape(Truncate(t.Desk, 14)));
-        if (cols.Contains(ColRegion)) cells.Add(Markup.Escape(t.Region));
-        if (cols.Contains(ColCptyName)) cells.Add(Markup.Escape(Truncate(t.Counterparty, 17)));
-        if (cols.Contains(ColRating)) cells.Add(Markup.Escape(t.Rating));
-        table.AddRow(cells.ToArray());
-    }
-    return table;
-}
-
-double StepPercentile(double quantile)
-{
-    var window = (int)Math.Min(stepCount, recentStepMicros.Length);
-    if (window == 0)
-        return 0;
-    var sorted = recentStepMicros.AsSpan(0, window).ToArray();
-    Array.Sort(sorted);
-    return sorted[Math.Min(window - 1, (int)(quantile * window))];
-}
-
-static string Money(double value) => Math.Abs(value) switch
-{
-    >= 1e9 => $"${value / 1e9:N1}B",
-    >= 1e6 => $"${value / 1e6:N1}M",
-    >= 1e3 => $"${value / 1e3:N1}K",
-    _ => $"${value:N0}",
-};
-
-static string Truncate(string value, int width) =>
-    value.Length <= width ? value : value[..(width - 1)] + "…";
-
-/// <summary>Custom linear aggregate: trade count and notional maintained together in one
-/// accumulator per group — folded from deltas, never recomputed.</summary>
-sealed class TradeStatsAggregate : ILinearAggregate<EnrichedTrade, (long Trades, double Notional)>
-{
-    public (long Trades, double Notional) Zero => (0, 0);
-
-    public (long Trades, double Notional) Map(EnrichedTrade trade, long weight) =>
-        (weight, trade.Notional * weight);
-
-    public (long Trades, double Notional) Combine((long Trades, double Notional) a, (long Trades, double Notional) b) =>
-        (a.Trades + b.Trades, a.Notional + b.Notional);
-}
-
-record Trade(long Id, string Side, int InstrumentId, int TraderId, int CounterpartyId, long Quantity, double Price);
-
-record Instrument(int Id, string Symbol, string AssetClass, string Currency, double BasePrice);
-
-record TraderRow(int Id, string Name, int DeskId);
-
+// Rows of shared tables are immutable records: every circuit is handed the same objects.
 record Desk(int Id, string Name, string Region);
+
+record Trader(int Id, string Name, int DeskId);
+
+record TraderDesk(int TraderId, string Trader, string Desk, string Region);
+
+record Instrument(int Id, string Symbol, string AssetClass, decimal BasePrice);
 
 record Counterparty(int Id, string Name, string Rating);
 
+record Trade(long Id, int InstrumentId, int TraderId, int CounterpartyId, long Quantity, decimal Price);
+
+record Priced(Trade Trade, string Symbol, string AssetClass);
+
 record EnrichedTrade(
-    long Id, string Side, int InstrumentId, int TraderId, int CounterpartyId,
-    long Quantity, double Price, double Notional,
-    string Symbol, string AssetClass, string Currency,
-    string Trader, string Desk, string Region,
-    string Counterparty, string Rating);
+    long Id, string Symbol, string AssetClass, string Trader, string Desk, string Region,
+    string Counterparty, string Rating, decimal Notional);

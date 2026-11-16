@@ -22,8 +22,9 @@ namespace Incremental.Operators;
 ///
 /// When the circuit has a watermark, a key's state is dropped once the watermark passes its
 /// last event + gap. That deadline moves with the session as events arrive, unlike the
-/// static <see cref="KeyEviction{TKey}"/> policies, so the operator tracks it itself (stale
-/// queue entries are skipped lazily). The input is partitioned by key, so state and eviction
+/// static <see cref="KeyEviction{TKey}"/> policies, so the operator sets it itself, in a
+/// deadline store of its own — checkpointed with the events it bounds, so a key open at a
+/// restart still closes. The input is partitioned by key, so state and eviction
 /// decisions are worker-local and consistent (the watermark is frozen for the whole step).
 /// </summary>
 internal sealed class SessionWindowOperator<TKey, TValue> : IStepOperator
@@ -34,8 +35,8 @@ internal sealed class SessionWindowOperator<TKey, TValue> : IStepOperator
     private readonly Func<TValue, DateTimeOffset> _eventTime;
     private readonly long _gapTicks;
     private readonly WatermarkClock? _clock;
-    private readonly PriorityQueue<TKey, long> _deadlines = new();
-    private readonly Dictionary<TKey, long> _currentDeadline = [];
+    private readonly IDeadlineStore<TKey>? _deadlines;
+    private readonly List<TKey> _closed = [];
 
     public SessionWindowOperator(
         OperatorContext context,
@@ -47,6 +48,7 @@ internal sealed class SessionWindowOperator<TKey, TValue> : IStepOperator
         _eventTime = eventTime;
         _gapTicks = gapTicks;
         _clock = clock;
+        _deadlines = clock is null ? null : context.Storage.CreateDeadlineStore<TKey>(context.StateName("deadlines"));
     }
 
     // Per-step scratch, reused across steps and — for the per-key working lists — across the
@@ -183,38 +185,20 @@ internal sealed class SessionWindowOperator<TKey, TValue> : IStepOperator
     /// <paramref name="newItems"/> is sorted by <see cref="Sessionize"/> before this runs.</summary>
     private void TrackDeadline(TKey key, List<(long Ticks, TValue Value, long Weight)> newItems)
     {
-        if (_clock is null)
+        if (_deadlines is null)
             return;
 
         if (newItems.Count == 0)
-        {
-            _currentDeadline.Remove(key); // fully retracted; stale queue entries are skipped lazily
-            return;
-        }
-
-        var deadline = newItems[^1].Ticks + _gapTicks;
-        if (_currentDeadline.TryGetValue(key, out var existing) && existing == deadline)
-            return;
-        _currentDeadline[key] = deadline;
-        _deadlines.Enqueue(key, deadline);
+            _deadlines.Remove(key); // fully retracted
+        else
+            _deadlines.Set(key, newItems[^1].Ticks + _gapTicks);
     }
 
     private void EvictClosed()
     {
-        var watermark = _clock!.FrozenTicks;
-        List<TKey>? closed = null;
-        while (_deadlines.TryPeek(out var key, out var deadline) && deadline <= watermark)
-        {
-            _deadlines.Dequeue();
-            if (_currentDeadline.TryGetValue(key, out var current) && current == deadline)
-            {
-                _currentDeadline.Remove(key);
-                (closed ??= []).Add(key);
-            }
-            // Otherwise the entry is stale: the key was touched again (or fully retracted)
-            // after this deadline was queued.
-        }
-        if (closed is { Count: > 0 })
-            _events.RemoveGroups(closed);
+        _closed.Clear();
+        _deadlines!.TakeDue(_clock!.FrozenTicks, _closed);
+        if (_closed.Count > 0)
+            _events.RemoveGroups(_closed);
     }
 }

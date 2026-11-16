@@ -65,6 +65,19 @@ public sealed class HostedCircuitOptions
     /// <summary><see cref="CircuitOptions.CheckpointInterval"/>.</summary>
     public int CheckpointInterval { get; set; } = 1;
 
+    /// <summary><see cref="CircuitOptions.CheckpointMaxDelay"/>. Binds from configuration as
+    /// a time span (<c>"00:00:01"</c>).</summary>
+    public TimeSpan? CheckpointMaxDelay { get; set; }
+
+    /// <summary><see cref="CircuitOptions.ErrorPolicy"/>. With
+    /// <see cref="RecordErrorPolicy.DeadLetter"/>, register a reader for the dropped records
+    /// with <c>AddDeadLetterConsumer</c>: an unread dead-letter output stalls the circuit
+    /// once it is full.</summary>
+    public RecordErrorPolicy ErrorPolicy { get; set; } = RecordErrorPolicy.Fault;
+
+    /// <summary><see cref="CircuitOptions.DeadLetterCapacity"/>.</summary>
+    public int DeadLetterCapacity { get; set; } = 1024;
+
     /// <summary>What the host does when the circuit faults or a registered output consumer
     /// throws.</summary>
     public CircuitFaultBehavior FaultBehavior { get; set; } = CircuitFaultBehavior.StopHost;
@@ -80,5 +93,8 @@ public sealed class HostedCircuitOptions
         AutoStep = AutoStep,
         Storage = Storage ?? new InMemoryStorageProvider(),
         CheckpointInterval = CheckpointInterval,
+        CheckpointMaxDelay = CheckpointMaxDelay,
+        ErrorPolicy = ErrorPolicy,
+        DeadLetterCapacity = DeadLetterCapacity,
     };
 }

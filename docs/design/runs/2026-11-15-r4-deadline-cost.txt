@@ -1,0 +1,70 @@
+What EvictWhenFinal costs per open trade. A circuit of the reference shape built on the
+core API: a keyed input of nine-column trades (evictWhenFinal), a remembered lookup and
+two retroactive joins against three shared tables (EvictWhenFinal on each grouping), on
+ChangelogStorage over a KafkaLog; one local broker (the connector stack's), replication
+factor 1, zstd. "measured" is the managed heap after three forced full collections, less
+the same before the node was made. "estimated" is ChangelogStorageProvider.EstimateSize.
+The follower is ChangelogStorage.Follow on a second KafkaLog with the same circuit built
+on it (typed stores, layout "v1"). 2026-11-15, a 13th-gen i7-13700H.
+
+=== on Kafka (e2kfaf6e08f), no eviction, 100,000 trades, 400,102 records written ===
+leader (read the trades from their source): measured     706 B/trade   estimated    2044 B/trade   entries 4.0/trade (as bytes 0, held twice 0)
+    input.trades.upsert.rows.w0                    value      100000 entries     300 B/entry  (objects    256)  record    189 B
+    named.booked.tableLookup.remembered.w0         indexed    100000 entries     734 B/entry  (objects    640)  record    468 B
+    named.priced.tableJoin.facts.w0                indexed    100000 entries     445 B/entry  (objects    384)  record    248 B
+    named.with-desk.tableJoin.facts.w0             indexed    100000 entries     566 B/entry  (objects    510)  record    303 B
+follower (typed stores, read from the log): measured    2243 B/trade   estimated    2084 B/trade   entries 4.0/trade (as bytes 0, held twice 0)
+    input.trades.upsert.rows.w0                    value      100000 entries     300 B/entry  (objects    256)  record    189 B
+    named.booked.tableLookup.remembered.w0         indexed    100000 entries     774 B/entry  (objects    680)  record    468 B
+    named.priced.tableJoin.facts.w0                indexed    100000 entries     445 B/entry  (objects    384)  record    248 B
+    named.with-desk.tableJoin.facts.w0             indexed    100000 entries     566 B/entry  (objects    510)  record    303 B
+=== on Kafka (e2kd52c7e16), EvictWhenFinal: every trade open, 100,000 trades, 800,102 records written ===
+leader (read the trades from their source): measured    1167 B/trade   estimated    3482 B/trade   entries 8.0/trade (as bytes 0, held twice 0)
+    input.trades.upsert.deadlines.w0               deadline   100000 entries      65 B/entry  (objects      0)  record     27 B
+    input.trades.upsert.rows.w0                    value      100000 entries     300 B/entry  (objects    256)  record    189 B
+    named.booked.tableLookup.deadlines.w0          deadline   100000 entries     344 B/entry  (objects    256)  record    227 B
+    named.booked.tableLookup.remembered.w0         indexed    100000 entries     734 B/entry  (objects    640)  record    468 B
+    named.priced.tableJoin.deadlines.w0            deadline   100000 entries     472 B/entry  (objects    384)  record    281 B
+    named.priced.tableJoin.facts.w0                indexed    100000 entries     445 B/entry  (objects    384)  record    248 B
+    named.with-desk.tableJoin.deadlines.w0         deadline   100000 entries     558 B/entry  (objects    470)  record    336 B
+    named.with-desk.tableJoin.facts.w0             indexed    100000 entries     566 B/entry  (objects    510)  record    303 B
+follower (typed stores, read from the log): measured    3891 B/trade   estimated    3602 B/trade   entries 8.0/trade (as bytes 0, held twice 0)
+    input.trades.upsert.deadlines.w0               deadline   100000 entries      65 B/entry  (objects      0)  record     27 B
+    input.trades.upsert.rows.w0                    value      100000 entries     300 B/entry  (objects    256)  record    189 B
+    named.booked.tableLookup.deadlines.w0          deadline   100000 entries     384 B/entry  (objects    296)  record    227 B
+    named.booked.tableLookup.remembered.w0         indexed    100000 entries     774 B/entry  (objects    680)  record    468 B
+    named.priced.tableJoin.deadlines.w0            deadline   100000 entries     472 B/entry  (objects    384)  record    281 B
+    named.priced.tableJoin.facts.w0                indexed    100000 entries     445 B/entry  (objects    384)  record    248 B
+    named.with-desk.tableJoin.deadlines.w0         deadline   100000 entries     598 B/entry  (objects    510)  record    336 B
+    named.with-desk.tableJoin.facts.w0             indexed    100000 entries     566 B/entry  (objects    510)  record    303 B
+
+The state topics' log segments on the broker's disk (the .log files of every partition):
+  e2kfaf6e08f.state   8,793,042 bytes   no eviction: 100,000 trades, 400,102 records
+  e2kd52c7e16.state  15,478,126 bytes   EvictWhenFinal, every trade open: 100,000 trades, 800,102 records
+  e2me85aebc0.state  46,452,336 bytes   the run below: 180,000 trades arrived and 120,000 became final, 2,392,173 records
+
+Trades arriving and becoming final: 1,000 trades to a second of event time, one step per
+second of event time, open for 60 s, run flat out.
+
+prefix e2me85aebc0: 1000 trades per second of event time, 180 s of it, open 60 s, one step per second of event time, flat out
+    10 s of event time in    0.9 s: leader    80000 entries, follower    63596; records written     80011; this step     77 ms
+    20 s of event time in    1.6 s: leader   160000 entries, follower   152000; records written    160021; this step     48 ms
+    30 s of event time in    2.0 s: leader   240000 entries, follower   232000; records written    240031; this step     30 ms
+    40 s of event time in    2.5 s: leader   320000 entries, follower   312000; records written    320041; this step     36 ms
+    50 s of event time in    2.8 s: leader   400000 entries, follower   392000; records written    400051; this step     29 ms
+    60 s of event time in    3.2 s: leader   480000 entries, follower   472000; records written    480061; this step     34 ms
+    70 s of event time in    3.9 s: leader   488008 entries, follower   488008; records written    632063; this step     54 ms
+    80 s of event time in    4.6 s: leader   488008 entries, follower   488008; records written    792073; this step     71 ms
+    90 s of event time in    5.2 s: leader   488008 entries, follower   488008; records written    952083; this step     58 ms
+   100 s of event time in    5.9 s: leader   488008 entries, follower   488008; records written   1112093; this step     53 ms
+   110 s of event time in    6.7 s: leader   488008 entries, follower   488209; records written   1272103; this step     52 ms
+   120 s of event time in    7.3 s: leader   488008 entries, follower   488008; records written   1432113; this step    121 ms
+   130 s of event time in    8.1 s: leader   488008 entries, follower   488008; records written   1592123; this step     88 ms
+   140 s of event time in    8.7 s: leader   488008 entries, follower   488008; records written   1752133; this step     65 ms
+   150 s of event time in    9.4 s: leader   488008 entries, follower   488008; records written   1912143; this step     67 ms
+   160 s of event time in   10.0 s: leader   488008 entries, follower   488008; records written   2072153; this step     50 ms
+   170 s of event time in   10.7 s: leader   488008 entries, follower   488008; records written   2232163; this step     54 ms
+   180 s of event time in   11.3 s: leader   488008 entries, follower   488008; records written   2392173; this step     52 ms
+steady state (from 65 s on): 114,000 trades in 7.7 s = 14853 trades/s flat out;
+  16.00 state-topic records per trade (arrival and eviction together); a step of 1000 trades committed in 67 ms on average, 132 ms at most
+follower: largest difference from the leader's entry count at a reading 16404; equal 0 ms after the last step

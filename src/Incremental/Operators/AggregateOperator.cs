@@ -27,8 +27,11 @@ internal sealed class AggregateOperator<TKey, TValue, TResult> : IStepOperator
         _groups = context.Storage.CreateIndexedWeightStore<TKey, TValue>(context.StateName("groups"));
         _lastEmitted = context.Storage.CreateValueStore<TKey, TResult>(context.StateName("results"));
         _aggregate = aggregate;
-        _eviction = eviction is null ? null : new EvictionTracker<TKey>(eviction);
+        _eviction = eviction is null ? null : new EvictionTracker<TKey>(context, eviction);
+        _errors = context.Errors;
     }
+
+    private readonly RecordErrors? _errors;
 
     private readonly ZSet<KeyedValue<TKey, TResult>> _empty = new();
 
@@ -93,7 +96,20 @@ internal sealed class AggregateOperator<TKey, TValue, TResult> : IStepOperator
                 continue;
             }
 
-            var next = _aggregate.Aggregate(group);
+            TResult next;
+            if (_errors is null)
+                next = _aggregate.Aggregate(group);
+            else if (!TryAggregate(key, group, entries, _errors, out next))
+            {
+                // No result for the group as it stands: whatever was emitted for the key is
+                // retracted and forgotten, exactly as if the group had vanished.
+                if (hadPrevious)
+                {
+                    output.Add(new KeyedValue<TKey, TResult>(key, previous!), -1);
+                    removes.Add(key);
+                }
+                continue;
+            }
             if (hadPrevious && EqualityComparer<TResult>.Default.Equals(previous, next))
                 continue;
 
@@ -116,5 +132,32 @@ internal sealed class AggregateOperator<TKey, TValue, TResult> : IStepOperator
         }
 
         return output;
+    }
+
+    /// <summary>The dead-letter policy's call of the user aggregate. The group's contents are
+    /// integrated whatever happens here — that is not user code — so a group the aggregate
+    /// throws for simply has no result while it stays that way, and gets one again as soon
+    /// as a later step changes it into something the aggregate accepts. The last emitted
+    /// result is state, so this is consistent without relying on the aggregate being
+    /// deterministic. What is reported is every row this step added to or removed from the
+    /// group: one of them is what broke it, or failed to mend it.</summary>
+    private bool TryAggregate(
+        TKey key, IReadOnlyList<WeightedValue<TValue>> group, List<(TKey, TValue, long)> entries, RecordErrors errors,
+        out TResult next)
+    {
+        try
+        {
+            next = RecordErrors.Result(_aggregate.Aggregate(group));
+            return true;
+        }
+        catch (Exception ex)
+        {
+            var comparer = EqualityComparer<TKey>.Default;
+            foreach (var (entryKey, value, weight) in entries)
+                if (comparer.Equals(entryKey, key))
+                    errors.Add(new KeyedValue<TKey, TValue>(entryKey, value), weight, ex);
+            next = default!;
+            return false;
+        }
     }
 }

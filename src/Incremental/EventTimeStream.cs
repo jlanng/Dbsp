@@ -4,7 +4,7 @@ namespace Incremental;
 
 /// <summary>
 /// A stream whose records carry a declared event time (see
-/// <see cref="ZStream{T}.WithEventTime"/>). The timestamp selector travels in the type:
+/// <see cref="ZStream{T}.WithEventTime(Func{T,DateTimeOffset},TimeSpan)"/>). The timestamp selector travels in the type:
 /// groupings of this stream can be windowed, and operations that preserve the record shape
 /// (<see cref="Where"/>, <see cref="Distinct()"/>) keep the event time, while reshaping ones
 /// (<c>Select</c>, <c>SelectMany</c>) return a plain stream — the selector no longer applies
@@ -31,7 +31,7 @@ public sealed class EventTimeStream<T> : ZStream<T> where T : notnull
     /// <summary>Keeps the records matching <paramref name="predicate"/>, keeping the event time.</summary>
     public new EventTimeStream<T> Where(Func<T, bool> predicate) =>
         new(Builder,
-            Builder.AddNode("where", [NodeId], _ => new FilterOperator<T>(predicate)),
+            Builder.AddNode("where", [NodeId], ctx => new FilterOperator<T>(predicate, ctx.Errors)),
             _eventTime);
 
     /// <summary>Collapses the multiset to a set, keeping the event time; see
@@ -68,7 +68,7 @@ public sealed class EventTimeStream<T> : ZStream<T> where T : notnull
         var keyed = Builder.AddNode(
             "groupBy",
             [NodeId],
-            _ => new MapOperator<T, KeyedValue<TKey, T>>(v => new KeyedValue<TKey, T>(keySelector(v), v)));
+            ctx => new MapOperator<T, KeyedValue<TKey, T>>(KeySelectors.Keyed(keySelector, guarded: ctx.Errors is not null), ctx.Errors));
 
         var node = keyed;
         if (Builder.Options.IsSharded)
@@ -79,6 +79,6 @@ public sealed class EventTimeStream<T> : ZStream<T> where T : notnull
                 _ => new ExchangeOperator<KeyedValue<TKey, T>>(kv => keyHash!(kv.Key)),
                 isExchange: true);
         }
-        return new GroupedEventTimeStream<TKey, T>(Builder, node, _eventTime);
+        return new GroupedEventTimeStream<TKey, T>(Builder, node, _eventTime, keyHash);
     }
 }

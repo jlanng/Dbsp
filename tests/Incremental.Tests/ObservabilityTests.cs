@@ -45,6 +45,34 @@ public class ObservabilityTests
         Assert.IsType<InvalidOperationException>(fault.Exception);
     }
 
+    /// <summary>K7: a circuit whose changelog another writer has taken over (a replaced
+    /// leader's) stops; that is said once, not as an error.</summary>
+    [Fact]
+    public async Task A_circuit_stopped_by_a_fenced_changelog_is_not_logged_as_an_error()
+    {
+        var logs = new CapturingLoggerFactory();
+        var builder = new CircuitBuilder(new CircuitOptions
+        {
+            AutoStep = false,
+            Name = $"log-test-{Guid.NewGuid():N}",
+            LoggerFactory = logs,
+        });
+        var numbers = builder.Input<int>("numbers");
+        numbers
+            .Select(n => n == 13 ? throw new ChangelogFencedException("Node 'b' has taken the log over under term 2.") : n)
+            .ToOutput();
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        await circuit.Handle(numbers).InsertAsync(13);
+        await Assert.ThrowsAsync<ChangelogFencedException>(() => circuit.StepAsync());
+
+        Assert.DoesNotContain(logs.Entries, e => e.Level >= LogLevel.Warning);
+        var stopped = Assert.Single(logs.Entries, e => e.Message.Contains("taken its changelog over"));
+        Assert.Equal(LogLevel.Information, stopped.Level);
+        Assert.Contains("term 2", stopped.Message);
+    }
+
     [Fact]
     public async Task Steps_records_durations_commits_and_faults_are_measured()
     {

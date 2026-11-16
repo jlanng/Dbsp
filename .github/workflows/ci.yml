@@ -1,9 +1,18 @@
 name: CI
 
+# The enrichment-service branch is built on every push so that its work is checked before
+# there is a pull request for it; workflow_dispatch runs any branch by hand
+# (`gh workflow run CI --ref <branch>`).
 on:
   push:
-    branches: [main]
+    branches: [main, enrichment-service]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      broker_tests:
+        description: "Also run the broker-failure tests on three brokers (the kafka3 compose profile)"
+        type: boolean
+        default: false
 
 jobs:
   build-and-test:
@@ -22,17 +31,170 @@ jobs:
         run: dotnet build -c Release
       - name: Test
         run: dotnet test --project tests/Incremental.Tests -c Release --no-build
+      # No broker in CI: the integration tests skip, and the ones that need none
+      # (SnapshotCutTests) run.
+      - name: Test Kafka
+        run: dotnet test --project tests/Incremental.Kafka.Tests -c Release --no-build
+      # In memory throughout: the service's tests need no broker. They load real plugin
+      # assemblies from the test plugin projects' output directories, which the build made.
+      - name: Test Service
+        run: dotnet test --project tests/Incremental.Service.Tests -c Release --no-build
+      # The example plugin's own tests: its definitions on PipelineTestHarness, as a
+      # plugin author would write them.
+      - name: Test example pipelines
+        run: dotnet test --project examples/Incremental.EnrichmentService/Pipelines.Tests -c Release --no-build
+      # The smoke tests that need no broker. Each drives the example through its admin API
+      # (or prints its narrative), checks every claim against a model and exits 1 on one
+      # that does not hold. A few seconds each.
+      - name: Smoke, enrichment service on one in-memory node
+        run: dotnet run -c Release --no-build --project examples/Incremental.EnrichmentService -- --headless
+      - name: Smoke, enrichment service on two in-memory nodes with a takeover
+        run: dotnet run -c Release --no-build --project examples/Incremental.EnrichmentService -- --headless --nodes 2
+      - name: Smoke, trade enrichment on shared tables
+        run: dotnet run -c Release --no-build --project examples/Incremental.TradeEnrichment
       # Validates the NuGet packaging (metadata, XML docs, SourceLink, symbols) on every build.
       - name: Pack
         run: |
           dotnet pack src/Incremental -c Release --no-build -o artifacts/packages
           dotnet pack src/Incremental.Storage.Redis -c Release --no-build -o artifacts/packages
           dotnet pack src/Incremental.Hosting -c Release --no-build -o artifacts/packages
+          dotnet pack src/Incremental.Kafka -c Release --no-build -o artifacts/packages
+          dotnet pack src/Incremental.Service.Abstractions -c Release --no-build -o artifacts/packages
+          dotnet pack src/Incremental.Service -c Release --no-build -o artifacts/packages
+          dotnet pack src/Incremental.Service.Testing -c Release --no-build -o artifacts/packages
+          dotnet pack src/Incremental.Service.S3 -c Release --no-build -o artifacts/packages
+          dotnet pack src/Incremental.Service.Admin -c Release --no-build -o artifacts/packages
       - name: Upload packages
         uses: actions/upload-artifact@v7
         with:
           name: packages
           path: artifacts/packages/*.nupkg
+
+  # Everything that needs Kafka, Postgres, Kafka Connect and MinIO: the Kafka library's
+  # integration tests, the service's Kafka-backed classes (KafkaService*Tests, which the
+  # job above skips), the files connector's tests on the S3 store (S3FileConnectorTests,
+  # skipped above too) and the example's Kafka smoke, which kills a node and takes over.
+  # The stack is the repository's own compose file rather than `services:` containers,
+  # for two reasons: Postgres has to be started with `-c wal_level=logical`, which a
+  # service container cannot be given, and this way CI runs what a developer runs.
+  # These tests skip when the stack is unreachable, so each step also fails if anything
+  # was skipped: a green run here means they ran.
+  connector-stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The rolling-upgrade test runs this build against the one from before format
+          # levels, which is built from history below.
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Start Kafka, Postgres, Kafka Connect and MinIO
+        run: docker compose --profile connectors up -d --wait --wait-timeout 240
+      - name: Build
+        run: dotnet build -c Release
+      - name: Test Kafka against the broker
+        run: |
+          set -o pipefail
+          dotnet test --project tests/Incremental.Kafka.Tests -c Release --no-build | tee kafka-tests.log
+          # The summary's lines carry colour codes on a runner: taken out before the match.
+          # Two, exactly: KafkaPartitionWatermarkTests' two that kill and freeze a broker,
+          # which need three of them (the broker-failures job runs those).
+          sed 's/\x1b\[[0-9;]*m//g' kafka-tests.log | grep -Eq '^\s*skipped: 2\s*$'
+      # The last commit before state manifest format 8 and format levels: the "older
+      # build" of KafkaServiceProcessTests' rolling upgrade (docs/enrichment-service.md,
+      # Upgrading the nodes).
+      - name: Build the node from before format levels
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/older" 9de8da9
+          dotnet build "$RUNNER_TEMP/older/tests/Incremental.Service.FailoverApp"
+          # Its plugin, compiled against Incremental.Service before the abstractions: what
+          # both builds run in the two-build test, and what PluginTests loads on this build.
+          dotnet build "$RUNNER_TEMP/older/tests/Incremental.Service.TestPlugins/Acme.Pipelines"
+      - name: Test Service against the broker
+        env:
+          INCREMENTAL_OLDER_BUILD: ${{ runner.temp }}/older/tests/Incremental.Service.FailoverApp/bin/Debug/net10.0/Incremental.Service.FailoverApp.dll
+        run: |
+          set -o pipefail
+          dotnet test --project tests/Incremental.Service.Tests -c Release --no-build | tee service-tests.log
+          # Six, exactly: the tests that stop, kill and freeze brokers, which need three of
+          # them (the kafka3 compose profile, not started here). The S3 store's tests
+          # skip without MinIO, so a seventh skip fails here too.
+          sed 's/\x1b\[[0-9;]*m//g' service-tests.log | grep -Eq '^\s*skipped: 6\s*$'
+      - name: Smoke, enrichment service on Kafka with a killed leader
+        run: dotnet run -c Release --no-build --project examples/Incremental.EnrichmentService -- --headless --kafka --prefix ci${{ github.run_id }}
+      - name: Measured failover times
+        if: always()
+        run: |
+          cat tests/Incremental.Kafka.Tests/bin/Release/net10.0/measurements.log || true
+          cat tests/Incremental.Service.Tests/bin/Release/net10.0/measurements.log || true
+      - name: Container logs
+        if: failure()
+        run: |
+          docker compose --profile connectors logs --no-color --tail 200
+          # The broker's log cleaner writes to a file of its own, and a test that waits
+          # for it to compact a topic skips (which fails the step above) when it has not:
+          # what the cleaner was doing is only here.
+          docker compose --profile connectors exec -T kafka sh -c 'tail -n 400 /opt/kafka/logs/log-cleaner.log' || true
+      - name: Stop the stack
+        if: always()
+        run: docker compose --profile connectors down -v
+
+  # The tests that stop, kill and freeze brokers under a running pipeline, on the
+  # repository's three-broker compose profile. By hand only
+  # (`gh workflow run CI --ref <branch> -f broker_tests=true`): they take the whole of a
+  # runner for a quarter of an hour, and what they assert — one leader, nothing lost,
+  # the leadership not moved by one broker's loss — depends on three JVMs and two node
+  # processes keeping their heartbeats on two shared cores. docs/design/enrichment-service.md
+  # (S8, *CI*) has what the runs made of it so far cost and how they ended.
+  broker-failures:
+    if: github.event_name == 'workflow_dispatch' && inputs.broker_tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Start three brokers
+        run: docker compose --profile kafka3 up -d --wait --wait-timeout 240
+      - name: Build
+        run: dotnet build -c Release
+      - name: Broker-failure tests
+        env:
+          INCREMENTAL_KAFKA_BOOTSTRAP: localhost:9192,localhost:9292,localhost:9392
+          INCREMENTAL_KAFKA_REPLICATION: 3
+          INCREMENTAL_KAFKA_BROKERS: incremental-kafka3-1-1,incremental-kafka3-2-1,incremental-kafka3-3-1
+          INCREMENTAL_NODE_LOGS: ${{ runner.temp }}/node-logs
+        run: |
+          set -o pipefail
+          dotnet test --project tests/Incremental.Service.Tests -c Release --no-build -- --filter-method "*broker*" | tee broker-tests.log
+          # Here the brokers are there to be stopped: a skip means the run proved nothing.
+          sed 's/\x1b\[[0-9;]*m//g' broker-tests.log | grep -Eq '^\s*skipped: 0\s*$'
+          # A broker lost under a topic of several partitions: the watermark waits for
+          # the partitions that have no leader, and their records are not late.
+          dotnet test --project tests/Incremental.Kafka.Tests -c Release --no-build -- --filter-method "*ABrokerLost*" | tee kafka-broker-tests.log
+          sed 's/\x1b\[[0-9;]*m//g' kafka-broker-tests.log | grep -Eq '^\s*skipped: 0\s*$'
+      - name: What the runs measured
+        if: always()
+        run: |
+          cat tests/Incremental.Service.Tests/bin/Release/net10.0/measurements.log || true
+          cat tests/Incremental.Service.Tests/bin/Release/net10.0/broker-runs.jsonl || true
+          cat tests/Incremental.Kafka.Tests/bin/Release/net10.0/measurements.log || true
+      - name: Node logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: broker-failure-node-logs
+          path: ${{ runner.temp }}/node-logs
+      - name: Broker logs
+        if: failure()
+        run: docker compose --profile kafka3 logs --no-color --tail 300
+      - name: Stop the brokers
+        if: always()
+        run: docker compose --profile kafka3 down -v
 
   # Scaling assertions, not absolute timings: shared runners are too noisy to gate on
   # wall-clock numbers, so this job asserts that a fixed-size delta costs about the same

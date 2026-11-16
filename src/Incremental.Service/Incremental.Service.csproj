@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Incremental.Service</PackageId>
+    <Description>The generic parts of an enrichment service on Incremental: a table registry over shared tables, a supervisor that runs one circuit per pipeline and deploys, replaces and restarts them while the others run, pipeline definitions loaded from plugin assemblies at runtime, a catalog of what is deployed, and one node object that ties them to a leader/standby backend.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Incremental\Incremental.csproj" />
+    <ProjectReference Include="..\Incremental.Hosting\Incremental.Hosting.csproj" />
+    <ProjectReference Include="..\Incremental.Kafka\Incremental.Kafka.csproj" />
+    <ProjectReference Include="..\Incremental.Service.Abstractions\Incremental.Service.Abstractions.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Incremental.Service.Tests" />
+    <InternalsVisibleTo Include="Incremental.Service.Admin" />
+    <InternalsVisibleTo Include="Incremental.Service.Testing" />
+  </ItemGroup>
+
+</Project>

@@ -20,6 +20,27 @@ public interface IStorageProvider
 
     /// <summary>A plain key → value map. Used to remember previously emitted results for retraction.</summary>
     IValueStore<TKey, TValue> CreateValueStore<TKey, TValue>(string name) where TKey : notnull;
+
+    /// <summary>
+    /// A key → deadline map that hands back the keys whose deadline has passed. It is what
+    /// event-time operators keep their eviction and window-close deadlines in, so that a
+    /// circuit restored from a checkpoint closes exactly the keys an uninterrupted run
+    /// would have: a deadline is state like any other, staged with the step that set it
+    /// and committed with the checkpoint that covers that step.
+    /// <para>
+    /// The default serves a provider that does not checkpoint: a heap store, gone with the
+    /// operator. A checkpointing provider must implement this method — the default refuses
+    /// for one, because deadlines that do not survive a restart leave every key that was
+    /// open at the restart, and is never touched again, in state for good.
+    /// </para>
+    /// </summary>
+    IDeadlineStore<TKey> CreateDeadlineStore<TKey>(string name) where TKey : notnull =>
+        this is ICheckpointStorageProvider
+            ? throw new NotSupportedException(
+                $"{GetType().Name} checkpoints but does not implement {nameof(IStorageProvider)}.{nameof(CreateDeadlineStore)} " +
+                $"(asked for '{name}'): the deadlines of event-time operators (window closes, EvictWhen, session gaps) are " +
+                "checkpointed state, and must be staged and committed like the provider's other stores.")
+            : new InMemoryStorageProvider.DeadlineStore<TKey>();
 }
 
 /// <summary>
@@ -28,8 +49,9 @@ public interface IStorageProvider
 /// staged since the previous commit atomically together with the input offsets whose records
 /// produced it — so durable state and offsets always agree. A circuit whose
 /// <see cref="CircuitOptions.Storage"/> implements this interface commits automatically every
-/// <see cref="CircuitOptions.CheckpointInterval"/> steps, after all workers' shards for those
-/// steps are complete: one commit point for the whole circuit. After a crash, rebuild the
+/// <see cref="CircuitOptions.CheckpointInterval"/> steps (through <see cref="CommitAsync"/>),
+/// after all workers' shards for those steps are complete: one commit point for the whole
+/// circuit. After a crash, rebuild the
 /// circuit against the same provider — <see cref="Circuit.Start"/> recovers the checkpoint,
 /// <see cref="Circuit.CommittedOffset"/> tells the producer where to resume each source, and
 /// replayed records stamped at or below the checkpoint are dropped, making the restart
@@ -50,6 +72,29 @@ public interface ICheckpointStorageProvider : IStorageProvider
     /// <paramref name="inputOffsets"/>: either the new checkpoint lands in full, or the
     /// previous one remains intact.</summary>
     void Commit(IReadOnlyDictionary<string, long> inputOffsets);
+
+    /// <summary><see cref="Commit"/>, awaited: this is what the circuit calls. A provider
+    /// whose commit waits on I/O (a network round trip, a log transaction) overrides it so
+    /// that a process running many circuits does not hold a thread per commit in flight.
+    /// The default runs <see cref="Commit"/> synchronously. The contract is the same: when
+    /// the returned task completes the checkpoint has landed in full, and a failure leaves
+    /// the previous one intact. The circuit runs one commit at a time and no step while it
+    /// is pending, so an implementation need not guard against stores changing under it.</summary>
+    ValueTask CommitAsync(IReadOnlyDictionary<string, long> inputOffsets, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Commit(inputOffsets);
+        return default;
+    }
+
+    /// <summary>Whether the provider is keeping, beside the stores a circuit was built on,
+    /// a second copy of the committed state they were made from, which it lets go of at
+    /// the next commit (<see cref="ChangelogStorageProvider"/> does: the bytes, so that
+    /// types that have committed nothing have changed nothing). An auto-stepping circuit
+    /// that starts on such state and has nothing to read commits once, without a step,
+    /// so that an idle pipeline does not hold its state twice for as long as it is idle.
+    /// False by default.</summary>
+    bool HoldsRestoredCopy => false;
 
     /// <summary>The state manifest committed with the last checkpoint under
     /// <paramref name="scope"/> (one scope per process sharing the physical store), or null
@@ -175,6 +220,25 @@ public interface IIndexedWeightStore<TKey, TValue>
         foreach (var key in keys)
             RemoveGroup(key);
     }
+
+    /// <summary>Drops each (key, value) entry whatever its weight, leaving the rest of its
+    /// group alone (watermark-driven eviction of single records, <c>EvictWhenFinal</c>).
+    /// No-op for an entry that is not held. The default reads each entry's group; a
+    /// provider with a single-entry read overrides it.</summary>
+    void RemoveEntries(IReadOnlyList<KeyedValue<TKey, TValue>> entries)
+    {
+        var comparer = EqualityComparer<TValue>.Default;
+        foreach (var (key, value) in entries)
+        {
+            var group = GetGroup(key);
+            for (var i = 0; i < group.Count; i++)
+                if (comparer.Equals(group[i].Value, value))
+                {
+                    Update(key, value, -group[i].Weight);
+                    break;
+                }
+        }
+    }
 }
 
 public interface IValueStore<TKey, TValue> where TKey : notnull
@@ -207,4 +271,32 @@ public interface IValueStore<TKey, TValue> where TKey : notnull
         foreach (var key in keys)
             Remove(key);
     }
+}
+
+/// <summary>
+/// A key → deadline map, ordered by deadline: see
+/// <see cref="IStorageProvider.CreateDeadlineStore{TKey}"/>. Deadlines are UTC ticks. Like
+/// every store it belongs to one operator on one worker and is only touched by that
+/// worker's thread; writes are staged until the provider commits.
+/// </summary>
+public interface IDeadlineStore<TKey> where TKey : notnull
+{
+    /// <summary>Holds each of <paramref name="keys"/> that is not held yet, with the
+    /// deadline <paramref name="deadlineOf"/> gives for it. A key already held keeps its
+    /// deadline, and <paramref name="deadlineOf"/> is not called for it. The list may name
+    /// a key more than once. One call per step is the shape: a provider with per-call
+    /// latency answers it in one round trip.</summary>
+    void AddAll(IReadOnlyList<TKey> keys, Func<TKey, long> deadlineOf);
+
+    /// <summary>Holds <paramref name="key"/> with <paramref name="deadline"/>, replacing
+    /// the deadline it had.</summary>
+    void Set(TKey key, long deadline);
+
+    /// <summary>Forgets <paramref name="key"/>. No-op if it is not held.</summary>
+    void Remove(TKey key);
+
+    /// <summary>Removes every key whose deadline is at or below <paramref name="upTo"/> and
+    /// appends it to <paramref name="into"/>, in no particular order. Called once per step
+    /// by every operator that holds one, so finding nothing due must cost next to nothing.</summary>
+    void TakeDue(long upTo, List<TKey> into);
 }

@@ -1,0 +1,52 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <OutputType>Exe</OutputType>
+    <!-- As in Incremental.Tests: threading TestContext's token through every call is noise. -->
+    <NoWarn>$(NoWarn);xUnit1051</NoWarn>
+    <!-- The unload test asserts that a plugin's load context is collected; tiered
+         compilation's on-stack replacement can keep a frame's locals alive past their use. -->
+    <TieredPGO>false</TieredPGO>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Npgsql" Version="10.0.3" />
+    <PackageReference Include="xunit.v3" Version="4.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="..\..\src\Incremental.Service\Incremental.Service.csproj" />
+    <ProjectReference Include="..\..\src\Incremental.Service.Testing\Incremental.Service.Testing.csproj" />
+    <!-- The S3 store, which the files connector's tests also run against (MinIO). -->
+    <ProjectReference Include="..\..\src\Incremental.Service.S3\Incremental.Service.S3.csproj" />
+    <ProjectReference Include="..\..\src\Incremental.Service.Admin\Incremental.Service.Admin.csproj" />
+    <!-- A node with the admin UI mounted, tables, pipelines and a generator: what the admin
+         API's tests run against. -->
+    <ProjectReference Include="..\Incremental.Service.AdminHost\Incremental.Service.AdminHost.csproj" />
+    <!-- A contract assembly compiled into the host (AddContracts): the tests use its row
+         types, and the plugins below, which ship their own copy, get this one. -->
+    <ProjectReference Include="..\Incremental.Service.TestPlugins\Acme.Contracts\Acme.Contracts.csproj" />
+    <!-- Built, never referenced: the tests load these from their output directories. -->
+    <ProjectReference Include="..\Incremental.Service.TestPlugins\Acme.RefData\Acme.RefData.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\Incremental.Service.TestPlugins\Acme.Pipelines\Acme.Pipelines.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\Incremental.Service.TestPlugins\Acme.Pipelines.V2\Acme.Pipelines.V2.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\Incremental.Service.TestPlugins\Acme.Desks\Acme.Desks.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\Incremental.Service.TestPlugins\Acme.Venues\Acme.Venues.csproj" ReferenceOutputAssembly="false" />
+    <!-- The node the kill -9 tests run twice, as real processes. -->
+    <ProjectReference Include="..\Incremental.Service.FailoverApp\Incremental.Service.FailoverApp.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="../Shared/CommandLine.cs" Link="CommandLine.cs" />
+  </ItemGroup>
+
+</Project>

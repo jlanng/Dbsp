@@ -1,0 +1,356 @@
+# Brokers' and controllers' milestones, round four J4 (UTC, 2026-11-14/15).
+# Part 1: the four runs of 70 s on the five-minute timeout whose brokers logged to files (b1..b3: broker logs).
+== t300-70kill-d1 (topic prefix s9354e9cf6a814bf1)
+22:16:26,780 b2 [ControllerServer id=2] Starting controller (kafka.server.ControllerServer)
+22:16:26,797 b1 [ControllerServer id=1] Starting controller (kafka.server.ControllerServer)
+22:16:27,509 b3 [RaftManager id=3] Completed transition to Leader(localReplicaKey=ReplicaKey(id=3, directoryId=Optional[U4HOhqLl
+22:16:27,546 b1 [BrokerLifecycleManager id=1] Unable to register broker 1 because the controller returned error DUPLICATE_BROKER
+22:16:27,596 b2 [BrokerLifecycleManager id=2] Unable to register broker 2 because the controller returned error DUPLICATE_BROKER
+22:16:40,217 b1 [BrokerLifecycleManager id=1] Successfully registered broker 1 with broker epoch 5478 (kafka.server.BrokerLifecy
+22:16:40,422 b2 [BrokerLifecycleManager id=2] Successfully registered broker 2 with broker epoch 5479 (kafka.server.BrokerLifecy
+22:16:40,472 b1 [BrokerLifecycleManager id=1] The broker has been unfenced. Transitioning from RECOVERY to RUNNING. (kafka.serve
+22:16:40,517 b2 [BrokerLifecycleManager id=2] The broker has been unfenced. Transitioning from RECOVERY to RUNNING. (kafka.serve
+             … the same until 22:16:33,879: b2 [BrokerLifecycleManager id=2] Unable to register
+             … the same until 22:16:33,889: b1 [BrokerLifecycleManager id=1] Unable to register
+22:15:15.165 node a: the writer's last commit before the outage; 22:16:41.157: its first after (85.992 s)
+== t300-70stop-d1 (topic prefix s5e725cb09f704f9d)
+22:18:18,399 b1 [ControllerServer id=1] Starting controller (kafka.server.ControllerServer)
+22:18:18,473 b2 [ControllerServer id=2] Starting controller (kafka.server.ControllerServer)
+22:18:19,011 b3 [RaftManager id=3] Completed transition to Leader(localReplicaKey=ReplicaKey(id=3, directoryId=Optional[U4HOhqLl
+22:18:19,052 b1 [BrokerLifecycleManager id=1] Unable to register broker 1 because the controller returned error DUPLICATE_BROKER
+22:18:20,065 b2 [BrokerLifecycleManager id=2] Unable to register broker 2 because the controller returned error DUPLICATE_BROKER
+22:18:31,782 b1 [BrokerLifecycleManager id=1] Successfully registered broker 1 with broker epoch 6090 (kafka.server.BrokerLifecy
+22:18:32,101 b1 [BrokerLifecycleManager id=1] The broker has been unfenced. Transitioning from RECOVERY to RUNNING. (kafka.serve
+22:18:32,942 b2 [BrokerLifecycleManager id=2] Successfully registered broker 2 with broker epoch 6209 (kafka.server.BrokerLifecy
+22:18:33,113 b2 [BrokerLifecycleManager id=2] The broker has been unfenced. Transitioning from RECOVERY to RUNNING. (kafka.serve
+             … the same until 22:18:26,390: b2 [BrokerLifecycleManager id=2] Unable to register
+             … the same until 22:18:25,393: b1 [BrokerLifecycleManager id=1] Unable to register
+22:17:07.557 node a: the writer's last commit before the outage; 22:18:32.413: its first after (84.856 s)
+== t300-70kill-d2 (topic prefix s8349725422ab4c44)
+22:20:13,162 b1 [ControllerServer id=1] Starting controller (kafka.server.ControllerServer)
+22:20:13,339 b2 [ControllerServer id=2] Starting controller (kafka.server.ControllerServer)
+22:20:13,743 b3 [RaftManager id=3] Completed transition to Leader(localReplicaKey=ReplicaKey(id=3, directoryId=Optional[U4HOhqLl
+22:20:13,802 b2 [BrokerLifecycleManager id=2] Unable to register broker 2 because the controller returned error DUPLICATE_BROKER
+22:20:13,831 b1 [BrokerLifecycleManager id=1] Unable to register broker 1 because the controller returned error DUPLICATE_BROKER
+22:20:26,615 b1 [BrokerLifecycleManager id=1] Successfully registered broker 1 with broker epoch 6708 (kafka.server.BrokerLifecy
+22:20:26,672 b2 [BrokerLifecycleManager id=2] Successfully registered broker 2 with broker epoch 6709 (kafka.server.BrokerLifecy
+22:20:26,725 b1 [BrokerLifecycleManager id=1] The broker has been unfenced. Transitioning from RECOVERY to RUNNING. (kafka.serve
+22:20:26,773 b2 [BrokerLifecycleManager id=2] The broker has been unfenced. Transitioning from RECOVERY to RUNNING. (kafka.serve
+             … the same until 22:20:20,166: b2 [BrokerLifecycleManager id=2] Unable to register
+             … the same until 22:20:20,166: b1 [BrokerLifecycleManager id=1] Unable to register
+22:19:01.569 node a: the writer's last commit before the outage; 22:20:27.609: its first after (86.04 s)
+== t300-70stop-d2 (topic prefix s705de47148de4e5c)
+22:22:08,765 b1 [ControllerServer id=1] Starting controller (kafka.server.ControllerServer)
+22:22:08,938 b2 [ControllerServer id=2] Starting controller (kafka.server.ControllerServer)
+22:22:10,023 b3 [RaftManager id=3] Completed transition to Leader(localReplicaKey=ReplicaKey(id=3, directoryId=Optional[U4HOhqLl
+22:22:10,077 b1 [BrokerLifecycleManager id=1] Unable to register broker 1 because the controller returned error DUPLICATE_BROKER
+22:22:10,093 b2 [BrokerLifecycleManager id=2] Unable to register broker 2 because the controller returned error DUPLICATE_BROKER
+22:22:22,861 b1 [BrokerLifecycleManager id=1] Successfully registered broker 1 with broker epoch 7329 (kafka.server.BrokerLifecy
+22:22:22,862 b2 [BrokerLifecycleManager id=2] Successfully registered broker 2 with broker epoch 7330 (kafka.server.BrokerLifecy
+22:22:23,133 b2 [BrokerLifecycleManager id=2] The broker has been unfenced. Transitioning from RECOVERY to RUNNING. (kafka.serve
+22:22:23,165 b1 [BrokerLifecycleManager id=1] The broker has been unfenced. Transitioning from RECOVERY to RUNNING. (kafka.serve
+             … the same until 22:22:16,368: b2 [BrokerLifecycleManager id=2] Unable to register
+             … the same until 22:22:16,398: b1 [BrokerLifecycleManager id=1] Unable to register
+22:20:57.854 node a: the writer's last commit before the outage; 22:22:24.264: its first after (86.41 s)
+
+# Part 2: the controllers' own log (controller.log in each container) for the runs of record.
+== r40kill-1 (topic prefix s2733edee9b514ba8)
+22:39:01,852 controller 3: Becoming the active controller at epoch 37, next write offset 862. (org.apache.kafka
+22:39:10,853 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+22:39:10,855 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:39:14,812 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+22:39:14,855 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+== r40kill-2 (topic prefix s3e310f5180c3420c)
+22:40:30,716 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:40:34,791 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+22:40:35,763 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+22:41:41,003 controller 3: Becoming the active controller at epoch 70, next write offset 2094. (org.apache.kafk
+22:41:50,003 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+22:41:50,008 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:41:54,057 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+22:41:54,228 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+== r40kill-3 (topic prefix sbf39e6be5dc2427b)
+22:43:09,698 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:43:13,597 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+22:43:13,657 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+22:44:18,455 controller 3: Becoming the active controller at epoch 102, next write offset 3319. (org.apache.kaf
+22:44:27,455 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+22:44:27,457 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:44:31,317 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+22:44:31,360 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+== r40stop-1 (topic prefix s907eba2fb65c4950)
+22:36:24,821 controller 1: The request from broker 1 to unfence has been granted because it has caught up with 
+22:36:24,864 controller 1: The request from broker 3 to unfence has been granted because it has caught up with 
+22:36:24,900 controller 1: The request from broker 2 to unfence has been granted because it has caught up with 
+22:37:43,211 controller 3: Becoming the active controller at epoch 19, next write offset 367. (org.apache.kafka
+22:37:52,212 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+22:37:52,218 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:37:56,265 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+22:37:56,266 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+== r40stop-2 (topic prefix sf27986e41f684197)
+22:39:10,855 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:39:14,812 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+22:39:14,855 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+22:40:21,715 controller 3: Becoming the active controller at epoch 53, next write offset 1714. (org.apache.kafk
+22:40:30,715 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+22:40:30,716 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:40:34,791 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+22:40:35,763 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+== r40stop-3 (topic prefix scd1a5cd3551744a5)
+22:43:00,697 controller 3: Becoming the active controller at epoch 86, next write offset 2941. (org.apache.kafk
+22:43:09,697 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+22:43:09,698 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:43:13,597 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+22:43:13,657 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+== r70kill-1 (topic prefix sde1f445bbb3e4c87)
+22:46:18,309 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+22:46:22,251 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+22:46:22,307 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+22:47:58,856 controller 3: Becoming the active controller at epoch 159, next write offset 4553. (org.apache.kaf
+22:48:07,856 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+22:48:07,858 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:48:11,908 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+22:48:11,912 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+== r70kill-2 (topic prefix sbf5bfe6c943e41c1)
+22:50:02,921 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+22:50:02,923 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+22:51:40,765 controller 3: Becoming the active controller at epoch 216, next write offset 5795. (org.apache.kaf
+22:51:49,766 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+22:51:49,769 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:51:53,839 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+22:51:53,881 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+== r70kill-3 (topic prefix s9d701951a0124408)
+22:53:40,154 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:53:44,199 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+22:53:45,210 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+22:55:21,288 controller 3: Becoming the active controller at epoch 273, next write offset 7030. (org.apache.kaf
+22:55:30,288 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+22:55:30,291 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:55:34,336 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+22:55:35,341 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+== r70stop-1 (topic prefix se223c2e336564d2e)
+22:44:27,457 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:44:31,317 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+22:44:31,360 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+22:46:09,308 controller 3: Becoming the active controller at epoch 129, next write offset 4172. (org.apache.kaf
+22:46:18,309 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:46:18,309 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+22:46:22,251 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+22:46:22,307 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+== r70stop-2 (topic prefix s3fa569d51dbb49bd)
+22:48:07,858 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:48:11,908 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+22:48:11,912 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+22:49:49,875 controller 3: Becoming the active controller at epoch 187, next write offset 5411. (org.apache.kaf
+22:49:58,875 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+22:49:58,876 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:50:02,921 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+22:50:02,923 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+== r70stop-3 (topic prefix s01ea6813fc384702)
+22:51:49,769 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:51:53,839 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+22:51:53,881 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+22:53:31,153 controller 3: Becoming the active controller at epoch 244, next write offset 6648. (org.apache.kaf
+22:53:40,153 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+22:53:40,154 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:53:44,199 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+22:53:45,210 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+== r70t60kill-1 (topic prefix s58040d78ab4e4865)
+23:01:35,578 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+23:01:39,509 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+23:01:39,553 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+23:03:19,028 controller 3: Becoming the active controller at epoch 338, next write offset 10528. (org.apache.ka
+23:03:28,028 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+23:03:28,034 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+23:03:32,082 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+23:03:32,082 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+== r70t60kill-2 (topic prefix sb5cdd318d216404b)
+23:05:20,791 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+23:05:24,716 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+23:05:24,763 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+23:07:00,654 controller 3: Becoming the active controller at epoch 396, next write offset 11767. (org.apache.ka
+23:07:09,654 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+23:07:09,655 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+23:07:13,721 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+23:07:14,705 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+== r70t60kill-3 (topic prefix s0825c29246ea43cd)
+23:09:00,597 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+23:09:04,643 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+23:09:04,644 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+23:10:44,495 controller 3: Becoming the active controller at epoch 453, next write offset 13005. (org.apache.ka
+23:10:53,495 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+23:10:53,497 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+23:10:57,543 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+23:10:57,545 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+== r70t60stop-1 (topic prefix s9089344c163a473b)
+23:01:26,575 controller 3: Becoming the active controller at epoch 309, next write offset 10140. (org.apache.ka
+23:01:35,576 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+23:01:35,578 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+23:01:39,509 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+23:01:39,553 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+== r70t60stop-2 (topic prefix sf0ec5344d4574e66)
+23:03:28,034 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+23:03:32,082 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+23:03:32,082 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+23:05:11,790 controller 3: Becoming the active controller at epoch 367, next write offset 11387. (org.apache.ka
+23:05:20,790 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+23:05:20,791 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+23:05:24,716 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+23:05:24,763 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+== r70t60stop-3 (topic prefix sc0ab363f2b5c4318)
+23:07:09,655 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+23:07:13,721 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+23:07:14,705 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+23:08:51,596 controller 3: Becoming the active controller at epoch 425, next write offset 12618. (org.apache.ka
+23:09:00,596 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+23:09:00,597 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+23:09:04,643 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+23:09:04,644 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+== rtk-kill-b0 (topic prefix sd996d5f1c1ab4c25)
+22:57:25,461 controller 2: Becoming the active controller at epoch 275, next write offset 8397. (org.apache.kaf
+22:57:34,462 controller 2: Fencing broker 3 because its session has timed out. (org.apache.kafka.controller.Rep
+22:57:38,550 controller 2: The request from broker 3 to unfence has been granted because it has caught up with 
+22:58:16,712 controller 2: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:58:20,251 controller 2: The request from broker 1 to unfence has been granted because it has caught up with 
+== rtk-kill-b1 (topic prefix s36ea4d0f97b044a5)
+22:58:16,712 controller 2: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+22:58:20,251 controller 2: The request from broker 1 to unfence has been granted because it has caught up with 
+22:58:50,684 controller 3: Becoming the active controller at epoch 277, next write offset 9153. (org.apache.kaf
+22:58:59,684 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+22:59:04,238 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+== rtk-kill-b2 (topic prefix s2dc3d86b7f4f41ac)
+22:59:04,238 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+22:59:35,523 controller 2: Becoming the active controller at epoch 279, next write offset 9532. (org.apache.kaf
+22:59:44,524 controller 2: Fencing broker 3 because its session has timed out. (org.apache.kafka.controller.Rep
+22:59:48,590 controller 2: The request from broker 3 to unfence has been granted because it has caught up with 
+== rtk2-1-b0 (topic prefix s034f06c63f9f4253)
+00:01:44,684 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+00:01:49,343 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+== rtk2-2-b1 (topic prefix sb9a341a17e2546be)
+00:01:44,684 controller 3: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+00:01:49,343 controller 3: The request from broker 1 to unfence has been granted because it has caught up with 
+00:02:24,725 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+00:02:29,255 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+== rtk2-3-b2 (topic prefix s7a1c7be687c44fba)
+00:02:24,725 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+00:02:29,255 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+00:03:02,869 controller 2: Becoming the active controller at epoch 455, next write offset 20467. (org.apache.ka
+00:03:11,869 controller 2: Fencing broker 3 because its session has timed out. (org.apache.kafka.controller.Rep
+00:03:15,876 controller 2: The request from broker 3 to unfence has been granted because it has caught up with 
+== rtk2-4-b0 (topic prefix sa88d952ee76141df)
+00:03:02,869 controller 2: Becoming the active controller at epoch 455, next write offset 20467. (org.apache.ka
+00:03:11,869 controller 2: Fencing broker 3 because its session has timed out. (org.apache.kafka.controller.Rep
+00:03:15,876 controller 2: The request from broker 3 to unfence has been granted because it has caught up with 
+00:03:53,142 controller 2: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+00:03:57,546 controller 2: The request from broker 1 to unfence has been granted because it has caught up with 
+== rtk2-5-b1 (topic prefix s9c1b3725e6774377)
+00:04:30,067 controller 3: Becoming the active controller at epoch 457, next write offset 21226. (org.apache.ka
+00:04:39,068 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+00:04:42,865 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+== rtk2-6-b2 (topic prefix sb2d071de3e0a46b8)
+00:04:30,067 controller 3: Becoming the active controller at epoch 457, next write offset 21226. (org.apache.ka
+00:04:39,068 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+00:04:42,865 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+00:05:12,771 controller 1: Becoming the active controller at epoch 459, next write offset 21600. (org.apache.ka
+00:05:21,772 controller 1: Fencing broker 3 because its session has timed out. (org.apache.kafka.controller.Rep
+00:05:47,200 controller 1: The request from broker 3 to unfence has been granted because it has caught up with 
+== rtk2-7-b0 (topic prefix sfb31292dfd114e07)
+00:05:12,771 controller 1: Becoming the active controller at epoch 459, next write offset 21600. (org.apache.ka
+00:05:21,772 controller 1: Fencing broker 3 because its session has timed out. (org.apache.kafka.controller.Rep
+00:05:47,200 controller 1: The request from broker 3 to unfence has been granted because it has caught up with 
+00:06:18,146 controller 2: Becoming the active controller at epoch 461, next write offset 22021. (org.apache.ka
+00:06:27,147 controller 2: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+00:06:32,299 controller 2: The request from broker 1 to unfence has been granted because it has caught up with 
+== rtk2-8-b1 (topic prefix s34e7eec0a4104ea9)
+00:06:18,146 controller 2: Becoming the active controller at epoch 461, next write offset 22021. (org.apache.ka
+00:06:27,147 controller 2: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+00:06:32,299 controller 2: The request from broker 1 to unfence has been granted because it has caught up with 
+00:07:03,429 controller 3: Becoming the active controller at epoch 463, next write offset 22399. (org.apache.ka
+00:07:12,430 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+00:07:16,229 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+== rtk2-9-b2 (topic prefix s6ace5fbfd1794ebe)
+00:07:03,429 controller 3: Becoming the active controller at epoch 463, next write offset 22399. (org.apache.ka
+00:07:12,430 controller 3: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+00:07:16,229 controller 3: The request from broker 2 to unfence has been granted because it has caught up with 
+00:07:49,684 controller 2: Becoming the active controller at epoch 465, next write offset 22781. (org.apache.ka
+00:07:58,685 controller 2: Fencing broker 3 because its session has timed out. (org.apache.kafka.controller.Rep
+00:08:02,804 controller 2: The request from broker 3 to unfence has been granted because it has caught up with 
+== sep40kill-1 (topic prefix s56b0eadabca340cc)
+23:17:26,431 controller 101: Becoming the active controller at epoch 1, next write offset 1. (org.apache.kafka.co
+23:17:26,572 controller 101: The request from broker 3 to unfence has been granted because it has caught up with 
+23:17:26,585 controller 101: The request from broker 1 to unfence has been granted because it has caught up with 
+23:17:26,621 controller 101: The request from broker 2 to unfence has been granted because it has caught up with 
+23:18:23,659 controller 101: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+23:18:23,705 controller 101: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+23:18:59,383 controller 101: The request from broker 1 to unfence has been granted because it has caught up with 
+23:18:59,513 controller 101: The request from broker 2 to unfence has been granted because it has caught up with 
+== sep40kill-2 (topic prefix s3b7c80c4d84046b4)
+23:19:32,431 controller 101: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+23:19:32,565 controller 101: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+23:20:06,866 controller 101: The request from broker 1 to unfence has been granted because it has caught up with 
+23:20:06,898 controller 101: The request from broker 2 to unfence has been granted because it has caught up with 
+== sep40stop-1 (topic prefix s18d3e250354044a2)
+23:20:06,866 controller 101: The request from broker 1 to unfence has been granted because it has caught up with 
+23:20:06,898 controller 101: The request from broker 2 to unfence has been granted because it has caught up with 
+23:20:41,047 controller 101: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+23:20:42,209 controller 101: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+23:21:14,608 controller 101: The request from broker 1 to unfence has been granted because it has caught up with 
+23:21:14,663 controller 101: The request from broker 2 to unfence has been granted because it has caught up with 
+== sep70kill-1 (topic prefix s6bf5644103a04df4)
+23:21:14,608 controller 101: The request from broker 1 to unfence has been granted because it has caught up with 
+23:21:14,663 controller 101: The request from broker 2 to unfence has been granted because it has caught up with 
+23:21:47,656 controller 101: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+23:21:47,712 controller 101: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+23:22:52,266 controller 101: The request from broker 1 to unfence has been granted because it has caught up with 
+23:22:52,375 controller 101: The request from broker 2 to unfence has been granted because it has caught up with 
+== sep70stop-1 (topic prefix s73110e1cd0f04ab4)
+23:22:52,266 controller 101: The request from broker 1 to unfence has been granted because it has caught up with 
+23:22:52,375 controller 101: The request from broker 2 to unfence has been granted because it has caught up with 
+23:23:27,619 controller 101: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+23:23:28,792 controller 101: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+23:24:31,011 controller 101: The request from broker 2 to unfence has been granted because it has caught up with 
+23:24:31,043 controller 101: The request from broker 1 to unfence has been granted because it has caught up with 
+== septk-kill-b0 (topic prefix s1666571fc7aa4398)
+23:24:31,011 controller 101: The request from broker 2 to unfence has been granted because it has caught up with 
+23:24:31,043 controller 101: The request from broker 1 to unfence has been granted because it has caught up with 
+23:25:04,105 controller 101: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+23:25:08,834 controller 101: The request from broker 1 to unfence has been granted because it has caught up with 
+== septk-kill-b1 (topic prefix se81c08b0ff77410f)
+23:25:04,105 controller 101: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+23:25:08,834 controller 101: The request from broker 1 to unfence has been granted because it has caught up with 
+23:25:44,109 controller 101: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+23:25:48,657 controller 101: The request from broker 2 to unfence has been granted because it has caught up with 
+== septk-kill-b2 (topic prefix s8d28851e495e46cf)
+23:25:04,105 controller 101: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+23:25:08,834 controller 101: The request from broker 1 to unfence has been granted because it has caught up with 
+23:25:44,109 controller 101: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+23:25:48,657 controller 101: The request from broker 2 to unfence has been granted because it has caught up with 
+23:26:23,926 controller 101: Fencing broker 3 because its session has timed out. (org.apache.kafka.controller.Rep
+23:26:28,535 controller 101: The request from broker 3 to unfence has been granted because it has caught up with 
+== check-all (topic prefix s9dc5e7627bc84754)
+00:26:09,677 controller 1: Becoming the active controller at epoch 37, next write offset 2702. (org.apache.kafk
+00:26:18,677 controller 1: Fencing broker 3 because its session has timed out. (org.apache.kafka.controller.Rep
+00:26:23,943 controller 1: The request from broker 3 to unfence has been granted because it has caught up with 
+00:26:49,360 controller 2: Becoming the active controller at epoch 38, next write offset 3195. (org.apache.kafk
+00:26:57,546 controller 2: The request from broker 1 to unfence has been granted because it has caught up with 
+00:27:05,975 controller 1: Becoming the active controller at epoch 39, next write offset 3464. (org.apache.kafk
+00:27:13,893 controller 1: The request from broker 2 to unfence has been granted because it has caught up with 
+00:27:30,127 controller 1: The request from broker 3 to unfence has been granted because it has caught up with 
+== check-tk-b0 (topic prefix sda27ffecc1dd4ff6)
+00:27:05,975 controller 1: Becoming the active controller at epoch 39, next write offset 3464. (org.apache.kafk
+00:27:13,893 controller 1: The request from broker 2 to unfence has been granted because it has caught up with 
+00:27:30,127 controller 1: The request from broker 3 to unfence has been granted because it has caught up with 
+00:28:03,205 controller 2: Becoming the active controller at epoch 41, next write offset 4018. (org.apache.kafk
+00:28:12,206 controller 2: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+00:28:16,420 controller 2: The request from broker 1 to unfence has been granted because it has caught up with 
+== check-tk-b1 (topic prefix sd40238f6942943fb)
+00:28:03,205 controller 2: Becoming the active controller at epoch 41, next write offset 4018. (org.apache.kafk
+00:28:12,206 controller 2: Fencing broker 1 because its session has timed out. (org.apache.kafka.controller.Rep
+00:28:16,420 controller 2: The request from broker 1 to unfence has been granted because it has caught up with 
+00:28:48,604 controller 1: Becoming the active controller at epoch 43, next write offset 4397. (org.apache.kafk
+00:28:57,604 controller 1: Fencing broker 2 because its session has timed out. (org.apache.kafka.controller.Rep
+00:29:02,043 controller 1: The request from broker 2 to unfence has been granted because it has caught up with 
+== check-tk-b2 (topic prefix s03746ffc4e8f4b81)
+00:29:02,043 controller 1: The request from broker 2 to unfence has been granted because it has caught up with 
+00:29:40,485 controller 1: Fencing broker 3 because its session has timed out. (org.apache.kafka.controller.Rep
+00:29:44,855 controller 1: The request from broker 3 to unfence has been granted because it has caught up with 

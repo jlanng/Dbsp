@@ -5,13 +5,52 @@ namespace Incremental;
 /// <summary>One queued input record: a weighted value plus the source (partition, offset)
 /// the producer stamped it with, or offset -1 when unstamped — the input then numbers
 /// records as it consumes them (partition is ignored).</summary>
-internal readonly record struct InputEntry<T>(T Value, long Weight, int Partition, long Offset) where T : notnull;
+/// With <see cref="Rejection"/> set it is a record the source could not turn into a value:
+/// it has no value and is on its way to the dead letters (or to fault the circuit).
+internal readonly record struct InputEntry<T>(T Value, long Weight, int Partition, long Offset, InputRejection? Rejection = null)
+    where T : notnull;
+
+/// <summary>A source record that never became an input value — it would not deserialize,
+/// say — with the exception that says why. It travels through the input's channel in the
+/// record's place, so that its offset is consumed in order like any other.</summary>
+internal sealed class InputRejection(object? record, Exception error)
+{
+    /// <summary>Not a rejection at all: the entry carries a position and nothing else
+    /// (<see cref="InputHandle{T}.AdvanceAsync"/>). The drain admits its offset and passes
+    /// on. It shares the rejection's slot so that an ordinary entry stays the size it was.</summary>
+    public static readonly InputRejection Advance = new(null, new InvalidOperationException("An input position with no record."));
+
+    /// <summary>Not a rejection either, and not a position: the source says that it reads
+    /// the entry's partition and that records of it may be on their way
+    /// (<see cref="InputHandle{T}.ExpectPartitionAsync"/>). It travels in the channel so
+    /// that it takes effect in order with the records around it.</summary>
+    public static readonly InputRejection ExpectPartition = new(null, new InvalidOperationException("A partition the source reads."));
+
+    /// <summary>The source stands at the end of the entry's partition
+    /// (<see cref="InputHandle{T}.IdlePartitionAsync"/>).</summary>
+    public static readonly InputRejection IdlePartition = new(null, new InvalidOperationException("A partition the source has read to its end."));
+
+    /// <summary>True for the two notes about a partition, which carry no offset and are
+    /// read before the entry is admitted.</summary>
+    public bool IsPartitionNote => ReferenceEquals(this, ExpectPartition) || ReferenceEquals(this, IdlePartition);
+
+    public object? Record { get; } = record;
+    public Exception Error { get; } = error;
+
+    /// <summary>What the drain throws under <see cref="RecordErrorPolicy.Fault"/>.</summary>
+    public InvalidOperationException Fault(string inputName, int partition, long offset) => new(
+        $"Input '{inputName}' was handed a record its source could not read (partition {partition}, offset {offset}): " +
+        $"{Error.Message} Under RecordErrorPolicy.DeadLetter the record is reported on Circuit.DeadLetters and skipped instead.",
+        Error);
+}
 
 /// <summary>One queued keyed-input command: an upsert of <see cref="Value"/> under
 /// <see cref="Key"/>, or a delete of the key (<see cref="Value"/> default), stamped as
-/// <see cref="InputEntry{T}"/> is.</summary>
+/// <see cref="InputEntry{T}"/> is. With <see cref="Error"/> set it is an upsert whose key
+/// could not be derived, on its way to the dead letters: it has no key.</summary>
 internal readonly record struct KeyedInputEntry<TKey, TValue>(
-    TKey Key, bool IsDelete, TValue? Value, int Partition, long Offset)
+    TKey Key, bool IsDelete, TValue? Value, int Partition, long Offset, Exception? Error = null,
+    InputRejection? Rejection = null)
     where TKey : notnull
     where TValue : notnull;
 
@@ -41,6 +80,11 @@ public sealed class InputHandle<T> where T : notnull
     private StampingLock _stamping;
 
     internal InputHandle(ChannelWriter<InputEntry<T>> writer) => _writer = writer;
+
+    /// <summary>Set by the input's port when event time is declared on the input: only
+    /// then does a note about a partition mean anything, and only then is it sent. An
+    /// input without it would run a step — and commit — for a note it then ignores.</summary>
+    internal bool TimesPartitions { get; init; }
 
     /// <summary>Inserts <paramref name="value"/> (weight +1), unstamped.</summary>
     public ValueTask InsertAsync(T value, CancellationToken cancellationToken = default) =>
@@ -96,6 +140,88 @@ public sealed class InputHandle<T> where T : notnull
                 .ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Reports a source record that could not be turned into a value — one that does not
+    /// deserialize, say — in the record's place in the feed. Its position is consumed like
+    /// any record's, so the checkpoint covers it and a replay drops it. Under
+    /// <see cref="RecordErrorPolicy.DeadLetter"/> it appears on
+    /// <see cref="Circuit.DeadLetters"/> with <paramref name="record"/> (whatever the source
+    /// has to identify it: topic, partition, offset, the raw bytes) and
+    /// <paramref name="error"/>; under <see cref="RecordErrorPolicy.Fault"/> it faults the
+    /// circuit, as a record that throws inside an operator does.
+    /// </summary>
+    public ValueTask RejectAsync(object? record, Exception error, int partition, long offset, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(error);
+        ArgumentOutOfRangeException.ThrowIfNegative(partition);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        _stamping.Lock(stamped: true);
+        return InputWrites.WriteAsync(_writer, new InputEntry<T>(default!, 0, partition, offset, new InputRejection(record, error)), cancellationToken);
+    }
+
+    /// <summary>
+    /// Records that the source has been read up to and including <paramref name="offset"/>
+    /// of <paramref name="partition"/> with nothing to hand on for it: an offset with no
+    /// record behind it (a Kafka transaction marker), a record that means nothing to this
+    /// input, or the place a source chose to start. It travels through the channel like a
+    /// record, so the position is consumed in order and committed with the next
+    /// checkpoint — and a source that resumes from <see cref="Circuit.CommittedOffsets"/>
+    /// does not come back to offsets it had already passed, which may no longer exist. An
+    /// offset at or below the partition's position changes nothing.
+    /// </summary>
+    public ValueTask AdvanceAsync(int partition, long offset, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(partition);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        _stamping.Lock(stamped: true);
+        return InputWrites.WriteAsync(_writer, new InputEntry<T>(default!, 0, partition, offset, InputRejection.Advance), cancellationToken);
+    }
+
+    /// <summary>
+    /// Says that the source reads <paramref name="partition"/> and that its records may
+    /// still be on their way: from here the partition has an event-time clock of its own,
+    /// and the input's watermark is the least over such partitions — so a partition that
+    /// is behind the others (a backlog after a restart, a broker that was away) holds the
+    /// watermark back until it has caught up, where otherwise the others' newer records
+    /// would make its own late. A partition named here holds the watermark until it has
+    /// brought a record or is said to be idle (<see cref="IdlePartitionAsync"/>); named
+    /// again while idle, it holds the watermark again. Records of a partition never named
+    /// are timed together, as the input's always were.
+    /// <para>
+    /// A source says this for every partition when it starts — after a restart too: what
+    /// it knew of a partition's end before it stopped is no longer true. It has an effect
+    /// only where event time is declared on the input itself
+    /// (<c>input.WithEventTime(…, lateness)</c>) on an unclustered circuit; anywhere else
+    /// nothing is sent. It travels through the channel like a record.
+    /// </para>
+    /// </summary>
+    public ValueTask ExpectPartitionAsync(int partition, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(partition);
+        _stamping.Lock(stamped: true);
+        if (!TimesPartitions)
+            return default;
+        return InputWrites.WriteAsync(_writer, new InputEntry<T>(default!, 0, partition, -1, InputRejection.ExpectPartition), cancellationToken);
+    }
+
+    /// <summary>
+    /// Says that the source stands at the end of <paramref name="partition"/>: there is
+    /// nothing more to read from it for now, so it stops holding the watermark back
+    /// (<see cref="ExpectPartitionAsync"/>). Its next record makes it count again. Say it
+    /// only of a partition known to be at its end — one that cannot be read (its broker
+    /// is away) is not idle, it is behind — and take it back with
+    /// <see cref="ExpectPartitionAsync"/> when that stops being known: a record that
+    /// arrives on an idle partition behind the watermark the others have made is late.
+    /// </summary>
+    public ValueTask IdlePartitionAsync(int partition, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(partition);
+        _stamping.Lock(stamped: true);
+        if (!TimesPartitions)
+            return default;
+        return InputWrites.WriteAsync(_writer, new InputEntry<T>(default!, 0, partition, -1, InputRejection.IdlePartition), cancellationToken);
+    }
+
     /// <summary>Signals that no more data will arrive on this input. Once every input of a
     /// circuit is complete and drained, its outputs complete too.</summary>
     public void Complete() => _writer.TryComplete();
@@ -141,7 +267,35 @@ public sealed class KeyedInputHandle<TKey, TValue>
     public ValueTask UpsertAsync(TValue value, CancellationToken cancellationToken = default)
     {
         _stamping.Lock(stamped: false);
-        return Write(new KeyedInputEntry<TKey, TValue>(_keySelector(value), false, value, -1, -1), cancellationToken);
+        return Upsert(value, -1, -1, cancellationToken);
+    }
+
+    /// <summary>Set by the circuit when its policy is <see cref="RecordErrorPolicy.DeadLetter"/>:
+    /// an upsert whose key selector throws or returns null then travels to the circuit as a
+    /// record with no key, which the drain reports on the dead-letter output — in the
+    /// record's place in the feed, so its offset is consumed like any other — instead of
+    /// the exception reaching the producer. Written once, before the circuit is handed out.</summary>
+    internal bool ReportsBadKeys { get; set; }
+
+    /// <summary>As <see cref="InputHandle{T}.TimesPartitions"/>.</summary>
+    internal bool TimesPartitions { get; init; }
+
+    private ValueTask Upsert(TValue value, int partition, long offset, CancellationToken cancellationToken)
+    {
+        if (!ReportsBadKeys)
+            return Write(new KeyedInputEntry<TKey, TValue>(_keySelector(value), false, value, partition, offset), cancellationToken);
+
+        TKey key;
+        try
+        {
+            key = RecordErrors.Key(_keySelector(value));
+        }
+        catch (Exception ex)
+        {
+            return InputWrites.WriteAsync(
+                _writer, new KeyedInputEntry<TKey, TValue>(default!, false, value, partition, offset, ex), cancellationToken);
+        }
+        return Write(new KeyedInputEntry<TKey, TValue>(key, false, value, partition, offset), cancellationToken);
     }
 
     /// <summary>Upserts the row, stamped with its source offset (partition 0).</summary>
@@ -154,7 +308,7 @@ public sealed class KeyedInputHandle<TKey, TValue>
         ArgumentOutOfRangeException.ThrowIfNegative(partition);
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
         _stamping.Lock(stamped: true);
-        return Write(new KeyedInputEntry<TKey, TValue>(_keySelector(value), false, value, partition, offset), cancellationToken);
+        return Upsert(value, partition, offset, cancellationToken);
     }
 
     /// <summary>Retracts the current row for <paramref name="key"/>, if any, unstamped.</summary>
@@ -182,6 +336,49 @@ public sealed class KeyedInputHandle<TKey, TValue>
         if (entry.Key is null)
             throw new ArgumentNullException("key", "A keyed input's key cannot be null.");
         return InputWrites.WriteAsync(_writer, entry, cancellationToken);
+    }
+
+    /// <inheritdoc cref="InputHandle{T}.RejectAsync"/>
+    public ValueTask RejectAsync(object? record, Exception error, int partition, long offset, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(error);
+        ArgumentOutOfRangeException.ThrowIfNegative(partition);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        _stamping.Lock(stamped: true);
+        return InputWrites.WriteAsync(_writer,
+            new KeyedInputEntry<TKey, TValue>(default!, false, default, partition, offset, null, new InputRejection(record, error)), cancellationToken);
+    }
+
+    /// <inheritdoc cref="InputHandle{T}.AdvanceAsync"/>
+    public ValueTask AdvanceAsync(int partition, long offset, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(partition);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        _stamping.Lock(stamped: true);
+        return InputWrites.WriteAsync(_writer,
+            new KeyedInputEntry<TKey, TValue>(default!, false, default, partition, offset, null, InputRejection.Advance), cancellationToken);
+    }
+
+    /// <inheritdoc cref="InputHandle{T}.ExpectPartitionAsync"/>
+    public ValueTask ExpectPartitionAsync(int partition, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(partition);
+        _stamping.Lock(stamped: true);
+        if (!TimesPartitions)
+            return default;
+        return InputWrites.WriteAsync(_writer,
+            new KeyedInputEntry<TKey, TValue>(default!, false, default, partition, -1, null, InputRejection.ExpectPartition), cancellationToken);
+    }
+
+    /// <inheritdoc cref="InputHandle{T}.IdlePartitionAsync"/>
+    public ValueTask IdlePartitionAsync(int partition, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(partition);
+        _stamping.Lock(stamped: true);
+        if (!TimesPartitions)
+            return default;
+        return InputWrites.WriteAsync(_writer,
+            new KeyedInputEntry<TKey, TValue>(default!, false, default, partition, -1, null, InputRejection.IdlePartition), cancellationToken);
     }
 
     /// <summary>Signals that no more data will arrive on this input; see <see cref="InputHandle{T}.Complete"/>.</summary>
@@ -323,4 +520,155 @@ public sealed class OutputHandle<T> where T : notnull
                 $"Output '{Name}' already has a consumer. An output is a single channel — a second subscription " +
                 "would silently split the feed. Declare a second output on the same stream to consume it twice.");
     }
+}
+
+/// <summary>
+/// One step's changes on an acknowledged output: every row the step touched, with its
+/// signed weight, and the <see cref="Sequence"/> of the step that produced them.
+/// </summary>
+public readonly struct OutputBatch<T> where T : notnull
+{
+    private readonly AcknowledgedOutputHandle<T> _owner;
+
+    internal OutputBatch(AcknowledgedOutputHandle<T> owner, long sequence, ZSet<T> changes)
+    {
+        _owner = owner;
+        Sequence = sequence;
+        Changes = changes;
+    }
+
+    /// <summary>The sequence number of the step that produced this batch. Sequences rise
+    /// by one per step, are committed with every checkpoint and continue from the committed
+    /// value after a restart — so they increase strictly along one run, steps that produced
+    /// nothing for this output leave gaps, and a batch whose sequence is not above the
+    /// highest one the sink has already applied is a redelivery: the circuit restarted and
+    /// is re-running the steps after its last checkpoint.</summary>
+    public long Sequence { get; }
+
+    /// <summary>The step's changes: value → signed weight. Never empty.</summary>
+    public ZSet<T> Changes { get; }
+
+    /// <summary>Confirms this batch, and every earlier one, as delivered; see
+    /// <see cref="AcknowledgedOutputHandle{T}.Acknowledge"/>.</summary>
+    public void Acknowledge() => _owner.Acknowledge(Sequence);
+}
+
+/// <summary>
+/// Consumer-side handle to an acknowledged output: the at-least-once way to read a circuit.
+/// Batches arrive as on a plain output — one per step that produced changes, through one
+/// bounded channel with one consumer — but each carries its step's sequence number, and the
+/// consumer confirms it once the batch is safely in the sink. With a checkpointing storage
+/// provider the circuit does not commit a checkpoint until every batch published so far has
+/// been acknowledged, so a crash can never lose a batch: after a restart the circuit re-runs
+/// the steps since its last checkpoint and delivers their output again. What a sink must
+/// therefore tolerate is repetition — apply batches idempotently (keyed upserts do), or use
+/// <see cref="OutputBatch{T}.Sequence"/> to recognise a redelivery.
+/// <para>
+/// Redelivered batches repeat sequence numbers, not necessarily contents: an auto-stepping
+/// circuit may cut the replayed input into different steps. The batches of the replayed
+/// window still add up to the same change.
+/// </para>
+/// <para>
+/// The price is that the circuit waits at each commit point (every
+/// <see cref="CircuitOptions.CheckpointInterval"/> steps) for the acknowledgement, running no
+/// further step meanwhile; inputs back up behind it as with any slow consumer. A consumer
+/// that stops reading before the output completes faults the circuit rather than leave it
+/// waiting for ever. An acknowledged output keeps no state and has no bootstrap batch.
+/// </para>
+/// </summary>
+public sealed class AcknowledgedOutputHandle<T> where T : notnull
+{
+    private readonly ChannelReader<OutputBatch<T>> _reader;
+    private readonly Runtime.AcknowledgedOutputPort<T> _port;
+    private int _claimed;
+
+    internal AcknowledgedOutputHandle(string name, ChannelReader<OutputBatch<T>> reader, Runtime.AcknowledgedOutputPort<T> port)
+    {
+        Name = name;
+        _reader = reader;
+        _port = port;
+    }
+
+    internal string Name { get; }
+
+    /// <summary>Advanced: the output's raw channel, for step-level consumption and
+    /// non-blocking emptiness checks. Bypasses the consumer claim and the detection of a
+    /// consumer that has gone away — do not mix with <see cref="Batches"/> or
+    /// <see cref="ConsumeAsync"/>, which read the same channel. Batches read here are
+    /// acknowledged the same way.</summary>
+    public ChannelReader<OutputBatch<T>> Reader => _reader;
+
+    /// <summary>The highest sequence acknowledged so far; 0 before the first.</summary>
+    public long AcknowledgedSequence => _port.AcknowledgedSequence;
+
+    /// <summary>
+    /// The output's batches, in step order. Acknowledge each (or a later one — an
+    /// acknowledgement covers everything before it) once the sink has it. The enumeration
+    /// completes when the circuit disposes and throws <see cref="CircuitFaultedException"/>
+    /// if it faults. Ending it early — cancelling, breaking out of the loop, an exception in
+    /// the loop body — tells the circuit its consumer is gone, and the circuit faults. One
+    /// consumer only: a second call throws.
+    /// </summary>
+    public IAsyncEnumerable<OutputBatch<T>> Batches(CancellationToken cancellationToken = default)
+    {
+        if (Interlocked.Exchange(ref _claimed, 1) != 0)
+            throw new InvalidOperationException(
+                $"Output '{Name}' already has a consumer. An output is a single channel — a second subscription " +
+                "would silently split the feed. Declare a second output on the same stream to consume it twice.");
+        return BatchesCore(cancellationToken);
+    }
+
+    private async IAsyncEnumerable<OutputBatch<T>> BatchesCore(
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var completed = false;
+        try
+        {
+            await foreach (var batch in _reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+                yield return batch;
+            completed = true;
+        }
+        finally
+        {
+            if (!completed)
+                _port.Abandon();
+        }
+    }
+
+    /// <summary>Runs <paramref name="sink"/> over every batch, in order, one at a time, and
+    /// acknowledges each batch when its call returns — so returning means "delivered". If
+    /// the sink throws, the batch is not acknowledged, the exception propagates, and the
+    /// circuit faults (its consumer is gone). Completes when the output does.</summary>
+    public async Task ConsumeAsync(
+        Func<OutputBatch<T>, CancellationToken, ValueTask> sink, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(sink);
+        await foreach (var batch in Batches(cancellationToken).ConfigureAwait(false))
+        {
+            try
+            {
+                await sink(batch, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // Before the enumeration unwinds, so the circuit's fault names the cause.
+                _port.Abandon(ex);
+                throw;
+            }
+            batch.Acknowledge();
+        }
+    }
+
+    /// <summary>Tells the circuit this output's consumer is gone for good and will
+    /// acknowledge nothing more — what ending <see cref="Batches"/> early does implicitly.
+    /// A commit waiting on this output stops waiting and fails: a running circuit faults,
+    /// and a circuit being disposed finishes without its final commit, so the unacknowledged
+    /// steps are delivered again after the restart. This is the way out for a shutdown that
+    /// has run out of time. Idempotent.</summary>
+    public void Abandon() => _port.Abandon();
+
+    /// <summary>Confirms every batch with a sequence up to and including
+    /// <paramref name="sequence"/> as delivered. Safe from any thread, and to repeat. Throws
+    /// if no batch with that sequence has been published.</summary>
+    public void Acknowledge(long sequence) => _port.Acknowledge(sequence);
 }

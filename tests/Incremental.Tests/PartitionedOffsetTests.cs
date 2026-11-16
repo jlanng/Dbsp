@@ -222,4 +222,58 @@ public class PartitionedOffsetTests
             throw Xunit.Sdk.SkipException.ForSkip("Redis is not reachable on localhost:6379 — run `docker compose up -d`.");
         }
     }
+    /// <summary>A position with no record behind it: a source that has read past a
+    /// transaction marker, or a record that carried nothing for the input, says so, and the
+    /// checkpoint records it like a record's offset.</summary>
+    [Fact]
+    public async Task An_advance_moves_the_committed_position_without_a_record()
+    {
+        var storage = new InMemoryCheckpointStorageProvider();
+        Circuit Build(out InputStream<(int Id, string Region)> orders, out KeyedInputStream<int, string> names, out Output<int> lengths)
+        {
+            var builder = new CircuitBuilder(new CircuitOptions { AutoStep = false, Storage = storage, Name = "advance" });
+            orders = builder.Input<(int Id, string Region)>("orders");
+            names = builder.KeyedInput<int, string>("names", s => s.Length);
+            lengths = orders.Select(o => o.Id).Concat(names.Select(s => s.Length)).ToOutput();
+            return builder.Build();
+        }
+
+        var circuit = Build(out var orders, out var names, out var lengths);
+        circuit.Start();
+        await circuit.Handle(orders).InsertAsync((1, "emea"), 0, 10);
+        await circuit.Handle(orders).AdvanceAsync(0, 12);         // 11 and 12 held nothing for us
+        await circuit.Handle(orders).AdvanceAsync(3, 99);         // a partition that has handed on no record at all
+        await circuit.Handle(names).UpsertAsync("ab", 1, 5);
+        await circuit.Handle(names).AdvanceAsync(1, 6);
+        await circuit.StepAsync();
+        var delta = await circuit.Handle(lengths).Reader.ReadAsync();
+        Assert.Equal(2, delta.DistinctCount);                             // the two records, and nothing for the advances
+        Assert.Equal(new Dictionary<int, long> { [0] = 12, [3] = 99 }, circuit.CommittedOffsets("orders"));
+        Assert.Equal(new Dictionary<int, long> { [1] = 6 }, circuit.CommittedOffsets("names"));
+
+        // An advance alone is a step's worth of input: it is committed without a record.
+        await circuit.Handle(orders).AdvanceAsync(0, 20);
+        await circuit.StepAsync();
+        Assert.Equal(20, circuit.CommittedOffsets("orders")[0]);
+        Assert.False(circuit.Handle(lengths).Reader.TryRead(out _));
+        await circuit.DisposeAsync();
+
+        // After a restart the position holds: a record at or below it is a replay, and an
+        // advance to a lower offset moves nothing back.
+        var restarted = Build(out orders, out names, out lengths);
+        restarted.Start();
+        Assert.Equal(new Dictionary<int, long> { [0] = 20, [3] = 99 }, restarted.CommittedOffsets("orders"));
+        await restarted.Handle(orders).InsertAsync((2, "emea"), 0, 20);   // dropped
+        await restarted.Handle(orders).AdvanceAsync(0, 15);               // nothing
+        await restarted.Handle(orders).InsertAsync((3, "emea"), 0, 21);
+        await restarted.StepAsync();
+        var resumed = await restarted.Handle(lengths).Reader.ReadAsync();
+        Assert.Equal(1, resumed.WeightOf(3));
+        Assert.Equal(0, resumed.WeightOf(2));
+        Assert.Equal(21, restarted.CommittedOffsets("orders")[0]);
+
+        // An advance is a stamped entry: it cannot be mixed with unstamped records.
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await restarted.Handle(orders).InsertAsync((9, "x")));
+        await restarted.DisposeAsync();
+    }
 }

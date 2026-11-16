@@ -16,7 +16,10 @@ namespace Incremental.Hosting;
 /// valid from any constructor, and <em>started</em> (checkpoint recovery, workers, pump) by
 /// the generic host; records sent before that simply wait in the input's bounded channel.
 /// At shutdown the host completes the inputs and drains the circuit while the registered
-/// output consumers and views keep reading, and only then stops them. Your own services
+/// output consumers and views keep reading, and only then stops them. With an acknowledged
+/// output the drain ends with the circuit's final checkpoint waiting for the consumer to
+/// acknowledge the last batches, inside the host's shutdown timeout; if the timeout wins,
+/// that commit is skipped and those steps are delivered again after the restart. Your own services
 /// should follow the same rule: a producer stops sending when its stopping token fires; a
 /// consumer written by hand reads its output <em>to completion</em> rather than cancelling
 /// on the stopping token — an output nobody reads blocks the drain until the host's
@@ -36,6 +39,7 @@ public sealed class CircuitHost<TDefinition> : IAsyncDisposable where TDefinitio
     private readonly List<Task> _consumers = [];
     private int _started;
     private int _stopped;
+    private bool _abandoned; // shutdown ran out of time
 
     internal CircuitHost(
         IServiceProvider services,
@@ -84,6 +88,12 @@ public sealed class CircuitHost<TDefinition> : IAsyncDisposable where TDefinitio
     /// exactly one consumer: one registered with <c>AddOutputConsumer</c>, or a
     /// <see cref="View{T}"/>, already is it.</summary>
     public OutputHandle<T> Handle<T>(Func<TDefinition, Output<T>> select) where T : notnull =>
+        Circuit.Handle(select(Definition));
+
+    /// <summary>Redeems one of the definition's acknowledged outputs for its live handle.
+    /// One consumer here too: one registered with <c>AddAcknowledgedOutputConsumer</c>
+    /// already is it.</summary>
+    public AcknowledgedOutputHandle<T> Handle<T>(Func<TDefinition, AcknowledgedOutput<T>> select) where T : notnull =>
         Circuit.Handle(select(Definition));
 
     /// <summary>The in-memory view of a table-shaped output
@@ -135,7 +145,7 @@ public sealed class CircuitHost<TDefinition> : IAsyncDisposable where TDefinitio
             // The output has lost its consumer, so its results are gone from here on: that
             // gets the same treatment as a fault. What remains is read and discarded, so the
             // circuit can still drain at shutdown instead of stalling on this output.
-            OnTerminalFailure(ex, "An output consumer of circuit {Circuit} threw; the rest of that output is being discarded");
+            OnTerminalFailure(ex, registration.FailureMessage);
             try
             {
                 await registration.DiscardAsync(this, _abandon.Token).ConfigureAwait(false);
@@ -152,6 +162,12 @@ public sealed class CircuitHost<TDefinition> : IAsyncDisposable where TDefinitio
         try
         {
             await Circuit.Completion.ConfigureAwait(false);
+        }
+        catch when (Volatile.Read(ref _abandoned))
+        {
+            // Shutdown ran out of time and cut the consumers loose; an acknowledged output
+            // losing its consumer that way faults the circuit so that its drain ends without
+            // committing. StopAsync has already reported the abandoned shutdown.
         }
         catch (Exception ex)
         {
@@ -191,6 +207,12 @@ public sealed class CircuitHost<TDefinition> : IAsyncDisposable where TDefinitio
                 "the usual cause is an output with no consumer still reading it. State up to the last committed " +
                 "checkpoint is safe.",
                 Circuit.Name);
+
+            // Before the consumers are cancelled, so the fault this may cause is already
+            // known to be shutdown's doing (see WatchForFaultAsync).
+            Volatile.Write(ref _abandoned, true);
+            foreach (var registration in _consumerRegistrations)
+                registration.Abandon(this);
         }
         finally
         {

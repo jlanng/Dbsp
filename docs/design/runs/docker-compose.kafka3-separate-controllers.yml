@@ -1,0 +1,60 @@
+# Three brokers and three controllers of their own (KRaft, Kafka 3.9.0): the shape of a
+# cluster whose controllers are not its brokers, as Amazon MSK's documentation describes
+# its KRaft clusters.
+# Used for the runs of 2026-11-14 in docs/design/runs (round four, J4): the kafka3 profile
+# of the repository's compose file has every broker a controller as well, so losing two
+# brokers there also loses the controller quorum. Not a profile of the repository.
+#   docker compose -p kafka3sep -f docs/design/runs/docker-compose.kafka3-separate-controllers.yml up -d
+#   INCREMENTAL_KAFKA_BOOTSTRAP=localhost:9592,localhost:9692,localhost:9792
+#   INCREMENTAL_KAFKA_REPLICATION=3
+#   INCREMENTAL_KAFKA_BROKERS=kafka3sep-broker-1-1,kafka3sep-broker-2-1,kafka3sep-broker-3-1
+# Remove with: docker compose -p kafka3sep -f … down
+# Fixed addresses on a network of its own, for the reasons the kafka3 profile gives.
+x-common: &common
+  image: apache/kafka:3.9.0
+x-env: &env
+  CLUSTER_ID: "5L6g3nShT-eMCtK--X86sw"
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 101@10.89.94.21:9093,102@10.89.94.22:9093,103@10.89.94.23:9093
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT
+  KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_MIN_INSYNC_REPLICAS: 2
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+  KAFKA_LOG_DIRS: /tmp/kafka-logs
+services:
+  controller-1:
+    <<: *common
+    networks: { kafka3sep: { ipv4_address: 10.89.94.21 } }
+    environment: { <<: *env, KAFKA_NODE_ID: 101, KAFKA_PROCESS_ROLES: controller, KAFKA_LISTENERS: "CONTROLLER://10.89.94.21:9093" }
+  controller-2:
+    <<: *common
+    networks: { kafka3sep: { ipv4_address: 10.89.94.22 } }
+    environment: { <<: *env, KAFKA_NODE_ID: 102, KAFKA_PROCESS_ROLES: controller, KAFKA_LISTENERS: "CONTROLLER://10.89.94.22:9093" }
+  controller-3:
+    <<: *common
+    networks: { kafka3sep: { ipv4_address: 10.89.94.23 } }
+    environment: { <<: *env, KAFKA_NODE_ID: 103, KAFKA_PROCESS_ROLES: controller, KAFKA_LISTENERS: "CONTROLLER://10.89.94.23:9093" }
+  broker-1:
+    <<: *common
+    ports: ["9592:9592"]
+    networks: { kafka3sep: { ipv4_address: 10.89.94.11 } }
+    environment: { <<: *env, KAFKA_NODE_ID: 1, KAFKA_PROCESS_ROLES: broker, KAFKA_LISTENERS: "PLAINTEXT://:19092,HOST://:9592", KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://10.89.94.11:19092,HOST://localhost:9592" }
+  broker-2:
+    <<: *common
+    ports: ["9692:9692"]
+    networks: { kafka3sep: { ipv4_address: 10.89.94.12 } }
+    environment: { <<: *env, KAFKA_NODE_ID: 2, KAFKA_PROCESS_ROLES: broker, KAFKA_LISTENERS: "PLAINTEXT://:19092,HOST://:9692", KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://10.89.94.12:19092,HOST://localhost:9692" }
+  broker-3:
+    <<: *common
+    ports: ["9792:9792"]
+    networks: { kafka3sep: { ipv4_address: 10.89.94.13 } }
+    environment: { <<: *env, KAFKA_NODE_ID: 3, KAFKA_PROCESS_ROLES: broker, KAFKA_LISTENERS: "PLAINTEXT://:19092,HOST://:9792", KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://10.89.94.13:19092,HOST://localhost:9792" }
+networks:
+  kafka3sep:
+    ipam:
+      config:
+        - subnet: 10.89.94.0/24

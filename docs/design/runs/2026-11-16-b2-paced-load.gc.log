@@ -1,0 +1,375 @@
+== m3-before-1
+gc 01:38:32.947 #1 gen2 reason=4 type=1 heap=45 MB
+gc 01:38:33.319 #3 gen2 reason=4 type=1 heap=99 MB
+gc 01:38:34.065 #4 gen2 reason=4 type=1 heap=233 MB
+gc 01:38:34.681 #5 gen2 reason=4 type=1 heap=315 MB
+gc 01:38:35.160 #6 gen2 reason=4 type=1 heap=386 MB
+gc 01:38:35.658 #8 gen2 reason=4 type=1 heap=394 MB
+gc 01:38:36.512 #9 gen2 reason=4 type=1 heap=554 MB
+gc 01:38:37.347 #10 gen2 reason=4 type=1 heap=641 MB
+gc 01:38:38.161 #12 gen2 reason=4 type=1 heap=650 MB
+gc 01:38:39.389 #13 gen2 reason=4 type=1 heap=952 MB
+gc 01:38:41.189 #15 gen2 reason=4 type=1 heap=1165 MB
+gc 01:38:43.312 #16 gen2 reason=4 type=1 heap=1574 MB
+gc 01:38:44.469 pause 367 ms in #17 gen0 concurrent=False compacted=True heap=1738 MB load=4961 MB of 12403
+gc 01:38:45.927 #18 gen2 reason=4 type=1 heap=1857 MB
+gc 01:38:48.907 #20 gen2 reason=4 type=1 heap=2231 MB
+gc 01:38:51.310 pause 812 ms in #21 gen1 concurrent=False compacted=False heap=2864 MB load=5788 MB of 12403
+gc 01:38:52.835 #22 gen2 reason=4 type=1 heap=2605 MB
+gc 01:38:54.932 pause 286 ms in #23 gen0 concurrent=False compacted=True heap=3336 MB load=6339 MB of 12403
+gc 01:38:58.238 pause 586 ms in #24 gen1 concurrent=False compacted=False heap=4169 MB load=6891 MB of 12403
+gc 01:39:00.750 #25 gen2 reason=4 type=1 heap=4096 MB
+gc 01:39:05.874 pause 432 ms in #27 gen0 concurrent=False compacted=True heap=4972 MB load=8544 MB of 12403
+gc 01:39:14.402 #29 gen2 reason=10 type=0 heap=3934 MB
+gc 01:39:14.402 pause 1610 ms in #30 gen2 concurrent=False compacted=True heap=3998 MB load=9096 MB of 12403
+gc 01:39:14.402 #30 gen2 reason=10 type=0 heap=3934 MB
+gc 01:39:14.402 pause 1610 ms in #30 gen2 concurrent=False compacted=True heap=3998 MB load=9096 MB of 12403
+== m3-before-2
+gc 01:40:10.071 #1 gen2 reason=4 type=1 heap=45 MB
+gc 01:40:10.301 #3 gen2 reason=4 type=1 heap=55 MB
+gc 01:40:11.001 #4 gen2 reason=4 type=1 heap=187 MB
+gc 01:40:11.710 #5 gen2 reason=4 type=1 heap=278 MB
+gc 01:40:12.267 #6 gen2 reason=4 type=1 heap=312 MB
+gc 01:40:13.046 #8 gen2 reason=4 type=1 heap=411 MB
+gc 01:40:13.612 #9 gen2 reason=4 type=1 heap=470 MB
+gc 01:40:14.128 #10 gen2 reason=4 type=1 heap=573 MB
+gc 01:40:14.776 #11 gen2 reason=4 type=1 heap=680 MB
+gc 01:40:15.604 #13 gen2 reason=4 type=1 heap=676 MB
+gc 01:40:16.724 #14 gen2 reason=4 type=1 heap=954 MB
+gc 01:40:18.771 #16 gen2 reason=4 type=1 heap=1194 MB
+gc 01:40:20.963 #17 gen2 reason=4 type=1 heap=1593 MB
+gc 01:40:21.442 pause 279 ms in #18 gen0 concurrent=False compacted=True heap=1865 MB load=5068 MB of 13033
+gc 01:40:23.462 #19 gen2 reason=4 type=1 heap=1930 MB
+gc 01:40:24.783 pause 339 ms in #20 gen0 concurrent=False compacted=True heap=2170 MB load=5503 MB of 13033
+gc 01:40:26.609 #21 gen2 reason=4 type=1 heap=2229 MB
+gc 01:40:28.405 pause 552 ms in #22 gen1 concurrent=False compacted=False heap=2739 MB load=5792 MB of 13033
+gc 01:40:28.406 pause 552 ms in #22 gen1 concurrent=False compacted=False heap=2739 MB load=5792 MB of 13033
+gc 01:40:30.120 #23 gen2 reason=4 type=1 heap=2702 MB
+gc 01:40:32.038 pause 374 ms in #24 gen0 concurrent=False compacted=True heap=3152 MB load=6372 MB of 13033
+gc 01:40:35.419 pause 420 ms in #25 gen1 concurrent=False compacted=False heap=3976 MB load=6806 MB of 13033
+gc 01:40:37.777 #26 gen2 reason=4 type=1 heap=4109 MB
+gc 01:40:42.896 pause 358 ms in #28 gen0 concurrent=False compacted=True heap=4746 MB load=8399 MB of 13033
+gc 01:40:49.667 #30 gen2 reason=10 type=0 heap=3934 MB
+gc 01:40:49.667 pause 3196 ms in #30 gen2 concurrent=False compacted=True heap=3996 MB load=8978 MB of 13033
+gc 01:40:50.912 #31 gen2 reason=10 type=0 heap=3934 MB
+gc 01:40:50.912 pause 1244 ms in #31 gen2 concurrent=False compacted=True heap=3995 MB load=8978 MB of 13033
+== m3-before-3
+gc 01:41:47.255 #1 gen2 reason=4 type=1 heap=42 MB
+gc 01:41:47.471 #3 gen2 reason=4 type=1 heap=54 MB
+gc 01:41:48.085 #4 gen2 reason=4 type=1 heap=186 MB
+gc 01:41:48.726 #5 gen2 reason=4 type=1 heap=280 MB
+gc 01:41:49.270 #6 gen2 reason=4 type=1 heap=322 MB
+gc 01:41:50.181 #8 gen2 reason=4 type=1 heap=415 MB
+gc 01:41:50.763 #9 gen2 reason=4 type=1 heap=475 MB
+gc 01:41:51.370 #10 gen2 reason=4 type=1 heap=549 MB
+gc 01:41:52.224 #11 gen2 reason=4 type=1 heap=675 MB
+gc 01:41:52.902 pause 213 ms in #12 gen1 concurrent=False compacted=False heap=856 MB load=4059 MB of 13047
+gc 01:41:53.512 #13 gen2 reason=4 type=1 heap=828 MB
+gc 01:41:54.914 #14 gen2 reason=4 type=1 heap=1131 MB
+gc 01:41:57.083 #16 gen2 reason=4 type=1 heap=1471 MB
+gc 01:41:58.768 pause 436 ms in #17 gen0 concurrent=False compacted=True heap=1813 MB load=5363 MB of 13047
+gc 01:41:59.951 #18 gen2 reason=4 type=1 heap=1750 MB
+gc 01:42:02.640 #20 gen2 reason=4 type=1 heap=2075 MB
+gc 01:42:05.812 pause 739 ms in #21 gen1 concurrent=False compacted=False heap=3052 MB load=6088 MB of 13047
+gc 01:42:06.532 #22 gen2 reason=4 type=1 heap=2500 MB
+gc 01:42:09.442 pause 315 ms in #23 gen0 concurrent=False compacted=True heap=3313 MB load=6668 MB of 13047
+gc 01:42:12.687 pause 450 ms in #24 gen1 concurrent=False compacted=False heap=4300 MB load=7248 MB of 13047
+gc 01:42:14.111 #25 gen2 reason=4 type=1 heap=3863 MB
+gc 01:42:16.545 pause 262 ms in #26 gen0 concurrent=False compacted=True heap=4349 MB load=8118 MB of 13047
+gc 01:42:28.362 #29 gen2 reason=10 type=0 heap=3934 MB
+gc 01:42:28.362 pause 1732 ms in #30 gen2 concurrent=False compacted=True heap=4011 MB load=9567 MB of 13047
+gc 01:42:28.362 #30 gen2 reason=10 type=0 heap=3934 MB
+gc 01:42:28.362 pause 1732 ms in #30 gen2 concurrent=False compacted=True heap=4011 MB load=9567 MB of 13047
+== m3-after-1
+gc 01:39:21.252 #1 gen2 reason=4 type=1 heap=45 MB
+gc 01:39:21.583 #3 gen2 reason=4 type=1 heap=84 MB
+gc 01:39:22.090 #4 gen2 reason=4 type=1 heap=183 MB
+gc 01:39:22.971 #5 gen2 reason=4 type=1 heap=335 MB
+gc 01:39:23.634 #7 gen2 reason=1 type=1 heap=369 MB
+gc 01:39:24.342 #9 gen2 reason=4 type=1 heap=449 MB
+gc 01:39:25.254 #12 gen2 reason=4 type=1 heap=578 MB
+gc 01:39:26.897 #17 gen2 reason=4 type=1 heap=883 MB
+gc 01:39:29.994 #23 gen2 reason=1 type=1 heap=1367 MB
+gc 01:39:33.594 #31 gen2 reason=1 type=1 heap=1804 MB
+gc 01:39:39.634 #43 gen2 reason=1 type=1 heap=2819 MB
+gc 01:39:49.156 #63 gen2 reason=1 type=1 heap=4187 MB
+gc 01:40:02.008 #82 gen2 reason=10 type=0 heap=3934 MB
+gc 01:40:02.008 pause 2676 ms in #82 gen2 concurrent=False compacted=True heap=4006 MB load=8854 MB of 12853
+gc 01:40:04.058 #83 gen2 reason=10 type=0 heap=3934 MB
+gc 01:40:04.058 pause 2048 ms in #83 gen2 concurrent=False compacted=True heap=4006 MB load=8854 MB of 12853
+== m3-after-2
+gc 01:40:56.934 #1 gen2 reason=4 type=0 heap=30 MB
+gc 01:40:57.243 #2 gen2 reason=4 type=1 heap=61 MB
+gc 01:40:57.768 #3 gen2 reason=4 type=1 heap=189 MB
+gc 01:40:58.588 #4 gen2 reason=4 type=1 heap=328 MB
+gc 01:40:59.169 #6 gen2 reason=4 type=1 heap=342 MB
+gc 01:40:59.672 #8 gen2 reason=4 type=1 heap=404 MB
+gc 01:41:00.732 #11 gen2 reason=4 type=1 heap=526 MB
+gc 01:41:01.269 pause 203 ms in #12 gen1 concurrent=False compacted=True heap=545 MB load=3670 MB of 13213
+gc 01:41:02.597 #15 gen2 reason=1 type=1 heap=819 MB
+gc 01:41:04.923 #20 gen2 reason=1 type=1 heap=1167 MB
+gc 01:41:07.995 #27 gen2 reason=1 type=1 heap=1601 MB
+gc 01:41:14.089 #39 gen2 reason=1 type=1 heap=2593 MB
+gc 01:41:22.161 #56 gen2 reason=1 type=1 heap=3692 MB
+gc 01:41:34.822 #80 gen2 reason=1 type=1 heap=5630 MB
+gc 01:41:41.319 pause 1126 ms in #82 gen2 concurrent=False compacted=True heap=3998 MB load=9249 MB of 13213
+gc 01:41:41.319 #81 gen2 reason=10 type=0 heap=3934 MB
+gc 01:41:41.319 pause 1126 ms in #82 gen2 concurrent=False compacted=True heap=3998 MB load=9249 MB of 13213
+gc 01:41:41.319 #82 gen2 reason=10 type=0 heap=3934 MB
+gc 01:41:41.319 pause 1126 ms in #82 gen2 concurrent=False compacted=True heap=3998 MB load=9249 MB of 13213
+== m3-after-3
+gc 01:42:34.462 #1 gen2 reason=4 type=1 heap=46 MB
+gc 01:42:34.947 #3 gen2 reason=4 type=1 heap=97 MB
+gc 01:42:35.863 #4 gen2 reason=4 type=1 heap=250 MB
+gc 01:42:36.582 #5 gen2 reason=1 type=1 heap=312 MB
+gc 01:42:37.055 #6 gen2 reason=1 type=1 heap=366 MB
+gc 01:42:37.700 #9 gen2 reason=4 type=1 heap=409 MB
+gc 01:42:38.818 #12 gen2 reason=4 type=1 heap=639 MB
+gc 01:42:40.407 #16 gen2 reason=1 type=1 heap=856 MB
+gc 01:42:43.578 #22 gen2 reason=1 type=1 heap=1370 MB
+gc 01:42:47.383 #31 gen2 reason=1 type=1 heap=1886 MB
+gc 01:42:53.684 #43 gen2 reason=1 type=1 heap=2877 MB
+gc 01:43:03.176 #63 gen2 reason=1 type=1 heap=4228 MB
+gc 01:43:16.844 #81 gen2 reason=10 type=0 heap=3934 MB
+gc 01:43:16.844 pause 1071 ms in #82 gen2 concurrent=False compacted=True heap=4004 MB load=9341 MB of 13137
+gc 01:43:16.845 #82 gen2 reason=10 type=0 heap=3934 MB
+gc 01:43:16.845 pause 1071 ms in #82 gen2 concurrent=False compacted=True heap=4004 MB load=9341 MB of 13137
+== m4-before-1
+gc 01:43:32.034 #1 gen2 reason=4 type=0 heap=30 MB
+gc 01:43:32.338 #2 gen2 reason=4 type=1 heap=91 MB
+gc 01:43:32.832 #3 gen2 reason=4 type=1 heap=182 MB
+gc 01:43:33.628 #4 gen2 reason=4 type=1 heap=320 MB
+gc 01:43:34.176 #5 gen2 reason=4 type=1 heap=378 MB
+gc 01:43:34.614 #6 gen2 reason=4 type=1 heap=452 MB
+gc 01:43:35.049 #7 gen2 reason=4 type=1 heap=511 MB
+gc 01:43:35.464 #8 gen2 reason=4 type=1 heap=528 MB
+gc 01:43:36.126 #10 gen2 reason=4 type=1 heap=519 MB
+gc 01:43:36.801 #11 gen2 reason=4 type=1 heap=646 MB
+gc 01:43:37.984 #12 gen2 reason=4 type=1 heap=893 MB
+gc 01:43:39.086 #13 gen2 reason=4 type=1 heap=1010 MB
+gc 01:43:39.561 pause 237 ms in #14 gen1 concurrent=False compacted=False heap=1233 MB load=4370 MB of 12687
+gc 01:43:41.319 #15 gen2 reason=4 type=1 heap=1386 MB
+gc 01:43:43.141 pause 315 ms in #16 gen0 concurrent=False compacted=True heap=1696 MB load=4933 MB of 12687
+gc 01:43:44.123 #17 gen2 reason=4 type=1 heap=1797 MB
+gc 01:43:46.571 pause 303 ms in #18 gen0 concurrent=False compacted=True heap=2148 MB load=5356 MB of 12687
+gc 01:43:48.028 #19 gen2 reason=4 type=1 heap=2339 MB
+gc 01:43:50.023 pause 330 ms in #20 gen0 concurrent=False compacted=True heap=2540 MB load=5779 MB of 12687
+gc 01:43:51.861 #21 gen2 reason=4 type=1 heap=2860 MB
+gc 01:43:53.359 pause 209 ms in #22 gen0 concurrent=False compacted=False heap=3434 MB load=6343 MB of 12687
+gc 01:43:56.447 #23 gen2 reason=4 type=1 heap=3409 MB
+gc 01:43:57.307 pause 723 ms in #24 gen1 concurrent=False compacted=False heap=4038 MB load=7048 MB of 12687
+gc 01:44:01.197 pause 331 ms in #25 gen0 concurrent=False compacted=True heap=4235 MB load=7612 MB of 12687
+gc 01:44:07.778 #27 gen2 reason=0 type=1 heap=5292 MB
+gc 01:44:07.778 pause 269 ms in #28 gen0 concurrent=False compacted=False heap=6270 MB load=9162 MB of 12687
+gc 01:44:13.381 pause 1533 ms in #29 gen1 concurrent=False compacted=True heap=5056 MB load=10149 MB of 12687
+gc 01:44:24.837 #32 gen2 reason=10 type=0 heap=5212 MB
+gc 01:44:24.838 pause 1541 ms in #33 gen2 concurrent=False compacted=True heap=5275 MB load=10572 MB of 12687
+gc 01:44:24.838 #33 gen2 reason=10 type=0 heap=5212 MB
+gc 01:44:24.838 pause 1541 ms in #33 gen2 concurrent=False compacted=True heap=5275 MB load=10572 MB of 12687
+== m4-before-2
+gc 01:45:33.609 #1 gen2 reason=4 type=1 heap=44 MB
+gc 01:45:33.853 #3 gen2 reason=4 type=1 heap=55 MB
+gc 01:45:34.614 #4 gen2 reason=4 type=1 heap=195 MB
+gc 01:45:35.418 #5 gen2 reason=4 type=1 heap=321 MB
+gc 01:45:35.935 #6 gen2 reason=4 type=1 heap=365 MB
+gc 01:45:36.461 #8 gen2 reason=4 type=1 heap=392 MB
+gc 01:45:36.857 #9 gen2 reason=4 type=1 heap=448 MB
+gc 01:45:37.275 #10 gen2 reason=4 type=1 heap=486 MB
+gc 01:45:38.006 #11 gen2 reason=4 type=1 heap=669 MB
+gc 01:45:39.001 #13 gen2 reason=4 type=1 heap=747 MB
+gc 01:45:40.408 #14 gen2 reason=4 type=1 heap=1037 MB
+gc 01:45:41.897 pause 226 ms in #15 gen0 concurrent=False compacted=False heap=1439 MB load=4596 MB of 12166
+gc 01:45:42.806 #16 gen2 reason=4 type=1 heap=1334 MB
+gc 01:45:44.836 pause 300 ms in #17 gen0 concurrent=False compacted=True heap=1802 MB load=5272 MB of 12166
+gc 01:45:45.155 #18 gen2 reason=4 type=1 heap=1573 MB
+gc 01:45:47.638 #20 gen2 reason=4 type=1 heap=1912 MB
+gc 01:45:50.840 #21 gen2 reason=4 type=1 heap=2436 MB
+gc 01:45:51.758 pause 586 ms in #22 gen1 concurrent=False compacted=False heap=3072 MB load=6353 MB of 12166
+gc 01:45:55.338 pause 381 ms in #23 gen0 concurrent=False compacted=True heap=3509 MB load=7029 MB of 12166
+gc 01:45:58.834 pause 407 ms in #24 gen1 concurrent=False compacted=False heap=4512 MB load=7705 MB of 12166
+gc 01:45:59.082 #25 gen2 reason=4 type=1 heap=3699 MB
+gc 01:46:02.696 pause 380 ms in #26 gen0 concurrent=False compacted=True heap=4420 MB load=8651 MB of 12166
+gc 01:46:09.304 pause 219 ms in #28 gen0 concurrent=False compacted=False heap=6440 MB load=9868 MB of 12166
+gc 01:46:12.568 #29 gen2 reason=4 type=1 heap=6257 MB
+gc 01:46:17.386 pause 1891 ms in #31 gen1 concurrent=False compacted=True heap=6330 MB load=11896 MB of 12166
+gc 01:46:19.689 pause 382 ms in #34 gen1 concurrent=False compacted=True heap=5625 MB load=11761 MB of 12166
+gc 01:46:27.984 #42 gen2 reason=10 type=0 heap=5212 MB
+gc 01:46:27.985 pause 1400 ms in #43 gen2 concurrent=False compacted=True heap=5271 MB load=11626 MB of 12166
+gc 01:46:27.985 #43 gen2 reason=10 type=0 heap=5212 MB
+gc 01:46:27.985 pause 1400 ms in #43 gen2 concurrent=False compacted=True heap=5271 MB load=11626 MB of 12166
+== m4-after-1
+gc 01:44:31.097 #1 gen2 reason=4 type=1 heap=42 MB
+gc 01:44:31.294 #3 gen2 reason=4 type=1 heap=54 MB
+gc 01:44:31.903 #4 gen2 reason=4 type=1 heap=188 MB
+gc 01:44:32.546 #5 gen2 reason=4 type=1 heap=278 MB
+gc 01:44:33.170 #7 gen2 reason=4 type=1 heap=308 MB
+gc 01:44:33.725 #9 gen2 reason=4 type=1 heap=365 MB
+gc 01:44:34.561 #12 gen2 reason=4 type=1 heap=512 MB
+gc 01:44:36.638 #16 gen2 reason=4 type=1 heap=813 MB
+gc 01:44:39.185 #22 gen2 reason=1 type=1 heap=1200 MB
+gc 01:44:39.980 pause 283 ms in #23 gen1 concurrent=False compacted=True heap=1125 MB load=4517 MB of 12706
+gc 01:44:39.981 pause 283 ms in #23 gen1 concurrent=False compacted=True heap=1125 MB load=4517 MB of 12706
+gc 01:44:42.402 #29 gen2 reason=1 type=1 heap=1627 MB
+gc 01:44:48.321 #41 gen2 reason=1 type=1 heap=2581 MB
+gc 01:44:50.247 pause 312 ms in #43 gen1 concurrent=False compacted=True heap=2413 MB load=6212 MB of 12706
+gc 01:44:56.462 #58 gen2 reason=1 type=1 heap=3690 MB
+gc 01:45:09.178 #82 gen2 reason=1 type=1 heap=5631 MB
+gc 01:45:25.552 #101 gen2 reason=10 type=0 heap=5212 MB
+gc 01:45:25.552 pause 2955 ms in #101 gen2 concurrent=False compacted=True heap=5299 MB load=11436 MB of 12706
+gc 01:45:27.522 #102 gen2 reason=10 type=0 heap=5212 MB
+gc 01:45:27.522 pause 1969 ms in #102 gen2 concurrent=False compacted=True heap=5294 MB load=11436 MB of 12706
+== m4-after-2
+gc 01:46:34.291 #1 gen2 reason=4 type=1 heap=48 MB
+gc 01:46:34.627 #3 gen2 reason=4 type=1 heap=83 MB
+gc 01:46:35.134 #4 gen2 reason=4 type=1 heap=180 MB
+gc 01:46:35.904 #5 gen2 reason=4 type=1 heap=322 MB
+gc 01:46:36.450 #7 gen2 reason=4 type=1 heap=310 MB
+gc 01:46:37.061 #9 gen2 reason=1 type=1 heap=417 MB
+gc 01:46:37.955 #11 gen2 reason=1 type=1 heap=556 MB
+gc 01:46:39.205 #14 gen2 reason=4 type=1 heap=758 MB
+gc 01:46:41.750 #20 gen2 reason=4 type=1 heap=1114 MB
+gc 01:46:45.204 #28 gen2 reason=1 type=1 heap=1715 MB
+gc 01:46:51.341 #40 gen2 reason=1 type=1 heap=2554 MB
+gc 01:46:58.957 #56 gen2 reason=1 type=1 heap=3580 MB
+gc 01:47:12.213 #81 gen2 reason=1 type=1 heap=5689 MB
+gc 01:47:16.177 pause 275 ms in #83 gen1 concurrent=False compacted=True heap=5352 MB load=9874 MB of 11693
+gc 01:47:22.570 pause 359 ms in #88 gen0 concurrent=False compacted=True heap=6969 MB load=11044 MB of 11693
+gc 01:47:24.154 pause 779 ms in #89 gen1 concurrent=False compacted=True heap=7006 MB load=11174 MB of 11693
+gc 01:47:30.970 #93 gen2 reason=10 type=0 heap=5212 MB
+gc 01:47:30.970 pause 2050 ms in #94 gen2 concurrent=False compacted=True heap=5265 MB load=10784 MB of 11693
+gc 01:47:30.973 #94 gen2 reason=10 type=0 heap=5212 MB
+gc 01:47:30.977 pause 2050 ms in #94 gen2 concurrent=False compacted=True heap=5265 MB load=10784 MB of 11693
+== m5-before-1
+gc 01:47:54.962 #1 gen2 reason=4 type=1 heap=34 MB
+gc 01:47:55.288 #3 gen2 reason=4 type=1 heap=83 MB
+gc 01:47:55.986 #4 gen2 reason=4 type=1 heap=227 MB
+gc 01:47:56.550 #5 gen2 reason=4 type=1 heap=299 MB
+gc 01:47:57.073 #6 gen2 reason=4 type=1 heap=375 MB
+gc 01:47:57.577 #8 gen2 reason=4 type=1 heap=394 MB
+gc 01:47:57.994 #9 gen2 reason=4 type=1 heap=414 MB
+gc 01:47:58.912 #10 gen2 reason=4 type=1 heap=574 MB
+gc 01:47:59.966 #11 gen2 reason=4 type=1 heap=751 MB
+gc 01:48:01.549 #13 gen2 reason=4 type=1 heap=988 MB
+gc 01:48:03.203 pause 317 ms in #14 gen0 concurrent=False compacted=True heap=1269 MB load=4331 MB of 11137
+gc 01:48:03.612 #15 gen2 reason=4 type=1 heap=1196 MB
+gc 01:48:06.076 pause 204 ms in #16 gen0 concurrent=False compacted=False heap=1967 MB load=4826 MB of 11137
+gc 01:48:06.122 #17 gen2 reason=4 type=1 heap=1523 MB
+gc 01:48:08.454 #18 gen2 reason=4 type=1 heap=1888 MB
+gc 01:48:09.638 pause 257 ms in #19 gen0 concurrent=False compacted=True heap=2139 MB load=5568 MB of 11137
+gc 01:48:11.164 #20 gen2 reason=4 type=1 heap=2268 MB
+gc 01:48:13.162 pause 717 ms in #21 gen1 concurrent=False compacted=False heap=2847 MB load=5692 MB of 11137
+gc 01:48:18.961 #23 gen2 reason=4 type=1 heap=3840 MB
+gc 01:48:19.602 pause 208 ms in #24 gen0 concurrent=False compacted=False heap=4640 MB load=7548 MB of 11137
+gc 01:48:24.080 pause 571 ms in #25 gen1 concurrent=False compacted=False heap=4702 MB load=8167 MB of 11137
+gc 01:48:30.845 #27 gen2 reason=0 type=1 heap=5394 MB
+gc 01:48:30.851 pause 218 ms in #28 gen0 concurrent=False compacted=False heap=6782 MB load=9776 MB of 11137
+gc 01:48:34.921 pause 493 ms in #29 gen0 concurrent=False compacted=True heap=6138 MB load=10395 MB of 11137
+gc 01:48:36.728 pause 1422 ms in #30 gen1 concurrent=False compacted=True heap=5442 MB load=10642 MB of 11137
+gc 01:48:38.962 #35 gen2 reason=0 type=1 heap=5395 MB
+gc 01:48:43.185 pause 273 ms in #35 gen2 concurrent=True compacted=False heap=6413 MB load=11014 MB of 11137
+gc 01:48:50.038 pause 276 ms in #55 gen1 concurrent=False compacted=True heap=7552 MB load=11014 MB of 11137
+gc 01:48:54.159 #57 gen2 reason=0 type=0 heap=5960 MB
+gc 01:48:54.159 pause 3063 ms in #57 gen2 concurrent=False compacted=True heap=6070 MB load=10766 MB of 11137
+gc 01:48:57.774 pause 220 ms in #64 gen1 concurrent=False compacted=True heap=6913 MB load=10642 MB of 11137
+gc 01:49:00.596 #66 gen2 reason=10 type=0 heap=6490 MB
+gc 01:49:00.596 pause 1949 ms in #66 gen2 concurrent=False compacted=True heap=6531 MB load=10642 MB of 11137
+gc 01:49:02.326 #67 gen2 reason=10 type=0 heap=6490 MB
+gc 01:49:02.327 pause 1728 ms in #67 gen2 concurrent=False compacted=True heap=6530 MB load=10519 MB of 11137
+== m5-before-2
+gc 01:50:27.242 #1 gen2 reason=4 type=1 heap=44 MB
+gc 01:50:27.465 #3 gen2 reason=4 type=1 heap=55 MB
+gc 01:50:28.082 #4 gen2 reason=4 type=1 heap=188 MB
+gc 01:50:28.748 #5 gen2 reason=4 type=1 heap=277 MB
+gc 01:50:29.344 #6 gen2 reason=4 type=1 heap=350 MB
+gc 01:50:29.791 #7 gen2 reason=4 type=1 heap=314 MB
+gc 01:50:30.596 #9 gen2 reason=4 type=1 heap=481 MB
+gc 01:50:31.442 #10 gen2 reason=4 type=1 heap=579 MB
+gc 01:50:32.220 #11 gen2 reason=4 type=1 heap=671 MB
+gc 01:50:33.376 #13 gen2 reason=4 type=1 heap=812 MB
+gc 01:50:34.794 #14 gen2 reason=4 type=1 heap=1110 MB
+gc 01:50:35.717 pause 249 ms in #15 gen0 concurrent=False compacted=True heap=1226 MB load=4311 MB of 10487
+gc 01:50:36.742 #16 gen2 reason=4 type=1 heap=1382 MB
+gc 01:50:38.450 pause 200 ms in #17 gen0 concurrent=False compacted=False heap=1834 MB load=4777 MB of 10487
+gc 01:50:39.309 #18 gen2 reason=4 type=1 heap=1647 MB
+gc 01:50:41.879 pause 311 ms in #19 gen0 concurrent=False compacted=True heap=2240 MB load=5360 MB of 10487
+gc 01:50:42.082 #20 gen2 reason=4 type=1 heap=1979 MB
+gc 01:50:45.646 #21 gen2 reason=0 type=1 heap=2327 MB
+gc 01:50:45.647 pause 825 ms in #22 gen1 concurrent=False compacted=False heap=2883 MB load=5709 MB of 10487
+gc 01:50:49.262 pause 293 ms in #23 gen0 concurrent=False compacted=True heap=3272 MB load=6409 MB of 10487
+gc 01:50:52.640 #25 gen2 reason=4 type=1 heap=3665 MB
+gc 01:50:56.402 pause 293 ms in #26 gen0 concurrent=False compacted=True heap=4142 MB load=7690 MB of 10487
+gc 01:50:59.742 pause 793 ms in #27 gen1 concurrent=False compacted=False heap=5108 MB load=8157 MB of 10487
+gc 01:51:03.344 #28 gen2 reason=0 type=1 heap=5227 MB
+gc 01:51:03.345 pause 213 ms in #29 gen0 concurrent=False compacted=False heap=6166 MB load=8972 MB of 10487
+gc 01:51:07.422 pause 468 ms in #30 gen0 concurrent=False compacted=True heap=5725 MB load=9671 MB of 10487
+gc 01:51:09.207 pause 1014 ms in #31 gen1 concurrent=False compacted=True heap=5438 MB load=9904 MB of 10487
+gc 01:51:14.774 #43 gen2 reason=0 type=1 heap=6282 MB
+gc 01:51:15.660 pause 285 ms in #45 gen1 concurrent=False compacted=True heap=7063 MB load=10254 MB of 10487
+gc 01:51:19.311 pause 218 ms in #43 gen2 concurrent=True compacted=False heap=7038 MB load=10371 MB of 10487
+gc 01:51:20.654 pause 232 ms in #53 gen1 concurrent=False compacted=True heap=6946 MB load=10138 MB of 10487
+gc 01:51:22.238 pause 221 ms in #56 gen1 concurrent=False compacted=True heap=6954 MB load=10254 MB of 10487
+gc 01:51:28.094 #61 gen2 reason=0 type=0 heap=6123 MB
+gc 01:51:28.094 pause 3502 ms in #61 gen2 concurrent=False compacted=True heap=6306 MB load=10138 MB of 10487
+gc 01:51:30.534 pause 267 ms in #65 gen1 concurrent=False compacted=True heap=6691 MB load=10487 MB of 10487
+gc 01:51:33.719 #68 gen2 reason=10 type=0 heap=6490 MB
+gc 01:51:33.719 pause 1931 ms in #68 gen2 concurrent=False compacted=True heap=6546 MB load=10254 MB of 10487
+gc 01:51:35.640 #69 gen2 reason=10 type=0 heap=6490 MB
+gc 01:51:35.640 pause 1918 ms in #69 gen2 concurrent=False compacted=True heap=6545 MB load=10254 MB of 10487
+== m5-after-1
+gc 01:49:08.373 #1 gen2 reason=4 type=1 heap=30 MB
+gc 01:49:08.582 #3 gen2 reason=4 type=1 heap=82 MB
+gc 01:49:09.175 #4 gen2 reason=4 type=1 heap=186 MB
+gc 01:49:10.041 #5 gen2 reason=4 type=1 heap=339 MB
+gc 01:49:10.746 #7 gen2 reason=1 type=1 heap=372 MB
+gc 01:49:11.529 pause 282 ms in #8 gen1 concurrent=False compacted=True heap=374 MB load=3437 MB of 11047
+gc 01:49:11.602 #9 gen2 reason=4 type=1 heap=385 MB
+gc 01:49:12.471 #11 gen2 reason=1 type=1 heap=539 MB
+gc 01:49:13.756 #14 gen2 reason=1 type=1 heap=770 MB
+gc 01:49:16.047 #19 gen2 reason=1 type=1 heap=1167 MB
+gc 01:49:19.363 #26 gen2 reason=1 type=1 heap=1621 MB
+gc 01:49:25.236 #38 gen2 reason=1 type=1 heap=2587 MB
+gc 01:49:33.347 #55 gen2 reason=1 type=1 heap=3763 MB
+gc 01:49:46.089 #79 gen2 reason=1 type=1 heap=5629 MB
+gc 01:49:53.868 pause 309 ms in #82 gen0 concurrent=False compacted=True heap=6581 MB load=10556 MB of 11047
+gc 01:49:55.346 pause 968 ms in #83 gen1 concurrent=False compacted=True heap=6230 MB load=10802 MB of 11047
+gc 01:50:05.060 #95 gen2 reason=0 type=0 heap=5465 MB
+gc 01:50:05.060 pause 3763 ms in #95 gen2 concurrent=False compacted=True heap=5556 MB load=10679 MB of 11047
+gc 01:50:07.413 pause 229 ms in #97 gen0 concurrent=False compacted=True heap=6154 MB load=10065 MB of 11047
+gc 01:50:08.785 pause 218 ms in #98 gen0 concurrent=False compacted=True heap=6575 MB load=10188 MB of 11047
+gc 01:50:10.605 pause 580 ms in #99 gen1 concurrent=False compacted=True heap=6838 MB load=10925 MB of 11047
+gc 01:50:11.606 #101 gen2 reason=0 type=1 heap=7110 MB
+gc 01:50:12.390 pause 237 ms in #103 gen1 concurrent=False compacted=True heap=7247 MB load=11047 MB of 11047
+gc 01:50:20.542 pause 1897 ms in #108 gen2 concurrent=False compacted=True heap=6557 MB load=10434 MB of 11047
+gc 01:50:20.542 #107 gen2 reason=10 type=0 heap=6490 MB
+gc 01:50:20.544 pause 1897 ms in #108 gen2 concurrent=False compacted=True heap=6557 MB load=10434 MB of 11047
+gc 01:50:20.544 #108 gen2 reason=10 type=0 heap=6490 MB
+gc 01:50:20.544 pause 1897 ms in #108 gen2 concurrent=False compacted=True heap=6557 MB load=10434 MB of 11047
+== m5-after-2
+gc 01:51:42.100 #1 gen2 reason=4 type=1 heap=33 MB
+gc 01:51:42.431 #3 gen2 reason=4 type=1 heap=78 MB
+gc 01:51:42.981 #4 gen2 reason=4 type=1 heap=182 MB
+gc 01:51:43.610 #5 gen2 reason=4 type=1 heap=246 MB
+gc 01:51:44.662 #7 gen2 reason=4 type=1 heap=355 MB
+gc 01:51:45.201 #9 gen2 reason=4 type=1 heap=404 MB
+gc 01:51:46.091 #12 gen2 reason=4 type=1 heap=553 MB
+gc 01:51:47.632 #16 gen2 reason=1 type=1 heap=824 MB
+gc 01:51:49.898 #21 gen2 reason=1 type=1 heap=1145 MB
+gc 01:51:53.354 #28 gen2 reason=1 type=1 heap=1601 MB
+gc 01:51:59.134 pause 233 ms in #39 gen1 concurrent=False compacted=True heap=2695 MB load=5574 MB of 10451
+gc 01:51:59.572 #40 gen2 reason=1 type=1 heap=2581 MB
+gc 01:52:08.017 #57 gen2 reason=1 type=1 heap=3692 MB
+gc 01:52:20.855 #81 gen2 reason=1 type=1 heap=5602 MB
+gc 01:52:28.034 pause 217 ms in #84 gen0 concurrent=False compacted=True heap=6512 MB load=9871 MB of 10451
+gc 01:52:28.999 pause 664 ms in #85 gen1 concurrent=False compacted=True heap=6114 MB load=9987 MB of 10451
+gc 01:52:38.165 #97 gen2 reason=0 type=0 heap=5349 MB
+gc 01:52:38.166 pause 3302 ms in #97 gen2 concurrent=False compacted=True heap=5460 MB load=9987 MB of 10451
+gc 01:52:40.783 pause 269 ms in #99 gen0 concurrent=False compacted=True heap=6133 MB load=9406 MB of 10451
+gc 01:52:42.832 pause 206 ms in #100 gen0 concurrent=False compacted=True heap=6654 MB load=9755 MB of 10451
+gc 01:52:44.277 pause 503 ms in #102 gen1 concurrent=False compacted=True heap=6904 MB load=10335 MB of 10451
+gc 01:52:46.080 #106 gen2 reason=0 type=1 heap=7412 MB
+gc 01:52:46.861 pause 226 ms in #108 gen1 concurrent=False compacted=True heap=7555 MB load=10568 MB of 10451
+gc 01:52:52.226 pause 2271 ms in #111 gen2 concurrent=False compacted=True heap=6549 MB load=9755 MB of 10451
+gc 01:52:52.226 #111 gen2 reason=10 type=0 heap=6490 MB
+gc 01:52:52.226 pause 2271 ms in #111 gen2 concurrent=False compacted=True heap=6549 MB load=9755 MB of 10451
+gc 01:52:53.989 #112 gen2 reason=10 type=0 heap=6490 MB
+gc 01:52:53.990 pause 1758 ms in #112 gen2 concurrent=False compacted=True heap=6548 MB load=9755 MB of 10451

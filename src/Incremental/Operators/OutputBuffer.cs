@@ -7,7 +7,9 @@ namespace Incremental.Operators;
 /// so purely step-scoped garbage kept re-marking the whole live set on any GC
 /// configuration the host happened to have (see benchmarks/Incremental.Torture/README.md).
 /// A reused buffer is allocated once, grows to its edge's high-water mark, and stops
-/// feeding the collector entirely.
+/// feeding the collector entirely. (A mark set by one enormous delta and not approached
+/// again is given back after a while — see <see cref="ZSet{T}.Clear"/> — because clearing
+/// a buffer costs time in proportion to its capacity.)
 ///
 /// Reuse is safe for the same reason <see cref="ExchangeOperator{T}"/> reuses its
 /// fragments: every consumer of a node's output reads it before the producing operator

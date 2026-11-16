@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The same sources and the same assembly name as Acme.Pipelines, compiled with V2
+       defined: a second version of one plugin. -->
+  <PropertyGroup>
+    <AssemblyName>Acme.Pipelines</AssemblyName>
+    <RootNamespace>Acme.Pipelines</RootNamespace>
+    <DefineConstants>$(DefineConstants);V2</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Acme.Pipelines\*.cs" />
+    <ProjectReference Include="..\Acme.Contracts\Acme.Contracts.csproj" />
+  </ItemGroup>
+
+</Project>

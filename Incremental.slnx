@@ -1,22 +1,53 @@
 <Solution>
   <Folder Name="/benchmarks/">
     <Project Path="benchmarks/Incremental.Benchmarks/Incremental.Benchmarks.csproj" />
+    <Project Path="benchmarks/Incremental.Service.Scale/Incremental.Service.Scale.csproj" />
     <Project Path="benchmarks/Incremental.Torture/Incremental.Torture.csproj" />
   </Folder>
+  <Folder Name="/benchmarks/plugins/">
+    <Project Path="benchmarks/Incremental.Service.Scale/Contracts/Scale.Contracts.csproj" />
+    <Project Path="benchmarks/Incremental.Service.Scale/Pipelines/Scale.Pipelines.csproj" />
+  </Folder>
   <Folder Name="/examples/">
+    <Project Path="examples/Incremental.EnrichmentService/Incremental.EnrichmentService.csproj" />
     <Project Path="examples/Incremental.Example/Incremental.Example.csproj" />
     <Project Path="examples/Incremental.LogAnalytics/Incremental.LogAnalytics.csproj" />
     <Project Path="examples/Incremental.Showcase/Incremental.Showcase.csproj" />
     <Project Path="examples/Incremental.TaxiAnalytics/Incremental.TaxiAnalytics.csproj" />
     <Project Path="examples/Incremental.TradeEnrichment/Incremental.TradeEnrichment.csproj" />
   </Folder>
+  <Folder Name="/examples/plugins/">
+    <Project Path="examples/Incremental.EnrichmentService/Contracts/Enrichment.Contracts.csproj" />
+    <Project Path="examples/Incremental.EnrichmentService/Pipelines.Tests/Enrichment.Pipelines.Tests.csproj" />
+    <Project Path="examples/Incremental.EnrichmentService/Pipelines.V2/Enrichment.Pipelines.V2.csproj" />
+    <Project Path="examples/Incremental.EnrichmentService/Pipelines/Enrichment.Pipelines.csproj" />
+  </Folder>
   <Folder Name="/src/">
     <Project Path="src/Incremental.Hosting/Incremental.Hosting.csproj" />
+    <Project Path="src/Incremental.Kafka/Incremental.Kafka.csproj" />
+    <Project Path="src/Incremental.Service.Admin/Incremental.Service.Admin.csproj" />
+    <Project Path="src/Incremental.Service/Incremental.Service.csproj" />
+    <Project Path="src/Incremental.Service.Abstractions/Incremental.Service.Abstractions.csproj" />
+    <Project Path="src/Incremental.Service.S3/Incremental.Service.S3.csproj" />
+    <Project Path="src/Incremental.Service.Testing/Incremental.Service.Testing.csproj" />
     <Project Path="src/Incremental.Storage.Redis/Incremental.Storage.Redis.csproj" />
     <Project Path="src/Incremental/Incremental.csproj" />
   </Folder>
+  <Folder Name="/tests/plugins/">
+    <Project Path="tests/Incremental.Service.TestPlugins/Acme.Contracts/Acme.Contracts.csproj" />
+    <Project Path="tests/Incremental.Service.TestPlugins/Acme.Desks/Acme.Desks.csproj" />
+    <Project Path="tests/Incremental.Service.TestPlugins/Acme.Pipelines.V2/Acme.Pipelines.V2.csproj" />
+    <Project Path="tests/Incremental.Service.TestPlugins/Acme.Pipelines/Acme.Pipelines.csproj" />
+    <Project Path="tests/Incremental.Service.TestPlugins/Acme.RefData/Acme.RefData.csproj" />
+    <Project Path="tests/Incremental.Service.TestPlugins/Acme.Venues/Acme.Venues.csproj" />
+  </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Incremental.ClusterHost/Incremental.ClusterHost.csproj" />
+    <Project Path="tests/Incremental.Kafka.FailoverApp/Incremental.Kafka.FailoverApp.csproj" />
+    <Project Path="tests/Incremental.Kafka.Tests/Incremental.Kafka.Tests.csproj" />
+    <Project Path="tests/Incremental.Service.AdminHost/Incremental.Service.AdminHost.csproj" />
+    <Project Path="tests/Incremental.Service.FailoverApp/Incremental.Service.FailoverApp.csproj" />
+    <Project Path="tests/Incremental.Service.Tests/Incremental.Service.Tests.csproj" />
     <Project Path="tests/Incremental.Tests/Incremental.Tests.csproj" />
   </Folder>
 </Solution>
