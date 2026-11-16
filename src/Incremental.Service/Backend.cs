@@ -56,6 +56,12 @@ public interface IServiceBackend : IAsyncDisposable
 
     /// <summary>Kind, settings and counters, for an operator to read.</summary>
     BackendInfo Describe();
+
+    /// <summary>Whether every node of the deployment is in this one process (the in-memory
+    /// backend). Only there is the <c>memory</c> connector's log something a host's own
+    /// code writes for the pipelines to read; on a deployment of processes a starting spec
+    /// does not bind an input to it (<see cref="IServiceDiscovery.TemplateAsync"/>).</summary>
+    bool InProcess => false;
 }
 
 public sealed record BackendInfo(

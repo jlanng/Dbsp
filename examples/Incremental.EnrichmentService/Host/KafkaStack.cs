@@ -251,6 +251,14 @@ public sealed partial class KafkaStack : IAsyncDisposable
         return rows;
     }
 
+    /// <summary>The topics under the prefix (<c>{prefix}.…</c>), as the broker lists them.</summary>
+    public List<string> TopicsUnderPrefix()
+    {
+        using var admin = new AdminClientBuilder(new AdminClientConfig { BootstrapServers = Bootstrap }).Build();
+        return admin.GetMetadata(TimeSpan.FromSeconds(10)).Topics.Select(t => t.Topic)
+            .Where(t => t.StartsWith(Prefix + ".", StringComparison.Ordinal)).Order(StringComparer.Ordinal).ToList();
+    }
+
     /// <summary>Removes everything <see cref="EnsureAsync"/> made and every topic under the
     /// prefix. Best effort: a smoke run's names are its own.</summary>
     public async Task CleanUpAsync()

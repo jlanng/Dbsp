@@ -61,7 +61,8 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   at `/views` (`-- --nodes 2`: a standby on 5181). `-- --kafka --node a` and
   `-- --kafka --node b` are two processes on the connector stack (reference data in
   Postgres through Debezium, Kafka sinks; everything named after `--prefix`, default
-  `enrich`; `-- --kafka --clean` removes it). `-- --headless [--nodes 2 | --kafka]` is the
+  `enrich`; `-- --kafka --clean` removes it; the Kafka smoke runs under `--prefix` if given,
+  refusing one that already has topics, else under a fresh `smoke…` prefix). `-- --headless [--nodes 2 | --kafka]` is the
   smoke test: it drives the admin API, checks every sink against `Host/Model.cs`, and
   exits 1 on a claim that does not hold — run it after changing the service. CI runs the two
   in-memory ones (job `build-and-test`) and the Kafka one (job `connector-stack`, which starts

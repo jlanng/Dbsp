@@ -124,7 +124,7 @@ jobs:
           # skip without MinIO, so a seventh skip fails here too.
           sed 's/\x1b\[[0-9;]*m//g' service-tests.log | grep -Eq '^\s*skipped: 6\s*$'
       - name: Smoke, enrichment service on Kafka with a killed leader
-        run: dotnet run -c Release --no-build --project examples/Incremental.EnrichmentService -- --headless --kafka
+        run: dotnet run -c Release --no-build --project examples/Incremental.EnrichmentService -- --headless --kafka --prefix ci${{ github.run_id }}
       - name: Measured failover times
         if: always()
         run: |

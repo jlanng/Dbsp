@@ -195,7 +195,11 @@ public sealed class Smoke(ExampleOptions options)
         Console.WriteLine();
         if (options.Kafka)
         {
-            var prefix = "smoke" + Guid.NewGuid().ToString("N")[..10];
+            // The run's names are its own: a fresh prefix, or the one given with --prefix
+            // (K8: it was ignored) if nothing is under it yet. A prefix that holds topics
+            // may be a deployment's, and the smoke removes everything under its prefix at
+            // the end: it is refused before anything is made, and nothing is removed.
+            var prefix = options.PrefixGiven ? options.Prefix : "smoke" + Guid.NewGuid().ToString("N")[..10];
             var ports = FreePorts(4);
             var kafkaOptions = new ExampleOptions
             {
@@ -203,9 +207,24 @@ public sealed class Smoke(ExampleOptions options)
                 PostgresHostForConnect = options.PostgresHostForConnect, Connect = options.Connect,
                 SeedPipelines = false, Generate = false, Verbose = options.Verbose, Quiet = !options.Verbose,
             };
+            if (options.PrefixGiven)
+            {
+                await using var probe = new KafkaStack(kafkaOptions);
+                if (probe.TopicsUnderPrefix() is { Count: > 0 } existing)
+                {
+                    Console.WriteLine($"0. The prefix '{prefix}' given with --prefix already has {existing.Count} topic(s) ({string.Join(", ", existing.Take(3))}…).");
+                    Console.WriteLine($"   The smoke removes everything under its prefix when it ends, so it does not run on one in use: remove them with --kafka --clean --prefix {prefix}, or give another.");
+                    _claims++;
+                    throw new Failed("the prefix is free");
+                }
+            }
             _kafka = new KafkaStack(kafkaOptions);
             Console.WriteLine($"0. The local stack under the prefix '{prefix}': three Postgres tables, a Debezium connector, a trades topic, three sink topics.");
             await _kafka.EnsureAsync(_shape);
+            await Claim($"the run's topics are under the prefix '{prefix}'{(options.PrefixGiven ? ", the one given with --prefix" : "")}: trades and quotes", () =>
+                _kafka.TopicsUnderPrefix() is var topics && topics.Contains(_kafka.TradesTopic) && topics.Contains(_kafka.QuotesTopic)
+                    ? null
+                    : $"under '{prefix}.' the broker lists {string.Join(", ", topics)}");
             _world = new World(_shape, dataDirectory, _kafka, freshData: true);
             _specs = new Specs(_kafka, TimeSpan.Zero, retain: null);
 
@@ -592,6 +611,33 @@ public sealed class Smoke(ExampleOptions options)
         // What a deploy needs to know is asked of the service, not read from this host's source.
         var template = await _admin.GetAsync($"plugins/{Specs.Plugin}/{v2}/definitions/trade-enrichment/template?id=from-template");
         var templated = template["spec"]!;
+        if (_kafka is not null)
+        {
+            // K5: on Kafka the generated trade feed is not this host's to offer — the
+            // generator writes the trades topic — and an in-process memory log is read by
+            // nothing a process writes. The starting spec binds the slot to a topic and
+            // says what to fill in; the feed named by hand is refused at the dry run.
+            var namedFeed = templated.Deserialize<PipelineSpec>(SpecJson)! with
+            {
+                Inputs = new Dictionary<string, JsonElement> { ["trades"] = Specs.Json("""{ "connector": "trade-feed" }""") },
+            };
+            var refusedFeed = await _admin.PutAsync("pipelines/from-template?dryRun=true", namedFeed);
+            var filled = templated.Deserialize<PipelineSpec>(SpecJson)! with
+            {
+                Inputs = new Dictionary<string, JsonElement> { ["trades"] = Specs.Json($$"""{ "connector": "kafka", "connection": "log", "topic": "{{_kafka.TradesTopic}}" }""") },
+                Sinks = new Dictionary<string, JsonElement> { ["enriched"] = Specs.Json($$"""{ "connector": "kafka", "connection": "log", "topic": "{{_kafka.SinkTopic("from-template")}}" }""") },
+            };
+            var filledRun = await _admin.PutAsync("pipelines/from-template?dryRun=true", filled);
+            await Claim("on Kafka the starting spec for trade-enrichment binds 'trades' to a Kafka topic left to fill in — not to the generated feed nor to an in-process memory log, which nothing here writes — and the trade feed named by hand is refused at the dry run; filled in with the trades topic, it passes",
+                () => Unless(
+                    !template["valid"]!.GetValue<bool>()
+                    && templated["inputs"]?["trades"]?["connector"]?.GetValue<string>() == "kafka"
+                    && template["connectorsForSlot"]?["trades"]?.AsArray().All(c => c!.GetValue<string>() != "trade-feed") == true
+                    && refusedFeed.Status == 400 && (refusedFeed.Body?.ToJsonString().Contains("trade-feed") ?? false)
+                    && filledRun.Status == 200,
+                    $"the template was {template.ToJsonString()}; the dry run on the trade feed answered {refusedFeed.Status} {refusedFeed.Body?.ToJsonString()}, filled in {filledRun.Status} {filledRun.Body?.ToJsonString()}"));
+            return;
+        }
         var dryRun = await _admin.PutAsync("pipelines/from-template?dryRun=true", templated.Deserialize<PipelineSpec>(SpecJson)!);
         await Claim("the service offers a starting spec for trade-enrichment — slot 'trades' on trade-feed, slot 'enriched' on a view, settings at their defaults — and its dry run accepts it unchanged",
             () => Unless(

@@ -31,6 +31,11 @@ public sealed class ExampleOptions
 
     /// <summary>The Kafka topic prefix of this deployment, and the prefix of its Postgres tables.</summary>
     public string Prefix { get; init; } = "enrich";
+
+    /// <summary>Whether <c>--prefix</c> was given. The Kafka smoke names its run after a
+    /// fresh prefix of its own unless one was given; then it uses that one, and only if
+    /// nothing is under it yet.</summary>
+    public bool PrefixGiven { get; init; }
     public string Bootstrap { get; init; } = "localhost:9092";
     public string Postgres { get; init; } = "Host=localhost;Port=5432;Username=incremental;Password=incremental;Database=incremental";
 
@@ -76,7 +81,7 @@ public sealed class ExampleOptions
         ("--rate", "N", "Generated trades per second (50)."),
         ("--trade-ids", "N", "Trade ids the generated feed runs over before it repeats one, amending that trade (0: never repeats)."),
         ("--poison", "N", "One trade in N has no quantity, which one definition refuses (200; 0 for none)."),
-        ("--prefix", "name", "With --kafka: the prefix of the topics and Postgres tables (enrich)."),
+        ("--prefix", "name", "With --kafka: the prefix of the topics and Postgres tables (enrich). With --headless --kafka the run's own (a fresh one if not given); refused if topics are under it already."),
         ("--data", "dir", "Where the files live (a temporary directory)."),
         ("--no-generate", null, "Do not generate trades."),
         ("--no-pipelines", null, "Do not deploy the example's pipelines at first lead."),
@@ -159,6 +164,7 @@ public sealed class ExampleOptions
             TradeIds = Number("--trade-ids", "0"),
             Poison = Number("--poison", "200"),
             Prefix = Value("--prefix") ?? defaults.Prefix,
+            PrefixGiven = Value("--prefix") is not null,
             Bootstrap = Value("--bootstrap") ?? defaults.Bootstrap,
             Postgres = Value("--postgres") ?? defaults.Postgres,
             PostgresHostForConnect = Value("--postgres-host-for-connect") ?? defaults.PostgresHostForConnect,

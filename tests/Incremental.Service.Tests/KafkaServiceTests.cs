@@ -43,6 +43,33 @@ public class KafkaServiceTests(ITestOutputHelper output)
         return version;
     }
 
+    /// <summary>
+    /// K5: on a deployment of processes the memory connector's log is written by nothing,
+    /// so a starting spec does not bind an input to it — a pipeline deployed from it ran and
+    /// read nothing. The input is bound to a topic left to fill in, and the template says so.
+    /// The in-memory backend still offers it (SeamTests).
+    /// </summary>
+    [Fact]
+    public async Task On_kafka_a_starting_spec_binds_no_input_to_an_in_process_memory_log()
+    {
+        await using var env = KafkaTestEnv.Create();
+        await using var a = await env.StartNodeAsync("a", lead: true);
+        var template = await a.Node.Discovery.TemplateAsync(BuiltIn, "", "counts", "c", default);
+
+        Assert.Equal("kafka", template.Spec.Inputs["trades"].GetProperty("connector").GetString());
+        Assert.False(template.Valid);
+        Assert.Contains(template.Notes, n => n.Contains("Slot 'trades'") && n.Contains("'kafka'") && n.Contains("left to fill in"));
+        Assert.Contains("memory", template.ConnectorsForSlot["trades"]);        // still a connector a host may write
+        Assert.Equal("memory", template.Spec.Sinks["out"].GetProperty("connector").GetString());   // a sink is read by whoever asks
+
+        // Filled in, it passes.
+        var topic = await env.CreateTopicAsync("trades");
+        await a.Pipelines.ValidateAsync(template.Spec with
+        {
+            Inputs = new Dictionary<string, JsonElement> { ["trades"] = KafkaBinding(topic) },
+        }, default);
+    }
+
     [Fact]
     public async Task A_standby_on_kafka_sees_what_the_leader_deploys_and_carries_it_on_after_a_takeover()
     {

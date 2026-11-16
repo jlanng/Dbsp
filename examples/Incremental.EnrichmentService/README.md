@@ -152,10 +152,17 @@ var service = builder.Services.AddIncrementalService(o =>
     .AddContracts(typeof(Instrument).Assembly)                                      // row types and table definitions
     .AddObjectStore("refdata", _ => new LocalObjectStore(Path.Combine(world.DataDirectory, "refdata")))
     .AddObjectStore("lake", _ => world.Lake)                                        // quote files in, alerts and dead letters out
-    .AddTableSource("instrument-feed", _ => new InstrumentFeedSourceFactory(world.Instruments))
-    .AddTableSource("directory", _ => new DirectorySourceFactory(world.Traders, world.Desks))
-    .AddSourceConnector("trade-feed", _ => new TradeFeedConnector(world.Trades))
     .AddSinkConnector("view", _ => new ViewConnector(world.Views));
+if (world.Kafka is null)
+{
+    // The generated feeds and directories: in memory only. On Kafka the generator
+    // writes the trades topic and Postgres, and a slot bound to these would read
+    // nothing — so they are not offered there, and a spec that names them is refused.
+    service
+        .AddTableSource("instrument-feed", _ => new InstrumentFeedSourceFactory(world.Instruments))
+        .AddTableSource("directory", _ => new DirectorySourceFactory(world.Traders, world.Desks))
+        .AddSourceConnector("trade-feed", _ => new TradeFeedConnector(world.Trades));
+}
 ```
 
 The project file is part of the host too: it imports
@@ -172,7 +179,7 @@ node's memory comes to; the cluster page of the admin UI shows this process's.
 | `--kafka`, `--node a\|b` | the Kafka backend; which node this process is (ports 5180/5190 or 5181/5191) |
 | `--headless` | the smoke test |
 | `--clean` | with `--kafka`: remove the connector and the offsets Kafka Connect keeps for it, the replication slot, the Postgres tables and every topic under the prefix; the prefix can then be used again from scratch |
-| `--prefix name` | Kafka topic prefix and Postgres table prefix (lower-case letters and digits) |
+| `--prefix name` | Kafka topic prefix and Postgres table prefix (lower-case letters and digits). The Kafka smoke (`--headless --kafka`) uses it for its run if given — and refuses a prefix that already has topics, since it removes everything under its prefix when it ends — or a fresh `smoke…` prefix if not |
 | `--port N`, `--probe-port N`, `--peer-probe-port N` | |
 | `--rate N` | trades per second (50) |
 | `--trade-ids N` | trade ids come round after N, a later trade amending the earlier one (0, the default: never; the pipelines' state is bounded by event time, not by the ids) |

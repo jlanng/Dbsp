@@ -130,6 +130,8 @@ public sealed class InMemoryServiceBackend : IServiceBackend, ICatalogMirror
     public IBlobStore Blobs => _blobs;
     public INodeLeadership Leadership => _leadership;
 
+    public bool InProcess => true;
+
     public BackendInfo Describe() => new(
         "in-memory",
         new Dictionary<string, string>

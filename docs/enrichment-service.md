@@ -732,7 +732,7 @@ the definition's `Build`).
 | | |
 |---|---|
 | `GET plugins/{name}/{version}/definitions/{definition}` | its settings (type, default, range, enum values, required, state-neutral), its input and sink slots (kind, record type, key type), and the tables it reads and writes (slot, key and row type, definition). `?settings={…}` describes it under those settings instead of the defaults. |
-| `GET plugins/{name}/{version}/definitions/{definition}/template?id=…` | a spec to start from: real slot names, each bound to a connector this host registered for that kind of slot (the host's own before `memory` and `kafka`), settings at their defaults — with `valid` saying whether the dry run accepts it as it is, and `connectorsForSlot` listing the alternatives |
+| `GET plugins/{name}/{version}/definitions/{definition}/template?id=…` | a spec to start from: real slot names, each bound to a connector this host registered for that kind of slot (the host's own before `memory` and `kafka`; on Kafka an input is never bound to `memory`, whose log only code in the node's own process writes), settings at their defaults — with `valid` saying whether the dry run accepts it as it is, and `connectorsForSlot` listing the alternatives |
 | `GET connectors` | every registered connector: the slot kinds it supports, whether a reset clears what it wrote, and its config's properties if it describes them (`IConfigDescribed`) |
 | `GET connections` | the Kafka connections and object stores by name and kind. Nothing of where they point or how they authenticate. |
 | `GET table-sources` | the loader kinds — `file`, `kafka`, `debezium` and the host's — with their config and the kind of connection each names |
@@ -755,7 +755,9 @@ answers, in the example,
 and `PUT pipelines/exposure-eu` accepts that `spec` unchanged. Where a slot's connector
 needs more than its name (a `kafka` slot needs a connection and a topic, a `files` slot
 a store and a prefix) the template leaves those properties empty, `valid` is false and
-`notes` says what to fill in.
+`notes` says what to fill in. On the example's Kafka mode that is what a template
+gives for `executions`: the generated trade feed exists only in memory, so it is not
+registered there, and a spec that names it is refused at the dry run.
 
 ### 5. A test
 
@@ -1058,10 +1060,17 @@ var service = builder.Services.AddIncrementalService(o =>
     .AddContracts(typeof(Instrument).Assembly)                                      // row types and table definitions
     .AddObjectStore("refdata", _ => new LocalObjectStore(Path.Combine(world.DataDirectory, "refdata")))
     .AddObjectStore("lake", _ => world.Lake)                                        // quote files in, alerts and dead letters out
-    .AddTableSource("instrument-feed", _ => new InstrumentFeedSourceFactory(world.Instruments))
-    .AddTableSource("directory", _ => new DirectorySourceFactory(world.Traders, world.Desks))
-    .AddSourceConnector("trade-feed", _ => new TradeFeedConnector(world.Trades))
     .AddSinkConnector("view", _ => new ViewConnector(world.Views));
+if (world.Kafka is null)
+{
+    // The generated feeds and directories: in memory only. On Kafka the generator
+    // writes the trades topic and Postgres, and a slot bound to these would read
+    // nothing — so they are not offered there, and a spec that names them is refused.
+    service
+        .AddTableSource("instrument-feed", _ => new InstrumentFeedSourceFactory(world.Instruments))
+        .AddTableSource("directory", _ => new DirectorySourceFactory(world.Traders, world.Desks))
+        .AddSourceConnector("trade-feed", _ => new TradeFeedConnector(world.Trades));
+}
 ```
 
 Tables are seeded the same way pipelines are — written to the catalog once, by the

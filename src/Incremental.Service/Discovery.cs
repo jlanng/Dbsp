@@ -446,6 +446,13 @@ internal sealed class ServiceDiscovery(ServiceContext context) : IServiceDiscove
             var able = connectors.Where(c => c.Kinds.Contains(slot.Kind) && Carries(c.Name, slot)).Select(c => c.Name).ToList();
             forSlot[slot.Name] = able;
             var ordered = able.OrderBy(n => n is "memory" ? 1 : n is "kafka" ? 2 : n is "files" ? 3 : 0).ThenBy(n => n, StringComparer.Ordinal).ToList();
+
+            // An input on the memory connector reads a log of this process that only code in
+            // this process appends to. On a deployment of processes (Kafka) nothing does, and
+            // a pipeline deployed from such a template runs and reads nothing (K5): it is not
+            // offered there. It stays among the slot's connectors for a host that writes it.
+            if (!context.Backend.InProcess && slot.Kind is SlotKind.AppendInput or SlotKind.KeyedInput)
+                ordered.Remove("memory");
             foreach (var name in ordered)
             {
                 var config = new JsonObject { ["connector"] = name };
