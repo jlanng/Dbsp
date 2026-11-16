@@ -34,15 +34,38 @@ public sealed record CircuitStateStore(string Name, int NodeId, CircuitStateStor
 /// and for a builder that is asked beforehand (<see cref="CircuitBuilder.CheckState"/>).</summary>
 internal static class StateManifest
 {
-    /// <summary>The format this version writes.</summary>
-    private const string Format = "8";
+    /// <summary>The newest format this version writes: <see cref="Build"/> writes it, and
+    /// <see cref="AtLevel"/> turns the manifest into the one a lower format level asks
+    /// for. Every format from 6 on has a reader here, kept for good.</summary>
+    private const int Format = 8;
 
     /// <summary>The format before an input's partitions had event times of their own; see
-    /// <see cref="Problems"/>.</summary>
-    private const string FormatWithoutPartitionTimes = "7";
+    /// <see cref="Problems"/>. What format level 1 writes.</summary>
+    private const int FormatWithoutPartitionTimes = 7;
 
     /// <summary>The format before event-time state was checkpointed; see <see cref="Problems"/>.</summary>
-    private const string FormatWithoutEventTime = "6";
+    private const int FormatWithoutEventTime = 6;
+
+    /// <summary><paramref name="manifest"/> as a node writes it at format
+    /// <paramref name="level"/>: the same lines under that level's format. Formats 7 and
+    /// 8 differ in the marker's keys only (<see cref="Operators.WatermarkClock.AppendCheckpoint"/>
+    /// writes them or not by the same level), so nothing else of the manifest moves.</summary>
+    public static string AtLevel(string manifest, int level)
+    {
+        var end = manifest.IndexOf('\n');
+        var line = $"format={FormatLevel.ManifestFormat(level)}";
+        return end < 0 || manifest.AsSpan(0, end).SequenceEqual(line) ? manifest : line + manifest[end..];
+    }
+
+    /// <summary>The lowest format level that reads <paramref name="manifest"/>.</summary>
+    public static int LevelOf(string manifest)
+    {
+        var end = manifest.IndexOf('\n');
+        var line = end < 0 ? manifest.AsSpan() : manifest.AsSpan(0, end);
+        return line.StartsWith("format=") && int.TryParse(line["format=".Length..], out var format) && format >= Format
+            ? FormatLevel.PartitionTimes
+            : FormatLevel.Base;
+    }
 
     public static string Build(
         int workers, int processes, int eventTimeSources,
@@ -101,11 +124,14 @@ internal static class StateManifest
     }
 
     /// <summary>What stops a circuit of manifest <paramref name="current"/> resuming the
-    /// checkpoint of manifest <paramref name="committed"/>; empty when nothing does.</summary>
-    public static List<string> Problems(string committed, string current)
+    /// checkpoint of manifest <paramref name="committed"/> on a node that reads format
+    /// level <paramref name="reads"/>; empty when nothing does. The format
+    /// <paramref name="current"/> itself carries is not looked at: what the circuit will
+    /// write is the deployment's level at each commit.</summary>
+    public static List<string> Problems(string committed, string current, int reads = FormatLevel.Current)
     {
         var problems = new List<string>();
-        if (committed == current)
+        if (committed == current && reads >= FormatLevel.Current)
             return problems;
 
         static (Dictionary<string, string> Facts, List<string> Stores, Dictionary<string, string> Tables) Parse(string manifest)
@@ -130,32 +156,34 @@ internal static class StateManifest
         var (committedFacts, committedStores, committedTables) = Parse(committed);
         var (currentFacts, currentStores, currentTables) = Parse(current);
 
-        var committedFormat = committedFacts.GetValueOrDefault("format");
-        var currentFormat = currentFacts.GetValueOrDefault("format");
+        var committedText = committedFacts.GetValueOrDefault("format");
+        var committedFormat = int.TryParse(committedText, System.Globalization.NumberStyles.None, null, out var parsed) ? parsed : -1;
+        var readable = FormatLevel.ManifestFormat(reads);
         var eventTime = currentFacts.ContainsKey("eventtime");
-        if (committedFormat != currentFormat)
+
+        // The readers. A format-8 checkpoint is read by a node of format level 2 and
+        // refused below it: such a node would drop the partitions' times and go on from
+        // the newest of them. Format 7 → 8 added keys to the offsets marker and changed
+        // nothing else: a format-7 checkpoint resumes as it is, and the next commit is of
+        // whatever format the deployment writes by then. Format 6 → 7 changed nothing for
+        // a circuit without event time, whose checkpoint resumes the same way.
+        if (committedFormat > readable)
+            problems.Add(
+                $"the checkpoint was committed with format={committedText} and this node reads up to format={readable} " +
+                $"(format level {reads}): it was built before that format, or is pinned below it, and must be replaced " +
+                "with the build that wrote the checkpoint");
+        else if (committedFormat == FormatWithoutEventTime)
         {
-            // The migrations. Format 7 → 8 added keys to the offsets marker and changed
-            // nothing else: a format-7 checkpoint resumes as it is and is rewritten as
-            // format 8 by the next commit. Format 6 → 7 changed nothing for a circuit
-            // without event time, whose checkpoint resumes the same way.
-            if (committedFormat == FormatWithoutPartitionTimes && currentFormat == Format)
-            {
-                // Nothing stops it.
-            }
-            else if (committedFormat == FormatWithoutEventTime && currentFormat == Format)
-            {
-                if (eventTime)
-                    problems.Add(
-                        "the checkpoint was committed before event-time state was checkpointed (format=6, this version writes " +
-                        $"format={Format}) and this circuit uses event time: the checkpoint holds neither the watermark nor the " +
-                        "deadlines of the windows and keys that were open, so resumed from it late records would reopen closed " +
-                        "windows and the open keys would never be evicted. Start it from an empty state store and replay its inputs");
-            }
-            else
-                problems.Add($"format changed: the checkpoint was committed with format={committedFormat}, " +
-                             $"this circuit has format={currentFormat}");
+            if (eventTime)
+                problems.Add(
+                    "the checkpoint was committed before event-time state was checkpointed (format=6, this version writes " +
+                    $"format={FormatWithoutPartitionTimes} and up) and this circuit uses event time: the checkpoint holds neither the watermark nor the " +
+                    "deadlines of the windows and keys that were open, so resumed from it late records would reopen closed " +
+                    "windows and the open keys would never be evicted. Start it from an empty state store and replay its inputs");
         }
+        else if (committedFormat < FormatWithoutEventTime)
+            problems.Add($"format changed: the checkpoint was committed with format={committedText}, " +
+                         $"this version reads format={FormatWithoutEventTime} to format={Format}");
 
         foreach (var fact in new[] { "workers", "processes" })
             if (committedFacts.GetValueOrDefault(fact) != currentFacts.GetValueOrDefault(fact))
@@ -165,7 +193,7 @@ internal static class StateManifest
         // A circuit that gains its first event-time source starts a clock; one that loses
         // its last has none to restore. Between two counts the committed max event times
         // would be handed to the wrong sources.
-        if ((committedFormat == currentFormat || committedFormat == FormatWithoutPartitionTimes)
+        if (committedFormat is >= FormatWithoutPartitionTimes and <= Format
             && committedFacts.TryGetValue("eventtime", out var committedSources)
             && currentFacts.TryGetValue("eventtime", out var currentSources)
             && committedSources != currentSources)

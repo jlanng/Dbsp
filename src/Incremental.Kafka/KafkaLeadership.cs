@@ -752,6 +752,7 @@ public sealed class KafkaLeadership : IAsyncDisposable
             leaderChanged = record.Term != _leaderTerm || record.Node != _leaderNode || record.Resigned != _leaderResigned;
             _leaderTerm = record.Term;
             _log.NoteTermSeen(record.Term);
+            _log.NoteFormatSeen(record.Format);
             _leaderNode = record.Node;
             _leaderAt = record.At;
             _leaderResigned = record.Resigned;
@@ -858,6 +859,8 @@ public sealed class KafkaLeadership : IAsyncDisposable
         }
     }
 
+    private bool _unreadableSaid;
+
     private async Task<(string Reason, TimeSpan Silence)?> WaitToTakeOverAsync(CancellationToken token)
     {
         var tick = TimeSpan.FromMilliseconds(Math.Clamp(_options.TakeoverAfter.TotalMilliseconds / 20, 10, 100));
@@ -880,7 +883,19 @@ public sealed class KafkaLeadership : IAsyncDisposable
 
             if (manual)
                 return ("manual", silence);
-            if (_options.AutomaticTakeover && Environment.TickCount64 >= Interlocked.Read(ref _notBeforeTicks))
+
+            // A node that does not read what the logs are written at cannot lead them:
+            // it does not try, however long the silence. (Asked to by hand it tries, and
+            // the acquisition refuses before it has fenced anyone.)
+            var unreadable = _log.FormatLevelSeen > _log.Formats.Reads;
+            if (unreadable && !_unreadableSaid)
+            {
+                _unreadableSaid = true;
+                _logger?.LogError(
+                    "Node {Node} cannot lead: the logs are written at format level {Level} and it reads up to level {Reads}. " +
+                    "It will not take over; replace it with the build the leader runs.", NodeId, _log.FormatLevelSeen, _log.Formats.Reads);
+            }
+            if (!unreadable && _options.AutomaticTakeover && Environment.TickCount64 >= Interlocked.Read(ref _notBeforeTicks))
             {
                 // A heartbeat is late. Before the silence is long enough to act on, start
                 // watching for the other sign of life: a leader inside a long transaction.

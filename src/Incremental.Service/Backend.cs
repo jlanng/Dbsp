@@ -40,6 +40,20 @@ public interface IServiceBackend : IAsyncDisposable
 
     INodeLeadership Leadership { get; }
 
+    /// <summary>The persisted formats of this node: the level it reads, and the level the
+    /// deployment's logs are written at while it is the writer. A backend whose nodes are
+    /// always one build has nothing to decide and gives <see cref="PersistedFormat.Latest"/>.</summary>
+    PersistedFormat Formats => PersistedFormat.Latest;
+
+    /// <summary>The level the logs are written at as far as this node has read; 0 when
+    /// nothing has said. Above <see cref="PersistedFormat.Reads"/> on a node that cannot
+    /// read them.</summary>
+    int FormatLevelWritten => 0;
+
+    /// <summary>Raises the level the leader writes, durably and before anything is
+    /// written under it. Called by the leader once the other node reads the level.</summary>
+    Task RaiseFormatAsync(int level, CancellationToken cancellationToken) => Task.CompletedTask;
+
     /// <summary>Kind, settings and counters, for an operator to read.</summary>
     BackendInfo Describe();
 }
@@ -130,9 +144,12 @@ public sealed record KafkaLeadershipDetail(
 /// <see cref="ServiceOptions.AdvertisedAdminUrl"/>: a node that has been fenced no longer
 /// follows the catalog, so the probe is how it learns where the node that replaced it is.</summary>
 /// <remarks><c>Memory</c> is the answering process's memory when it said (null from a
-/// node that predates it).</remarks>
+/// node that predates it). <c>FormatReads</c> is the highest format level the answering
+/// node reads (<see cref="PersistedFormat.Reads"/>); 0 from a node built before levels,
+/// which reads <see cref="FormatLevel.Base"/>.</remarks>
 public sealed record PeerInfo(
-    string NodeId, NodeRole Role, long Term, bool Ready, string? NotReadyReason, string? AdminUrl = null, ProcessMemory? Memory = null);
+    string NodeId, NodeRole Role, long Term, bool Ready, string? NotReadyReason, string? AdminUrl = null, ProcessMemory? Memory = null,
+    int FormatReads = 0);
 
 
 public sealed record LeadershipCallbacks(

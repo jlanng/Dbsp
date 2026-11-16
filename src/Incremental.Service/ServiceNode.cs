@@ -296,7 +296,7 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
             throw new InvalidOperationException("The service node has already been started.");
         var backend = _context.Backend;
         await backend.ConnectAsync(cancellationToken).ConfigureAwait(false);
-        _context.Storage = ChangelogStorage.Follow(backend.State);
+        _context.Storage = ChangelogStorage.Follow(backend.State, new ChangelogStorageOptions { Formats = backend.Formats });
         backend.Leadership.Track(_context.Storage);
         backend.Leadership.Changed += status =>
             _context.Events.Publish("node", status.NodeId, $"{status.Role}, term {status.Term}");
@@ -519,10 +519,11 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         if (status.Role != NodeRole.Standby)
             return new PeerInfo(
                 NodeId, status.Role, status.Term, status.Role == NodeRole.Leader, status.Role == NodeRole.Leader ? null : status.Role.ToString(), admin,
-                ProcessMemory.Read());
+                ProcessMemory.Read(), _context.Backend.Formats.Reads);
         var readiness = Readiness();
         return new PeerInfo(
-            NodeId, status.Role, status.Term, readiness.TakeoverWouldBeWarm, readiness.NotWarmBecause.FirstOrDefault(), admin, ProcessMemory.Read());
+            NodeId, status.Role, status.Term, readiness.TakeoverWouldBeWarm, readiness.NotWarmBecause.FirstOrDefault(), admin, ProcessMemory.Read(),
+            _context.Backend.Formats.Reads);
     }
 
     // ── the loop: reconcile on a standby, trim and mirror on the leader ────────────────
@@ -607,7 +608,10 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
                     _peer = await ProbePeerAsync(stop).ConfigureAwait(false);
                     _peerSampled = true;
                     if (role == NodeRole.Leader && _context.IsLeader)
+                    {
                         await WatchCatalogWriterAsync(stop).ConfigureAwait(false);
+                        await RaiseFormatLevelAsync(stop).ConfigureAwait(false);
+                    }
                 }
 
                 // In every role, and off this loop: a standby that has just read
@@ -640,6 +644,45 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
     /// <summary>What this process last did to give memory back; null before the first
     /// time, and when <see cref="ServiceOptions.ReleaseUnusedMemoryEvery"/> is zero.</summary>
     public MemoryRelease? MemoryRelease => MemoryKeeper.Shared.Last;
+
+    /// <summary>
+    /// The leader's part of a rolling upgrade. It writes the persisted formats at the
+    /// level it found the logs at, and raises that level only when the other node has
+    /// just answered its probe as a standby and said it reads the higher one — to the
+    /// lower of what the two read. A standby that does not say (a build from before
+    /// levels) reads the base level; one that does not answer decides nothing. A node
+    /// that was told of no peer has no standby to wait for and writes its own level.
+    /// Never lowered: once raised, a node that reads less can neither follow nor lead.
+    /// </summary>
+    private async Task RaiseFormatLevelAsync(CancellationToken stop)
+    {
+        var backend = _context.Backend;
+        var formats = backend.Formats;
+        if (_context.Options.HoldFormatLevel || formats.Writes >= formats.Reads)
+            return;
+        int level;
+        string why;
+        if (!backend.Leadership.PeerExpected)
+        {
+            level = formats.Reads;
+            why = "this node was told of no other node";
+        }
+        else if (_peer is { Role: NodeRole.Standby } peer)
+        {
+            level = Math.Min(formats.Reads, Math.Max(FormatLevel.Base, peer.FormatReads));
+            why = $"the standby '{peer.NodeId}' reads level {Math.Max(FormatLevel.Base, peer.FormatReads)}";
+        }
+        else
+            return;
+        var from = formats.Writes;
+        if (level <= from)
+            return;
+        await backend.RaiseFormatAsync(level, stop).ConfigureAwait(false);
+        _logger.LogWarning(
+            "Service node {Node}: persisted formats raised from level {From} to level {Level} ({Why}). A node that reads less can no longer follow or lead",
+            NodeId, from, level, why);
+        _context.Events.Publish("node", NodeId, $"format level raised from {from} to {level}: {why}");
+    }
 
     private async Task<PeerInfo?> ProbePeerAsync(CancellationToken cancellationToken)
     {
@@ -779,6 +822,11 @@ public sealed class ServiceNode : IHostedService, IAsyncDisposable
         var faulted = handles.Count(h => h.FollowFault is not null || h.State is TableState.Faulted or TableState.Failed);
         var opening = handles.Count(h => h.State == TableState.Opening);
         var reasons = new List<string>();
+
+        // First: a node built before the level the logs are written at can read none of
+        // what follows, and no wait will change that.
+        if (_context.Backend.FormatLevelWritten > _context.Backend.Formats.Reads)
+            reasons.Add("format-level");
         if (!catalog.IsOpen)
             reasons.Add("catalog-not-open");
         else if (catalog.Version != _catalogApplied)

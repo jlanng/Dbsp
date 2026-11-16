@@ -19,6 +19,11 @@
     <InternalsVisibleTo Include="Incremental.Kafka" />
     <!-- LogSerializationBenchmarks compares the logs' JSON with the dense exchange codec. -->
     <InternalsVisibleTo Include="Incremental.Benchmarks" />
+    <!-- The proving format level (Storage/PersistedFormat.cs): a level no build writes,
+         which the rolling-upgrade tests run a pair of nodes across. -->
+    <InternalsVisibleTo Include="Incremental.Service" />
+    <InternalsVisibleTo Include="Incremental.Kafka.Tests" />
+    <InternalsVisibleTo Include="Incremental.Service.Tests" />
   </ItemGroup>
 
 </Project>

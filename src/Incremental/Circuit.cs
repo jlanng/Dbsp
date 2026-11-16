@@ -122,7 +122,12 @@ public sealed class Circuit : IAsyncDisposable
     // the checkpoint (renumbered positional state, changed worker count) refuses to run
     // instead of silently reading the wrong operators' state.
     private readonly ICheckpointStorageProvider? _checkpoint;
-    private readonly string _stateManifest = "";
+    private string _stateManifest = "";
+
+    // The formats of the node this circuit's checkpoints belong to, and the level the
+    // staged manifest was written for.
+    private readonly PersistedFormat _formats;
+    private int _manifestLevel = FormatLevel.Current;
     private Dictionary<string, long> _committedOffsets = new();
     private int _stepsSinceCommit;
 
@@ -182,6 +187,7 @@ public sealed class Circuit : IAsyncDisposable
         _loopContinue = loopRegions.Select(_ => new bool[options.Workers]).ToArray();
         _watermarkClock = watermarkClock;
         _checkpoint = options.Storage as ICheckpointStorageProvider;
+        _formats = (options.Storage as IPersistedFormatSource)?.Formats ?? PersistedFormat.Latest;
         if (options.ExchangeTimeout is { } timeout && timeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(options), "CircuitOptions.ExchangeTimeout must be positive, or null to wait forever.");
         Name = options.Name ?? $"circuit-{Interlocked.Increment(ref _autoNames)}";
@@ -333,12 +339,14 @@ public sealed class Circuit : IAsyncDisposable
             var scope = ManifestScope;
             if (_checkpoint.CommittedManifest(scope) is { } committedManifest)
             {
-                ValidateStateManifest(committedManifest, _stateManifest);
+                ValidateStateManifest(committedManifest, _stateManifest, _formats.Reads);
                 resuming = true;
                 _log.LogInformation(
                     "Circuit {Circuit} resuming from a committed checkpoint: state manifest validated, {Offsets} committed input offsets seeded",
                     Name, offsets.Count);
             }
+            _manifestLevel = _formats.Writes;
+            _stateManifest = StateManifest.AtLevel(_stateManifest, _manifestLevel);
             _checkpoint.StageManifest(scope, _stateManifest);
 
             foreach (var (key, offset) in offsets)
@@ -1035,8 +1043,18 @@ public sealed class Circuit : IAsyncDisposable
         foreach (var table in _derivedTables)
             table.AppendWrittenVersion(offsets);
 
+        // The format level is read once: the manifest and the marker's keys of one
+        // checkpoint are of one level. A raise since the last commit restages the manifest.
+        var level = _formats.Writes;
+        if (level != _manifestLevel)
+        {
+            _manifestLevel = level;
+            _stateManifest = StateManifest.AtLevel(_stateManifest, level);
+            _checkpoint!.StageManifest(ManifestScope, _stateManifest);
+        }
+
         // Between steps and after the freeze: the clock as the committed step left it.
-        _watermarkClock?.AppendCheckpoint(offsets);
+        _watermarkClock?.AppendCheckpoint(offsets, partitionTimes: level >= FormatLevel.PartitionTimes);
 
         if (_cluster is { } cluster)
         {
@@ -1089,9 +1107,9 @@ public sealed class Circuit : IAsyncDisposable
             _tables.Select(t => (t.TableName, t.Epoch)).Concat(_derivedTables.Select(t => (t.TableName, t.Epoch))),
             storeNames);
 
-    private static void ValidateStateManifest(string committed, string current)
+    private static void ValidateStateManifest(string committed, string current, int reads)
     {
-        var problems = StateManifest.Problems(committed, current);
+        var problems = StateManifest.Problems(committed, current, reads);
         if (problems.Count > 0)
             throw StateManifest.Mismatch(problems);
     }

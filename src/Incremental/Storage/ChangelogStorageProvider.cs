@@ -63,13 +63,16 @@ public sealed record StateSizeEstimate(
 /// record. A serializer must give back the same bytes for a key it has just deserialized.
 /// </para>
 /// </summary>
-public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
+public sealed class ChangelogStorageProvider : ICheckpointStorageProvider, IPersistedFormatSource
 {
     internal const byte FormatSerializer = 1;
     internal const byte FormatTagged = 2;
     private static ReadOnlySpan<byte> CommitKey => "$commit"u8;
 
     private readonly ChangelogStorage _storage;
+
+    /// <summary>The formats of the node this provider's storage belongs to.</summary>
+    public PersistedFormat Formats => _storage.Formats;
     private readonly int _partition;
     // Replaced only by UseSerializer, under the lock, while no typed store exists.
     private Utf8StateSerializer _serializer;
@@ -314,7 +317,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             {
                 layout = _layout;
                 incarnation = Math.Max(_incarnation, 1);
-                _encoder.Begin(transaction, _partition, incarnation);
+                _encoder.Begin(transaction, _partition, incarnation, Formats.WritesEnvelope);
                 _encoder.Commit(_commitSequence, writer.Term, _committedOffsets, _committedManifests, staged: null, announcement: true);
             }
             try
@@ -604,7 +607,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             {
                 incarnation = Math.Max(_incarnation, 1);
                 sequence = _commitSequence + 1;
-                _encoder.Begin(transaction, _partition, incarnation);
+                _encoder.Begin(transaction, _partition, incarnation, Formats.WritesEnvelope);
                 foreach (var store in _stores.Values)
                 {
                     if (!store.HasChanges)
@@ -689,7 +692,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
                     return;
                 next = _incarnation + 1;
 
-                _encoder.Begin(transaction, _partition, _incarnation);
+                _encoder.Begin(transaction, _partition, _incarnation, Formats.WritesEnvelope);
                 foreach (var store in _stores.Values)
                 {
                     // Undone first, so the tombstones cover exactly what the log holds.
@@ -705,7 +708,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
                 }
                 _encoder.CommitTombstone();
 
-                _encoder.Begin(transaction, _partition, next);
+                _encoder.Begin(transaction, _partition, next, Formats.WritesEnvelope);
                 _encoder.Commit(0, writer.Term, offsets: null, committed: null, staged: null);
             }
 
@@ -759,6 +762,10 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
     /// log order, only while no circuit on this provider has started.</summary>
     internal void ApplyReplicated(long incarnation, ReadOnlySpan<byte> rest, in ChangelogRecord record)
     {
+        // Before anything is applied: a value of a format level this node does not read
+        // stops the follower, as an unknown format byte stops a build from before it.
+        if (!record.IsTombstone)
+            Formats.RequireReadable(record.Value.Span);
         lock (_lock)
         {
             // An older incarnation's records are whatever compaction has not yet removed.
@@ -842,12 +849,18 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         if (record.IsTombstone)
             return;
 
-        _committedManifests.Clear();
         var offsets = new Dictionary<string, long>();
 
         var reader = new Utf8JsonReader(Payload(record.Value.Span));
         using var document = JsonDocument.ParseValue(ref reader);
         var commit = document.RootElement;
+
+        // Before anything of the commit is taken: a checkpoint of a format level this
+        // node does not read stops the follower here, not at a takeover it has already
+        // fenced the leader for.
+        foreach (var manifest in commit.GetProperty("manifests").EnumerateObject())
+            Formats.NoteSeen(StateManifest.LevelOf(manifest.Value.GetString()!));
+        _committedManifests.Clear();
         foreach (var offset in commit.GetProperty("offsets").EnumerateObject())
             offsets[offset.Name] = offset.Value.GetInt64();
         foreach (var manifest in commit.GetProperty("manifests").EnumerateObject())
@@ -874,6 +887,9 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
     /// <summary>A record value without its format byte and, in format 2, its layout tag.</summary>
     internal static ReadOnlySpan<byte> Payload(ReadOnlySpan<byte> value)
     {
+        // The proving level's envelope: the value of the level below, one byte in.
+        // Whether this node reads it was decided when the record arrived (ApplyReplicated).
+        value = PersistedFormat.Unwrapped(value);
         if (value.Length > 0 && value[0] == FormatSerializer)
             return value[1..];
         if (value.Length >= 2 && value[0] == FormatTagged && value.Length >= 2 + value[1])
@@ -888,7 +904,7 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
 
     /// <summary>The layout tag of a record value; empty for an untagged one.</summary>
     internal static ReadOnlySpan<byte> LayoutTag(ReadOnlySpan<byte> value) =>
-        value.Length >= 2 && value[0] == FormatTagged && value.Length >= 2 + value[1] ? value.Slice(2, value[1]) : default;
+        (value = PersistedFormat.Unwrapped(value)).Length >= 2 && value[0] == FormatTagged && value.Length >= 2 + value[1] ? value.Slice(2, value[1]) : default;
 
     // ── test and diagnostics hooks ─────────────────────────────────────────────────────
 
@@ -1110,6 +1126,10 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         /// <summary>The layout every value is written under; empty for none.</summary>
         public byte[] Tag { get; set; } = [];
 
+        /// <summary>Whether values are written in the proving level's envelope
+        /// (<see cref="FormatLevel.Proving"/>). Set per transaction, in <see cref="Begin"/>.</summary>
+        public bool Envelope { get; private set; }
+
         /// <summary>Entry records appended since the encoder was made, tombstones aside,
         /// and their bytes: the entry part of the key and the value.</summary>
         public long Records { get; private set; }
@@ -1127,6 +1147,8 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
         private void Header()
         {
             _value.Length = 0;
+            if (Envelope)
+                _value.Append(FormatLevel.EnvelopeByte);
             if (Tag.Length == 0)
             {
                 _value.Append(FormatSerializer);
@@ -1137,8 +1159,9 @@ public sealed class ChangelogStorageProvider : ICheckpointStorageProvider
             _value.Append(Tag);
         }
 
-        public void Begin(IStateChangelogTransaction transaction, int partition, long incarnation)
+        public void Begin(IStateChangelogTransaction transaction, int partition, long incarnation, bool envelope = false)
         {
+            Envelope = envelope;
             _transaction = transaction;
             _partition = partition;
             _key.Length = 0;

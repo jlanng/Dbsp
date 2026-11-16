@@ -298,6 +298,7 @@
     'catalog-behind': 'This node has not applied the latest catalog version',
     'table-opening': 'A table is still being opened',
     'state-behind': "This node's copy of pipeline state is behind the log",
+    'format-level': "The logs are written at a format level this node's build does not read; replace it with the build the leader runs",
     'plugin-pending': 'Plugin files are still being fetched',
     fenced: 'Another node took the writer; this process cannot lead again',
     resigned: 'This node stepped down; this process cannot lead again',

@@ -14,6 +14,12 @@ public sealed class ChangelogStorageOptions
     /// carries a format byte in front of the serializer's output.
     /// </summary>
     public IStateSerializer Serializer { get; init; } = JsonStateSerializer.Instance;
+
+    /// <summary>The persisted formats of the node this storage belongs to: what it reads
+    /// of the changelog and what it writes to it. The same instance as the changelog's
+    /// own, where the changelog has one (a <c>KafkaLog</c>'s). The default reads and
+    /// writes this build's level.</summary>
+    public PersistedFormat Formats { get; init; } = PersistedFormat.Latest;
 }
 
 /// <summary>
@@ -96,6 +102,9 @@ public sealed class ChangelogStorage : IAsyncDisposable
             throw;
         }
     }
+
+    /// <inheritdoc cref="ChangelogStorageOptions.Formats"/>
+    public PersistedFormat Formats => _options.Formats;
 
     /// <summary>Whether this storage holds the changelog's writer and has not lost it.</summary>
     public bool IsLeader => _writer is not null && _fenced is null;
@@ -199,6 +208,9 @@ public sealed class ChangelogStorage : IAsyncDisposable
                 if (_followFault is { } fault)
                     throw FollowerFailed(fault);
             }
+            // A writer never writes below a level it has read in the log: whoever wrote
+            // it had made sure every node reads it, and levels are not taken back.
+            _options.Formats.Raise(Math.Max(FormatLevel.Base, _options.Formats.Seen));
             _writer = writer;
             writer = null;
         }

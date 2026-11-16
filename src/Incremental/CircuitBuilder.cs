@@ -563,7 +563,8 @@ public sealed class CircuitBuilder
     {
         ArgumentNullException.ThrowIfNull(committed);
         var scope = Options.Cluster is { } cluster ? $"p{cluster.ProcessIndex}" : "local";
-        return committed.CommittedManifest(scope) is { } manifest ? StateManifest.Problems(manifest, DescribeStateManifest()) : [];
+        var reads = (committed as IPersistedFormatSource)?.Formats.Reads ?? FormatLevel.Current;
+        return committed.CommittedManifest(scope) is { } manifest ? StateManifest.Problems(manifest, DescribeStateManifest(), reads) : [];
     }
 
     public Circuit Build()

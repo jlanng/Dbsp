@@ -98,6 +98,16 @@ public sealed class ServiceOptions
     public TimeSpan AbandonTimeout { get; set; } = TimeSpan.FromSeconds(5);
     public TimeSpan StepDownTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// True: a leader never raises the level the persisted formats are written at
+    /// (<see cref="Incremental.Storage.PersistedFormat"/>), whatever its standby reads.
+    /// For the length of an upgrade that may have to be taken back: a level that has been
+    /// written is not lowered, and a build from before it can then neither follow nor
+    /// lead. False, the default: the leader raises the level when its standby says it
+    /// reads it — or at once on a node told of no peer.
+    /// </summary>
+    public bool HoldFormatLevel { get; set; }
+
     /// <summary>What a connector's own call is given — a source's <c>StartAsync</c>, a
     /// sink connector's <c>ResetAsync</c> — before the pipeline is treated as faulted and
     /// tried again. These run inside a takeover, which waits for every pipeline's start, so

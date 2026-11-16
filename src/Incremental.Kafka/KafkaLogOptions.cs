@@ -89,6 +89,19 @@ public sealed class KafkaLogOptions
     /// </summary>
     public TimeSpan TransactionTimeout { get; init; } = TimeSpan.FromMinutes(5);
 
+    /// <summary>
+    /// The persisted formats of the node this log belongs to
+    /// (<see cref="PersistedFormat"/>): what it reads, and what it writes now. The writer
+    /// announces the level it writes in every record of the leader topic, a new writer
+    /// goes on at the level the last one announced, and <see cref="KafkaLog.RaiseFormatAsync"/>
+    /// raises it. Give the same instance to the <see cref="ChangelogStorage"/> over this
+    /// log (<see cref="ChangelogStorageOptions.Formats"/>). The default reads and writes
+    /// this build's level from the start, which suits a deployment whose processes are
+    /// all replaced together; a node of the enrichment service passes one that is raised
+    /// only once both nodes read the level.
+    /// </summary>
+    public PersistedFormat Formats { get; set; } = PersistedFormat.Latest;
+
     /// <summary>How long the log writer waits for more commits before it begins a
     /// transaction for the ones it has. Zero (the default) adds no latency: commits that
     /// arrive while a transaction is in flight ride in the next one, which is where the

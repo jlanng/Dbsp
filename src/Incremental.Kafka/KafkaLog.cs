@@ -77,6 +77,68 @@ public sealed class KafkaLog : IAsyncDisposable
         while ((seen = Interlocked.Read(ref _termSeen)) < term)
             Interlocked.CompareExchange(ref _termSeen, term, seen);
     }
+
+    // The highest format level a writer has announced in the leader topic, as far as this
+    // process has read it; 0 before any.
+    private int _formatSeen;
+
+    /// <summary>Tells the log of a format level a writer announced in the leader topic.</summary>
+    internal void NoteFormatSeen(int level)
+    {
+        int seen;
+        while ((seen = Volatile.Read(ref _formatSeen)) < level)
+            Interlocked.CompareExchange(ref _formatSeen, level, seen);
+    }
+
+    /// <summary>The persisted formats of this log's node (<see cref="KafkaLogOptions.Formats"/>).</summary>
+    public PersistedFormat Formats => _options.Formats;
+
+    /// <summary>The highest format level this process has read from the leader topic: what
+    /// the logs are written at. 0 when no writer has announced one — every writer so far
+    /// was built before levels and writes <see cref="FormatLevel.Base"/>.</summary>
+    public int FormatLevelSeen => Volatile.Read(ref _formatSeen);
+
+    // What this writer announces: Formats.Writes, or the level a raise is making durable.
+    private int _formatAnnounced;
+    private readonly SemaphoreSlim _raising = new(1, 1);
+
+    /// <summary>
+    /// Raises the level this writer writes (<see cref="PersistedFormat.Writes"/>) to
+    /// <paramref name="level"/>: commits a heartbeat that announces it, and only then
+    /// lets anything be written under it. So every reader of the logs is told of a level
+    /// before it meets a record of it, and a writer that is fenced before the
+    /// announcement is committed has written nothing of the level. Writer only; a level
+    /// at or below the current one does nothing. Never lowered.
+    /// </summary>
+    /// <exception cref="FormatLevelException">This node does not read the level.</exception>
+    public async Task RaiseFormatAsync(int level, CancellationToken cancellationToken = default)
+    {
+        Formats.RequireReads(level);
+        if (!IsWriter)
+            throw new InvalidOperationException("This Kafka log is not the writer, so it cannot raise the format level.");
+        await _raising.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (level <= Formats.Writes)
+                return;
+            Volatile.Write(ref _formatAnnounced, level);
+            var commit = new LogCommit();
+            commit.Add(_leaderPartition, HeartbeatKey, HeartbeatValue(resigned: false));
+            await EnqueueAsync(commit).ConfigureAwait(false);
+            NoteFormatSeen(level);
+            Formats.Raise(level);
+            _options.Logger?.LogInformation(
+                "Kafka log {Prefix}: format level raised to {Level}; everything written from here is of that level.",
+                _options.TopicPrefix, level);
+        }
+        finally
+        {
+            _raising.Release();
+        }
+    }
+
+    private int FormatAnnounced => Math.Max(Volatile.Read(ref _formatAnnounced), Formats.Writes);
+
     private long _heartbeatSequence;
     private long _idleHeartbeats;
     private long _inTransactionHeartbeats;
@@ -471,6 +533,10 @@ public sealed class KafkaLog : IAsyncDisposable
     private async Task AcquireCoreAsync(Action begun, CancellationToken cancellationToken, CancellationToken whileFree)
     {
         var clock = System.Diagnostics.Stopwatch.StartNew();
+
+        // Before anything that fences: a node that cannot read what the logs are written
+        // at must not take them from one that can.
+        Formats.RequireReads(FormatLevelSeen);
         if (!_initialised)
         {
             begun();
@@ -565,6 +631,17 @@ public sealed class KafkaLog : IAsyncDisposable
         }
         var term = last + 1;
         var termRead = clock.Elapsed;
+
+        // The level the last writer wrote at is this one's to go on from: it is never
+        // lowered, and it is raised only by RaiseFormatAsync. A writer that announced none
+        // was built before levels and wrote the base level. Read with the term, so a
+        // writer that was not heard by this process is not missed; a level this node does
+        // not read ends the acquisition — after the fence, which is why it is checked
+        // before it too, from what was heard.
+        // What this node has itself read of a level in the logs counts too: a writer from
+        // before levels that led for a moment in between announced none.
+        Formats.Raise(Math.Max(FormatLevel.Base, Math.Max(FormatLevelSeen, Formats.Seen)));
+        Volatile.Write(ref _formatAnnounced, Formats.Writes);
         WhileAcquiring?.Invoke("term-read");
         cancellationToken.ThrowIfCancellationRequested();
         ThrowIfFenced();
@@ -574,7 +651,7 @@ public sealed class KafkaLog : IAsyncDisposable
         // to stop and nothing queued.
         var commit = new LogCommit();
         commit.Add(_leaderPartition, TermKey,
-            JsonSerializer.SerializeToUtf8Bytes(new LeaderRecord(term, NodeId, DateTimeOffset.UtcNow)).Prefixed(JsonFormat));
+            JsonSerializer.SerializeToUtf8Bytes(new LeaderRecord(term, NodeId, DateTimeOffset.UtcNow, Format: FormatAnnounced)).Prefixed(JsonFormat));
         Execute([commit]);
         await commit.Completion.Task.ConfigureAwait(false);
         lock (_gate)
@@ -597,8 +674,11 @@ public sealed class KafkaLog : IAsyncDisposable
     /// each new writer, in its first transaction. Under the key <c>heartbeat</c>: rewritten
     /// in every transaction, and once per heartbeat interval by an idle writer. Terms never
     /// fall along the topic, so the last record carries the current one.
-    /// <c>Resigned</c>: the writer stepped down after this record and will write no more.</summary>
-    internal sealed record LeaderRecord(long Term, string? Node, DateTimeOffset At, long Sequence = 0, bool Resigned = false);
+    /// <c>Resigned</c>: the writer stepped down after this record and will write no more.
+    /// <c>Format</c>: the format level the writer writes (<see cref="PersistedFormat"/>);
+    /// 0 from a writer built before levels, which writes <see cref="FormatLevel.Base"/>.
+    /// A build from before levels ignores the member.</summary>
+    internal sealed record LeaderRecord(long Term, string? Node, DateTimeOffset At, long Sequence = 0, bool Resigned = false, int Format = 0);
 
     /// <summary>Parses a leader-topic record; null for one this version does not know.</summary>
     internal static (LeaderRecord Record, bool IsHeartbeat)? ParseLeaderRecord(ConsumeResult<byte[], byte[]> record)
@@ -630,7 +710,10 @@ public sealed class KafkaLog : IAsyncDisposable
                 ReadTo(consumer, end, record =>
                 {
                     if (ParseLeaderRecord(record) is { } parsed)
+                    {
                         term = Math.Max(term, parsed.Record.Term);
+                        NoteFormatSeen(parsed.Record.Format);
+                    }
                 }, cancellationToken);
                 if (term > 0 || from == start)
                     return term;
@@ -663,7 +746,7 @@ public sealed class KafkaLog : IAsyncDisposable
     internal void Depose(string reason) => MarkFenced(new KafkaLogFencedException(reason), reason);
 
     private byte[] HeartbeatValue(bool resigned) => JsonSerializer.SerializeToUtf8Bytes(
-        new LeaderRecord(Term, NodeId, DateTimeOffset.UtcNow, Interlocked.Increment(ref _heartbeatSequence), resigned)).Prefixed(JsonFormat);
+        new LeaderRecord(Term, NodeId, DateTimeOffset.UtcNow, Interlocked.Increment(ref _heartbeatSequence), resigned, FormatAnnounced)).Prefixed(JsonFormat);
 
     // ── the writer thread: group commit ────────────────────────────────────────────────
 

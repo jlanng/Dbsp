@@ -104,21 +104,37 @@ internal sealed class WatermarkClock(int workers)
     /// left out; a partition named and not yet heard from is written, as
     /// <see cref="long.MinValue"/>, because that it was named is state.
     /// Called by the coordinator between steps, after <see cref="Freeze"/>.</summary>
-    public void AppendCheckpoint(Dictionary<string, long> offsets)
+    public void AppendCheckpoint(Dictionary<string, long> offsets, bool partitionTimes = true)
     {
         if (_frozenTicks != long.MinValue)
             offsets[OffsetKeys.Watermark] = _frozenTicks;
         for (var t = 0; t < _trackers.Count; t++)
         {
             var maxSeen = MaxAcrossWorkers(_trackers[t]);
+            if (_trackers[t].Partitions is { } partitions)
+            {
+                if (partitionTimes)
+                {
+                    foreach (var (partition, time) in partitions)
+                    {
+                        offsets[OffsetKeys.WatermarkPartition(t, partition, idleFlag: false)] = time.MaxSeenTicks;
+                        offsets[OffsetKeys.WatermarkPartition(t, partition, idleFlag: true)] = time.Idle ? 1 : 0;
+                    }
+                }
+                else
+                {
+                    // Below format level 2 the checkpoint has one time per source, and a
+                    // build of that level takes it for the newest event time the source
+                    // has read from any partition: that is what it is given. Such a build
+                    // resumes as it always did; this one, resuming the same checkpoint,
+                    // holds the watermark where it was committed until its source has
+                    // named the partitions again and each has brought a record or is idle.
+                    foreach (var (_, time) in partitions)
+                        maxSeen = Math.Max(maxSeen, time.MaxSeenTicks);
+                }
+            }
             if (maxSeen != long.MinValue)
                 offsets[_sourceKeys[t]] = maxSeen;
-            if (_trackers[t].Partitions is { } partitions)
-                foreach (var (partition, time) in partitions)
-                {
-                    offsets[OffsetKeys.WatermarkPartition(t, partition, idleFlag: false)] = time.MaxSeenTicks;
-                    offsets[OffsetKeys.WatermarkPartition(t, partition, idleFlag: true)] = time.Idle ? 1 : 0;
-                }
         }
     }
 

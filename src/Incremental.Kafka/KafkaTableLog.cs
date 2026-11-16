@@ -198,22 +198,31 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
     private void AddHeads(LogCommit commit, Head head)
     {
         var value = JsonSerializer.SerializeToUtf8Bytes(head, HeadJson).Prefixed(KafkaLog.JsonFormat);
+        if (_log.Formats.WritesEnvelope)
+            value = value.Prefixed(FormatLevel.EnvelopeByte);
         foreach (var partition in _rows)
             commit.Add(partition, HeadKey, value);
     }
 
-    private static Head ParseHead(byte[] value)
+    private Head ParseHead(byte[] value)
     {
-        CheckFormat(value);
-        return JsonSerializer.Deserialize<Head>(value.AsSpan(1), HeadJson)
+        var json = Readable(value);
+        return JsonSerializer.Deserialize<Head>(json, HeadJson)
             ?? throw new InvalidDataException("A table head record is empty.");
     }
 
-    private static void CheckFormat(ReadOnlySpan<byte> value)
+    /// <summary>A record's JSON, behind its format byte. The readers, by byte: 1 is
+    /// JSON; the proving level's envelope (<see cref="FormatLevel.Proving"/>) is a
+    /// format-1 record one byte in, which a node below that level refuses as it refuses
+    /// any byte it does not know.</summary>
+    private ReadOnlySpan<byte> Readable(ReadOnlySpan<byte> value)
     {
+        _log.Formats.RequireReadable(value);
+        value = PersistedFormat.Unwrapped(value);
         if (value.Length == 0 || value[0] != KafkaLog.JsonFormat)
             throw new InvalidDataException(
                 $"A table log record has format byte {(value.Length == 0 ? "(none)" : value[0].ToString())}; this version reads format {KafkaLog.JsonFormat}.");
+        return value[1..];
     }
 
     /// <summary>The last committed head, or null for a table nobody has created yet. Every
@@ -558,8 +567,7 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
 
     private TRow ParseRow(byte[] value)
     {
-        CheckFormat(value);
-        var reader = new Utf8JsonReader(value.AsSpan(1));
+        var reader = new Utf8JsonReader(Readable(value));
         reader.Read();
         while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
         {
@@ -663,8 +671,7 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
 
     private Chunk ParseChunk(byte[] value, List<TableChange<TKey, TRow>> into)
     {
-        CheckFormat(value);
-        var reader = new Utf8JsonReader(value.AsSpan(1));
+        var reader = new Utf8JsonReader(Readable(value));
         string epoch = "";
         long version = -1;
         var index = -1;

@@ -47,6 +47,20 @@ public sealed class KafkaServiceBackendOptions
     /// <summary>Versions of history a table's log keeps whatever the retention floor says.
     /// History is disk here, so the default is large.</summary>
     public int RetainedHistoryVersions { get; init; } = 100_000;
+
+    /// <summary>
+    /// The highest persisted-format level this node reads (<see cref="FormatLevel"/>);
+    /// null, the default, is this build's. A lower one makes the node behave as a build
+    /// of that level in everything it reads and writes — it refuses what such a build
+    /// refuses — which is how an upgrade is rehearsed without the older build. The node's
+    /// <see cref="PersistedFormat"/> is made from it and replaces
+    /// <see cref="KafkaLogOptions.Formats"/> of <see cref="Log"/>.
+    /// </summary>
+    public int? ReadsFormatLevel { get; init; }
+
+    /// <summary>A node of the proving level, or one below it, for the tests of a change
+    /// of a format byte.</summary>
+    internal PersistedFormat? FormatsForTesting { get; init; }
 }
 
 /// <summary>
@@ -78,6 +92,11 @@ public sealed class KafkaServiceBackend : IServiceBackend
         // The log speaks too — an aborted transaction, a commit that is not coming back —
         // and a host that gave it no logger of its own would never hear it.
         options.Log.Logger ??= loggerFactory?.CreateLogger("Incremental.Kafka");
+
+        // A node of the service writes what its standby reads: its formats start at the
+        // base level and follow the deployment's, not the build's.
+        Formats = options.FormatsForTesting ?? new PersistedFormat(options.ReadsFormatLevel);
+        options.Log.Formats = Formats;
         _leadership = new NodeLeadership(this);
         _blobs = new KafkaBlobStore(options.Log, NodeId, _logger);
     }
@@ -94,6 +113,9 @@ public sealed class KafkaServiceBackend : IServiceBackend
     public KafkaLeadership? KafkaLeadership => _leadership.Inner;
 
     public IStateChangelog State => Log.State;
+    public PersistedFormat Formats { get; }
+    public int FormatLevelWritten => _log is { } log ? Math.Max(log.FormatLevelSeen, log.IsWriter ? Formats.Writes : Formats.Seen) : 0;
+    public Task RaiseFormatAsync(int level, CancellationToken cancellationToken) => Log.RaiseFormatAsync(level, cancellationToken);
     public int RetainedHistoryVersions => _options.RetainedHistoryVersions;
     public IBlobStore Blobs => _blobs;
     public INodeLeadership Leadership => _leadership;
@@ -127,8 +149,9 @@ public sealed class KafkaServiceBackend : IServiceBackend
             ["retainedHistoryVersions"] = RetainedHistoryVersions.ToString(CultureInfo.InvariantCulture),
             ["probeListen"] = _options.ProbeListen?.ToString() ?? "",
             ["peerProbe"] = _options.PeerProbe is { } peer ? $"{peer.Host}:{peer.Port}" : "",
+            ["formatLevelReads"] = Formats.Reads.ToString(CultureInfo.InvariantCulture),
         };
-        var counters = new Dictionary<string, long>();
+        var counters = new Dictionary<string, long> { ["formatLevelWritten"] = FormatLevelWritten };
         if (_log is { } connected)
         {
             counters["transactionsCommitted"] = connected.TransactionsCommitted;
@@ -689,7 +712,8 @@ internal static class PeerDetail
     public static string Write(PeerInfo self) =>
         (self.Ready ? "ready" : "notready:" + Uri.EscapeDataString(self.NotReadyReason ?? ""))
         + (self.AdminUrl is { Length: > 0 } url ? ";admin=" + Uri.EscapeDataString(url) : "")
-        + (self.Memory is { } memory ? ";mem=" + memory.Encode() : "");
+        + (self.Memory is { } memory ? ";mem=" + memory.Encode() : "")
+        + (self.FormatReads > 0 ? ";fmt=" + self.FormatReads.ToString(CultureInfo.InvariantCulture) : "");
 
     public static PeerInfo Read(string nodeId, NodeRole role, long term, string? detail)
     {
@@ -702,8 +726,10 @@ internal static class PeerDetail
                 : "the node gave no readiness";
         var admin = parts.Skip(1).FirstOrDefault(p => p.StartsWith("admin=", StringComparison.Ordinal));
         var memory = parts.Skip(1).FirstOrDefault(p => p.StartsWith("mem=", StringComparison.Ordinal));
+        var format = parts.Skip(1).FirstOrDefault(p => p.StartsWith("fmt=", StringComparison.Ordinal));
         return new PeerInfo(
             nodeId, role, term, ready, reason, admin is null ? null : Uri.UnescapeDataString(admin["admin=".Length..]),
-            memory is null ? null : ProcessMemory.Decode(memory["mem=".Length..]));
+            memory is null ? null : ProcessMemory.Decode(memory["mem=".Length..]),
+            format is not null && int.TryParse(format["fmt=".Length..], NumberStyles.None, CultureInfo.InvariantCulture, out var reads) ? reads : 0);
     }
 }
