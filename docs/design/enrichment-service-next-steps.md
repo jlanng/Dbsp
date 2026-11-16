@@ -1,5 +1,10 @@
 # Enrichment service: next steps (round five, the last)
 
+> **Carried out.** Round five was built, reviewed and checked on 2026-11-16 (head
+> `bbc0f08` at the last critic's check). What was done, what was not, what remains and
+> how to merge: [enrichment-service-round5-report.md](enrichment-service-round5-report.md).
+> The plan below is kept as it was written.
+
 Saved on 2026-11-15 at commit `0a08a27` of branch `enrichment-service`, to be worked on
 later. It is the plan for one more round of work and then a stop. The design is
 [enrichment-service.md](enrichment-service.md); the numbers in brackets are items of its
