@@ -62,6 +62,7 @@ jobs:
           dotnet pack src/Incremental.Service.Abstractions -c Release --no-build -o artifacts/packages
           dotnet pack src/Incremental.Service -c Release --no-build -o artifacts/packages
           dotnet pack src/Incremental.Service.Testing -c Release --no-build -o artifacts/packages
+          dotnet pack src/Incremental.Service.S3 -c Release --no-build -o artifacts/packages
           dotnet pack src/Incremental.Service.Admin -c Release --no-build -o artifacts/packages
       - name: Upload packages
         uses: actions/upload-artifact@v7
@@ -69,9 +70,10 @@ jobs:
           name: packages
           path: artifacts/packages/*.nupkg
 
-  # Everything that needs Kafka, Postgres and Kafka Connect: the Kafka library's
+  # Everything that needs Kafka, Postgres, Kafka Connect and MinIO: the Kafka library's
   # integration tests, the service's Kafka-backed classes (KafkaService*Tests, which the
-  # job above skips) and the example's Kafka smoke, which kills a node and takes over.
+  # job above skips), the files connector's tests on the S3 store (S3FileConnectorTests,
+  # skipped above too) and the example's Kafka smoke, which kills a node and takes over.
   # The stack is the repository's own compose file rather than `services:` containers,
   # for two reasons: Postgres has to be started with `-c wal_level=logical`, which a
   # service container cannot be given, and this way CI runs what a developer runs.
@@ -89,7 +91,7 @@ jobs:
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
-      - name: Start Kafka, Postgres and Kafka Connect
+      - name: Start Kafka, Postgres, Kafka Connect and MinIO
         run: docker compose --profile connectors up -d --wait --wait-timeout 240
       - name: Build
         run: dotnet build -c Release
@@ -118,7 +120,8 @@ jobs:
           set -o pipefail
           dotnet test --project tests/Incremental.Service.Tests -c Release --no-build | tee service-tests.log
           # Six, exactly: the tests that stop, kill and freeze brokers, which need three of
-          # them (the kafka3 compose profile, not started here).
+          # them (the kafka3 compose profile, not started here). The S3 store's tests
+          # skip without MinIO, so a seventh skip fails here too.
           sed 's/\x1b\[[0-9;]*m//g' service-tests.log | grep -Eq '^\s*skipped: 6\s*$'
       - name: Smoke, enrichment service on Kafka with a killed leader
         run: dotnet run -c Release --no-build --project examples/Incremental.EnrichmentService -- --headless --kafka
