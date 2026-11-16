@@ -74,8 +74,10 @@ internal sealed class KafkaTestEnv : IAsyncDisposable
     };
 
     public KafkaServiceBackendOptions Backend(
-        string nodeId, bool automaticTakeover = false, int probePort = 0, int peerPort = 0, int retainedHistoryVersions = 100_000) => new()
+        string nodeId, bool automaticTakeover = false, int probePort = 0, int peerPort = 0, int retainedHistoryVersions = 100_000,
+        Incremental.Storage.PersistedFormat? formats = null) => new()
     {
+        FormatsForTesting = formats,
         RetainedHistoryVersions = retainedHistoryVersions,
         Log = Log(nodeId),
         TakeoverAfter = TimeSpan.FromMilliseconds(1500),
@@ -89,11 +91,11 @@ internal sealed class KafkaTestEnv : IAsyncDisposable
     public async Task<TestService> StartNodeAsync(
         string nodeId, MemoryConnector? memory = null, bool lead = false, bool automaticTakeover = false,
         int probePort = 0, int peerPort = 0, Action<ServiceOptions>? options = null, Action<IncrementalServiceBuilder>? configure = null,
-        int retainedHistoryVersions = 100_000)
+        int retainedHistoryVersions = 100_000, Incremental.Storage.PersistedFormat? formats = null)
     {
         var service = await TestService.StartAsync(null, nodeId, memory, options, builder =>
         {
-            builder.UseKafkaBackend(Backend(nodeId, automaticTakeover, probePort, peerPort, retainedHistoryVersions));
+            builder.UseKafkaBackend(Backend(nodeId, automaticTakeover, probePort, peerPort, retainedHistoryVersions, formats));
             configure?.Invoke(builder);
         });
         if (lead)

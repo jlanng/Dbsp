@@ -226,6 +226,27 @@ public sealed class WindowedTotals : IPipelineDefinition
             .ToDictionary(Key);
 }
 
+/// <summary>The windowed totals with event time declared on the input itself, so the clock
+/// keeps a time per partition of the source and the checkpoint holds them — the state
+/// that format level 2 added.</summary>
+[Pipeline("windowed-by-partition")]
+public sealed class WindowedByPartition : IPipelineDefinition
+{
+    public void Build(PipelineBuilder p)
+    {
+        var totals = p.Input<Tick>("ticks")
+            .WithEventTime(t => t.At(), TimeSpan.FromMilliseconds(WindowedTotals.LatenessMs))
+            .GroupBy(t => t.Trader)
+            .TumblingWindow(TimeSpan.FromMilliseconds(WindowedTotals.WindowMs))
+            .Sum(t => t.Quantity).Named("totals");
+        p.UpsertSink("live", totals.Rows().Select(Row), WindowedTotals.Key);
+        p.UpsertSink("final", totals.OnClose().Named("finals").Rows().Select(Row), WindowedTotals.Key);
+    }
+
+    private static WindowTotal Row(WindowedValue<string, decimal> w) =>
+        new(w.Key, (long)(w.WindowStart - Tick.Epoch).TotalMilliseconds, w.Value);
+}
+
 /// <summary>The windowed totals again, over an input whose name starts as the clock's own
 /// entries in the checkpoint do. It is an input like any other.</summary>
 [Pipeline("windowed-oddly-named")]

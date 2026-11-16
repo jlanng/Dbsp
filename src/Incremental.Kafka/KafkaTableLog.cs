@@ -370,6 +370,20 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
         var versionKey = new byte[8];
         BinaryPrimitives.WriteInt64BigEndian(versionKey, version.Version);
 
+        // Read once: every record of a version is of one format level.
+        var envelope = _log.Formats.WritesEnvelope;
+
+        void StartRecord(ArrayBufferWriter<byte> record)
+        {
+            if (envelope)
+            {
+                record.GetSpan(1)[0] = FormatLevel.EnvelopeByte;
+                record.Advance(1);
+            }
+            record.GetSpan(1)[0] = KafkaLog.JsonFormat;
+            record.Advance(1);
+        }
+
         var chunk = new ArrayBufferWriter<byte>(Math.Min(_log.Options.MaxRecordBytes, 64 * 1024));
         var row = new ArrayBufferWriter<byte>(1024);
         using var chunkWriter = new Utf8JsonWriter(chunk, new JsonWriterOptions { SkipValidation = true });
@@ -379,8 +393,7 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
         void StartChunk()
         {
             chunk.ResetWrittenCount();
-            chunk.GetSpan(1)[0] = KafkaLog.JsonFormat;
-            chunk.Advance(1);
+            StartRecord(chunk);
             chunkWriter.Reset(chunk);
             chunkWriter.WriteStartObject();
             chunkWriter.WriteString("epoch"u8, _epoch);
@@ -433,8 +446,7 @@ public sealed class KafkaTableLog<TKey, TRow> : ITableLog<TKey, TRow>
             {
                 // Serialized once, written twice: into the change, and as the row record.
                 row.ResetWrittenCount();
-                row.GetSpan(1)[0] = KafkaLog.JsonFormat;
-                row.Advance(1);
+                StartRecord(row);
                 rowWriter.Reset(row);
                 rowWriter.WriteStartObject();
                 rowWriter.WriteNumber("v"u8, version.Version);

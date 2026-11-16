@@ -536,6 +536,12 @@ public sealed class KafkaLog : IAsyncDisposable
 
         // Before anything that fences: a node that cannot read what the logs are written
         // at must not take them from one that can.
+        // A process that follows the leader topic has heard the level; one that has heard
+        // nothing — no leadership watches for it, or every writer so far was built before
+        // levels — reads the topic's tail first. Only then: takeovers are timed, and a
+        // standby that has heard pays nothing here.
+        if (FormatLevelSeen == 0)
+            await ReadLastTermAsync(cancellationToken).ConfigureAwait(false);
         Formats.RequireReads(FormatLevelSeen);
         if (!_initialised)
         {
