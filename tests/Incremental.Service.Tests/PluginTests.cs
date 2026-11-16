@@ -44,7 +44,7 @@ public class PluginTests
         Assert.Equal("Acme.Pipelines.dll", v1.MainAssembly);
         Assert.Matches("^[0-9a-f]{16}$", v1.Version);
         Assert.Equal(["Acme.Contracts.dll", "Acme.Pipelines.deps.json", "Acme.Pipelines.dll"], v1.Files.Select(f => f.Path));
-        Assert.Equal(["trade-enrichment", "trader-counts"], v1.Definitions.Select(d => d.Name));
+        Assert.Equal(["trade-enrichment", "trade-notes", "trader-counts"], v1.Definitions.Select(d => d.Name));
         // What tells this version from the next for a person: when, by whom, and what the
         // build calls itself.
         Assert.InRange(v1.ImportedAt!.Value, DateTimeOffset.UtcNow.AddMinutes(-1), DateTimeOffset.UtcNow);
@@ -81,7 +81,7 @@ public class PluginTests
         // version that added a member to a record would show it.
         var diff = await service.Node.Discovery.DiffAsync(Plugin, v1.Version, v2.Version, default);
         Assert.True(diff.ShapesCompared);
-        Assert.Equal(["trade-enrichment", "trader-counts"], diff.Definitions.Select(d => d.Definition));
+        Assert.Equal(["trade-enrichment", "trade-notes", "trader-counts"], diff.Definitions.Select(d => d.Definition));
         Assert.All(diff.Definitions, d => { Assert.Equal("unchanged", d.Change); Assert.Empty(d.Members); });
         Assert.Empty(diff.TableDefinitions);
         var described = await service.Node.Discovery.DescribeDefinitionAsync(Plugin, v2.Version, "trade-enrichment", null, default);

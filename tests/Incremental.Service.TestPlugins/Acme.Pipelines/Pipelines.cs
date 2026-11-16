@@ -55,6 +55,22 @@ public sealed class TraderCounts : IPipelineDefinition
 /// <summary>Private to the plugin: each loaded version has its own type of this name.</summary>
 public sealed record Seen(string Trader, long TradeId);
 
+/// <summary>A sink row of a type private to the plugin, on both kinds of sink: what a
+/// connector's record format is given to write is then a type of the plugin's own load
+/// context, and the context unloads only if the connector kept none of it.</summary>
+[Pipeline("trade-notes")]
+public sealed class TradeNotes : IPipelineDefinition
+{
+    public void Build(PipelineBuilder p)
+    {
+        var notes = p.Input<Trade>("trades").Select(t => new Note(t.Id, t.Trader, Version.Name));
+        p.UpsertSink("notes", notes, n => n.TradeId);
+        p.AppendSink("log", notes);
+    }
+}
+
+public sealed record Note(long TradeId, string Trader, string Version);
+
 public static class Version
 {
 #if V2

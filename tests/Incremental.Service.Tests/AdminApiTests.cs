@@ -1055,7 +1055,7 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         }));
         Assert.Equal(201, good.Code);
         Assert.Equal("acme.pipelines", good["plugin"].GetProperty("name").GetString());
-        Assert.Equal(["trade-enrichment", "trader-counts"], good["plugin"].GetProperty("definitions").EnumerateArray().Select(d => d.GetProperty("name").GetString()));
+        Assert.Equal(["trade-enrichment", "trade-notes", "trader-counts"], good["plugin"].GetProperty("definitions").EnumerateArray().Select(d => d.GetProperty("name").GetString()));
         var version = good["plugin"].GetProperty("version").GetString()!;
         var stored = await admin.Get("plugins/acme.pipelines");
         Assert.Equal(version, stored["versions"][0].GetProperty("plugin").GetProperty("version").GetString());
