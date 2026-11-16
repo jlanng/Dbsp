@@ -1722,16 +1722,8 @@ numbers); the in-memory
 backend compacts its state log as it goes (`InMemoryBackendOptions.StateCompactAbove`);
 and its two files sinks keep the newest 200 objects each (`"retain": 200`), because a
 directory has no lifecycle rule.
-A Release build at the default rate reaches about 650 MB of resident memory in twenty
-minutes and was between 640 and 720 MB from then to the fortieth, with 170 to 310
-thousand records in the state log throughout and 760 to 1,700 objects, under 10 MB,
-in its files directory. At `--rate 5000` event time runs a hundred times faster and a
-minute of it is 300,000 executions held by the join until it closes: about a million
-state records and 1.8 to 2.7 GB, with no trend over nine minutes. The numbers, and
-what they were before a lookup in `execution-quality` was moved, are under *As built*,
-S6 (*The second review's findings*), in the design document. Those runs were made with
-trade ids coming round at 20,000, before trade-enrichment forgot its final trades;
-with ids that never repeat its state is now bounded by its open window instead (S8).
+A Release build at the default rate levels off at about 650 to 720 MB of resident
+memory; the runs are in the design document (S6, S8).
 
 Things to try in the UI, in the default mode:
 
@@ -2084,11 +2076,90 @@ has one node after its first takeover and none after its second. The contract:
   standby answers and takes up to `StopTimeout` to drain if not.
 
 In systemd that is `Restart=always` with `RestartSec` small and `StartLimitIntervalSec=0`;
-in Kubernetes a pod's default `restartPolicy: Always` (its back-off is capped at five
-minutes, which is long: a `Deployment` of one replica per node id, or a `StatefulSet`,
-and an alert on `node.role`); in ECS a service. Where there is no platform — a terminal,
-a container whose entry point is the node — `NodeSupervisor.RunAsync(args)` is the same
-contract in the process itself, as the example uses it (*On Kafka, with a standby*).
+in ECS a service; in Kubernetes, the recipe below. Where there is no platform — a
+terminal, a container whose entry point is the node — `NodeSupervisor.RunAsync(args)` is
+the same contract in the process itself, as the example uses it (*On Kafka, with a
+standby*).
+
+**On Kubernetes (EKS).** Production runs the two nodes as one `StatefulSet` of two
+pods. What each part is for:
+
+- *Restarts.* A pod's `restartPolicy` is `Always`, but the kubelet cannot tell exit codes
+  apart: it starts every container again after a back-off that grows from ten seconds to
+  five minutes, and a node replaced twice in ten minutes would wait. So the container's
+  entry point is the host under `NodeSupervisor.RunAsync(args)` (*On Kafka, with a
+  standby*, has the lines): the supervisor is the container's main process and keeps the
+  contract — the node again at once after 3 and 4, after a delay that doubles to half a
+  minute after 5 or a crash, never giving up — and the kubelet's own restart is left for
+  the supervisor itself. The supervisor passes SIGTERM on and gives the node
+  `NodeSupervisorOptions.StopTimeout` (60 s) before it kills it, so set
+  `terminationGracePeriodSeconds` above that.
+- *Identity.* The node id is the pod's name (`node-0`, `node-1`: the downward API's
+  `metadata.name`), which a `StatefulSet` keeps across restarts and rollouts; two pods
+  never run under one id, which would fence each other. The peer probe of `node-0` is
+  `node-1.node:5191` and the other way round, through the headless `Service` the
+  `StatefulSet` names. The host reads both from its environment.
+- *Probes.* Map them to the node's health endpoint (`MapIncrementalHealth`, outside the
+  admin API's loopback rule): `startupProbe` and `livenessProbe` on `/health/live`, which
+  fails only when the node has not started or has been disposed — give the startup probe
+  as long as a cold node takes to restore its tables (*How large, how fast*), and the
+  liveness probe longer than a restart by the supervisor takes; `readinessProbe` on
+  `/health/ready?warm=true`, which on a leader is ready when it leads and on a standby
+  only once a takeover now would be warm (plain `/health/ready` is ready as soon as a
+  standby's catalog is open). Readiness does not decide who leads: Kafka does.
+- *Rollouts that never stop both nodes.* `updateStrategy: RollingUpdate` with
+  `podManagementPolicy: OrderedReady` replaces one pod at a time and waits for the new one
+  to be ready — warm, by the probe above — before it stops the other. A leader that is
+  stopped steps down to its warm standby, so a rollout costs two takeovers of about a
+  second each, and nothing is lost. A rollout is an upgrade (*Upgrading the nodes*,
+  below), so the format level is raised only when both pods run the new build. A
+  `PodDisruptionBudget` with `maxUnavailable: 1` keeps a drain of the cluster's machines
+  from taking both, and a spread over zones keeps one zone's loss from taking both.
+- *Alerts.* On `node.role` and `standby_ready` (*Operating it: monitoring*): a deployment
+  with one node runs, but it has no failover.
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: node }
+spec:
+  serviceName: node                  # a headless Service of that name: node-0.node, node-1.node
+  replicas: 2
+  podManagementPolicy: OrderedReady
+  updateStrategy: { type: RollingUpdate }
+  selector: { matchLabels: { app: enrichment-node } }
+  template:
+    metadata: { labels: { app: enrichment-node } }
+    spec:
+      terminationGracePeriodSeconds: 90          # above the supervisor's 60 s StopTimeout
+      topologySpreadConstraints:
+        - { maxSkew: 1, topologyKey: topology.kubernetes.io/zone, whenUnsatisfiable: DoNotSchedule,
+            labelSelector: { matchLabels: { app: enrichment-node } } }
+      containers:
+        - name: node
+          image: registry.example/enrichment-host:1.4.0   # entry point: the host under NodeSupervisor.RunAsync
+          env:
+            - name: NODE_ID
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+          ports: [ { name: admin, containerPort: 5180 }, { name: probe, containerPort: 5191 } ]
+          startupProbe:   { httpGet: { path: /health/live, port: admin }, periodSeconds: 5, failureThreshold: 120 }
+          livenessProbe:  { httpGet: { path: /health/live, port: admin }, periodSeconds: 10, failureThreshold: 6 }
+          readinessProbe: { httpGet: { path: /health/ready?warm=true, port: admin }, periodSeconds: 5 }
+          resources:
+            requests: { memory: 12Gi }               # Sizing a node: the peak, not the steady state
+            limits:   { memory: 12Gi }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: node }
+spec:
+  maxUnavailable: 1
+  selector: { matchLabels: { app: enrichment-node } }
+```
+
+This recipe has not been run on EKS (decision 7 in the design document puts everything
+on AWS off); it is what the contract above asks of Kubernetes. MSK with IAM is under
+*On Amazon MSK*.
 
 Two nodes that share a process — the in-memory backend's two nodes, as the example's
 `--nodes 2` and the admin test host run them — cannot end the process when one of them
@@ -2572,16 +2643,9 @@ built every circuit on the state it follows and only starts them:
 | `kill -9` → first record in the last sink | 4.2 s | 4.3 s | 4.2 s |
 | a cold standby until it is warm (the table, then that state) | 10.0 s | 13.4 s | 26.9 s |
 
-Nor with the table: at three million rows the takeover was 0.98 s and the last sink had
-its first record 4.4 s after the kill.
-
-Of the takeover's second, half is the Kafka client waiting to retry while the broker
-aborts the dead writer's open transaction; the rest is reading the last term, promoting
-the tables (a few milliseconds for all of them), and starting twenty sources and sinks.
-That half second is there only when the leader died inside a transaction and the
-client has to ask twice; after a leader that died between transactions the fence and
-the storage stage took 24 to 56 ms together.
-The three seconds before it are yours to set: a shorter `TakeoverAfter` mistakes a slow
+Nor with the table: at three million rows the takeover was 0.98 s. Half of the
+takeover's second is the broker aborting the dead writer's open transaction, when it
+had one. The three seconds before it are yours to set: a shorter `TakeoverAfter` mistakes a slow
 broker for a dead leader sooner.
 
 **What takes as long as the data.** Three things read everything, and so take time in
@@ -2611,17 +2675,9 @@ table of one to five million rows added 1–5 MB.
 | the longest the leader stood still in the steady state | 33 ms | 30 ms |
 | `kill -9` → first record in every sink | 4.0 s | 4.1 s |
 
-Two nodes of five million rows run side by side on a 30 GB machine with the broker
-beside them. That was not so before the settings and fixes of *Sizing a node*, the
-next section, which also has what a row and a state entry cost and how to work a
-node's size out for a deployment that does not exist yet: the same million rows took
-7.7 GB on the leader and 5.3 GB on the standby, and five million took 15 GB on one
-node, and two did not fit. On the broker a million of these rows are 134 MB (141 bytes a row, zstd), and
-the state of the four pipelines 141 MB.
-
-**What was not measured**: ten million rows. Nothing in a takeover reads the rows, so
-the failover numbers should hold — they were the same at one and at five million — and
-the loading, the cold start and the memory scale as above.
+*Sizing a node*, the next section, has what a row and a state entry cost and how to
+work a node's size out. On the broker a million of these rows are 134 MB (zstd), and
+the state of the four pipelines 141 MB. Ten million rows were not measured.
 
 **Through a broker failure** (three brokers, each also a controller, replication factor
 3, `min.insync.replicas` 2 — `docker compose --profile kafka3`; two supervised node
@@ -2634,14 +2690,12 @@ sink timing what arrives):
 | the same — the broker that was the active controller (twenty of them away for 45 s) | 40 | 0 | 12 to 15 s, and once 26 s |
 | a rolling restart: each broker shut down, five seconds, started | 30 | 0 | 0.6 to 1.8 s |
 | one of three frozen for 20 s or 60 s: it answers nothing and its connections stay open | 9 | 0 | 11 to 16 s |
-| the same with the Kafka client's own default settings | 6 | 3 | 8 to 61 s |
 | every broker killed in turn, 15 s each | 2 | 0 | 13 to 14 s |
 | two of three stopped, or killed in one moment, for 40 s: no quorum, nothing commits until fourteen to sixteen seconds after they are back | 6 | 0 | 54 to 56 s |
 | the same for 70 s | 6 | 0 | 85 to 86 s |
 | the same for 70 s with the leader's transaction timeout set to 60 s, which the outage then outlasts | 14 | 10: the leader's writer ended, the node exited 3, the standby led | 85 to 89 s (once 72 s and then a second silence) |
 | two of three away for 40 s, and for 70 s, on a cluster whose controllers are not its brokers | 5 | 0 | 42 to 44 s, and 72 to 74 s |
 | two of three frozen for 45 s, and for 70 s: they keep their connections and answer nothing | 8 | 0 | 46 to 47 s, and 71 to 72 s |
-| the same before the standby held for brokers that do not answer (the fourth review's runs) | 8 | 5: the standby took over within half a second of the brokers' return | |
 | one of three killed in the same moment as the leader's process | 21 | yes, as intended: the standby led 8.7 to 10.6 s after the kill, 13.2 to 14.5 s when the broker was also the active controller, and once after 35 s | about as long (these runs time the takeover, not the sink) |
 | one of three gone for ten minutes, the leader's process killed after five | 1 | yes, as intended: the standby led 3.5 s after the kill, on two brokers, and the killed node came back as its standby | 11 s (the broker's loss) |
 
@@ -2660,24 +2714,19 @@ only the first row. A rolling restart is another thing altogether: a broker that
 asked to stop hands its partitions over first, and the sink pauses for about a second
 per broker.
 
-**The service's part is not to add to it**, and until this was measured it added a
-great deal: the Kafka client's own defaults wait ten seconds before reconnecting to a
-broker that went away and sixty for one that stops answering, which is how a leader
-came to be silent for thirty to fifty seconds and lose the leadership to its standby
-over one broker. Every client the service creates now starts from settings of its own
-(`KafkaClientDefaults`: reconnect within a second, give a silent broker six seconds,
-ask for the topics' leaders every two, and — admin clients — keep a connection to every
-broker, without which a standby reconnected to a dead broker thirty thousand times a
-second); what you put in a connection's `ClientConfig`
-is applied on top. Leave them unless you have measured otherwise — in particular a
+**The service's part is not to add to it.** The Kafka client's own defaults wait ten
+seconds before reconnecting to a broker that went away and sixty for one that stops
+answering — long enough for a leader to lose the leadership over one broker. Every
+client the service creates starts from settings of its own (`KafkaClientDefaults`:
+reconnect within a second, give a silent broker six seconds, ask for the topics'
+leaders every two, and — admin clients — keep a connection to every broker); what you
+put in a connection's `ClientConfig` is applied on top. Leave them unless you have measured otherwise — in particular a
 `socket.timeout.ms` near the takeover ceiling brings the leadership moves back.
 
 **A broker that stops answering is the harder case** — frozen, or its host or zone cut
 off, so that connections stay open and nothing comes back. Each client finds that out
 by a request of its own timing out, one connection after another. The frozen-broker
-rows are that: with the service's settings the sink is silent for eleven to sixteen
-seconds and the same node leads; with the client's defaults the standby took over at
-the ceiling in half the runs and the sink was silent for up to a minute.
+rows are that: the sink is silent for eleven to sixteen seconds and the same node leads.
 
 **The leadership does not move for one broker.** If the brokers lose their quorum for
 longer than `TakeoverCeiling`, the standby asks them whether anybody could commit
@@ -2692,10 +2741,8 @@ nothing can be committed through brokers that cannot be asked. What a leader
 cannot count on surviving is `KafkaLogOptions.TransactionTimeout` without a commit —
 five minutes. Past it the leader's open transaction fails in its client, or is timed
 out by the brokers' transaction coordinator, and more often than not the writer is
-finished with it (in ten of fourteen outages that outlasted a timeout set to 60 s;
-which it is depends on where the commit stood when the brokers went, and is taken
-apart in `docs/design/durability-and-standby.md`, *A leader does not outlive its
-transaction timeout*): the node ends with exit code 3, its supervisor starts it again
+finished with it (`docs/design/durability-and-standby.md`, *A leader does not outlive
+its transaction timeout*): the node ends with exit code 3, its supervisor starts it again
 as the standby, and the standby leads. The sink is complete either way and is silent
 no longer for it — what you lose is a warm standby, for as long as the restarted node
 takes to restore.
@@ -2713,15 +2760,11 @@ on MSK too unless your configuration sets it); a node then cannot become the lea
 and says so by that name.
 
 **Whose time the minute is.** After two of three brokers come back, nothing commits
-for another fourteen to sixteen seconds on this cluster, and all but the last second
-of that is the brokers': about two for their processes and for the controllers to
-elect a leader, nine (`broker.session.timeout.ms`) in which that new controller will
-not let the returning brokers register because it has not yet given their dead
-predecessors up, and four or five until their next attempt is accepted. The leader's
-transaction commits within a second of a second replica being back in sync. A cluster
-whose controllers are separate from its brokers and keep their quorum — as MSK's
-documentation describes its KRaft clusters — does not pay the middle part: there the same outages cost two to four
-seconds over their own length (the fourth row; five runs on one machine, not MSK).
+for another fourteen to sixteen seconds on this cluster, nearly all of it the brokers'
+(nine of them `broker.session.timeout.ms`). The leader's transaction commits within a
+second of a second replica being back in sync. A cluster whose controllers are separate
+from its brokers — as MSK's documentation describes its KRaft clusters — does not pay
+the middle part: there the same outages cost two to four seconds over their own length.
 
 **A broker lost in the same moment as the leader** — a zone, say — is a failover that
 waits for the brokers. The dead broker was a replica of every partition, so until the
@@ -2729,29 +2772,21 @@ controller gives it up (the nine seconds again; twelve to fifteen if it was also
 active controller, which a cluster with controllers of its own does not have) the
 leader topic cannot be read to its end, the dead leader's open transaction cannot be
 aborted, and the partitions it led have no leader. The standby leads one to two and a
-half seconds after that: 8.7 to 10.6 s from the kill in eight takeovers, 13.2 to 14.5 s
-in eleven where the broker was the active controller as well. No setting of the service
-shortens the wait. Once in twenty-one it took 35 s: the broker that took the transaction
-coordinator over spent twenty-two seconds waiting to connect to the dead broker's
-address, which no longer answered at all, before it dealt with the dead leader's
-transaction (`socket.connection.setup.timeout.ms` on the brokers: ten seconds, then
-twenty). A host that vanishes behaves like that; one whose process dies does not.
+half seconds after that: 9 to 11 s from the kill, 13 to 15 s where the broker was the
+active controller as well. No setting of the service shortens the wait. A broker whose
+host vanishes, rather than whose process dies, can add the brokers'
+`socket.connection.setup.timeout.ms` to that (once 35 s in all).
 
 A standby that does start a takeover stops if the leader is heard again before it has
 taken the log (the transactional id). Once it has, the leader is fenced whatever it
 did a moment before, and the takeover goes through — a standby that stood down there
-would leave nobody leading. And a takeover that is itself fenced before it has committed anything — which a replaced
-leader's Kafka client can do to its successor through the transaction coordinator, and
-once did, leaving two fenced nodes — no longer ends the node: it stands by again and
+would leave nobody leading. And a takeover that is itself fenced before it has
+committed anything — which a replaced leader's Kafka client can do to its successor
+through the transaction coordinator — does not end the node: it stands by again and
 takes over a few seconds later. The node that *was* the writer and is fenced still
 ends, and its supervisor starts it again (*Operating it*).
 
-**What is left.** One kill of a controller in forty silenced the sink for 26 s instead of fourteen: the
-two brokers that remained spent the twenty seconds the third was away waiting on
-connections to it before the leader's next transaction could begin, and went on when it
-returned. The leadership did not move. It did not happen again in the kills made to
-catch it, so its cause inside the brokers is read from their logs and not shown
-(`docs/design/enrichment-service.md`, S7). Nothing here was run on MSK: a cluster with
+**On your cluster.** Nothing here was run on MSK: a cluster with
 other session timeouts, with controllers of its own, or with brokers a network away
 will have other figures, and the two that matter to set against them are
 `TakeoverCeiling` (30 s: longer than your brokers take to give a broker up, with room)
@@ -2763,10 +2798,8 @@ brokers that cannot commit).
 A pipeline's state is whatever its operators keep between steps, and for an enrichment
 pipeline most of it is kept per record. Over a stream of facts — trades, executions,
 orders, where every record is a new key — that is state that grows with the feed unless
-something closes it. Measured on the example before round four (S8 in the design
-document), the reference pipeline `trade-enrichment` with trade ids that never repeat
-held 11,900 entries after one minute at 50 trades a second, 60,000 after five and
-120,200 after ten: four entries per trade, for ever, about 340 bytes each.
+something closes it: without eviction the reference pipeline `trade-enrichment` keeps
+four entries per trade, for ever.
 
 **What is kept per fact.**
 
@@ -2826,9 +2859,9 @@ What it means for a trade, with `openSeconds` as the lateness:
   *late records* on its page, `pipeline.late_records` on the meter, an event when it
   starts and at most every ten minutes while it goes on (`PipelineTestHarness.LateRecords`
   in a test). Choose `openSeconds` to cover the disorder the feed can have within a
-  partition, not only how late a correction may come. What the watermark follows, and
-  the two things that used to make honest trades late, are under *Event time on a
-  topic of several partitions* and *A record stamped in the future* below.
+  partition, not only how late a correction may come. What the watermark follows is
+  under *Event time on a topic of several partitions* and *A record stamped in the
+  future* below.
 - A change of reference data corrects exactly the trades at or after the watermark,
   however the steps fall: a final trade not yet evicted is left alone too.
 - A record whose event time cannot be read — the selector throws on it — is a dead
@@ -2854,9 +2887,7 @@ input's time is then the *least* of what its partitions have brought, not the ne
 read from any of them. A partition that is behind the others — a backlog after a
 restart or a takeover, which the client hands over a partition at a time; the
 partitions of a broker that was away — holds the watermark where its own records are,
-and they are not late. Before this they were: with three partitions and ten minutes of
-backlog on each, read from one broker with one time for the input, 951 to 1,188 of
-1,800 records were dropped as late in four runs; with a time per partition, none.
+and they are not late.
 
 - *A quiet partition.* A partition with nothing to read would hold the watermark for
   ever, so one the source has read to its end stops counting once it has stood there
@@ -2871,11 +2902,8 @@ backlog on each, read from one broker with one time for the input, 951 to 1,188 
   watermark again until it has been read to its end and has stood there five seconds
   more. So a broker's loss holds the watermark — nothing closes, state grows by the
   feed's rate — for as long as its partitions have no leader, and what was produced to
-  them meanwhile is not late when it comes. Measured on three brokers, six partitions,
-  300 records a second stamped as produced, one broker killed or frozen for 20 s, a
-  lateness of 5 s, three runs of each: no record late, where the same topic read with
-  one time for the input lost 747 to 1,223 of about 10,000. A lateness under five
-  seconds is not covered: the other partitions can move the watermark that far before
+  them meanwhile is not late when it comes. A lateness under five seconds is not
+  covered: the other partitions can move the watermark that far before
   the source knows.
 - *What the watermark waits for* is on the pipeline's page when its state is flagged as
   growing, and in its status as `watermarkHeldBy`: the input and the partition. A
@@ -2894,9 +2922,8 @@ of the node's clock is a record in error, not a record: under `errorPolicy: Dead
 it is a dead letter (`EventTimeAheadException`, with the record) and the pipeline goes
 on; under `Fault` the pipeline faults on it, as on any record a delegate throws on,
 and starts again onto the same record until it is skipped by a reset or its time has
-come. Before this bound such a record moved the watermark to its time: every record
-after it was late and every open trade and window closed, with nothing but the
-late-record count to show for it, and the only way out was a reset.
+come. Without the bound such a record would move the watermark to its time, and every
+record after it would be late.
 
 - The bound is `ServiceOptions.MaxEventTimeAhead` for the node (a day; null for none)
   and `circuit.maxEventTimeAhead` in a spec for one pipeline (`"400.00:00:00"` for a
@@ -2924,13 +2951,10 @@ record is open. For `trade-enrichment`:
   trade*. The earlier one is final by the later one's time: it is not retracted, the
   input never runs the two in one step, and the sink receives them in order. That is
   so whether the pipeline reads them a second apart or together in a backlog, and
-  whether or not the watermark had passed the earlier one. (Until round five it
-  depended on exactly that: a pipeline that read both in one step took them for one
-  trade amended and never delivered the first.)
+  whether or not the watermark had passed the earlier one.
 - An upsert whose own execution time is behind the watermark is late and changes
   nothing: it is counted as a late record, and the row its id holds — the trade as
-  last amended in time — stays. (Until round five a late version of an open trade took
-  the trade out of the sink.)
+  last amended in time — stays.
 - So **an id must not be used for another trade within `openSeconds`** of event time:
   the second would amend the first. And an amendment must not move a trade's execution
   time *forward* by more than `openSeconds`: it would be taken for another trade, and
@@ -2959,25 +2983,15 @@ record.
 **In the state log** an open trade is one record per entry when it arrives and one
 tombstone per entry when it is final: sixteen records for `trade-enrichment`'s eight
 entries, where the same pipeline without eviction wrote four and kept them for ever.
-A deadline's record carries the trade in its key, and so does its tombstone. Measured
-on one local broker (zstd, the log's default; replication factor 1), the reference
-shape with a nine-column trade: 2.1 KB of record values per trade on arrival before
-compression, 155 B on disk per open trade, 260 B on disk for a trade's whole life —
-against 88 B per trade, never reclaimed, without eviction. Flat out, a thousand
-trades to a step, that circuit ran 14,900 trades a second against the broker — 238,000
-state records a second — a step committing in 67 ms on average and 132 ms at most,
-with a follower holding typed stores never more than a step or two behind. On the
-example itself at a thousand trades a second (two processes, the connector stack):
-32,000 state records and 0.69 MB a second for its two trade pipelines, a standby
-whose state lag read nothing at sixteen readings of nineteen and under 1,700 records
-at the others, and a takeover of 0.9 s after the 3 s of silence. Not
-measured: three brokers and a network between them, the log cleaner's load on a topic
-that turns over this fast, and anything on MSK.
+A deadline's record carries the trade in its key, and so does its tombstone. On disk
+(zstd) that came to about 260 B for a trade's whole life with a nine-column trade,
+against 88 B per trade, never reclaimed, without eviction. The example at a thousand
+trades a second writes about 32,000 state records and 0.7 MB a second for its two
+trade pipelines. Not measured: the log cleaner's load on a topic that turns over this
+fast, and anything on MSK.
 
-Measured on the example after the change, at 50 trades a second with the seeded
-`openSeconds` of 120: 23,882 entries after one minute, 47,980 after two, 48,059 after
-five and the same after ten, about 14.9 MB — 2 × 4 × 50 × 120 = 48,000. Before, the same
-run held 120,200 at ten minutes and was growing by 12,000 a minute. An hour open at a
+On the example at 50 trades a second with the seeded `openSeconds` of 120 the state
+levels off at about 48,000 entries, 15 MB — 2 × 4 × 50 × 120 = 48,000. An hour open at a
 thousand trades a second would be 3.6 million open trades, 29 million entries and about
 9 GB on each node, leader and standby alike: the window is a sizing decision, and
 *Sizing a node* is where its bytes go.
@@ -3196,72 +3210,53 @@ file or its four settings:
 | `ConcurrentGarbageCollection` | `true` | Old-generation collections that do not stop the node: in the steady state there was no full blocking collection, and the longest the leader stood still was 33 ms |
 | `GarbageCollectionAdaptationMode` | `0` | The adaptive mode (the runtime's default for server collection) held the same memory as these settings and paused three times as long |
 | `System.GC.HeapCount` | `8`, or the node's cores if fewer | Each heap keeps memory ready of its own, and a heap per core on a large machine is more than twenty one-worker circuits fill. Four heaps held 0.3 GB less than eight and paused nearly three times as long |
-| `System.GC.ConserveMemory` | not set | It has the old generation compacted once that much of it is free space (at `5` a half, at `7` three tenths). It took a tenth off the leader's working set at a million rows — 3.1 GB at `5` and 3.0 GB at `7` for 3.4 GB, and 6.0 and about 5.2 GB for 6.7 GB at the peak — and nothing at five million in the steady state. The state fill, a backlog of a million orders through four stateful pipelines, took a sixth longer in some runs of every setting, more of them the more was conserved (one of seven without, three of seven at `5`, seven of nine at `7`); the slower runs also tended to follow the largest ones, so the setting's part in it is not established. A setting that asks for full blocking collections was not taken on that evidence; a node that wants the memory sets it |
+| `System.GC.ConserveMemory` | not set | It has the old generation compacted once that much of it is free space. It took a tenth off the leader's working set at a million rows and nothing at five million, and it asks for full blocking collections; a node that wants the memory sets it |
 
-Two things about pauses. A bulk load is where the long ones happen, and there are two
-kinds. The young generations fill with rows that survive, and one collection copies
-them all: on four cores, gigabytes copied at about a millisecond a megabyte, 1.4 to
-2.4 s at four and five million rows. A table's writer paces a large load so that this
-does not happen (`SharedTableOptions.LoadPacing`, on unless a table's options set it to
+Pauses. A bulk load is where the long ones happen, and there are two kinds. The young
+generations fill with rows that survive, and one collection copies them all — seconds
+at four and five million rows. A table's writer paces a large load so that this does
+not happen (`SharedTableOptions.LoadPacing`, on unless a table's options set it to
 null): once a run of commits has written 100,000 changes it asks for a young collection
-every 128 MB the process allocates, so each copy is a step's worth. Measured on four
-cores, loading three million rows the leader's longest stop went from 0.55–0.81 s to
-0.19–0.20 s and the load took 5 % longer; four million, from 1.5–1.9 s to 0.3–0.8 s.
-The other kind it does not touch: a full blocking collection, 0.1 to 0.15 s per
-gigabyte of heap on eight heaps and longer on fewer cores, which the collector makes
-when the process's memory stands near its high-load threshold — 90 % of the machine's
-or the container's memory. Loading five million rows (6.5 GB) where that left about a
-gigabyte spare, the leader stood still for 3.1 to 3.8 s with pacing and without it,
-past `TakeoverAfter` (3 s). Above 85 % of the threshold the writer asks for nothing,
-because a collection asked for there is the collector's cue for the full one. That is
-the node's size, not the load's speed: give it the memory *The arithmetic* asks for,
-or load a table of that size before the standby is started. `ConserveMemory`, where it is set, asks for such
-collections when the heap is fragmented; none was seen in two minutes of steady load
-with a twentieth of the rows rewritten, and a node with tens of gigabytes that churns
-should measure its longest pause before setting it (`GC.GetGCMemoryInfo(GCKind.FullBlocking)`,
-or the scale rig's `longest-stall`). Nothing here ran for longer than four minutes.
+every 128 MB the process allocates, so each copy is a step's worth (at three million
+rows the leader's longest stop went from over half a second to 0.2 s, and the load
+took 5 % longer). The other kind it does not touch: a full blocking collection, 0.1 to
+0.15 s per gigabyte of heap, which the collector makes when the process's memory stands
+near its high-load threshold — 90 % of the machine's or the container's memory. A node
+loaded that close to it stands still for seconds whatever the pace, past
+`TakeoverAfter`; above 85 % of the threshold the writer asks for nothing, because a
+collection asked for there is the collector's cue for the full one. That is the node's
+size, not the load's speed: give it the memory *The arithmetic* asks for, or load a
+table of that size before the standby is started. A node with tens of gigabytes that
+churns should measure its longest pause before setting `ConserveMemory`
+(`GC.GetGCMemoryInfo(GCKind.FullBlocking)`, or the scale rig's `longest-stall`).
 
 ### What the service does itself
 
-Before these, a node's working set was three to five times what it held: 7.7 GB on a
-leader holding 2.2 GB, 5.3 GB on its standby. Where it was, and what was done:
+Four things would make a node's working set several times what it holds; the node
+deals with each, and each has a setting:
 
-- **The Kafka client's fetch queues: 2 GB.** The client keeps a queue of fetched
-  records per partition, not per consumer, and fills it while the consumer is behind;
-  at the 16 MB a source's was set to, twenty pipelines reading a backlog from a topic
-  of four partitions held 2 GB. A source's default is now 2 MB
-  (`KafkaSourceOptions.FetchBufferKilobytes`): 0.8 GB at the same point, with the
-  state fill and the steady state no slower. A connection's
-  `queued.max.messages.kbytes` still overrides it. The logs' own readers keep 8 MB
-  (`KafkaLogOptions.FetchBufferKilobytes`): a node uses them only while it restores or
-  follows, and at 2 MB a restore was, if anything, slower (a table of a million rows
-  read in 4.3 to 6.0 s over five runs, against 3.9 to 5.0 s at 8 MB).
-- **The C allocator kept what the client freed.** Of 2.1 GB the allocator held at the
-  end of a state fill, 34 MB was in use: glibc keeps freed memory in per-thread arenas
-  and returns it only when asked. The node asks (`malloc_trim`) every
+- **The Kafka client's fetch queues.** The client keeps a queue of fetched records per
+  partition, and fills it while the consumer is behind. A source's is 2 MB
+  (`KafkaSourceOptions.FetchBufferKilobytes`; a connection's
+  `queued.max.messages.kbytes` overrides it). The logs' own readers keep 8 MB
+  (`KafkaLogOptions.FetchBufferKilobytes`), used only while a node restores or follows.
+- **The C allocator keeps what the client frees.** glibc keeps freed memory in
+  per-thread arenas and returns it only when asked. The node asks (`malloc_trim`) every
   `ServiceOptions.ReleaseUnusedMemoryEvery` (30 s; zero turns it off): about 0.1 s for
-  2 GB, nothing when there is nothing to return. `MALLOC_ARENA_MAX`, the usual advice,
-  is not the fix: with two arenas the state fill took two and a half times as long.
-- **The collector kept what a burst had needed: 2 to 3.5 GB.** After a load or a
-  restore the collector holds the memory the burst allocated into, and lets a region go
-  only after some twenty collections have passed without a use for it. A leader under
-  steady load gets there in a minute or two; a standby that has become warm, or a
-  leader whose inputs are quiet, collects a few times an hour. So the same keeper asks
-  for young-generation collections — 20 to 30 ms each on these heaps, twenty-five of
-  them, a quarter of a second apart — while the collector holds a quarter more than is
-  live and the process is collecting seldom, and rests for longer and longer when
-  asking does not help. It never asks for a full collection.
-- **An idle pipeline held its state twice.** A circuit built on restored state keeps
-  the bytes it was built from until its types have committed (*Limits*); a pipeline
-  with nothing to read never commits. It now commits once, without a step, two seconds
-  after such a start. The pipeline's page says how many entries are held twice while
-  they are.
+  2 GB, nothing when there is nothing to return. Do not set `MALLOC_ARENA_MAX` instead:
+  with two arenas a state fill took two and a half times as long.
+- **The collector keeps what a burst needed.** After a load or a restore the collector
+  holds the memory the burst allocated into until some twenty collections have passed;
+  a quiet node collects a few times an hour. So the same keeper asks a quiet node for
+  young-generation collections (20 to 30 ms each) while the collector holds a quarter
+  more than is live. It never asks for a full collection.
+- **An idle pipeline would hold its state twice.** A circuit built on restored state
+  keeps the bytes it was built from until its types have committed (*Limits*); a
+  pipeline with nothing to read commits once, without a step, two seconds after such a
+  start. The pipeline's page says how many entries are held twice while they are.
 
-What was looked at and is not waste: 0.5 GB of the heap at a million rows is large
-arrays — the maps of the table and of the state stores themselves, not garbage from
-the load; a table's retained history is bounded at 65,536 row changes
-(`SharedTableOptions.TailChanges`), 1 MB after a load of five million rows and at most
-some 85 MB of superseded rows for rows of this width.
+A table's retained history is bounded at 65,536 row changes
+(`SharedTableOptions.TailChanges`).
 
 ## On Amazon MSK
 

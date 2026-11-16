@@ -701,7 +701,7 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         Assert.Equal(HttpStatusCode.Forbidden, (await Admin.Get("", r => { r.RequestUri = new Uri(Admin.Node.Admin); r.Headers.Host = "admin.example"; })).Status);
 
         var health = Admin.Node.Url + "/health/";
-        foreach (var path in new[] { "live", "ready", "status" })
+        foreach (var path in new[] { "live", "ready", "ready?warm=true", "status" })
         {
             var answer = await Admin.SendAsync(HttpMethod.Get, path, configure: r => { r.Headers.Add("X-Forwarded-For", "203.0.113.9"); r.Headers.Host = "lb.example"; }, baseUrl: health);
             Assert.Equal(200, answer.Code);

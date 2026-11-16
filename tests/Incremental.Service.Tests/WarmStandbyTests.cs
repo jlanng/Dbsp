@@ -397,10 +397,17 @@ public class WarmStandbyTests
                 () => b.Node.Status.Standby is { TakeoverWouldBeWarm: false, PipelinesToBuild: 1 } standby && standby.NotWarmBecause.Contains("pipeline-building"),
                 "the standby to say it is still building a pipeline");
             Assert.Equal(PipelineState.Unbuilt, b.Pipelines.Get("p").State);
+
+            // /health/ready says ready (the catalog is open); ?warm=true, the rollout's gate,
+            // does not until the takeover would be warm. The leader is ready either way.
+            Assert.True(Admin.IncrementalAdminExtensions.Ready(b.Node, warm: false).Ready);
+            Assert.False(Admin.IncrementalAdminExtensions.Ready(b.Node, warm: true).Ready);
+            Assert.True(Admin.IncrementalAdminExtensions.Ready(a.Node, warm: true).Ready);
             StandbyShy.Gate.Set();
             await Eventually(
                 () => b.Node.Status.Standby is { TakeoverWouldBeWarm: true, PipelinesToBuild: 0 } && b.Pipelines.Get("p").State == PipelineState.Built,
                 "the standby to be warm once the circuit is built");
+            await Eventually(() => Admin.IncrementalAdminExtensions.Ready(b.Node, warm: true).Ready, "the rollout's gate to open");
         }
         finally
         {

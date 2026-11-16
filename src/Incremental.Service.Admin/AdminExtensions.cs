@@ -226,7 +226,9 @@ public static class IncrementalAdminExtensions
     /// Maps <c>{prefix}/live</c>, <c>{prefix}/ready</c> (200 or 503) and
     /// <c>{prefix}/status</c> (200 with the level and its reason codes). These sit outside
     /// the admin group and its loopback rule, so a kubelet or a load balancer can reach
-    /// them; they return codes, never ids or messages.
+    /// them; they return codes, never ids or messages. <c>{prefix}/ready?warm=true</c> is
+    /// stricter on a standby: ready only once a takeover now would be warm — the gate for
+    /// a rollout, which must not stop the leader before its standby can take its place.
     /// </summary>
     public static RouteGroupBuilder MapIncrementalHealth(this IEndpointRouteBuilder endpoints, string prefix = "/health")
     {
@@ -237,10 +239,10 @@ public static class IncrementalAdminExtensions
             var health = node.Health;
             return Results.Json(new { live = health.Live }, AdminJson.Options, statusCode: health.Live ? 200 : 503);
         });
-        group.MapGet("/ready", (ServiceNode node) =>
+        group.MapGet("/ready", (ServiceNode node, bool? warm) =>
         {
-            var health = node.Health;
-            return Results.Json(new { ready = health.Ready, role = node.Status.Leadership.Role }, AdminJson.Options, statusCode: health.Ready ? 200 : 503);
+            var (ready, role) = Ready(node, warm ?? false);
+            return Results.Json(new { ready, role }, AdminJson.Options, statusCode: ready ? 200 : 503);
         });
         group.MapGet("/status", (ServiceNode node) =>
         {
@@ -250,6 +252,16 @@ public static class IncrementalAdminExtensions
                 AdminJson.Options);
         });
         return group;
+    }
+
+    /// <summary>What <c>/ready</c> answers: the node's own readiness, and with
+    /// <paramref name="warm"/> on a standby also that its takeover would be warm.</summary>
+    internal static (bool Ready, NodeRole Role) Ready(ServiceNode node, bool warm)
+    {
+        var status = node.Status;
+        var ready = status.Health.Ready
+            && (!warm || status.Leadership.Role != NodeRole.Standby || status.Standby is { TakeoverWouldBeWarm: true });
+        return (ready, status.Leadership.Role);
     }
 }
 
