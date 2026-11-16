@@ -15,9 +15,11 @@ namespace Incremental.Storage;
 /// </summary>
 public static class FormatLevel
 {
-    /// <summary>What every build since layouts (round two) writes: state-log values of
-    /// format bytes 1 and 2, table-log records of format byte 1, state manifest format 7.
-    /// A build that says nothing of levels is at this one.</summary>
+    /// <summary>What the build before levels wrote (commit 9de8da9, the last of round
+    /// four): state-log values of format bytes 1 and 2, table-log records of format byte
+    /// 1, state manifest format 7. A build that says nothing of levels is taken to be at
+    /// this one; builds older than that one (from before layouts, or before state
+    /// manifest format 7) do not read it and were never part of a rolling upgrade.</summary>
     public const int Base = 1;
 
     /// <summary>State manifest format 8: an input's partitions have event times of their

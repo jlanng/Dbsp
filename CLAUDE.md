@@ -41,7 +41,11 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   `tests/Incremental.Service.FailoverApp` as real processes, both of which a solution build
   produces (the test project references them build-order only). The Kafka classes share
   one non-parallel collection; measured failover times go to `measurements.log` beside
-  the test assembly.
+  the test assembly. One test runs this build against the build from before format
+  levels and skips without it: `git worktree add --detach <dir> 9de8da9`, build
+  `<dir>/tests/Incremental.Service.FailoverApp`, and set `INCREMENTAL_OLDER_BUILD` to
+  its `Incremental.Service.FailoverApp.dll` (CI's `connector-stack` does). Run it, and
+  `RollingUpgradeTests`, after changing anything a node persists.
 - Admin UI: `dotnet run --project tests/Incremental.Service.AdminHost` serves a node with
   tables, pipelines and a generator at http://127.0.0.1:5180/admin/ (`-- --nodes 2` adds a
   standby on 5181; `--read-only`, `--no-rows`, `--port`;
@@ -424,7 +428,8 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     commit under `$watermark#s{n}#m{p}` and `$watermark#s{n}#i{p}` — two keys whose
     names never change, because a provider may keep the marker by setting keys and
     removing none (Redis does): do not put a flag in a key's name. State manifest
-    format 8; a format-7 checkpoint resumes as it is. Never make a partition idle on
+    format 8, which is format level 2 (below): a format-7 checkpoint resumes as it is,
+    and a node writes these keys only once its deployment is at that level. Never make a partition idle on
     the passing of time: a source says so only on evidence that it is at the end
     (`KafkaSource.PartitionEnds`: on an end-of-partition answer, after
     `IdlePartitionAfter`), takes it back when the evidence stops coming, and names
@@ -471,7 +476,43 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   lateness re-declares time and registers no clock source.
 - Checkpointed state identity is covered by the state manifest (committed with every
   checkpoint, validated at `Start()`); store names are positional unless pinned with
-  `.Named()` — changing store naming or the manifest format needs a format-version bump.
+  `.Named()` — changing store naming or the manifest format needs a format-version bump,
+  and a format-version bump is a new format level.
+- Format levels (`Storage/PersistedFormat.cs`; docs/design/durability-and-standby.md,
+  *As built: format levels*; the guide's *Upgrading the nodes*). Nodes are upgraded one
+  at a time, so two builds share the logs for the length of an upgrade: a node reads
+  every persisted format up to its build's level (`PersistedFormat.Reads`) and writes
+  the level its deployment is at (`Writes`), which the leader raises only when its
+  standby has said it reads the higher one. So a change of any persisted format — a
+  state-log or table-log format byte, the commit record, the state manifest, a key of
+  the checkpoint's marker — is never an edit of what is written: add a level to
+  `FormatLevel`, raise `Current`, write the new format only where `Formats.Writes` has
+  reached the level (read once per transaction: one commit is of one level), keep the
+  reader of everything below it for good, and add the pair of levels to
+  `FormatLevelTests.Pairs` and `RollingUpgradeTests.Pairs`. What must stay:
+  - A level is announced before it is written (`KafkaLog.RaiseFormatAsync` commits a
+    heartbeat carrying it, then moves `Writes`) and is never lowered: a new writer goes
+    on at the level in the leader topic and at no less than the highest it has itself
+    read in a log (`PersistedFormat.Seen`) — a writer from before levels announces none.
+  - A node that does not read the level is refused before `InitTransactions`, never
+    after: it must fence nobody. It does not take over by itself, stops following at
+    the first record of the level (`FormatLevelException`), and says `format-level`.
+  - The leader topic's records and the probe's detail line carry the level and so are
+    outside it: format byte 1 for good, and only new members a reader skips
+    (`LeaderRecord.Format`, `;fmt=`). An absent level is level 1.
+  - Level 1 is what the build before round five wrote (commit 9de8da9); a build from
+    before levels cannot say what it reads, and is the "older build" of
+    `KafkaServiceProcessTests`' two-build test (`INCREMENTAL_OLDER_BUILD`, which CI's
+    `connector-stack` builds from history). A reader exists only for a format that
+    holds what the newer one needs: a format-6 checkpoint of an event-time pipeline
+    stays refused at every level.
+  - `FormatLevel.Proving` (byte `0x7E` in front of every state-log value and table-log
+    record) is a level no build writes: it is how a change of a format byte is run
+    through an upgrade by the tests. Never give that byte to a real format, and never
+    make the proving level reachable from options a host can set.
+  - `PersistedFormat.Latest` (a log or a storage given no formats) writes the build's
+    level from the start: for a circuit on a storage of its own, where every process
+    is replaced together. A node of the service never uses it on Kafka.
 - Backpressure comes only from bounded channels (inputs, outputs). Never buffer unboundedly.
   This includes outputs: stream-shaped outputs never maintain integrated (snapshot) state —
   only table-shaped (keyed/windowed) outputs may, and theirs is bounded by eviction. The
@@ -493,7 +534,8 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
 - `ChangelogStorage` (`Storage/ChangelogStorage*.cs`). Its record keys
   (`pipeline NUL incarnation NUL store NUL entry`) and the format byte in front of every
   value are a persisted format: changing either needs a new format byte, not an edit
-  (1: the serializer's output; 2: a layout tag in front of it). A
+  (1: the serializer's output; 2: a layout tag in front of it; a new byte is a new
+  format level, see *Format levels*). A
   follower applies the log to the stores until `PromoteAsync`, and `Recover()` and commits
   throw before it. Takeover order: promote tables, then the storage, then `Start()` each
   circuit.

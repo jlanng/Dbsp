@@ -1995,6 +1995,71 @@ lost answers 409 `takeover-lost`). Start the first node of a new deployment befo
 second: two nodes that start together on an empty log both take over, and one is fenced
 at once.
 
+**Upgrading the nodes.** One node at a time, the standby first; the deployment never
+has both nodes down, and no step needs the two to be the same build.
+
+1. Replace the standby with the new build and wait until it is ready (`GET node`:
+   `status.standby.takeoverWouldBeWarm`). It reads everything the old leader writes:
+   a build keeps the readers of every older format.
+2. Move the leadership to it: `POST node/takeover` on the new node, or stop the old
+   leader, which steps down to a ready standby by itself. The new build now leads and
+   writes *what the old build reads* — not its own newest formats.
+3. Start the old leader's replacement — the new build — as the standby. (Started as the
+   old build instead, it is a warm standby again and can lead again: until step 4 the
+   upgrade can be taken back at any point by the same moves in reverse.)
+4. Nothing to do. Once a second the leader asks its standby what it reads (the probe;
+   `status.peer.formatReads`), and when the standby says it reads the newer formats the
+   leader starts writing them. It logs one warning, *persisted formats raised from
+   level 1 to level 2*, and the event feed carries it.
+
+What moves in step 4 is the deployment's **format level**: a number that names
+everything a node writes that another node must read — the state log's records and
+checkpoints, the table logs, the catalog. `GET node` has it as `formats`: `reads` (the
+highest level this build reads), `written` (what the logs are at), `held`. A build reads
+every level up to its own. A leader writes the level it found the logs at and raises it
+only on its standby's word; a standby that does not answer decides nothing, and one
+from before levels existed says nothing and counts as level 1. The raise is committed
+in the leader topic before the first record of the new level, and the next leader,
+whichever node it is, goes on at it.
+
+A level that has been written is not taken back, and that is the one thing to know
+before step 3: **after the raise the old build can no longer run this deployment.** A
+node built before the level says so and stays out — it is not ready
+(`format-level`: *the logs are written at a format level this node's build does not
+read*), it never takes over by itself, and a takeover asked of it is refused before it
+has fenced anyone. To keep the way back open for longer than the upgrade takes — a new
+build on probation — start the new nodes with `ServiceOptions.HoldFormatLevel = true`:
+the leader then never raises, and both builds can lead for as long as it is set. Remove
+it (a restart of each node, standby first) when the old build is not coming back.
+
+Three cases outside the four steps:
+
+- *A lone node*, or two nodes that were given no probe addresses (`PeerProbe`): a
+  leader that was told of no other node has nobody to ask and writes its own level as
+  soon as it leads. Two nodes without probes are upgraded with `HoldFormatLevel` set on
+  the new build until both run it. Give the nodes their probes instead.
+- *The build this one replaces has no format levels* (any build before this
+  version). It reads level 1, which is exactly what it wrote, so the four steps hold
+  for it too — the first upgrade through them was run against that build as real
+  processes (`KafkaServiceProcessTests`, *The build from before format levels…*).
+  But it cannot *say* that it does not read level 2: started again after the raise it
+  calls itself a warm standby, and if it takes over it leads with every pipeline
+  `NeedsReset` (*the checkpoint was committed with format=8, this circuit has
+  format=7*). Nothing is lost by that — the state is untouched, and the new build
+  taking over again runs every pipeline from where it stood — but nothing runs
+  meanwhile, and a `reset` there would throw the state away. After the raise, do not
+  start the old build. From this version on a node knows.
+- *Older still.* Level 1 is the formats of the version before this one. A checkpoint
+  from before event-time state was kept (state manifest format 6) is still not resumed
+  by a pipeline that uses event time, at any level: it holds no watermark and no
+  deadlines, and no reader can supply what was never written. That pipeline needs
+  `state=reset`, as before; see the limits.
+
+What an upgrade does not cover is what a format level does not name: a new build's
+*definitions* (a plugin version is deployed, not rolled), and behaviour that differs
+between builds without a format changing — for the length of the upgrade whichever
+build leads decides, for instance, whether a record is late.
+
 **Takeover and step-down by hand.** `POST node/takeover` on the standby is refused
 unless it is warm; `POST node/stepdown` on the leader is refused unless the peer answers
 as a ready standby. Both take `dryRun=true` (the answer is the plan) and `force=true`,
@@ -2007,7 +2072,9 @@ curl -X POST 'http://127.0.0.1:5181/admin/api/node/takeover?confirm=b' -H 'X-Inc
 
 **When a standby is warm.** A standby says it is ready (`GET node`, the probe, the
 `standby_ready` gauge) when a takeover now would be a warm one, and otherwise why not:
-`catalog-not-open`, `catalog-behind`, `table-opening`, `table-faulted`, `state-behind`,
+`format-level` (the logs are written at a format level this build does not read: see
+*Upgrading the nodes*), `catalog-not-open`, `catalog-behind`, `table-opening`,
+`table-faulted`, `state-behind`,
 `plugin-pending` (a plugin version a pipeline names is not fetched yet) and
 `pipeline-building` — a circuit it can build on the state it follows is not built yet,
 which after a cold start lasts about a second per million entries of the largest
@@ -3193,9 +3260,12 @@ resources are ARNs (`…:topic/<cluster>/<uuid>/{prefix}.*`,
   running build's types hold, as it does after any other commit. A standby keeps the
   second copy only until the leader has checkpointed under the spec it built. The
   pipeline's page shows the entries held twice while there are any.
-- **Both nodes are upgraded together** across the build that introduced layouts: a
-  node from before it refuses the records a newer leader writes (a new format byte in
-  the state log). Stop the standby, replace the leader, start the standby.
+- **A format level, once raised, is not lowered.** Nodes are upgraded one at a time
+  (*Operating it*, *Upgrading the nodes*) and the older build can lead again at any
+  point until the leader raises the level; after that it cannot, and the build from
+  before levels existed does not know it. Builds older than the one before this
+  version (from before layouts, or before event-time state was checkpointed) are not
+  part of any rolling upgrade: both nodes are replaced together, as before.
 - **`keep` is checked as far as the state can say.** The layout (worker count, store
   names, table identities) is compared before anything stops; whether stored values read
   as their new types is found when the new generation is built, and a failure there rolls
@@ -3234,8 +3304,8 @@ resources are ARNs (`…:topic/<cluster>/<uuid>/{prefix}.*`,
 - **Windows:** an idle input stalls the watermark, and events later than the allowed
   lateness are dropped without a record ([intro.md](intro.md#event-time-watermarks-and-lateness)).
 - **A checkpoint written before event-time state was kept does not resume a pipeline
-  that uses event time.** State manifests are format 7 from this version: the watermark
-  and the deadlines of open windows and keys are checkpointed
+  that uses event time.** State manifests are format 7 or later (8 once the format
+  level is 2): the watermark and the deadlines of open windows and keys are checkpointed
   ([intro.md](intro.md#event-time-state-across-a-restart)). A pipeline with
   `WithEventTime` whose state was committed by an earlier build is refused at its start
   (`state-incompatible`, with the reason) and needs `state=reset`; a pipeline without

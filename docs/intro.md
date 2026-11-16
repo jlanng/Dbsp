@@ -242,7 +242,10 @@ Two consequences for whoever changes a definition. A checkpoint taken before thi
 so (state manifest format 6) does not resume a circuit that uses event time — start
 that one from an empty state store — while one without event time resumes untouched.
 (Format 8 added the partitions' times to the checkpoint; a format-7 checkpoint resumes
-as it is, and a build that writes format 7 refuses a format-8 one.)
+as it is, and a build from before format 8 refuses a format-8 one. A circuit on a
+storage of its own writes format 8; a node of the enrichment service writes format 7
+until both nodes of its deployment read 8 — `PersistedFormat`, and the service guide's
+*Upgrading the nodes*.)
 And the number of `WithEventTime` sources is part of the manifest: adding or removing
 one, other than the first or the last, needs a fresh state store too.
 

@@ -680,7 +680,7 @@ operators orphans downstream state (detected, loudly); `.Named("revenue")` on th
 stateful operator returns pins its identity by name instead, so the circuit can evolve
 around it and a rebuild still finds its state. Pure additions — new operators, whose state
 starts empty — are always allowed. A name pins identity, not meaning: state is resumed
-as-is, so rename the operator when its computation changes. The manifest is format 7:
+as-is, so rename the operator when its computation changes. The manifest is format 7 or 8 (8 holds the event times of an input's partitions; `docs/intro.md`):
 a checkpoint from before event-time state was checkpointed (format 6) resumes a circuit
 that has no event time and is refused by one that has; so is a changed number of
 `WithEventTime` sources.

@@ -48,7 +48,7 @@ public interface IServiceBackend : IAsyncDisposable
     /// <summary>The level the logs are written at as far as this node has read; 0 when
     /// nothing has said. Above <see cref="PersistedFormat.Reads"/> on a node that cannot
     /// read them.</summary>
-    int FormatLevelWritten => 0;
+    int FormatLevelWritten => Formats.Writes;
 
     /// <summary>Raises the level the leader writes, durably and before anything is
     /// written under it. Called by the leader once the other node reads the level.</summary>

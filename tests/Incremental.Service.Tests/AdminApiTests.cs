@@ -1246,6 +1246,13 @@ public class AdminApiTests(SharedAdminHost shared) : IClassFixture<SharedAdminHo
         Assert.Equal("node-a", node["status"].GetProperty("peer").GetProperty("nodeId").GetString());
         Assert.True(node["peerExpected"].GetBoolean());
 
+        // The persisted formats: what this build reads, what the logs are at, and what
+        // the other node said it reads.
+        Assert.Equal(Incremental.Storage.FormatLevel.Current, node["formats"].GetProperty("reads").GetInt32());
+        Assert.Equal(Incremental.Storage.FormatLevel.Current, node["formats"].GetProperty("written").GetInt32());
+        Assert.False(node["formats"].GetProperty("held").GetBoolean());
+        Assert.Equal(Incremental.Storage.FormatLevel.Current, node["status"].GetProperty("peer").GetProperty("formatReads").GetInt32());
+
         // Rows come from the standby's own copy, with how far behind it is.
         var rows = await admin.SendAsync(HttpMethod.Get, "tables/instruments/rows?key=7", baseUrl: standby);
         Assert.Equal(7, rows["rows"][0].GetProperty("key").GetInt32());

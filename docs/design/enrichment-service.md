@@ -1615,11 +1615,15 @@ persisted formats, upgrade rules, availability and data-loss trade-offs, exposur
 claims only AWS can check. Each was checked against the code in round four (S8); the
 numbers are the items' own, from the runs they cite.
 
-1. **Upgrades are in lockstep** (31). Every state-log value carries format byte 2
-   (`ChangelogStorageProvider.FormatTagged`), and a node built before a format change
-   cannot follow a leader built after it, so both nodes are replaced together. To allow
-   rolling upgrades later, every format byte shipped by then needs a reader kept for
-   ever; decide whether the first deployment must support them.
+1. **Upgrades roll, one node at a time, and a format level once raised is not
+   lowered** (31; built in round five, S9). A node reads every persisted format up to
+   its build's level and writes the level its deployment is at; the leader raises it
+   when its standby says it reads the higher one. Until then the older build can lead
+   again; afterwards it cannot. Decide how long a new build is on probation before the
+   raise (`ServiceOptions.HoldFormatLevel`; the default is no time at all: the raise
+   follows the second node's upgrade by a second), and never run two nodes without
+   probe addresses through an upgrade without it. The cost that stays: every format a
+   build has shipped needs its reader kept for ever.
 2. **The `files` connector's formats are persisted** (22, 54, 63). Object names
    (`{step:D19}-{term:D6}-{base:D19}.jsonl`) and the source's position packed into the
    checkpoint's partition → offset map are what deployed pipelines resume from; changing
@@ -1836,6 +1840,9 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     the cost is that compaction can remove the marker from under a follower that is
     behind, which then applies another version's records to its typed stores — the
     per-record tag exists because that cannot be ruled out.
+    *Round five (S9, B6):* this stays true of that one boundary and of no later one.
+    From the build before round five on, a change of a persisted format is a format
+    level, written only once both nodes read it; nodes are upgraded one at a time.
 32. **The takeover ceiling stays at 30 s** (S6; S7 found why it was reached). The loss
     of one broker silences a leader for 8 to 15 s with the client settings of S7 —
     11 to 16 s if the broker stops answering instead of dying, and once 26 s — so the
@@ -1874,6 +1881,14 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     from the keys of its state. The deadlines can be rebuilt; the watermark cannot, so
     the first late record after such a start would still reopen a window — once per
     pipeline, at the upgrade. It would also want an enumeration on every store.
+    *Round five (S9, B6):* rolling upgrades do not change this, and cannot. A node
+    keeps a reader for every older format that holds what the newer one needs: format
+    7 is read by every build since, format 8 by a node of format level 2, and a
+    format-6 checkpoint of a pipeline without event time as before. A format-6
+    checkpoint of an event-time pipeline is not a format to read but state that was
+    never written — no watermark, no deadlines — so it is refused at every level and
+    the pipeline needs `state=reset`. The first format level is therefore the formats
+    of the build before round five (manifest 7), not anything older.
 37. *Moot (the alternative is what happens, S7).* **State bytes are kept beside the typed stores until the first commit after a
     start** (S6), so a leader's idle pipeline holds its state twice for as long as it is
     idle. *Alternative:* commit once as soon as a circuit has started on existing state,
@@ -7554,3 +7569,163 @@ the newest instead of the least — killed by 3, 3 and 6 tests; the rule removed
   not started ("recent account payments have failed or your spending limit needs to
   be increased"), which is the account's, not the branch's. Everything those jobs
   run was run here on the last commit's build, the broker tests included.
+
+#### Rolling upgrades across a change of a persisted format (B6)
+
+Until this step a build that changed a persisted format needed both nodes replaced
+together — and the step before this one had just made such a change (state manifest
+format 8, which the build before it refuses). What was built is one mechanism for
+every such change, with that one as its first case.
+
+**The level.** `Storage/PersistedFormat.cs`. A *format level* is a number that names
+everything a node writes that another node must read: the state log's values and commit
+records, the state manifest and the keys of the checkpoint's marker, the table logs'
+records (the catalog is one). Level 1 (`FormatLevel.Base`) is what the build before
+round five wrote; level 2 (`PartitionTimes`) is manifest format 8 and the partitions'
+event times in the marker. A node has one `PersistedFormat`, shared by its log, its
+storage and its circuits: `Reads`, fixed — the build's level, or a lower one the node
+is pinned to, in which case it refuses what a build of that level would refuse — and
+`Writes`, the deployment's, which starts at 1, is never lowered, and is read once per
+transaction. A change of a persisted format is from now on a new constant there, the
+new format written only where `Writes` has reached it, and the reader of everything
+below it kept.
+
+**Who decides.** On Kafka the writer announces the level it writes in every record of
+the leader topic (`LeaderRecord.Format`, a member a build from before levels ignores
+and never writes; absent reads as 1). A new writer goes on at the level it reads there
+with the term (`AcquireCoreAsync`), and at no less than the highest level it has itself
+met in a log (`PersistedFormat.Seen`: a manifest of format 8, the proving byte) — which
+is what keeps the level when a writer from before levels led in between and announced
+none. `KafkaLog.RaiseFormatAsync` raises it: a heartbeat that announces the level is
+committed first, and only then is anything written under it, so no reader meets a
+record of a level it was not told of. In the service the leader raises
+(`ServiceNode.RaiseFormatLevelAsync`, once a second, with the probe it already makes):
+when its peer has just answered as a standby and said what it reads (`;fmt=N` in the
+probe's detail, which a reader skips if it does not know it; none reads as 1), to the
+lower of the two nodes' levels. No answer decides nothing. A node told of no peer
+raises to its own level at once; `ServiceOptions.HoldFormatLevel` stops every raise.
+
+**Who is refused, and when.** A node that does not read the level the logs are at:
+does not take over by itself (`WaitToTakeOverAsync`); is refused by
+`AcquireCoreAsync` before `InitTransactions`, so it fences nobody — from what it heard
+of the leader topic, or from a read of the topic's tail when it heard nothing; stops
+following at the first commit record or value of the level (`FormatLevelException`
+from `ChangelogStorageProvider.ApplyReplicated` / `ReadCommit`, and from a table log's
+`Readable`); and says `format-level` as the first reason it is not ready. `GET node`
+has `formats: { reads, written, held }`.
+
+**The first real case: manifest 7 → 8.** `StateManifest.Problems` takes the node's
+level: a format-8 checkpoint is refused by a node that reads level 1 (as the old build
+refuses it) and formats 6 (without event time) and 7 are read by every node; what the
+circuit *writes* is no longer the build's constant but `Writes` at each commit
+(`Circuit.CommitCheckpoint` restages the manifest when the level has moved, and
+`WatermarkClock.AppendCheckpoint` writes the partitions' keys or not by the same
+level). At level 1 the marker has one time per source — the newest across its
+partitions, which is what the older build would have written there and what it takes
+it for. A level-2 node resuming such a checkpoint holds the watermark where it was
+committed until its source has named its partitions again and each has brought a
+record or is idle: it never regresses and makes nothing late that was not.
+
+**The proving level.** A real change of a *format byte* — of the state log's values or
+the table logs' records — has not happened since layouts, and the mechanism would be
+unproven for exactly the case the plan names. `FormatLevel.Proving` is a level no
+build writes or asks for (internal; a test's `PersistedFormat.ForTesting`): under it
+every state-log value and every table-log record is the level below's with byte `0x7E`
+in front, which a node below the level refuses as a build refuses a byte it does not
+know. It costs one branch per value read and per transaction written. It is how the
+whole path — hold back, hear, raise, refuse — runs on every build against formats that
+really are unreadable below the level.
+
+**What the state manifest's history means now (Open for James 36).** Said plainly:
+nothing changed for format 6. A reader is kept for every format that *holds* what a
+newer one needs; a format-6 checkpoint of an event-time pipeline holds neither the
+watermark nor the deadlines, so there is nothing a reader could read, and it is
+refused at every level as before (`state=reset`). Formats 5 and older are refused as
+before. Rolling upgrades begin at the build before round five; the boundaries before
+it (layouts, event-time state) stay lockstep or reset, and no deployment is on those
+builds.
+
+**Measured and tested.**
+
+- *Two real builds.* `KafkaServiceProcessTests.The_build_from_before_format_levels…`:
+  the build of commit `9de8da9` and this one as processes on one deployment (a table
+  loaded from Kafka, two pipelines from a plugin, 3,200 trades, a reference row
+  changed at every stage). Older leader and older standby; standby replaced by this
+  build; takeover; the older build back as standby, warm — it reads the catalog, the
+  table and the state this build writes — and the level still 1 after three more
+  probes; takeover *back* to the older build, which leads on state this build wrote;
+  takeover again; the second node replaced; the level raised to 2 within the leader's
+  next probe; a takeover at level 2. Sinks equal to the model at each of the eight
+  stages, four takeovers. Then the hazard, on the build that has no levels: the older
+  build started after the raise calls itself warm, takes over, and leads with both
+  pipelines `NeedsReset` (*format=8 … this circuit has format=7*); this build takes
+  over again, goes on at level 2 although the older leader announced none, and the
+  sinks equal the model. Four whole runs, all passed
+  (`docs/design/runs/2026-11-16-b6-rolling-upgrade.measurements.log`). The test skips
+  without `INCREMENTAL_OLDER_BUILD`; CI's `connector-stack` builds the older node from
+  history and sets it.
+- *Two nodes of this build at different levels*, in one process on Kafka
+  (`RollingUpgradeTests`, for 1 → 2 and for 2 → proving): the same upgrade with a
+  table, a join and a windowed pipeline whose event time is declared on a
+  three-partition input; windows close while it goes on; at every stage the three
+  sinks equal the model, at the end every window's final is there once, the last
+  leader counted no late record, and the logs hold the higher level only after the raise (manifest and marker
+  keys; the proving byte in the state topic and the table's rows topic). An older
+  node started at the end says `format-level` and its forced takeover is refused with
+  the leader undisturbed. A second test: a lone leader writes its own level; a leader
+  told to hold does not raise for a standby that reads more.
+- *The logs alone* (`KafkaFormatLevelTests`, 3): a writer goes on at the announced
+  level; a raise outlives its writer; a node below the level is refused before the
+  fence while the writer it would have replaced still commits; a change of the format
+  byte is read by a node of the level and by none below, on the state log and a table
+  log; a standby below the level stands by through five takeover timeouts without
+  trying.
+- *The engine* (`FormatLevelTests`, 8): a pair of storages through the same upgrade
+  on the in-memory changelog — including a takeover back to the lower level before
+  the raise — with a partitioned event-time circuit, five seeded workloads over the
+  pairs 1 → 2, 2 → proving and 1 → proving, outputs integrated as a transactional
+  sink would hold them and equal to an uninterrupted run's; what level 1 writes for a
+  partitioned source; the manifest's readers by level.
+- Mutations, each against the engine tests: the marker written at the build's level
+  whatever the deployment's (3 fail), a new writer starting at the base level instead
+  of the level it has read (5), a follower not looking at a commit record's manifest
+  (4); and the standby's guard removed against the Kafka test (1).
+
+**Left.**
+
+- *The build before this one cannot say what it reads.* After the raise it must not be
+  started: it calls itself a warm standby and, leading, stops every pipeline as
+  `NeedsReset`. Shown above to lose nothing, but nothing runs until the newer build
+  leads again, and a `reset` there would discard state. Every later build refuses by
+  itself. The raise follows the second node's upgrade by about a second unless
+  `HoldFormatLevel` is set, so the window in which the upgrade can be taken back is
+  only as long as the operator makes it.
+- *No peer, no question.* A leader with no probe address raises at once. Two nodes
+  without probes and with different builds are therefore protected only by
+  `HoldFormatLevel`; the guide says so. A raise by an operator's command instead of a
+  setting was not built.
+- *The leader asks one standby.* The service has two nodes. A third process that reads
+  the logs — nothing in the service is one — would not be asked.
+- *What a level does not name.* Behaviour that differs between builds with no format
+  changing: for the length of an upgrade whichever build leads decides. The
+  event-time step is the example — a returning key, a late version, the bound on a
+  time in the future are judged by the leader's build — and the two-build test above
+  uses pipelines without event time, so it does not exercise it. The leader topic's
+  records and the probe's line are outside the levels too: they are how the level
+  travels, and may only gain members a reader can skip. The `files` connector's
+  formats and the blob topic stay as CLAUDE.md has them.
+- *A level-1 checkpoint has no partition times*, so a node that leads at level 1 pays
+  K1's restart cost in full at each takeover (every partition holds the watermark
+  until it has brought a record or is idle), for as long as an upgrade is held.
+- *Found on the way, not B6's:* a burst that arrives after an input's partitions have
+  all gone idle is read a partition at a time, and the first partition read moves the
+  watermark before the others are heard — the idle ones hold nothing back. With 5 s of
+  event time produced at once over three partitions and a lateness of 2 s, 19 of 50
+  records were late (the first build of `RollingUpgradeTests`' feed, twice in two
+  runs; the feed now stays inside the lateness). It is K1's idle rule working as
+  written, and the same as before K1 — but K1's "a backlog is not late" does not cover
+  a backlog that begins after five quiet seconds.
+- *Not run:* the scale rig and the torture rig; the three-broker profile; the two
+  admin UI tests (no Chrome on this machine; `app.js` gained one line of text, the
+  reason `format-level`). CI has not run since the account's billing stopped it, so
+  the workflow's new step (build the older node from history) has never run.

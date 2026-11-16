@@ -94,6 +94,16 @@ internal static class AdminApi
                     isSelf = leader.NodeId == node.NodeId && status.Leadership.Role == NodeRole.Leader,
                 },
                 peerExpected = node.Backend.Leadership.PeerExpected,
+
+                // The persisted formats: what this build reads, what the logs are written
+                // at as far as this node knows (0: nothing has said), and whether a
+                // leader here would hold the level where it is.
+                formats = new
+                {
+                    reads = node.Backend.Formats.Reads,
+                    written = node.Backend.FormatLevelWritten,
+                    held = node.Options.HoldFormatLevel,
+                },
                 contracts = ContractAssemblies.All
                     .Select(a => a.GetName().Name!)
                     .Distinct(StringComparer.Ordinal)

@@ -241,3 +241,29 @@ INCREMENTAL_KAFKA_BROKERS=incremental-kafka3-1-1,incremental-kafka3-2-1,incremen
 ```
 
 A 4-processor cloud VM, 15 GB; Kafka 3.9.0 in containers on the same machine.
+
+## 2026-11-16, round five — rolling upgrades (B6)
+
+`docs/design/enrichment-service.md`, *As built*, S9, *Rolling upgrades across a change
+of a persisted format*.
+
+- `2026-11-16-b6-rolling-upgrade.measurements.log` — the lines
+  `KafkaServiceProcessTests.The_build_from_before_format_levels_and_this_one_take_turns_until_both_are_this_one`
+  wrote to `measurements.log` beside the test assembly, every run of it made in the
+  step. The first three lines are the test before its last stage was added (the older
+  build started after the raise); each later pair is one run of the whole test.
+
+The older build is commit `9de8da9` — the last before round five, which writes state
+manifest format 7 and has no format levels — built in a worktree; the newer one is the
+step's own, at each run's time. Both as real processes
+(`tests/Incremental.Service.FailoverApp`) on the connector stack's one broker:
+
+```
+git worktree add --detach <dir> 9de8da9
+dotnet build <dir>/tests/Incremental.Service.FailoverApp
+INCREMENTAL_OLDER_BUILD=<dir>/tests/Incremental.Service.FailoverApp/bin/Debug/net10.0/Incremental.Service.FailoverApp.dll \
+  dotnet test --project tests/Incremental.Service.Tests -- --filter-method '*The_build_from_before_format_levels*'
+```
+
+Without the variable the test skips. A 4-processor cloud VM, 15 GB; Kafka 3.9.0 in a
+container on the same machine.

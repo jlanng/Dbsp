@@ -2802,3 +2802,52 @@ keeps failing early.
 - `InitTransactions` is called in one-second slices so that a takeover can be called
   off. The client documents the call as resumable; a broker that answers slower than a
   second was not tried.
+
+## As built: format levels — rolling upgrades (2026-11-16)
+
+Everything in the logs is a persisted format, and until now a build that changed one
+could not share a deployment with the build before it. The rule since: **a node reads
+every format up to its build's level and writes the level its deployment is at**
+(`Storage/PersistedFormat.cs`; the service's side and the tests are in
+enrichment-service.md, S9).
+
+- *A level* names all of it at once — state-log values and commit records, the state
+  manifest and the marker's keys, table-log records. One number, because a node either
+  reads what another build writes or does not; a level per log would have to be raised
+  in some order and a node could be caught between.
+- *Reads* is the build's (or lower, pinned). *Writes* is the deployment's: 1 on a
+  deployment nobody has led, read from the leader topic by each new writer, raised
+  only by `KafkaLog.RaiseFormatAsync`, never lowered.
+- *The leader topic carries it.* `LeaderRecord.Format` rides on the term record and on
+  every heartbeat, so the topic's tail has it, as it has the term; a writer from
+  before levels writes no such member and reads as level 1. The leader topic's own
+  records are therefore outside the levels: format byte 1 for good, new members only.
+- *Announce, then write.* A raise commits a heartbeat carrying the new level and only
+  then lets the node's `Writes` move. A writer fenced before that commit has written
+  nothing of the level; a reader of any log has been told before it meets a record.
+- *Refuse before the fence.* `AcquireCoreAsync` compares the level it has heard with
+  what the node reads before `InitTransactions` — the call that fences. A process that
+  has heard nothing (no leadership follows the topic for it, or every writer so far
+  was from before levels) reads the topic's tail first; one that has heard pays
+  nothing, and takeovers are timed. After the fence the level is read again with the
+  term, for the writer nobody heard.
+- *What a node has read counts.* A writer never writes below the highest level it has
+  met in a log (`PersistedFormat.Seen`, set by the storage's follower and the table
+  logs' readers; applied in `ChangelogStorage.PromoteAsync` and at acquisition).
+  Without it a writer from before levels, leading for a moment after a raise, would
+  reset the deployment to level 1 by announcing nothing.
+- *A standalone log* — `KafkaLogOptions.Formats` left alone, a `ChangelogStorage` with
+  no options — is `PersistedFormat.Latest`: it writes its build's level from the
+  start, which is right where every process is replaced together and wrong for a
+  rolling upgrade. A host that wants one gives the log and the storage one
+  `new PersistedFormat()` and calls `RaiseFormatAsync` when its own nodes agree; the
+  enrichment service does this from the peer probe.
+- *The proving level* (`FormatLevel.Proving`, byte `0x7E`) is a format change no build
+  ships, so that the path a real change of a format byte will take is run by tests on
+  every build. Do not give `0x7E` to a real format.
+
+To change a persisted format: add a level constant, raise `FormatLevel.Current`, write
+the new format only where `Formats.Writes` has reached the level (read once per
+transaction), keep every reader, and add the pair (old level, new level) to
+`FormatLevelTests.Pairs` and `RollingUpgradeTests.Pairs`.
+

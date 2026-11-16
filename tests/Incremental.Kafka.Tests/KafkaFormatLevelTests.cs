@@ -140,4 +140,44 @@ public class KafkaFormatLevelTests
         await Assert.ThrowsAsync<FormatLevelException>(() => stale.AcquireWriterAsync()).WaitAsync(Timeout);
         Assert.True(writer.IsWriter);
     }
+
+    [Fact]
+    public async Task A_standby_that_does_not_read_the_level_never_takes_over_however_long_the_silence()
+    {
+        await using var env = KafkaEnv.Create();
+        var after = TimeSpan.FromMilliseconds(800);
+        KafkaLeadershipOptions Options() => new() { TakeoverAfter = after, StartLeadingAsync = (_, _) => Task.CompletedTask };
+
+        var leaderLog = await env.ConnectAsync(With(env, new PersistedFormat(), "new"));
+        var leader = new KafkaLeadership(leaderLog, Options());
+        await leader.StartAsync().WaitAsync(Timeout);
+        await leader.WhenRoleAsync(NodeRole.Leader).WaitAsync(Timeout);
+        await leaderLog.RaiseFormatAsync(FormatLevel.PartitionTimes).WaitAsync(Timeout);
+
+        var oldLog = await env.ConnectAsync(With(env, new PersistedFormat(reads: FormatLevel.Base), "old"));
+        await using var old = new KafkaLeadership(oldLog, Options());
+        await old.StartAsync().WaitAsync(Timeout);
+        await KafkaEnv.EventuallyAsync(() => Task.FromResult(oldLog.FormatLevelSeen == FormatLevel.PartitionTimes), "the standby to hear the level");
+
+        // The leader goes without a word. A standby that reads the level would lead
+        // within the takeover timeout; this one stands by through five of them.
+        await leader.DisposeAsync();
+        await leaderLog.DisposeAsync();
+        await Task.Delay(after * 5);
+        Assert.Equal(NodeRole.Standby, old.Role);
+        Assert.False(oldLog.IsWriter);
+        Assert.Equal(0, old.TakeoversAbandoned); // it did not so much as try
+
+        // Asked by hand it is refused, and is a standby still: it fenced nobody.
+        var refused = await Assert.ThrowsAnyAsync<Exception>(() => old.TakeOverAsync()).WaitAsync(Timeout);
+        Assert.Contains("format level 2", refused.Message);
+        Assert.Equal(NodeRole.Standby, old.Role);
+
+        // A node of the level takes the logs as from any dead leader.
+        var nextLog = await env.ConnectAsync(With(env, new PersistedFormat(), "next"));
+        await using var next = new KafkaLeadership(nextLog, Options());
+        await next.StartAsync().WaitAsync(Timeout);
+        await next.WhenRoleAsync(NodeRole.Leader).WaitAsync(Timeout);
+        Assert.Equal(FormatLevel.PartitionTimes, nextLog.Formats.Writes);
+    }
 }
