@@ -9,11 +9,13 @@
     <ProjectReference Include="..\Incremental\Incremental.csproj" />
     <ProjectReference Include="..\Incremental.Hosting\Incremental.Hosting.csproj" />
     <ProjectReference Include="..\Incremental.Kafka\Incremental.Kafka.csproj" />
+    <ProjectReference Include="..\Incremental.Service.Abstractions\Incremental.Service.Abstractions.csproj" />
   </ItemGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="Incremental.Service.Tests" />
     <InternalsVisibleTo Include="Incremental.Service.Admin" />
+    <InternalsVisibleTo Include="Incremental.Service.Testing" />
   </ItemGroup>
 
 </Project>

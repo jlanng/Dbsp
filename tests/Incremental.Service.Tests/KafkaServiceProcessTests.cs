@@ -40,7 +40,7 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         /// builds against each other; null is this build's.</param>
         public AppNode(
             KafkaTestEnv env, string id, int probePort, int peerPort, bool plugins = false, int tables = 0, bool supervised = false,
-            string? appDll = null)
+            string? appDll = null, string? pluginDirectory = null)
         {
             Id = id;
             Supervised = supervised;
@@ -66,7 +66,7 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
 
                 // The plugin's package directory is given to one node only: the other must
                 // get the plugin through Kafka or not at all.
-                "--plugins", plugins ? Path.GetDirectoryName(TestService.PluginDirectory("Acme.Pipelines"))! : "",
+                "--plugins", plugins ? pluginDirectory ?? Path.GetDirectoryName(TestService.PluginDirectory("Acme.Pipelines"))! : "",
             })
                 info.ArgumentList.Add(argument);
             _process = Process.Start(info) ?? throw new InvalidOperationException("Failed to start the service failover app.");
@@ -309,6 +309,20 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         }
     }
 
+    /// <summary>The older build's <c>Acme.Pipelines</c> package directory, as the
+    /// <c>--plugins</c> argument takes it (the configuration's directory), from the path of
+    /// that build's failover app: <c>{worktree}/tests/Incremental.Service.FailoverApp/bin/{c}/{tfm}/…dll</c>.</summary>
+    internal static string OlderPluginDirectory(string olderAppDll)
+    {
+        var tfmDirectory = Path.GetDirectoryName(Path.GetFullPath(olderAppDll))!;
+        var configuration = Path.GetFileName(Path.GetDirectoryName(tfmDirectory)!);
+        var tests = Path.GetFullPath(Path.Combine(tfmDirectory, "..", "..", "..", ".."));
+        var directory = Path.Combine(tests, "Incremental.Service.TestPlugins", "Acme.Pipelines", "bin", configuration);
+        Assert.True(File.Exists(Path.Combine(directory, Path.GetFileName(tfmDirectory), "Acme.Pipelines.dll")),
+            $"The older build's Acme.Pipelines is not built under {directory}: build tests/Incremental.Service.TestPlugins/Acme.Pipelines in that worktree too.");
+        return directory;
+    }
+
     /// <summary>
     /// The rolling upgrade with the build from before format levels as the older node: a
     /// real process of that build (<c>INCREMENTAL_OLDER_BUILD</c>, the path of its
@@ -328,6 +342,14 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
             return;
         }
         Assert.True(File.Exists(older), $"INCREMENTAL_OLDER_BUILD names {older}, which is not there.");
+
+        // The plugin both builds run is the older build's: compiled against
+        // Incremental.Service, before the plugin-facing types moved to
+        // Incremental.Service.Abstractions. A deployment's stored plugins predate the
+        // upgrade, so this is what a node of this build must load (through the service's
+        // type forwards); one compiled against the abstractions does not load on the
+        // older build at all.
+        var olderPlugins = OlderPluginDirectory(older);
         await using var env = KafkaTestEnv.Create();
         var tradesTopic = await env.CreateTopicAsync("trades", partitions: 2);
         var instrumentsTopic = await env.CreateTopicAsync("instruments", compacted: true);
@@ -355,7 +377,7 @@ public class KafkaServiceProcessTests(ITestOutputHelper output)
         }
 
         AppNode Node(string id, bool thisBuild) =>
-            new(env, id, ports[id == "a" ? 0 : 1], ports[id == "a" ? 1 : 0], plugins: true, appDll: thisBuild ? null : older);
+            new(env, id, ports[id == "a" ? 0 : 1], ports[id == "a" ? 1 : 0], plugins: true, appDll: thisBuild ? null : older, pluginDirectory: olderPlugins);
         static long Level(JsonElement status) =>
             status.GetProperty("counters").TryGetProperty("formatLevelWritten", out var level) ? level.GetInt64() : -1;
         Task<JsonElement> WarmAsync(AppNode standby, string leader) => standby.StatusWhenAsync(

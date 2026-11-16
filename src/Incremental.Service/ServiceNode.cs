@@ -22,6 +22,7 @@ internal sealed class ServiceRegistrations
     public Dictionary<string, Func<IServiceProvider, IConnector>> Connectors { get; } = new(StringComparer.Ordinal);
     public Dictionary<string, Func<IServiceProvider, IObjectStore>> ObjectStores { get; } = new(StringComparer.Ordinal);
     public Dictionary<string, Func<IServiceProvider, KafkaConnection>> KafkaConnections { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, Func<IServiceProvider, IRecordFormat>> RecordFormats { get; } = new(StringComparer.Ordinal);
     public Func<IServiceProvider, IServiceBackend>? Backend { get; set; }
 
     /// <summary>The topic prefix of the Kafka backend's own log, when that is the backend.</summary>

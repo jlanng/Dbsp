@@ -615,9 +615,10 @@ directory, or a zip of it, is the package.
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
   <ItemGroup>
-    <!-- Provided by the host: compile against them, copy nothing of them. "native" matters:
-         without it the Kafka client's native libraries (about 100 MB) land in runtimes/. -->
-    <ProjectReference Include="…/src/Incremental.Service/Incremental.Service.csproj" Private="false" ExcludeAssets="runtime;native" />
+    <!-- Provided by the host: compile against them, copy nothing of them. These two are
+         all a plugin needs of the service: the definition interfaces, PipelineBuilder and
+         table definitions are in the abstractions, and nothing of hosting or Kafka is. -->
+    <ProjectReference Include="…/src/Incremental.Service.Abstractions/Incremental.Service.Abstractions.csproj" Private="false" ExcludeAssets="runtime;native" />
     <ProjectReference Include="…/src/Incremental/Incremental.csproj" Private="false" ExcludeAssets="runtime;native" />
     <ProjectReference Include="../Contracts/Enrichment.Contracts.csproj" Private="false" />
     <!-- A private dependency: copied beside the plugin and loaded from there. -->
@@ -641,8 +642,8 @@ Where a plugin's references are loaded from:
 1. A **contract assembly** the process has loaded — always that one, even if the plugin
    ships its own copy.
 2. The **host**, for the assemblies whose types cross between host and plugin —
-   `Incremental*`, `Microsoft.Extensions.*`, `Confluent.Kafka` and the framework —
-   whatever the plugin ships.
+   `Incremental*`, `Microsoft.Extensions.*` and the framework — whatever the plugin
+   ships.
 3. The **host**, for any other assembly it happens to carry, if the host's version is at
    least the one the plugin was built against. If the plugin was built against a newer
    one and ships it, the plugin gets its own copy.
@@ -759,7 +760,7 @@ a store and a prefix) the template leaves those properties empty, `valid` is fal
 ### 5. A test
 
 A definition is tested without a node. `PipelineTestHarness`
-(`Incremental.Service.Testing`, in the `Incremental.Service` package) binds the settings
+(the `Incremental.Service.Testing` package) binds the settings
 and runs `Build` exactly as the service does, over tables the test fills, with inputs
 the test feeds and sinks it reads. Steps are the test's to take, and a step returns when
 the sinks hold what it produced — so there is nothing to wait for and nothing to poll.
@@ -1027,7 +1028,7 @@ here, but the harness knows no test framework):
 
 ```xml
 <ItemGroup>
-  <PackageReference Include="Incremental.Service" Version="…" />
+  <PackageReference Include="Incremental.Service.Testing" Version="…" />
   <PackageReference Include="xunit.v3" Version="4.0.1" />
   <ProjectReference Include="..\Contracts\Enrichment.Contracts.csproj" />
   <ProjectReference Include="..\Pipelines\Enrichment.Pipelines.csproj" />

@@ -136,6 +136,27 @@ public sealed class IncrementalServiceBuilder
         return this;
     }
 
+    /// <summary>
+    /// A record format of the <c>kafka</c> connector and the <c>kafka</c> table loader,
+    /// which a slot or a loader chooses with <c>"format": "<paramref name="name"/>"</c>:
+    /// the seam for what the owner's topics carry (Avro, Protobuf, a schema registry's
+    /// framing). JSON is built in as <c>json</c>, the default, and Debezium's change events
+    /// as <c>debezium</c>; neither name can be taken. The factory runs once per process,
+    /// when a slot first names the format; see <see cref="IRecordFormat"/> for what a format
+    /// may keep.
+    /// </summary>
+    public IncrementalServiceBuilder AddRecordFormat(string name, Func<IServiceProvider, IRecordFormat> format)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(name);
+        ArgumentNullException.ThrowIfNull(format);
+        if (name is KafkaSlotConfig.JsonFormat or KafkaSlotConfig.DebeziumFormat)
+            throw new ArgumentException($"'{name}' is a built-in format of the kafka connector.", nameof(name));
+        if (!ServiceNames.IsValid(name))
+            throw new ArgumentException($"'{name}' is not a valid format name: it must match [a-z0-9][a-z0-9._-]{{0,62}}.", nameof(name));
+        _registrations.RecordFormats[name] = format;
+        return this;
+    }
+
     /// <summary>A rooted store of files or objects that a spec may name as its connection.</summary>
     public IncrementalServiceBuilder AddObjectStore(string name, Func<IServiceProvider, IObjectStore> store)
     {

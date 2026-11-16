@@ -115,6 +115,31 @@ public sealed class KafkaConnections
 
     public IReadOnlyCollection<string> Names => _registrations.KafkaConnections.Keys;
 
+    private readonly Dictionary<string, IRecordFormat> _formats = new(StringComparer.Ordinal);
+
+    /// <summary>The record formats the host registered (<c>AddRecordFormat</c>), by name;
+    /// <c>json</c> and <c>debezium</c> are built in and not among them.</summary>
+    internal IReadOnlyCollection<string> FormatNames => _registrations.RecordFormats.Keys;
+
+    /// <summary>The services the formats are given.</summary>
+    internal IServiceProvider Services => _services;
+
+    /// <summary>The registered format of that name, made once for this service (never in
+    /// a static: a format is asked for codecs of a plugin's types). Throws, listing what
+    /// there is, when there is none.</summary>
+    internal IRecordFormat Format(string name)
+    {
+        lock (_formats)
+        {
+            if (_formats.TryGetValue(name, out var format))
+                return format;
+            if (!_registrations.RecordFormats.TryGetValue(name, out var factory))
+                throw new InvalidOperationException(
+                    $"no record format named '{name}' is registered (built in: json, debezium; registered: {string.Join(", ", FormatNames.Order(StringComparer.Ordinal))})");
+            return _formats[name] = factory(_services) ?? throw new InvalidOperationException($"the factory of record format '{name}' returned null");
+        }
+    }
+
     /// <summary>The connection of that name. Throws, listing the registered names, when
     /// there is none.</summary>
     public KafkaConnection Get(string? name)
@@ -149,8 +174,13 @@ internal sealed record KafkaSlotConfig
     /// committed position.</summary>
     public string? StartFrom { get; init; }
 
-    /// <summary><c>json</c> (the default) or <c>debezium</c>. Sources only.</summary>
+    /// <summary><c>json</c> (the default), <c>debezium</c> (a keyed input only), or a record
+    /// format the host registered (<c>AddRecordFormat</c>), for any slot and for a
+    /// <c>kafka</c> table loader.</summary>
     public string? Format { get; init; }
+
+    public const string JsonFormat = "json";
+    public const string DebeziumFormat = "debezium";
 
     /// <summary><c>own</c> (the default: an idempotent producer of the sink's own) or
     /// <c>log</c>: the backend's transactional producer. Sinks only.</summary>
@@ -184,14 +214,44 @@ internal sealed record KafkaSlotConfig
             throw new InvalidOperationException("the kafka config needs a \"topic\"");
         if (parsed.StartFrom is not (null or "earliest" or "latest"))
             throw new InvalidOperationException($"startFrom is 'earliest' or 'latest', not '{parsed.StartFrom}'");
-        if (parsed.Format is not (null or "json" or "debezium"))
-            throw new InvalidOperationException($"format is 'json' or 'debezium', not '{parsed.Format}'");
+        if (parsed.Format is { } format && !ServiceNames.IsValid(format))
+            throw new InvalidOperationException($"format is 'json', 'debezium' or the name of a registered record format, not '{format}'");
         if (parsed.Producer is not (null or "own" or "log"))
             throw new InvalidOperationException($"producer is 'own' or 'log', not '{parsed.Producer}'");
         return parsed;
     }
 
-    public bool IsDebezium => Format == "debezium";
+    public bool IsDebezium => Format == DebeziumFormat;
+
+    /// <summary>The registered format the config names; null for the built-in JSON (and
+    /// for Debezium, which is read by its own decoder). Throws for a name nobody registered.</summary>
+    public IRecordFormat? RegisteredFormat(KafkaConnections connections) =>
+        Format is null or JsonFormat or DebeziumFormat ? null : connections.Format(Format);
+
+    /// <summary>A reader through a registered format's codec, made for this slot now.</summary>
+    public static KafkaDeserializer<T> Reader<T>(IRecordFormat format, KafkaConnections connections, string topic, RecordPart part,
+        string owner, string slot, JsonSerializerOptions json)
+    {
+        var codec = format.CreateCodec<T>(new RecordFormatContext
+        {
+            Topic = topic, Part = part, Owner = owner, Slot = slot, Json = json, Services = connections.Services,
+        }) ?? throw new InvalidOperationException($"the record format {format.GetType().Name} gave no codec for {typeof(T).Name}");
+        return (ReadOnlySpan<byte> data, in KafkaRecord record) =>
+            codec.Read(data, new RecordOrigin(record.Topic, record.Partition, record.Offset, record.Timestamp)) is { } value
+                ? value
+                : throw new FormatException($"The record format read null, which is not a {typeof(T).Name}.");
+    }
+
+    /// <summary>A writer through a registered format's codec, made for this slot now.</summary>
+    public static KafkaSerializer<T> Writer<T>(IRecordFormat format, KafkaConnections connections, string topic, RecordPart part,
+        string owner, string slot, JsonSerializerOptions json)
+    {
+        var codec = format.CreateCodec<T>(new RecordFormatContext
+        {
+            Topic = topic, Part = part, Owner = owner, Slot = slot, Json = json, Services = connections.Services,
+        }) ?? throw new InvalidOperationException($"the record format {format.GetType().Name} gave no codec for {typeof(T).Name}");
+        return codec.Write;
+    }
 
     public KafkaSourceOptions Source(KafkaConnection connection, ILogger logger, Action<KafkaRecord, Exception>? onUnreadableTableRecord = null) => new()
     {
@@ -222,6 +282,8 @@ internal sealed record KafkaSlotConfig
 public sealed class KafkaConnector(KafkaConnections connections)
     : IAppendSourceConnector, IKeyedSourceConnector, IUpsertSinkConnector, IAppendSinkConnector, IConfigDescribed, IPresenceChecked
 {
+    private ConfigSchema? _schema;
+
     /// <summary>An input's topic that does not exist: a source never creates its topic,
     /// so the pipeline would fault at every start until someone does.</summary>
     public async ValueTask<string?> MissingAsync(JsonElement config, SlotKind kind, CancellationToken cancellationToken)
@@ -234,12 +296,16 @@ public sealed class KafkaConnector(KafkaConnections connections)
             : null;
     }
 
-    public ConfigSchema ConfigSchema { get; } = new(
+    /// <summary>The config's members; <c>format</c> offers the formats the host registered.</summary>
+    public ConfigSchema ConfigSchema => _schema ??= new(
     [
         new("connection", "string", Required: true, Description: "A Kafka connection the host registered; it holds the bootstrap servers and client settings."),
         new("topic", "string", Required: true, Description: "The topic read or written."),
         new("startFrom", "string", Description: "Where to start with no committed position.", Values: ["earliest", "latest"], Default: "earliest", AppliesTo: ConfigProperty.Sources),
-        new("format", "string", Description: "Plain JSON values, or Debezium change events.", Values: ["json", "debezium"], Default: "json", AppliesTo: [SlotKind.KeyedInput]),
+        connections.FormatNames.Count == 0
+            ? new("format", "string", Description: "Plain JSON values, or Debezium change events.", Values: [KafkaSlotConfig.JsonFormat, KafkaSlotConfig.DebeziumFormat], Default: KafkaSlotConfig.JsonFormat, AppliesTo: [SlotKind.KeyedInput])
+            : new("format", "string", Description: "What the topic's keys and values are: plain JSON, a record format the host registered, or (a keyed input only) Debezium change events.",
+                Values: [KafkaSlotConfig.JsonFormat, .. connections.FormatNames.Order(StringComparer.Ordinal), KafkaSlotConfig.DebeziumFormat], Default: KafkaSlotConfig.JsonFormat),
         new("producer", "string", Description: "A producer of the sink's own, or the backend's transactional one (connection 'log' only).", Values: ["own", "log"], Default: "own", AppliesTo: ConfigProperty.Sinks),
     ], "A topic as an append or keyed input, or as an upsert (compacted) or append sink.");
 
@@ -251,6 +317,7 @@ public sealed class KafkaConnector(KafkaConnections connections)
         if (config.Producer == "log" && connection.Log is null)
             throw new InvalidOperationException(
                 "\"producer\": \"log\" needs the connection the Kafka backend registers as 'log': only that one has the transactional producer");
+        config.RegisteredFormat(connections); // a format nobody registered is refused at the dry run
         return (config, connection);
     }
 
@@ -276,11 +343,20 @@ public sealed class KafkaConnector(KafkaConnections connections)
             throw new InvalidOperationException("\"startFrom\" and \"reloadWhenPositionLost\" are a source's settings");
     }
 
+    // A registered format's codecs are made here, for this generation's slot, and are
+    // held only by the source or sink they are given to: they go with the generation.
+    private KafkaDeserializer<T> Reader<T>(KafkaSlotConfig config, IRecordFormat? format, RecordPart part, string owner, string slot, JsonSerializerOptions json) =>
+        format is null ? KafkaDeserializers.Json<T>(json) : KafkaSlotConfig.Reader<T>(format, connections, config.Topic!, part, owner, slot, json);
+
+    private KafkaSerializer<T> Writer<T>(KafkaSlotConfig config, IRecordFormat? format, RecordPart part, string owner, string slot, JsonSerializerOptions json) =>
+        format is null ? KafkaSerializers.Json<T>(json) : KafkaSlotConfig.Writer<T>(format, connections, config.Topic!, part, owner, slot, json);
+
     async Task<IRunningSource> IAppendSourceConnector.StartAsync<T>(SourceContext<T> context, CancellationToken cancellationToken)
     {
         var (config, connection) = Resolve(context.Config);
+        var reader = Reader<T>(config, config.RegisteredFormat(connections), RecordPart.Value, context.PipelineId, context.Slot, context.Json);
         var source = await KafkaSource.StartAsync(
-            context.Circuit, context.Stream, config.Source(connection, context.Logger), KafkaDeserializers.Json<T>(context.Json), cancellationToken)
+            context.Circuit, context.Stream, config.Source(connection, context.Logger), reader, cancellationToken)
             .ConfigureAwait(false);
         return new RunningKafkaSource(source);
     }
@@ -288,9 +364,12 @@ public sealed class KafkaConnector(KafkaConnections connections)
     async Task<IRunningSource> IKeyedSourceConnector.StartAsync<TKey, TValue>(KeyedSourceContext<TKey, TValue> context, CancellationToken cancellationToken)
     {
         var (config, connection) = Resolve(context.Config);
+        var format = config.RegisteredFormat(connections);
         var decoder = config.IsDebezium
             ? Debezium.Changes<TKey, TValue>(KafkaSlotConfig.DebeziumJson())
-            : KafkaDeserializers.Keyed(KafkaDeserializers.Json<TKey>(context.Json), KafkaDeserializers.Json<TValue>(context.Json));
+            : KafkaDeserializers.Keyed(
+                Reader<TKey>(config, format, RecordPart.Key, context.PipelineId, context.Slot, context.Json),
+                Reader<TValue>(config, format, RecordPart.Value, context.PipelineId, context.Slot, context.Json));
         var source = await KafkaSource.StartAsync(
             context.Circuit, context.Stream, config.Source(connection, context.Logger), decoder, cancellationToken).ConfigureAwait(false);
         return new RunningKafkaSource(source);
@@ -314,14 +393,19 @@ public sealed class KafkaConnector(KafkaConnections connections)
     IUpsertSink<TKey, TRow> IUpsertSinkConnector.Create<TKey, TRow>(SinkContext context)
     {
         var (config, connection) = Resolve(context.Config);
+        var format = config.RegisteredFormat(connections);
         return new KafkaUpsertSink<TKey, TRow>(
-            Sink(config, connection, context), KafkaSerializers.Json<TKey>(context.Json), KafkaSerializers.Json<TRow>(context.Json));
+            Sink(config, connection, context),
+            Writer<TKey>(config, format, RecordPart.Key, context.PipelineId, context.Slot, context.Json),
+            Writer<TRow>(config, format, RecordPart.Value, context.PipelineId, context.Slot, context.Json));
     }
 
     IAppendSink<T> IAppendSinkConnector.Create<T>(SinkContext context)
     {
         var (config, connection) = Resolve(context.Config);
-        return new KafkaAppendSink<T>(Sink(config, connection, context), KafkaSerializers.Json<T>(context.Json));
+        return new KafkaAppendSink<T>(
+            Sink(config, connection, context),
+            Writer<T>(config, config.RegisteredFormat(connections), RecordPart.Value, context.PipelineId, context.Slot, context.Json));
     }
 
     private sealed class RunningKafkaSource : IRunningSource
@@ -403,9 +487,15 @@ internal sealed class KafkaTableSource<TKey, TRow>(KafkaConnections connections,
     internal static KafkaSlotConfig Check(KafkaConnections connections, TableLoaderSpec loader)
     {
         var config = KafkaSlotConfig.Parse(loader.Config ?? default);
-        if (config.Connector is not null || config.Connection is not null || config.Format is not null || config.Producer is not null)
+        if (config.Connector is not null || config.Connection is not null || config.Producer is not null)
             throw new InvalidOperationException(
-                "a table loader's config accepts topic, startFrom and reloadWhenPositionLost; the connection is the loader's own \"connection\"");
+                "a table loader's config accepts topic, startFrom, format and reloadWhenPositionLost; the connection is the loader's own \"connection\"");
+        if (config.Format is not null && (loader.Kind != "kafka" || config.IsDebezium))
+            throw new InvalidOperationException(
+                loader.Kind == "kafka"
+                    ? "a Debezium change topic is the debezium loader's: \"kind\": \"debezium\""
+                    : $"the {loader.Kind} loader reads Debezium change events and takes no format");
+        config.RegisteredFormat(connections); // a format nobody registered is refused at the declaration
         connections.Get(loader.Connection).RequireTopic(config.Topic!);
         return config;
     }
@@ -418,7 +508,12 @@ internal sealed class KafkaTableSource<TKey, TRow>(KafkaConnections connections,
         // policy the call throws, which stops the loader at that record.
         var options = config.Source(connection, context.Logger, (record, error) =>
             context.Unreadable($"{record.Topic}[{record.Partition}]@{record.Offset}", error, record.Value));
-        var decoder = debezium ? Debezium.Changes<TKey, TRow>() : KafkaDeserializers.Keyed<TKey, TRow>();
+        var format = config.RegisteredFormat(connections);
+        var decoder = debezium ? Debezium.Changes<TKey, TRow>()
+            : format is null ? KafkaDeserializers.Keyed<TKey, TRow>()
+            : KafkaDeserializers.Keyed(
+                KafkaSlotConfig.Reader<TKey>(format, connections, config.Topic!, RecordPart.Key, context.Table.Name, context.Table.Name, TableKeys.Json),
+                KafkaSlotConfig.Reader<TRow>(format, connections, config.Topic!, RecordPart.Value, context.Table.Name, context.Table.Name, TableKeys.Json));
 
         context.Report(TableSourceState.Starting, options.Topic);
         await using var source = await KafkaSource.StartTableLoaderAsync(context.Table, options, decoder, cancellationToken).ConfigureAwait(false);

@@ -401,6 +401,43 @@ public class PluginTests
         Assert.Equal(["desks", "instruments"], shape.TablesRead.Order());
     }
 
+    /// <summary>A plugin compiled before the plugin-facing types moved to
+    /// Incremental.Service.Abstractions names them in Incremental.Service: the service's
+    /// type forwards must send it to where they live, or no stored plugin survives the
+    /// upgrade. The plugin is the build before format levels' own <c>Acme.Pipelines</c>
+    /// (<c>INCREMENTAL_OLDER_BUILD</c>, as for the two-build test).</summary>
+    [Fact]
+    public async Task A_plugin_compiled_against_the_service_before_the_abstractions_loads_and_runs()
+    {
+        if (Environment.GetEnvironmentVariable("INCREMENTAL_OLDER_BUILD") is not { Length: > 0 } older)
+        {
+            Assert.Skip("INCREMENTAL_OLDER_BUILD is not set: see KafkaServiceProcessTests' two-build test.");
+            return;
+        }
+        var directory = Path.Combine(KafkaServiceProcessTests.OlderPluginDirectory(older), "net10.0");
+        using (var file = File.OpenRead(Path.Combine(directory, "Acme.Pipelines.dll")))
+        using (var pe = new System.Reflection.PortableExecutable.PEReader(file))
+        {
+            var metadata = System.Reflection.Metadata.PEReaderExtensions.GetMetadataReader(pe);
+            var references = metadata.AssemblyReferences.Select(h => metadata.GetString(metadata.GetAssemblyReference(h).Name)).ToList();
+            Assert.Contains("Incremental.Service", references);
+            Assert.DoesNotContain("Incremental.Service.Abstractions", references);
+        }
+
+        await using var service = await StartAsync();
+        var plugin = await service.Plugins.ImportDirectoryAsync(directory, default);
+        await service.DeclareInstrumentsAsync();
+        var trades = Trades(0, 60);
+        service.Memory.Log<Trade>("in").AppendRange(trades);
+        await service.DeployAsync(TraderCounts("old-plugin", plugin.Version, "in", "out"));
+        var output = service.Memory.UpsertSink<string, string>("out");
+        await Eventually(() => Same(output.Rows, CountLines("v1", trades)), "the old plugin's pipeline to count");
+
+        // And it unloads like any other.
+        await service.Pipelines.RemoveAsync("old-plugin", new ActionOptions(), default);
+        await CollectedAsync(() => service.Plugins.LiveContexts == 0, $"the old plugin's load context is collected (alive: {service.Plugins.LiveContexts})");
+    }
+
     [Fact]
     public void A_reference_goes_to_the_host_when_its_types_cross_the_boundary_or_the_hosts_version_will_do()
     {
@@ -408,8 +445,22 @@ public class PluginTests
 
         // Types that cross between host and plugin are the host's, whatever the plugin ships.
         Assert.True(HostAssemblies.Provides(Named("System.Text.Json", 99), pluginShipsIt: true));
-        Assert.True(HostAssemblies.Provides(Named("Incremental.Service", 99), pluginShipsIt: true));
+        Assert.True(HostAssemblies.Provides(Named("Incremental", 99), pluginShipsIt: true));
+        Assert.True(HostAssemblies.Provides(Named("Incremental.Service.Abstractions", 99), pluginShipsIt: true));
         Assert.True(HostAssemblies.Provides(Named("Microsoft.Extensions.Logging.Abstractions", 99), pluginShipsIt: true));
+
+        // The rest of the host's Incremental* is the host's too: a second copy of the
+        // service would be a second service's types and statics in the plugin's context.
+        Assert.True(HostAssemblies.Provides(Named("Incremental.Service", 99), pluginShipsIt: true));
+        Assert.True(HostAssemblies.Provides(Named("Incremental.Kafka", 99), pluginShipsIt: true));
+
+        // The Kafka client's types reach no plugin since the abstractions name none of
+        // them, so it is shared like any library the host carries: by version.
+        var kafka = typeof(Confluent.Kafka.IProducer<,>).Assembly.GetName();
+        Assert.False(HostAssemblies.AlwaysShared(kafka.Name!));
+        Assert.True(HostAssemblies.Provides(Named(kafka.Name!, kafka.Version!.Major), pluginShipsIt: true));
+        Assert.True(HostAssemblies.Provides(Named(kafka.Name!, kafka.Version.Major + 1), pluginShipsIt: false));
+        Assert.False(HostAssemblies.Provides(Named(kafka.Name!, kafka.Version.Major + 1), pluginShipsIt: true));
 
         // Anything else the host carries is shared while the host's version satisfies the
         // reference; a plugin built against a newer one, and shipping it, gets its own.

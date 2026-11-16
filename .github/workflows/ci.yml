@@ -59,7 +59,9 @@ jobs:
           dotnet pack src/Incremental.Storage.Redis -c Release --no-build -o artifacts/packages
           dotnet pack src/Incremental.Hosting -c Release --no-build -o artifacts/packages
           dotnet pack src/Incremental.Kafka -c Release --no-build -o artifacts/packages
+          dotnet pack src/Incremental.Service.Abstractions -c Release --no-build -o artifacts/packages
           dotnet pack src/Incremental.Service -c Release --no-build -o artifacts/packages
+          dotnet pack src/Incremental.Service.Testing -c Release --no-build -o artifacts/packages
           dotnet pack src/Incremental.Service.Admin -c Release --no-build -o artifacts/packages
       - name: Upload packages
         uses: actions/upload-artifact@v7
@@ -106,6 +108,9 @@ jobs:
         run: |
           git worktree add --detach "$RUNNER_TEMP/older" 9de8da9
           dotnet build "$RUNNER_TEMP/older/tests/Incremental.Service.FailoverApp"
+          # Its plugin, compiled against Incremental.Service before the abstractions: what
+          # both builds run in the two-build test, and what PluginTests loads on this build.
+          dotnet build "$RUNNER_TEMP/older/tests/Incremental.Service.TestPlugins/Acme.Pipelines"
       - name: Test Service against the broker
         env:
           INCREMENTAL_OLDER_BUILD: ${{ runner.temp }}/older/tests/Incremental.Service.FailoverApp/bin/Debug/net10.0/Incremental.Service.FailoverApp.dll

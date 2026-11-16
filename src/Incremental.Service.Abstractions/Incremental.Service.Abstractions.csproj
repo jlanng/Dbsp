@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Incremental.Service.Abstractions</PackageId>
+    <RootNamespace>Incremental.Service</RootNamespace>
+    <Description>What a plugin of the Incremental enrichment service compiles against: the pipeline definition interfaces, the builder a definition's Build is given, table definitions for contract assemblies, and the record format seam of the Kafka connectors. Nothing of hosting, Kafka or the service's runtime.</Description>
+  </PropertyGroup>
+
+  <!-- Only the core. A reference added here reaches every plugin: PluginBoundaryTests
+       fails when one of the service's hosting or Kafka assemblies does. -->
+  <ItemGroup>
+    <ProjectReference Include="..\Incremental\Incremental.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Incremental.Service" />
+    <InternalsVisibleTo Include="Incremental.Service.Testing" />
+    <InternalsVisibleTo Include="Incremental.Service.Tests" />
+  </ItemGroup>
+
+</Project>

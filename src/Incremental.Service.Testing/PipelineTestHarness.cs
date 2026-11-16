@@ -29,7 +29,7 @@ namespace Incremental.Service.Testing;
 public sealed class PipelineTestHarness : IAsyncDisposable
 {
     private readonly Circuit _circuit;
-    private readonly PipelineBuilder _pipeline;
+    private readonly PipelineBinding _pipeline;
     private readonly MemoryConnector _memory = new();
     private readonly List<Task> _deliveries = [];
     private readonly List<DeadLetter> _deadLetters = [];
@@ -43,7 +43,7 @@ public sealed class PipelineTestHarness : IAsyncDisposable
     /// <typeparamref name="TDefinition"/>.</summary>
     public static Builder For<TDefinition>() where TDefinition : class, new() => new(typeof(TDefinition));
 
-    private PipelineTestHarness(string id, Circuit circuit, PipelineBuilder pipeline, JsonSerializerOptions json, InMemoryCheckpointStorageProvider storage, long? maxStateEntries)
+    private PipelineTestHarness(string id, Circuit circuit, PipelineBinding pipeline, JsonSerializerOptions json, InMemoryCheckpointStorageProvider storage, long? maxStateEntries)
     {
         _maxStateEntries = maxStateEntries;
         _id = id;
@@ -428,7 +428,7 @@ public sealed class PipelineTestHarness : IAsyncDisposable
                 LoggerFactory = _logging,
             });
             var logger = (_logging ?? NullLoggerFactory.Instance).CreateLogger("Incremental.Service.Pipelines");
-            var pipeline = new PipelineBuilder(spec, circuit, null!, logger, _services ?? NoServices.Instance, detached: true);
+            var pipeline = new PipelineBinding(spec, circuit, null!, logger, _services ?? NoServices.Instance, detached: true);
             foreach (var (name, table) in _tables)
                 pipeline.StandIns[name] = table;
             binding.Build(pipeline, settings);

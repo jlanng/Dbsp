@@ -543,7 +543,7 @@ because both become directory names.
 
 **Type sharing, exactly.** A pipeline context resolves an assembly name in this order:
 (1) a loaded contract assembly, by simple name, *even if the plugin ships its own copy*;
-(2) the host's own — `Incremental*`, `Microsoft.Extensions.*`, `Confluent.Kafka`, the
+(2) the host's own — `Incremental*`, `Microsoft.Extensions.*`, the
 framework — from the default context, whatever the plugin ships; (3) any other assembly
 the host carries, from the default context, if the host's version is at least the one
 referenced or the plugin ships none; (4) anything else privately, through

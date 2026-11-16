@@ -25,19 +25,6 @@ public sealed record ActionPlan(string Action, string Target, bool DryRun, IRead
 
 public sealed record ActionOptions(long? ExpectedGeneration = null, bool DryRun = false, string? Caller = null);
 
-/// <summary>A refusal with a stable code and the HTTP status the admin API answers with.</summary>
-public sealed class ServiceException(string code, string message, int status = 409, IReadOnlyList<string>? details = null)
-    : Exception(message)
-{
-    public string Code { get; } = code;
-    public int Status { get; } = status;
-    public IReadOnlyList<string> Details { get; } = details ?? [];
-
-    public static ServiceException NotFound(string what) => new("not-found", $"{what} does not exist.", 404);
-    public static ServiceException Invalid(string message, IReadOnlyList<string>? details = null) => new("invalid", message, 400, details);
-    public static ServiceException Conflict(string message) => new("conflict", message);
-}
-
 internal static class ServiceJson
 {
     /// <summary>For the service's own records (specs, manifests, audit). Never given a

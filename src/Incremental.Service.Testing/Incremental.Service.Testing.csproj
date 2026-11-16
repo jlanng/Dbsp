@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Incremental.Service.Testing</PackageId>
+    <RootNamespace>Incremental.Service.Testing</RootNamespace>
+    <Description>PipelineTestHarness: runs one pipeline definition of the Incremental enrichment service in a test, bound and built exactly as the service builds it, with in-memory tables, inputs and sinks.</Description>
+  </PropertyGroup>
+
+  <!-- The harness runs the service's own binding and build code, so it needs the service;
+       what it hands a test is the core's and the abstractions' types and its own. -->
+  <ItemGroup>
+    <ProjectReference Include="..\Incremental.Service.Abstractions\Incremental.Service.Abstractions.csproj" />
+    <ProjectReference Include="..\Incremental.Service\Incremental.Service.csproj" />
+  </ItemGroup>
+
+</Project>

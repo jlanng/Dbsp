@@ -15,7 +15,7 @@ internal sealed class Generation
 {
     public required long Number { get; set; }
     public required Circuit Circuit { get; init; }
-    public required PipelineBuilder Builder { get; init; }
+    public required PipelineBinding Builder { get; init; }
     public List<(string Slot, IRunningSource Source)> Sources { get; } = [];
     public List<Task> Deliveries { get; } = [];
     public Dictionary<string, SinkSlotStats> SinkStats { get; } = new(StringComparer.Ordinal);
@@ -610,7 +610,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         var definition = lease.Definition(spec.Definition);
         var settings = definition.BindSettings(spec.Settings, lease.Json);
         var builder = new CircuitBuilder(new CircuitOptions { Name = spec.Id + " (dry run)", Workers = spec.Circuit.Workers });
-        var pipeline = new PipelineBuilder(spec, builder, context.Tables, _logger, context.Services);
+        var pipeline = new PipelineBinding(spec, builder, context.Tables, _logger, context.Services);
         try
         {
             definition.Build(pipeline, settings);
@@ -641,7 +641,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         return (pipeline.Shape, pipeline.Graph, problems, describeState ? TryDescribeState(pipeline) : null);
     }
 
-    private StateShape? TryDescribeState(PipelineBuilder pipeline)
+    private StateShape? TryDescribeState(PipelineBinding pipeline)
     {
         try
         {
@@ -692,7 +692,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         var definition = lease.Definition(spec.Definition);
         var settings = definition.BindSettings(spec.Settings, lease.Json);
         var builder = new CircuitBuilder(new CircuitOptions { Name = spec.Id + " (described)", Workers = spec.Circuit.Workers });
-        var pipeline = new PipelineBuilder(spec, builder, context.Tables, _logger, context.Services);
+        var pipeline = new PipelineBinding(spec, builder, context.Tables, _logger, context.Services);
         definition.Build(pipeline, settings);
         return TryDescribeState(pipeline);
     }
@@ -814,7 +814,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         }
     }
 
-    private void CheckBindings(PipelineSpec spec, PipelineBuilder pipeline, bool claims = false)
+    private void CheckBindings(PipelineSpec spec, PipelineBinding pipeline, bool claims = false)
     {
         var errors = new List<string>();
         var owned = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -1978,7 +1978,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             AcknowledgeDeadLetters = spec.DeadLetters is not null,
             LoggerFactory = logs,
         });
-        var pipeline = new PipelineBuilder(spec, builder, context.Tables, _logger, context.Services);
+        var pipeline = new PipelineBinding(spec, builder, context.Tables, _logger, context.Services);
         definition.Build(pipeline, settings);
         CheckBindings(spec, pipeline);
         runtime.Shape = pipeline.Shape;

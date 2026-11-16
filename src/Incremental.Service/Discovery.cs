@@ -49,9 +49,6 @@ public sealed record ConnectionInfo(string Name, string Kind);
 /// <see cref="TableLoaderSpec.Connection"/> names, null when it takes none.</summary>
 public sealed record TableSourceInfo(string Kind, bool BuiltIn, string? Connection, ConfigSchema? Config);
 
-/// <summary>A table a definition reads or writes: the slot (which a spec's <c>tables</c>
-/// can bind to a declared table), the table it resolves to, and the types.</summary>
-public sealed record TableSlotShape(string Slot, string Table, string Access, string KeyType, string RowType, string Definition);
 
 /// <summary>
 /// Everything a deploy of one definition needs to know: its settings (with defaults,
@@ -390,12 +387,12 @@ internal sealed class ServiceDiscovery(ServiceContext context) : IServiceDiscove
             }
         }
 
-        PipelineBuilder? pipeline = null;
+        PipelineBinding? pipeline = null;
         if (built)
         {
             var spec = new PipelineSpec { Id = "describe", Plugin = plugin, Version = version, Definition = name };
             var builder = new CircuitBuilder(new CircuitOptions { Name = $"{name} (described)" });
-            pipeline = new PipelineBuilder(spec, builder, context.Tables, context.LoggerFactory.CreateLogger("Incremental.Service.Pipelines"), context.Services, detached: true);
+            pipeline = new PipelineBinding(spec, builder, context.Tables, context.LoggerFactory.CreateLogger("Incremental.Service.Pipelines"), context.Services, detached: true);
             try
             {
                 definition.Build(pipeline, bound);

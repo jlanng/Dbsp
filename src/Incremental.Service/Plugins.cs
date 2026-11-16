@@ -15,20 +15,6 @@ using Microsoft.Extensions.Logging;
 
 namespace Incremental.Service;
 
-/// <summary>
-/// Marks a contract assembly: it holds <see cref="TableDefinition{TKey,TRow}"/>s and the
-/// row and key types of shared tables. It is loaded once per process and never unloaded,
-/// and every pipeline plugin that references it gets that one copy — even if it ships its
-/// own — so two plugins agree on a row type.
-/// </summary>
-[AttributeUsage(AttributeTargets.Assembly)]
-public sealed class IncrementalContractAttribute : Attribute;
-
-/// <summary>Marks a settings property that changes no stored row — a label, a batch size —
-/// so that changing it keeps the pipeline's state without being asked.</summary>
-[AttributeUsage(AttributeTargets.Property)]
-public sealed class StateNeutralAttribute : Attribute;
-
 public enum PluginKind { Pipeline, Contract }
 
 public sealed record PluginFile(string Path, string Sha256, long Size);
@@ -125,9 +111,15 @@ internal static class ServiceNames
 /// whether a plugin's reference goes there.
 /// <para>
 /// The assemblies whose types cross between the host and a plugin are always the host's,
-/// whatever the plugin ships: <c>Incremental*</c>, <c>Microsoft.Extensions.*</c>,
-/// <c>Confluent.Kafka</c> and the framework (<c>System.*</c> and its kin). Two copies of
-/// one of those would be two sets of types, and a definition could not be handed a builder.
+/// whatever the plugin ships: <c>Incremental*</c>, <c>Microsoft.Extensions.*</c> and the
+/// framework (<c>System.*</c> and its kin). Two copies of one of those would be two sets of
+/// types, and a definition could not be handed a builder. What a plugin compiles against
+/// is <c>Incremental</c> and <c>Incremental.Service.Abstractions</c>, whose surface names
+/// nothing of Kafka (<c>PluginBoundaryTests</c>), so the Kafka client is not among them: a
+/// plugin that ships a newer <c>Confluent.Kafka</c> of its own, for a client of its own,
+/// gets its copy by the next rule. The other <c>Incremental*</c> assemblies stay the host's
+/// although no plugin-facing type is in them: a plugin that loaded its own copy of the
+/// service would hold a second service's types and statics.
 /// </para>
 /// <para>
 /// Any other assembly the host happens to carry is shared when the host's version
@@ -184,7 +176,6 @@ internal static class HostAssemblies
         name.Equals("Incremental", StringComparison.OrdinalIgnoreCase)
         || name.StartsWith("Incremental.", StringComparison.OrdinalIgnoreCase) && Contains(name)
         || name.StartsWith("Microsoft.Extensions.", StringComparison.OrdinalIgnoreCase)
-        || name.Equals("Confluent.Kafka", StringComparison.OrdinalIgnoreCase)
         || name.Equals("System", StringComparison.OrdinalIgnoreCase)
         || name.StartsWith("System.", StringComparison.OrdinalIgnoreCase)
         || name is "mscorlib" or "netstandard" or "WindowsBase" or "Microsoft.CSharp" or "Microsoft.VisualBasic" or "Microsoft.VisualBasic.Core"
@@ -431,8 +422,9 @@ internal sealed class DefinitionBinding(string name, Type type, Type? settingsTy
         return ex;
     }
 
-    public void Build(PipelineBuilder pipeline, object? settings)
+    public void Build(PipelineBinding binding, object? settings)
     {
+        var pipeline = binding.Builder;
         try
         {
             var instance = Activator.CreateInstance(type)

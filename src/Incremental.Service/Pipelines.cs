@@ -4,47 +4,6 @@ using Microsoft.Extensions.Logging;
 
 namespace Incremental.Service;
 
-/// <summary>
-/// A pipeline definition with no settings: a class with a public parameterless constructor
-/// whose <see cref="Build"/> describes one circuit. <c>Build</c> runs many times — at
-/// import, at every dry run, for every generation — and must do nothing but describe the
-/// circuit: no I/O, no threads, no static writes.
-/// </summary>
-public interface IPipelineDefinition
-{
-    void Build(PipelineBuilder pipeline);
-}
-
-/// <summary>A pipeline definition with one settings type, bound from the spec's
-/// <c>settings</c> and validated before anything is built.</summary>
-public interface IPipelineDefinition<TSettings> where TSettings : class
-{
-    void Build(PipelineBuilder pipeline, TSettings settings);
-}
-
-/// <summary>Names a definition; without it the class name is the name.</summary>
-[AttributeUsage(AttributeTargets.Class)]
-public sealed class PipelineAttribute(string name) : Attribute
-{
-    public string Name { get; } = name;
-    public string? Description { get; init; }
-}
-
-public enum SlotKind { AppendInput, KeyedInput, UpsertSink, AppendSink }
-
-/// <summary>An input or sink slot: its kind and the type of its records; for a keyed input
-/// and an upsert sink also the type of the key. <c>Members</c> spells the record type
-/// out — one line per type it is made of, <c>Name { member: Type; … }</c> — so that two
-/// versions of a slot can be compared by what they carry, not only by a type's name.</summary>
-public sealed record SlotShape(string Name, SlotKind Kind, string Type, string? KeyType = null, IReadOnlyList<string>? Members = null);
-
-/// <summary>What a definition's <c>Build</c> declared: its slots and the tables it reads
-/// and writes, by declared table name. Known for any pipeline that has ever validated.</summary>
-public sealed record PipelineShape(
-    IReadOnlyList<SlotShape> Inputs, IReadOnlyList<SlotShape> Sinks,
-    IReadOnlyList<string> TablesRead, IReadOnlyList<string> TablesWritten,
-    IReadOnlyList<TableSlotShape>? TableSlots = null);
-
 /// <summary>The circuit a definition declared, node by node (the core's
 /// <see cref="CircuitBuilder.Describe"/>), and which of its outputs is which sink slot.
 /// Input slots and tables are in the nodes' kinds: <c>input[slot]</c>, <c>table[name]</c>.</summary>
@@ -58,12 +17,14 @@ public sealed record PipelineValidation(PipelineSpec Spec, PipelineShape Shape, 
 public sealed record PipelineTransition(DateTimeOffset Time, PipelineState State, long Generation, string? Why);
 
 /// <summary>
-/// What a definition builds against. <see cref="Circuit"/> is the core's builder, so
-/// lookups, aggregates, event time and windows are the core API with nothing in between;
-/// the methods here bind the circuit's edges to named slots, which the spec binds to
-/// connectors and declared tables.
+/// The service's half of a <see cref="PipelineBuilder"/> (<see cref="IPipelineBinder"/>):
+/// the slots a definition's <c>Build</c> declared, with what it takes to start each slot's
+/// connector, and the tables it reads and writes, resolved through the registry — or,
+/// detached, to stand-ins of the definition's own shape. The supervisor, the dry run,
+/// discovery and the test harness all build a definition through one of these, and hand
+/// the definition its <see cref="Builder"/>.
 /// </summary>
-public sealed class PipelineBuilder
+internal sealed class PipelineBinding : IPipelineBinder
 {
     private readonly PipelineSpec _spec;
     private readonly ITableRegistry _tables;
@@ -78,25 +39,22 @@ public sealed class PipelineBuilder
     /// harness puts its tables here before <c>Build</c> and reads the rest after.</summary>
     internal Dictionary<string, object> StandIns => _standIns;
 
-    internal PipelineBuilder(
+    internal PipelineBinding(
         PipelineSpec spec, CircuitBuilder circuit, ITableRegistry tables, ILogger logger, IServiceProvider services, bool detached = false)
     {
         _detached = detached;
         _spec = spec;
         _tables = tables;
         Circuit = circuit;
-        Logger = logger;
         Services = services;
+        Builder = new PipelineBuilder(this, circuit, logger, services);
     }
 
+    /// <summary>What the definition's <c>Build</c> is given.</summary>
+    public PipelineBuilder Builder { get; }
+
     public string PipelineId => _spec.Id;
-
-    /// <summary>Everything the core offers.</summary>
     public CircuitBuilder Circuit { get; }
-    public ILogger Logger { get; }
-
-    /// <summary>The host's services. A service the definition needs (a pricing library, a
-    /// clock) comes from here, not from a static: statics pin the plugin's load context.</summary>
     public IServiceProvider Services { get; }
 
     internal List<InputSlot> Inputs { get; } = [];
@@ -139,7 +97,7 @@ public sealed class PipelineBuilder
         Sinks.Select(s => new SlotShape(s.Name, s.Kind, s.Type, s.KeyType, s.Members)).ToList(),
         [.. TablesRead], [.. TablesWritten], [.. TableSlots]);
 
-    private void Claim(string slot)
+    public void Claim(string slot)
     {
         ArgumentException.ThrowIfNullOrEmpty(slot);
         if (slot == PipelineSpec.DeadLetterSlot)
@@ -151,57 +109,51 @@ public sealed class PipelineBuilder
 
     private string TableName(string slot) => _spec.Tables.GetValueOrDefault(slot, slot);
 
-    /// <summary>A shared table to join or look up against. The definition gives the key
-    /// and row types and the default slot name; the spec's <c>tables</c> binds the slot to
-    /// a declared table, so one definition can read <c>instruments-eu</c> in one
-    /// deployment and <c>instruments-us</c> in another.</summary>
-    public TableRef<TKey, TRow> Table<TKey, TRow>(TableDefinition<TKey, TRow> table, string? slot = null)
+    public SharedTable<TKey, TRow> ReadTable<TKey, TRow>(TableDefinition<TKey, TRow> table, string slot)
         where TKey : notnull
         where TRow : class
     {
-        ArgumentNullException.ThrowIfNull(table);
-        var name = TableName(slot ?? table.Name);
-        var shared = Resolve(table, slot ?? table.Name, name, written: false);
+        var name = TableName(slot);
+        var shared = Resolve(table, slot, name, written: false);
         if (!TablesRead.Contains(name))
             TablesRead.Add(name);
         TableTypes[name] = (typeof(TKey), typeof(TRow));
-        return Circuit.Table(shared);
+        return shared;
     }
 
-    /// <summary>An append input: records, each inserted or removed.</summary>
-    public InputStream<T> Input<T>(string slot) where T : notnull
+    public SharedTable<TKey, TRow> WriteTable<TKey, TRow>(TableDefinition<TKey, TRow> table, string slot)
+        where TKey : notnull
+        where TRow : class
     {
-        Claim(slot);
-        var stream = Circuit.Input<T>(slot);
+        var name = TableName(slot);
+        var shared = Resolve(table, slot, name, written: true);
+        if (TablesWritten.Contains(name))
+            throw new InvalidOperationException($"Table '{name}' is written twice by this definition.");
+        TablesWritten.Add(name);
+        TableTypes[name] = (typeof(TKey), typeof(TRow));
+        return shared;
+    }
+
+    public void Input<T>(string slot, InputStream<T> stream) where T : notnull =>
         Inputs.Add(new InputSlot(slot, SlotKind.AppendInput, typeof(T).Name, StateShapes.Members(typeof(T)),
             (connector, start) => connector is IAppendSourceConnector append
                 ? append.StartAsync(new SourceContext<T>(start, stream), start.Cancellation)
                 : throw Mismatch(slot, connector, "an append input (Input<T>)"))
         { Stream = stream, Clr = (typeof(T), null) });
-        return stream;
-    }
 
-    /// <summary>A keyed input: upserts and deletes by key.</summary>
-    public KeyedInputStream<TKey, TValue> KeyedInput<TKey, TValue>(string slot, Func<TValue, TKey> key)
+    public void KeyedInput<TKey, TValue>(string slot, KeyedInputStream<TKey, TValue> stream)
         where TKey : notnull
-        where TValue : notnull
-    {
-        Claim(slot);
-        var stream = Circuit.KeyedInput(slot, key);
+        where TValue : notnull =>
         Inputs.Add(new InputSlot(slot, SlotKind.KeyedInput, typeof(TValue).Name, StateShapes.Members(typeof(TValue)),
             (connector, start) => connector is IKeyedSourceConnector keyed
                 ? keyed.StartAsync(new KeyedSourceContext<TKey, TValue>(start, stream), start.Cancellation)
                 : throw Mismatch(slot, connector, "a keyed input (KeyedInput<TKey, TValue>)"))
         { KeyType = typeof(TKey).Name, Stream = stream, Clr = (typeof(TValue), typeof(TKey)) });
-        return stream;
-    }
 
-    /// <summary>A keyed result delivered as upserts and deletes, at least once.</summary>
     public void UpsertSink<TKey, TRow>(string slot, ZStream<KeyedValue<TKey, TRow>> rows)
         where TKey : notnull
         where TRow : notnull
     {
-        Claim(slot);
         var output = rows.ToAcknowledgedOutput();
         MarkSink(slot);
         Sinks.Add(new SinkSlot(slot, SlotKind.UpsertSink, typeof(TRow).Name, StateShapes.Members(typeof(TRow)),
@@ -218,13 +170,10 @@ public sealed class PipelineBuilder
         { KeyType = typeof(TKey).Name, Clr = (typeof(TRow), typeof(TKey)) });
     }
 
-    /// <summary>A result delivered as upserts keyed by <paramref name="key"/>. The stream
-    /// must hold at most one row per key at a time.</summary>
     public void UpsertSink<T, TKey>(string slot, ZStream<T> rows, Func<T, TKey> key)
         where T : notnull
         where TKey : notnull
     {
-        Claim(slot);
         var output = rows.ToAcknowledgedOutput();
         MarkSink(slot);
         Sinks.Add(new SinkSlot(slot, SlotKind.UpsertSink, typeof(T).Name, StateShapes.Members(typeof(T)),
@@ -241,10 +190,8 @@ public sealed class PipelineBuilder
         { KeyType = typeof(TKey).Name, Clr = (typeof(T), typeof(TKey)) });
     }
 
-    /// <summary>An append-only result. A retraction on the stream faults the pipeline.</summary>
     public void AppendSink<T>(string slot, ZStream<T> rows) where T : notnull
     {
-        Claim(slot);
         var output = rows.ToAcknowledgedOutput();
         MarkSink(slot);
         Sinks.Add(new SinkSlot(slot, SlotKind.AppendSink, typeof(T).Name, StateShapes.Members(typeof(T)),
@@ -259,33 +206,6 @@ public sealed class PipelineBuilder
             },
             circuit => circuit.Handle(output).Abandon())
         { Clr = (typeof(T), null) });
-    }
-
-    /// <summary>Writes the stream into a declared table (a derived table): this pipeline
-    /// is then the table's one writer.</summary>
-    public void ToTable<TKey, TRow>(TableDefinition<TKey, TRow> table, ZStream<TRow> rows, string? slot = null)
-        where TKey : notnull
-        where TRow : class
-    {
-        ArgumentNullException.ThrowIfNull(table);
-        var name = TableName(slot ?? table.Name);
-        var shared = Resolve(table, slot ?? table.Name, name, written: true);
-        if (TablesWritten.Contains(name))
-            throw new InvalidOperationException($"Table '{name}' is written twice by this definition.");
-        TablesWritten.Add(name);
-        TableTypes[name] = (typeof(TKey), typeof(TRow));
-        rows.ToTable(shared);
-    }
-
-    /// <inheritdoc cref="ToTable{TKey,TRow}(TableDefinition{TKey,TRow}, ZStream{TRow}, string?)"/>
-    public void ToTable<TKey, TValue, TRow>(
-        TableDefinition<TKey, TRow> table, KeyedZStream<TKey, TValue> rows, Func<TKey, TValue, TRow> row, string? slot = null)
-        where TKey : notnull
-        where TValue : notnull
-        where TRow : class
-    {
-        ArgumentNullException.ThrowIfNull(row);
-        ToTable(table, rows.Select(kv => row(kv.Key, kv.Value)), slot);
     }
 
     private static ServiceException Mismatch(string slot, IConnector connector, string kind) =>
@@ -374,16 +294,6 @@ public sealed record PipelineCircuitOptions
     /// resumes the same state. Null (the default) is no limit: the growth flag
     /// (<see cref="ServiceOptions.StateGrowthAlarmAfter"/>) still applies either way.</summary>
     public long? MaxStateEntries { get; init; }
-}
-
-/// <summary>A pipeline's state passed <see cref="PipelineCircuitOptions.MaxStateEntries"/>.</summary>
-public sealed class StateLimitExceededException(string pipeline, long entries, long limit)
-    : Exception($"Pipeline '{pipeline}' holds {entries:N0} state entries, more than its limit of {limit:N0} (circuit.maxStateEntries). " +
-                "It is not restarted, since it would resume the same state: raise the limit by a replace that keeps the state, or reset it.")
-{
-    public string Pipeline { get; } = pipeline;
-    public long Entries { get; } = entries;
-    public long Limit { get; } = limit;
 }
 
 /// <summary>

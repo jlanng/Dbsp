@@ -279,10 +279,10 @@ public class DeadLetterSinkTests
         var harness = Assert.Throws<InvalidOperationException>(() =>
         {
             var builder = new CircuitBuilder(new CircuitOptions());
-            var pipeline = new PipelineBuilder(
+            var pipeline = new PipelineBinding(
                 new PipelineSpec { Id = "p", Plugin = "x", Definition = "y" }, builder, null!,
                 Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, null!);
-            pipeline.AppendSink("deadLetters", pipeline.Input<Trade>("trades"));
+            pipeline.Builder.AppendSink("deadLetters", pipeline.Builder.Input<Trade>("trades"));
         });
         Assert.Contains("dead-letter sink", harness.Message);
     }

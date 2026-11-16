@@ -737,7 +737,29 @@ internal sealed class TableRegistry(ServiceContext context) : ITableRegistry
     private ITableHandle CreateHandle(TableSpec spec)
     {
         var definition = context.Plugins.ResolveTableDefinition(spec);
-        return ((ITableDefinitionInternal)definition).CreateHandle(this, spec);
+        return ((ITableDefinitionInternal)definition).Accept(new HandleOf(this, spec));
+    }
+
+    private sealed class HandleOf(TableRegistry registry, TableSpec spec) : ITableDefinitionVisitor<ITableHandle>
+    {
+        public ITableHandle Visit<TKey, TRow>(TableDefinition<TKey, TRow> definition)
+            where TKey : notnull
+            where TRow : class =>
+            new TableHandle<TKey, TRow>(registry, definition, spec);
+    }
+
+    /// <summary>Asks the loader's factory for a source of the definition's types and lets
+    /// it go: a factory that does not serve them says so here, before anything is opened.</summary>
+    private sealed class SourceCheck(TableRegistry registry, TableLoaderSpec loader) : ITableDefinitionVisitor<bool>
+    {
+        public bool Visit<TKey, TRow>(TableDefinition<TKey, TRow> definition)
+            where TKey : notnull
+            where TRow : class
+        {
+            var source = registry.CreateSource<TKey, TRow>(loader);
+            (source as IDisposable)?.Dispose();
+            return true;
+        }
     }
 
     /// <summary>Opens what the catalog names and this node has not, and drops what the
@@ -846,7 +868,7 @@ internal sealed class TableRegistry(ServiceContext context) : ITableRegistry
             {
                 try
                 {
-                    ((ITableDefinitionInternal)definition).CheckSource(this, loader);
+                    ((ITableDefinitionInternal)definition).Accept(new SourceCheck(this, loader));
                 }
                 catch (Exception ex) when (ex is not ServiceException and not OperationCanceledException)
                 {

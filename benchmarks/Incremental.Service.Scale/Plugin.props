@@ -10,7 +10,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="$(MSBuildThisFileDirectory)..\..\src\Incremental.Service\Incremental.Service.csproj" Private="false" ExcludeAssets="runtime;native" />
+    <ProjectReference Include="$(MSBuildThisFileDirectory)..\..\src\Incremental.Service.Abstractions\Incremental.Service.Abstractions.csproj" Private="false" ExcludeAssets="runtime;native" />
     <ProjectReference Include="$(MSBuildThisFileDirectory)..\..\src\Incremental\Incremental.csproj" Private="false" ExcludeAssets="runtime;native" />
   </ItemGroup>
 
