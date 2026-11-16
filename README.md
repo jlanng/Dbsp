@@ -441,8 +441,9 @@ so implementations never see cross-thread access to one store.
   service publishes a meter, `Incremental.Service`, for a monitoring system; and the
   admin API says what a deploy needs — a definition's slots and settings, the registered
   connectors and connections, a starting spec. A `files` connector reads and writes
-  JSON-lines objects through `IObjectStore` (a directory is built in; S3 is yours to
-  plug in), with a paged listing, a settle time for late objects, deletes, retention
+  JSON-lines objects through `IObjectStore` (a directory is built in; an S3 bucket is
+  the optional package `Incremental.Service.S3`, tested against MinIO and not against
+  Amazon S3), with a paged listing, a settle time for late objects, deletes, retention
   and compaction; an input that is not there is a dry-run warning and a *waiting*
   state; a spec's `deadLetters` keeps dropped records in any append sink, at least
   once and across a takeover, and `PipelineTestHarness` (package
@@ -773,6 +774,8 @@ src/Incremental.Service.Abstractions  what a plugin compiles against: IPipelineD
                                        PipelineBuilder, TableDefinition, IRecordFormat; the
                                        core is its only reference
 src/Incremental.Service.Testing    PipelineTestHarness for plugin authors
+src/Incremental.Service.S3         an S3 object store for the files connector (AWS SDK; tested
+                                       against MinIO in the connector stack, not against S3)
 src/Incremental.Service.Admin      the admin JSON API and web UI for a service node (ASP.NET
                                        Core; the UI is embedded, hand-written, no build step)
 tests/Incremental.Tests            xunit: Z-set algebra, per-step delta semantics, multi-worker runs,

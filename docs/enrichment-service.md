@@ -3452,7 +3452,8 @@ resources are ARNs (`…:topic/<cluster>/<uuid>/{prefix}.*`,
   it deletes, which leaves a window of one call in which it can delete a file the new
   leader has just stored again. Importing the version again puts the file back.
 - **The `files` connector is plain.** JSON lines only; no compression, no Parquet, no
-  partitioned paths. A source reads strictly in name order: an object that arrives more
+  partitioned paths. Its S3 store has been run against MinIO only: on Amazon S3 itself,
+  IAM authentication, listing and stamps are unverified. A source reads strictly in name order: an object that arrives more
   than `settle` behind one with a greater name is never read, and nothing says so. A
   store without a paged listing (`ListPageAsync`) is listed whole at every poll. A
   replaced leader's late sink object reads as real until its successor's first object

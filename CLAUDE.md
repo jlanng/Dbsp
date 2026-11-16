@@ -87,8 +87,13 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   fails when a block and its region differ or a C# block has no source. Edit the source,
   then copy the region into the document.
 - Connector stack: `docker compose --profile connectors up -d` adds Kafka (`localhost:9092`), Postgres with
-  logical decoding (`localhost:5432`, user/password/db `incremental`) and Debezium's Kafka
-  Connect (`localhost:8083`). Plain `docker compose up -d` stays Redis-only.
+  logical decoding (`localhost:5432`, user/password/db `incremental`), Debezium's Kafka
+  Connect (`localhost:8083`) and MinIO (`http://localhost:9000`, `incremental` /
+  `incremental-secret`; the image is Pigsty's build of the MinIO server, MinIO's own
+  images being no longer published). Plain `docker compose up -d` stays Redis-only.
+  `S3FileConnectorTests` run the files connector's tests on the S3 store against that
+  MinIO (`INCREMENTAL_S3_ENDPOINT` points them elsewhere) and skip without it; CI's
+  `connector-stack` job counts them among the service tests whose skips it holds to six.
 - Three brokers: `docker compose --profile kafka3 up -d` (replication factor 3,
   `min.insync.replicas` 2, on `localhost:9192,localhost:9292,localhost:9392`; no volume;
   fixed addresses on a network of their own, 10.89.93.0/24 — a container cluster whose
@@ -739,6 +744,20 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     warning and a `Waiting` state, never a refusal or a fault of the files paths. The `files` source holds one line of at most
     `maxLineLength` characters; its ordinals only rise, past anything a checkpoint may
     hold of a half-sent name (`FilePosition.Next`).
+  - The S3 store (`src/Incremental.Service.S3`, `S3ObjectStore`, `AddS3ObjectStore`) is
+    an optional package: `Incremental.Service` never references it or the AWS SDK. It
+    keeps `IObjectStore`'s contract with S3's own means, and each must stay: a page is
+    one `ListObjectsV2` (`StartAfter`, `MaxKeys`), never a whole listing; an object
+    appears only by a `PutObject` or `CompleteMultipartUpload` sent after the write's
+    callback has returned, and a multipart upload begun for a write that throws or is
+    cancelled is aborted; `Modified` is the listing's `LastModified` and `Identity` the
+    ETag, never a time of the node's; a missing object read throws
+    `FileNotFoundException`, which the connector takes for "gone since it was listed".
+    It is checked against MinIO only (decision 7: real S3 is unverified, and its docs say
+    so). `FileConnectorTests` is abstract and every test in it runs on both stores
+    (`LocalFileConnectorTests`, `S3FileConnectorTests`): a new files-connector test goes
+    in the base and reaches the store only through `IObjectStore`, `NamesUnderAsync` and
+    `AgeAsync`, never through the file system.
   - `ITableSourceFactory.Create` and `ITypedConnector.RequireTypes` run at dry runs:
     they open nothing. The binding has a name,
     `PipelineSupervisor.LayoutOf(spec)` (plugin version, definition, settings, workers,

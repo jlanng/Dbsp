@@ -73,6 +73,7 @@ Two rules run through the whole design and are stated once here:
 | `src/Incremental.Service.Abstractions` | net8.0; net10.0 | Incremental | what a plugin compiles against: the definition interfaces, `PipelineBuilder`, table definitions, the record format seam (round five, B1) |
 | `src/Incremental.Service` | net8.0; net10.0 | Incremental, Incremental.Hosting, Incremental.Kafka, the abstractions | everything below except HTTP |
 | `src/Incremental.Service.Testing` | net8.0; net10.0 | Incremental.Service | `PipelineTestHarness` |
+| `src/Incremental.Service.S3` | net8.0; net10.0 | Incremental.Service, `AWSSDK.S3` | `S3ObjectStore` and `AddS3ObjectStore`: the `files` connector on a bucket (round five, B5); tested against MinIO, not Amazon S3 |
 | `src/Incremental.Service.Admin` | net8.0; net10.0 | Incremental.Service, `FrameworkReference Microsoft.AspNetCore.App` | JSON API, health endpoints, embedded UI |
 | `tests/Incremental.Service.Tests` | net10.0 | both, xunit v3 | Kafka tests skip like `tests/Incremental.Kafka.Tests/KafkaEnv.cs` |
 

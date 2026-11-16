@@ -12,8 +12,9 @@ public sealed record ObjectInfo(string Path, long Length, DateTimeOffset Modifie
 /// <summary>
 /// Files or objects under a root the host registered by name
 /// (<c>AddObjectStore("refdata", …)</c>). Specs name the store and a relative path; they
-/// cannot name a host or an absolute path. Local files are built in; anything else (S3) is
-/// the host's implementation.
+/// cannot name a host or an absolute path. Local files are built in; an S3 bucket is the
+/// optional package <c>Incremental.Service.S3</c> (tested against MinIO, not Amazon S3);
+/// anything else is the host's implementation.
 /// </summary>
 public interface IObjectStore
 {
