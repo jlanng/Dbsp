@@ -475,10 +475,13 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         Assert.Equal(2, b.Leadership.Term);
         gate.Set();
         await a.Leadership.WhenFinished.WaitAsync(Timeout);
-        await KafkaEnv.EventuallyAsync(() => Task.FromResult(log.Contains("fenced")), "the client to report the fence");
-        await Task.Delay(500);
+        // Whether the stalled transaction reaches the client depends on whether the leader
+        // topic told a first (then the writer stops, and the client says nothing); either
+        // way nothing is an error, and what the client says of the fence is Information.
+        // The client's own lines are classified by the next test, from a real run.
+        await Task.Delay(1_000);
         Assert.Empty(log.AtLeast(LogLevel.Error));
-        Assert.Contains(log.Entries, e => e.Level == LogLevel.Information && KafkaLog.IsFenceMessage(e.Message));
+        Assert.All(log.Entries.Where(e => KafkaLog.IsFenceMessage(e.Message)), e => Assert.Equal(LogLevel.Information, e.Level));
 
         // The replaced node learns who replaced it from the leader topic.
         await KafkaEnv.EventuallyAsync(() => Task.FromResult(a.Leadership.Status.Previous is not null), "a to read who replaced it");
@@ -499,6 +502,19 @@ public class KafkaLeadershipTests(ITestOutputHelper output)
         await KafkaEnv.EventuallyAsync(() => Task.FromResult(b.Leadership.Status.Previous is not null), "b to read who replaced it");
         Assert.Equal(new PreviousLeadership(2, "a", 3, "manual"), b.Leadership.Status.Previous);
     }
+
+    /// <summary>The lines the Kafka client wrote on a replaced leader of the example (K7,
+    /// a manual takeover on the connector stack), verbatim: each is a fence, and is logged at
+    /// Information; a line about anything else keeps its level.</summary>
+    [Theory]
+    [InlineData("rdkafka#producer-3 ADDPARTS: [thrd:main]: TxnCoordinator/1: Failed to add partition \"kseven.leader\" [0] to transaction: Broker: Producer attempted an operation with an old epoch", true)]
+    [InlineData("rdkafka#producer-3 TXNERR: [thrd:main]: Fatal transaction error: Failed to add partitions to transaction: Local: This instance has been fenced by a newer instance (_FENCED)", true)]
+    [InlineData("rdkafka#producer-3 FATAL: [thrd:main]: Fatal error: Local: This instance has been fenced by a newer instance: Failed to add partitions to transaction: Local: This instance has been fenced by a newer instance", true)]
+    [InlineData("Failed to add partitions to transaction: Local: This instance has been fenced by a newer instance", true)]
+    [InlineData("rdkafka#producer-3 FAIL: [thrd:localhost:9092/1]: localhost:9092/1: Connect to ipv4#127.0.0.1:9092 failed: Connection refused", false)]
+    [InlineData("Fatal error: Local: Broker transport failure", false)]
+    public void The_clients_lines_about_a_fence_are_told_from_others(string line, bool fence) =>
+        Assert.Equal(fence, KafkaLog.IsFenceMessage(line));
 
     private sealed class ListLogger : ILogger
     {

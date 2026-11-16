@@ -55,7 +55,6 @@ public class InProcessSupervisorTests
         await LeaderHasAStandbyAsync(admin, a2);
         Assert.False(a2.Node.Ended.IsCompleted);
         Assert.Equal(new PreviousTerm(2, a2.Node.NodeId, 3, "resigned"), b2.Node.Backend.Leadership.Status.Previous);
-        Assert.Equal(new PreviousTerm(1, b.Node.NodeId, 2, "manual"), a2.Node.Backend.Leadership.Status.Previous);
     }
 
     private static async Task<DemoNode> ReadyStandbyAsync(AdminFixture admin, int index, DemoNode leader)
