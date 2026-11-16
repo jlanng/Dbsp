@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Incremental.Service.S3</PackageId>
+    <RootNamespace>Incremental.Service.S3</RootNamespace>
+    <Description>An S3 object store for the Incremental enrichment service's files connector: listing a page at a time after a name, writes that are whole or absent, the store's own stamps for the source's settle rule. Tested against MinIO; not checked against Amazon S3 itself.</Description>
+  </PropertyGroup>
+
+  <!-- Optional: a host that registers an S3 store references this package; the service
+       itself does not, so the AWS SDK reaches no host that does not ask for it. -->
+  <ItemGroup>
+    <ProjectReference Include="..\Incremental.Service\Incremental.Service.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="AWSSDK.S3" Version="4.0.104.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Incremental.Service.Tests" />
+  </ItemGroup>
+
+</Project>

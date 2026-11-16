@@ -95,6 +95,29 @@ services:
       timeout: 5s
       retries: 30
 
+  # An S3-compatible object store for the files connector's S3 store
+  # (src/Incremental.Service.S3): its tests and the files connector's tests run against
+  # it. From the host: http://localhost:9000, access key `incremental`, secret
+  # `incremental-secret` (throwaway). The tests make their own bucket. The image is the
+  # MinIO server as Pigsty builds it: MinIO's own images are no longer published to
+  # Docker Hub or Quay. MinIO is S3's API, not S3: real S3 is not checked here.
+  minio:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    profiles: ["connectors"]
+    command: ["server", "/data"]
+    ports:
+      - "9000:9000"
+    environment:
+      MINIO_ROOT_USER: incremental
+      MINIO_ROOT_PASSWORD: incremental-secret
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/live > /dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
   # A production-shaped Kafka, kept out of the default profiles:
   #   docker compose --profile kafka3 up -d
   # Three brokers in KRaft mode, every topic at replication factor 3 with
@@ -224,3 +247,4 @@ volumes:
   redis-data:
   kafka-data:
   postgres-data:
+  minio-data:

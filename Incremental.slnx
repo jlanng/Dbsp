@@ -28,6 +28,7 @@
     <Project Path="src/Incremental.Service.Admin/Incremental.Service.Admin.csproj" />
     <Project Path="src/Incremental.Service/Incremental.Service.csproj" />
     <Project Path="src/Incremental.Service.Abstractions/Incremental.Service.Abstractions.csproj" />
+    <Project Path="src/Incremental.Service.S3/Incremental.Service.S3.csproj" />
     <Project Path="src/Incremental.Service.Testing/Incremental.Service.Testing.csproj" />
     <Project Path="src/Incremental.Storage.Redis/Incremental.Storage.Redis.csproj" />
     <Project Path="src/Incremental/Incremental.csproj" />

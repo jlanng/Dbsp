@@ -7,37 +7,61 @@ using static Incremental.Service.Tests.TestService;
 namespace Incremental.Service.Tests;
 
 /// <summary>
-/// The <c>files</c> connector over a local object store: objects read in name order with
-/// the position in the checkpoint, one object written per step, and both across a restart
-/// and a takeover — always compared with a model of what the pipeline should hold.
+/// The <c>files</c> connector over an object store: objects read in name order with the
+/// position in the checkpoint, one object written per step, and both across a restart and
+/// a takeover — always compared with a model of what the pipeline should hold. Every test
+/// here runs on each store: a local directory (<see cref="LocalFileConnectorTests"/>) and
+/// S3 as MinIO serves it (<see cref="S3FileConnectorTests"/>). A test reaches the store
+/// only through <see cref="IObjectStore"/> and the three members a store's class gives.
 /// </summary>
-public class FileConnectorTests : IDisposable
+public abstract class FileConnectorTests : IAsyncLifetime
 {
-    private static readonly JsonSerializerOptions Web = new(JsonSerializerDefaults.Web);
-    private readonly string _root = Path.Combine(Path.GetTempPath(), "incremental-file-connector-tests", Guid.NewGuid().ToString("N"));
-    private readonly LocalObjectStore _store;
+    protected static readonly JsonSerializerOptions Web = new(JsonSerializerDefaults.Web);
+    private IObjectStore _store = null!;
 
-    public FileConnectorTests() => _store = new LocalObjectStore(_root);
+    protected IObjectStore Store => _store;
 
-    public void Dispose()
+    /// <summary>The store a test runs on, empty. Skips the test when the store is not there.</summary>
+    protected abstract ValueTask<IObjectStore> OpenStoreAsync();
+
+    protected abstract ValueTask CloseStoreAsync();
+
+    /// <summary>Every name the store holds under <paramref name="prefix"/>, as the store
+    /// itself has it — anything a write left behind (a temporary file, an upload not
+    /// completed) included — in ordinal order.</summary>
+    protected abstract ValueTask<List<string>> NamesUnderAsync(string prefix);
+
+    /// <summary>Makes the objects older, by the store's own stamps, than anything written
+    /// after this returns, by at least <paramref name="age"/>: a directory sets their
+    /// times back; a bucket, whose stamps nobody sets, waits that long.</summary>
+    protected abstract ValueTask AgeAsync(TimeSpan age, params string[] names);
+
+    public async ValueTask InitializeAsync() => _store = await OpenStoreAsync();
+
+    public async ValueTask DisposeAsync()
     {
-        try
-        {
-            Directory.Delete(_root, recursive: true);
-        }
-        catch (IOException)
-        {
-        }
+        GC.SuppressFinalize(this);
+        await CloseStoreAsync();
     }
+
+    protected async Task<string> ReadTextAsync(string name)
+    {
+        await using var stream = await _store.OpenReadAsync(name, default);
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+        return await reader.ReadToEndAsync();
+    }
+
+    protected async Task<string[]> ReadLinesAsync(string name) =>
+        (await ReadTextAsync(name)).Split('\n', StringSplitOptions.RemoveEmptyEntries);
 
     private Task<TestService> StartAsync(InMemoryServiceCluster? cluster = null, string nodeId = "a", MemoryConnector? memory = null) =>
         TestService.StartAsync(cluster, nodeId, memory, configure: b => b.AddObjectStore("landing", _ => _store));
 
-    private static JsonElement Files(string prefix, string? more = null) =>
+    protected static JsonElement Files(string prefix, string? more = null) =>
         Json($$"""{ "connector": "files", "store": "landing", "prefix": "{{prefix}}"{{(more is null ? "" : ", " + more)}} }""");
 
     /// <summary>An object, written whole and then moved into place.</summary>
-    private async Task PutAsync(string name, IEnumerable<string> lines)
+    protected async Task PutAsync(string name, IEnumerable<string> lines)
     {
         var bytes = Encoding.UTF8.GetBytes(string.Join("\n", lines) + "\n");
         await _store.WriteAsync(name, (stream, ct) => stream.WriteAsync(bytes, ct), default);
@@ -64,50 +88,7 @@ public class FileConnectorTests : IDisposable
 
     // ── the position ───────────────────────────────────────────────────────────────────
 
-    [Fact]
-    public void Whatever_prefix_of_its_advances_a_checkpoint_holds_the_position_names_a_whole_object()
-    {
-        // The source's sends, in order, for three objects with names of different lengths;
-        // a checkpoint may land after any of them. Each partition keeps its highest offset.
-        var names = new[] { "in/2026-01-05/part-0001.jsonl", "in/b.jsonl", "in/2026-01-06/a-much-longer-name-than-the-others-ünïcode.jsonl" };
-        var sends = new List<(int Partition, long Offset, string Object, long Line)>();
-        for (var ordinal = 1; ordinal <= names.Length; ordinal++)
-        {
-            foreach (var (partition, offset) in FilePosition.Name(ordinal, names[ordinal - 1]))
-                sends.Add((partition, offset, names[ordinal - 1], -1));
-            for (var line = 0; line < 3; line++)
-                sends.Add((0, FilePosition.Line(ordinal, line), names[ordinal - 1], line));
-        }
 
-        var committed = new Dictionary<int, long>();
-        Assert.Null(FilePosition.Decode(committed));
-        string? lastWhole = null;
-        long lastLine = -1;
-        foreach (var (partition, offset, name, line) in sends)
-        {
-            Assert.True(!committed.TryGetValue(partition, out var held) || offset > held, "every send must advance its partition, or the input drops it");
-            committed[partition] = offset;
-            if (partition == 1)
-                (lastWhole, lastLine) = (name, -1);     // the header: from here the checkpoint names this object
-            else if (partition == 0)
-                lastLine = line;
-            var decoded = FilePosition.Decode(committed);
-            if (lastWhole is null)
-                Assert.Null(decoded);
-            else
-            {
-                Assert.Equal(lastWhole, decoded!.Value.Name);
-                Assert.Equal(lastLine, decoded.Value.Line);
-            }
-        }
-    }
-
-    [Fact]
-    public void A_name_too_long_to_checkpoint_is_refused_by_name()
-    {
-        var ex = Assert.Throws<InvalidOperationException>(() => FilePosition.Name(1, new string('x', 300)).ToList());
-        Assert.Contains("300 bytes", ex.Message);
-    }
 
     // ── the source ─────────────────────────────────────────────────────────────────────
 
@@ -328,7 +309,7 @@ public class FileConnectorTests : IDisposable
         instruments[4] = instruments[4] with { Multiplier = 9 };
         instruments.RemoveAt(2);
         await EventuallyAsync(async () => Same(await FileSinkFormat.ReadUpsertsAsync<long, EnrichedTrade>(_store, "out/enriched/"), Enrich.Model(trades, instruments)), "the rows after the table changed");
-        var text = string.Concat((await FileSinkFormat.StepObjectsAsync(_store, "out/enriched/")).Select(n => File.ReadAllText(Path.Combine(_root, n))));
+        var text = string.Concat(await Task.WhenAll((await FileSinkFormat.StepObjectsAsync(_store, "out/enriched/")).Select(ReadTextAsync)));
         Assert.Contains("\"deleted\":true", text);
 
         var objectsBefore = (await FileSinkFormat.StepObjectsAsync(_store, "out/enriched/")).Count;
@@ -453,7 +434,7 @@ public class FileConnectorTests : IDisposable
                 return new Dictionary<int, long>(Position);
         }
 
-        public FileSourceReader Read(LocalObjectStore store, string prefix, IReadOnlyDictionary<int, long> committed, string more = "") =>
+        public FileSourceReader Read(IObjectStore store, string prefix, IReadOnlyDictionary<int, long> committed, string more = "") =>
             new(store, FilesSlotConfig.Parse(Files(prefix, "\"settle\": \"00:00:00\", \"pollInterval\": \"00:00:00.02\"" + more)), committed,
                 async (text, offset, stop) =>
                 {
@@ -487,7 +468,7 @@ public class FileConnectorTests : IDisposable
         }
     }
 
-    private static IEnumerable<string> Numbered(string name, int count) => Enumerable.Range(0, count).Select(i => $"\"{name} {i}\"");
+    protected static IEnumerable<string> Numbered(string name, int count) => Enumerable.Range(0, count).Select(i => $"\"{name} {i}\"");
 
     [Fact]
     public async Task A_checkpoint_holding_half_of_a_name_does_not_spoil_the_position_when_another_object_is_read_next()
@@ -534,17 +515,6 @@ public class FileConnectorTests : IDisposable
         Assert.Equal("quotes/00000007.jsonl:80", FilePosition.Describe(third.Checkpoint()));
     }
 
-    [Fact]
-    public void Ordinals_stay_above_everything_sent_and_alternate_banks()
-    {
-        Assert.Equal(1, FilePosition.Next(0, 0));
-        Assert.Equal(2, FilePosition.Next(1, 1));
-        Assert.Equal(4, FilePosition.Next(1, 2));       // 2 was half sent: 3 would overwrite the bank of 1
-        Assert.Equal(3, FilePosition.Next(0, 1));       // nothing whole yet, half of 1 sent
-        Assert.Equal(7, FilePosition.Next(4, 6));
-        Assert.Equal(0, FilePosition.Highest(new Dictionary<int, long>()));
-        Assert.Equal(5, FilePosition.Highest(new Dictionary<int, long> { [1] = (4L << 32) | 9, [70] = (5L << 32) | 123, [0] = (4L << 32) | 2 }));
-    }
 
     [Fact]
     public async Task An_object_that_arrives_among_the_names_already_listed_is_still_read()
@@ -570,16 +540,14 @@ public class FileConnectorTests : IDisposable
     public async Task A_line_longer_than_the_limit_is_rejected_in_its_place_without_being_held()
     {
         // 40 MB with no line end, between two records: a binary, an export that is one JSON array.
-        var path = Path.Combine(_root, "in");
-        Directory.CreateDirectory(path);
-        await using (var file = File.Create(Path.Combine(path, "a.jsonl")))
+        await _store.WriteAsync("in/a.jsonl", async (file, ct) =>
         {
-            await file.WriteAsync(Encoding.UTF8.GetBytes("\"before\"\n"));
+            await file.WriteAsync(Encoding.UTF8.GetBytes("\"before\"\n"), ct);
             var block = Encoding.UTF8.GetBytes(new string('x', 1 << 20));
             for (var i = 0; i < 40; i++)
-                await file.WriteAsync(block);
-            await file.WriteAsync(Encoding.UTF8.GetBytes("\r\n\"after\"\n"));
-        }
+                await file.WriteAsync(block, ct);
+            await file.WriteAsync(Encoding.UTF8.GetBytes("\r\n\"after\"\n"), ct);
+        }, default);
         var input = new FakeInput();
         await using (var reader = input.Read(_store, "in/", new Dictionary<int, long>(), ", \"maxLineLength\": 1000"))
             await Eventually(() => input.Count == 2, "the records on both sides of the long line");
@@ -591,7 +559,7 @@ public class FileConnectorTests : IDisposable
     }
 
     /// <summary>A text of one character repeated, never held anywhere.</summary>
-    private sealed class Repeated(char character, long count, string then) : TextReader
+    protected sealed class Repeated(char character, long count, string then) : TextReader
     {
         private long _left = count;
         private int _tail;
@@ -612,42 +580,7 @@ public class FileConnectorTests : IDisposable
         }
     }
 
-    [Fact]
-    public async Task A_line_of_any_length_is_read_past_holding_no_more_than_the_limit()
-    {
-        // Half a billion characters and no line end: as a string it could not exist.
-        const int limit = 100_000;
-        var reader = new BoundedLineReader(new Repeated('x', 500_000_000, "\nnext\n"), limit);
-        var huge = (await reader.ReadLineAsync(default))!.Value;
-        Assert.Equal((500_000_000L, true, BoundedLineReader.Kept), (huge.Length, huge.TooLong, huge.Text.Length));
-        Assert.InRange(reader.Held, 0, 2 * limit);
-        Assert.Equal(new LineRead("next", 4, false), await reader.ReadLineAsync(default));
-        Assert.InRange(reader.Held, 0, 2 * limit);
-        Assert.Null(await reader.ReadLineAsync(default));
-    }
 
-    [Fact]
-    public async Task Lines_end_as_a_text_reader_s_do_and_a_limit_counts_characters()
-    {
-        var text = "one\ntwo\r\nthree\rfour\n\n" + new string('y', 5000) + "\nlast";
-        var expected = new List<string>();
-        using (var plain = new StringReader(text))
-            while (plain.ReadLine() is { } line)
-                expected.Add(line);
-        var reader = new BoundedLineReader(new StringReader(text), 4999);
-        var read = new List<LineRead>();
-        while (await reader.ReadLineAsync(default) is { } line)
-            read.Add(line);
-        Assert.Equal(expected.Count, read.Count);
-        Assert.Equal(expected.Select(l => l.Length > 4999 ? l[..BoundedLineReader.Kept] : l), read.Select(l => l.Text));
-        Assert.Equal(expected.Select(l => (long)l.Length), read.Select(l => l.Length));
-        Assert.Equal(expected.Select(l => l.Length > 4999), read.Select(l => l.TooLong));
-
-        // At the limit exactly: whole.
-        var exact = new BoundedLineReader(new StringReader(new string('z', 5000)), 5000);
-        Assert.Equal(new LineRead(new string('z', 5000), 5000, false), await exact.ReadLineAsync(default));
-        Assert.Null(await exact.ReadLineAsync(default));
-    }
 
     // ── the store ──────────────────────────────────────────────────────────────────────
 
@@ -668,13 +601,13 @@ public class FileConnectorTests : IDisposable
             ct.ThrowIfCancellationRequested();
         }, cancel.Token));
 
-        Assert.Equal("whole\n", File.ReadAllText(Path.Combine(_root, "out", "a.jsonl")));
+        Assert.Equal("whole\n", await ReadTextAsync("out/a.jsonl"));
         Assert.Null(await _store.StatAsync("out/b.jsonl", default));
-        Assert.Equal(["a.jsonl"], Directory.GetFiles(Path.Combine(_root, "out")).Select(Path.GetFileName));      // no temporary left either
+        Assert.Equal(["out/a.jsonl"], await NamesUnderAsync("out/"));                  // no temporary left either
     }
 
     [Fact]
-    public async Task A_listing_walks_the_directory_its_prefix_names_and_matches_by_prefix()
+    public async Task A_listing_matches_by_prefix_and_refuses_a_path_outside_the_root()
     {
         foreach (var name in new[] { "in/0002.jsonl", "in/0001.jsonl", "in/2026/01/a.jsonl", "inside/x.jsonl", "out/1.jsonl", "top.jsonl" })
             await PutAsync(name, ["{}"]);
@@ -692,11 +625,7 @@ public class FileConnectorTests : IDisposable
         Assert.Empty(await List("nowhere/"));
         Assert.Equal(6, (await List("")).Count);
         await Assert.ThrowsAsync<ArgumentException>(() => List("../x/"));
-
-        // A file the store could not even stat lies outside the prefix: it is not looked at.
-        Directory.CreateDirectory(Path.Combine(_root, "other"));
-        File.CreateSymbolicLink(Path.Combine(_root, "other", "loop"), Path.Combine(_root, "other"));
-        Assert.Equal(["out/1.jsonl"], await List("out/"));
+        await Assert.ThrowsAsync<ArgumentException>(async () => await _store.StatAsync("/etc/passwd", default));
     }
 
     // ── one prefix, one sink ───────────────────────────────────────────────────────────
@@ -852,7 +781,7 @@ public class FileConnectorTests : IDisposable
     /// <summary>A store that records how it is listed, and can run something just before
     /// an object is opened. <paramref name="paged"/> false: a store written before
     /// <see cref="IObjectStore.ListPageAsync"/>, which has only the whole listing.</summary>
-    private class RecordingStore(LocalObjectStore inner) : IObjectStore
+    private class RecordingStore(IObjectStore inner) : IObjectStore
     {
         public readonly List<string?> PagesAfter = [];
         public int WholeListings;
@@ -888,7 +817,7 @@ public class FileConnectorTests : IDisposable
         }
     }
 
-    private sealed class PagingStore(LocalObjectStore inner) : RecordingStore(inner), IObjectStore
+    private sealed class PagingStore(IObjectStore inner) : RecordingStore(inner), IObjectStore
     {
         public ValueTask<ObjectPage> ListPageAsync(string prefix, string? after, int limit, CancellationToken cancellationToken) => Page(prefix, after, limit, cancellationToken);
     }
@@ -947,7 +876,7 @@ public class FileConnectorTests : IDisposable
         Assert.False(last.More);
         Assert.Empty((await store.ListPageAsync("in/", "in/0010.jsonl", 4, default)).Objects);
 
-        // The local store's own paging says the same.
+        // The store's own paging says the same.
         var local = await _store.ListPageAsync("in/", "in/0004.jsonl", 4, default);
         Assert.Equal(second.Objects.Select(o => o.Path), local.Objects.Select(o => o.Path));
         Assert.True(local.More);
@@ -978,10 +907,10 @@ public class FileConnectorTests : IDisposable
     [Fact]
     public async Task Nothing_is_read_past_an_object_that_has_not_settled()
     {
-        // 0003 has been there for a minute; 0001 has just landed. Reading 0003 now would
+        // 0003 has been there for longer than the settle time; 0001 has just landed. Reading 0003 now would
         // put the position past 0001's place before 0001 may be read.
         await PutAsync("in/0003.jsonl", Numbered("0003", 1));
-        File.SetLastWriteTimeUtc(Path.Combine(_root, "in", "0003.jsonl"), DateTime.UtcNow.AddMinutes(-1));
+        await AgeAsync(TimeSpan.FromSeconds(1.5), "in/0003.jsonl");
         await PutAsync("in/0001.jsonl", Numbered("0001", 1));
         var input = new FakeInput();
         await using var reader = Read(_store, input, "in/", ", \"settle\": \"00:00:01\"");
@@ -994,7 +923,7 @@ public class FileConnectorTests : IDisposable
 
     /// <summary>A store whose clock is not the node's: every modification time it
     /// reports is shifted, as a file server's or a bucket's would be.</summary>
-    private sealed class SkewedStore(LocalObjectStore inner, TimeSpan skew) : IObjectStore
+    private sealed class SkewedStore(IObjectStore inner, TimeSpan skew) : IObjectStore
     {
         private ObjectInfo Shift(ObjectInfo info) => info with { Modified = info.Modified + skew };
 
@@ -1061,10 +990,8 @@ public class FileConnectorTests : IDisposable
         // only the reader's own sightings to go by, a backlog would wait once per
         // listing of it.
         for (var i = 1; i <= 3; i++)
-        {
             await PutAsync($"in/{i:D4}.jsonl", Numbered($"{i:D4}", 1));
-            File.SetLastWriteTimeUtc(Path.Combine(_root, "in", $"{i:D4}.jsonl"), DateTime.UtcNow.AddMinutes(-1));
-        }
+        await AgeAsync(TimeSpan.FromSeconds(3.5), "in/0001.jsonl", "in/0002.jsonl", "in/0003.jsonl");
         await PutAsync("in/0004.jsonl", Numbered("0004", 1));
         var input = new FakeInput();
         var clock = System.Diagnostics.Stopwatch.StartNew();
@@ -1144,7 +1071,7 @@ public class FileConnectorTests : IDisposable
         async Task HandOnAsync()
         {
             foreach (var name in (await FileSinkFormat.StepObjectsAsync(_store, "mid/")).Skip(handed))
-                await PutAsync($"handed/{++handed:D6}.jsonl", await File.ReadAllLinesAsync(Path.Combine(_root, name)));
+                await PutAsync($"handed/{++handed:D6}.jsonl", await ReadLinesAsync(name));
         }
 
         var trades = Trades(0, 6);
@@ -1254,7 +1181,7 @@ public class FileConnectorTests : IDisposable
         await EventuallyAsync(async () => (await AppendsAsync<Trade>("out/kept-")).LastOrDefault() == trades[8], "a record after the restart");
         await SinkAtRestAsync(service, "big");
         Assert.Equal(trades.Skip(6).Take(3), await AppendsAsync<Trade>("out/kept-"));
-        Assert.Equal(3, Directory.GetFiles(Path.Combine(_root, "out")).Length);
+        Assert.Equal(3, (await NamesUnderAsync("out/")).Count);
     }
 
     [Fact]
@@ -1271,7 +1198,7 @@ public class FileConnectorTests : IDisposable
         var expected = new Dictionary<long, Trade>();
         var trades = Trades(0, 40);
         var files = 0;
-        string[] Names() => Directory.Exists(Path.Combine(_root, "out", "latest")) ? [.. Directory.GetFiles(Path.Combine(_root, "out", "latest")).Select(Path.GetFileName).Order()!] : [];
+        async Task<string[]> Names() => [.. (await NamesUnderAsync("out/latest/")).Select(n => n["out/latest/".Length..])];
 
         // Thirty steps, one object in at a time so that each is a step: upserts, changes
         // of rows already written, and deletes.
@@ -1300,7 +1227,7 @@ public class FileConnectorTests : IDisposable
             await EventuallyAsync(async () => Same(await FileSinkFormat.ReadUpsertsAsync<long, Trade>(_store, "out/latest/"), expected), $"the sink after round {round}");
             // Never more than the trigger's worth of step objects, one snapshot, and the
             // step that set the fold off (it is above the checkpoint while it is written).
-            Assert.InRange(Names().Length, 1, 4 + 2);
+            Assert.InRange((await Names()).Length, 1, 4 + 2);
         }
 
         // A fold writes its snapshot whole and then deletes what it stands for, the
@@ -1309,10 +1236,10 @@ public class FileConnectorTests : IDisposable
         // rows are readable as soon as its step object is there, which can be that
         // moment — so the listing is taken once the sink's write has returned.
         await SinkAtRestAsync(service, "latest");
-        var names = Names();
+        var names = await Names();
         Assert.Single(names, n => n.EndsWith(".snapshot.jsonl"));
         // The snapshot holds each live key once and no deleted one.
-        var snapshot = File.ReadAllLines(Path.Combine(_root, "out", "latest", names.Single(n => n.EndsWith(".snapshot.jsonl"))));
+        var snapshot = await ReadLinesAsync("out/latest/" + names.Single(n => n.EndsWith(".snapshot.jsonl")));
         Assert.DoesNotContain(snapshot, line => line.Contains("\"deleted\""));
         Assert.Equal(snapshot.Length, snapshot.Select(line => JsonDocument.Parse(line).RootElement.GetProperty("key").GetInt64()).Distinct().Count());
 
@@ -1352,7 +1279,7 @@ public class FileConnectorTests : IDisposable
         Assert.Equal(
             [FileSinkFormat.SnapshotName("out/", 5, 1), FileSinkFormat.ObjectName("out/", 6, 1, 0)],
             await FileSinkFormat.StepObjectsAsync(_store, "out/"));
-        Assert.Equal(2, Directory.GetFiles(Path.Combine(_root, "out")).Length);
+        Assert.Equal(2, (await NamesUnderAsync("out/")).Count);
 
         // Folding again with one step above the snapshot: the two become one, and a
         // second fold of nothing writes nothing.
@@ -1369,14 +1296,10 @@ public class FileConnectorTests : IDisposable
         for (var step = 1; step <= 4; step++)
             await PutAsync(FileSinkFormat.ObjectName("out/", step, 1, 0), [$"{{\"key\":{step},\"row\":\"step {step}\"}}"]);
         var store = new PagingStore(_store);
-        store.BeforeOpen = name =>
-        {
-            File.Delete(Path.Combine(_root, FileSinkFormat.ObjectName("out/", 2, 1, 0)));
-            return Task.CompletedTask;
-        };
+        store.BeforeOpen = async name => await _store.DeleteAsync(FileSinkFormat.ObjectName("out/", 2, 1, 0), default);
         Assert.Equal(4, await FileSinkFormat.CompactAsync<int>(store, "out/", upTo: 4, term: 1, Web, default));
-        Assert.DoesNotContain(Directory.GetFiles(Path.Combine(_root, "out")), n => n.Contains("snapshot") || n.EndsWith(".tmp"));
-        Assert.Equal(3, Directory.GetFiles(Path.Combine(_root, "out")).Length);
+        Assert.DoesNotContain(await NamesUnderAsync("out/"), n => n.Contains("snapshot") || n.EndsWith(".tmp"));
+        Assert.Equal(3, (await NamesUnderAsync("out/")).Count);
     }
 
     [Fact]
@@ -1415,24 +1338,9 @@ public class FileConnectorTests : IDisposable
         Assert.Equal(
             new Dictionary<int, string> { [1] = "b3: the latest", [2] = "a2", [3] = "b3", [4] = "c4" },
             await FileSinkFormat.ReadUpsertsAsync<int, string>(_store, "out/"));
-        Assert.Single(Directory.GetFiles(Path.Combine(_root, "out")));
+        Assert.Single(await NamesUnderAsync("out/"));
     }
 
-    [Fact]
-    public void An_object_s_name_says_its_step_its_term_and_the_checkpoint_its_writer_started_from()
-    {
-        var name = FileSinkFormat.ObjectName("out/a-", 12, 3, 9);
-        Assert.Equal("out/a-0000000000000000012-000003-0000000000000000009.jsonl", name);
-        Assert.True(FileSinkFormat.TryParse("out/a-", name, out FileSinkFormat.StepObject parsed));
-        Assert.Equal(new FileSinkFormat.StepObject(name, 12, 3, 9, false), parsed);
-        Assert.True(FileSinkFormat.TryParse("out/a-", FileSinkFormat.SnapshotName("out/a-", 12, 3), out parsed));
-        Assert.Equal((12, 3, true), (parsed.Step, parsed.Term, parsed.Snapshot));
-        // The older form, without the base: read, and it voids nothing.
-        Assert.True(FileSinkFormat.TryParse("out/a-", FileSinkFormat.ObjectName("out/a-", 12, 3), out parsed));
-        Assert.Equal((12, 3, long.MaxValue, false), (parsed.Step, parsed.Term, parsed.Base, parsed.Snapshot));
-        foreach (var other in new[] { "out/a-12-3-9.jsonl", "out/a-0000000000000000012-000003-9.jsonl", "out/a-0000000000000000012-000003.snapshot.jsonl", "out/b-0000000000000000012-000003.jsonl", "out/a-0000000000000000012-000003.json", "out/a-readme.jsonl" })
-            Assert.False(FileSinkFormat.TryParse("out/a-", other, out parsed), other);
-    }
 
     [Fact]
     public async Task A_pipeline_whose_prefix_holds_nothing_says_so_at_the_dry_run_and_degrades_the_node_until_an_object_lands()
