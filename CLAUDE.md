@@ -314,7 +314,13 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   never asks for a gen2, and it asks for nothing above its memory ceiling — near the
   collector's high-load threshold any collection asked for becomes a full blocking
   one (seen: an induced gen1 turned into a 3.5 s gen2). It runs after the version is
-  published, never before. A stop that remains near the threshold is the node's size,
+  published, never before. A run must be able to end while commits keep coming: it
+  ends at a pause of `QuietGap` and at a pace under `MinChangesPerSecond` over that
+  long — a table that changes steadily (CDC, a `ToTable` output) never pauses, and
+  without the pace rule it is "a large load" for good, with a blocking collection per
+  128 MB the whole process allocates. The mark of the last collection asked for is one
+  per process (`LoadPacer.s_allocatedAtStep`), not per writer: every writer measures
+  the same allocation counter. A stop that remains near the threshold is the node's size,
   not the writer's to fix. The scale rig's `--load-only [--no-pacing]` measures it.
 - What a node says it holds is estimated from samples taken as rows and entries are
   written or read, never by walking a table or a store: `SharedTable.EstimateMemory`,

@@ -3237,7 +3237,11 @@ not happen (`SharedTableOptions.LoadPacing`, on unless a table's options set it 
 null): once a run of commits has written 100,000 changes it asks for a young collection
 every 128 MB the process allocates, so each copy is a step's worth (at three million
 rows the leader's longest stop went from over half a second to 0.2 s, and the load
-took 5 % longer). The other kind it does not touch: a full blocking collection, 0.1 to
+took 5 % longer). A run is a load, not a table that keeps changing: it ends when the
+writer pauses for two seconds and when its pace over two seconds falls under 5,000
+changes a second (`TableLoadPacing.MinChangesPerSecond`), so a CDC table on a busy
+topic or a pipeline's output is never paced, and tables that load at once share the one
+pace. A load slower than that pace is left to the collector. The other kind it does not touch: a full blocking collection, 0.1 to
 0.15 s per gigabyte of heap, which the collector makes when the process's memory stands
 near its high-load threshold — 90 % of the machine's or the container's memory. A node
 loaded that close to it stands still for seconds whatever the pace, past

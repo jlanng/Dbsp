@@ -59,6 +59,57 @@ public class TableLoadPacingTests
     }
 
     [Fact]
+    public async Task A_table_that_changes_steadily_is_never_a_large_load()
+    {
+        // A CDC table or a pipeline's output: small commits that never pause for
+        // QuietGap. Their sum passes LargeAfterChanges many times over, and the process
+        // allocates for other reasons meanwhile; a trickle is not a load, however long.
+        var table = Table(new TableLoadPacing
+        {
+            LargeAfterChanges = 1_000, StepBytes = 1 << 20, QuietGap = TimeSpan.FromMilliseconds(200), MemoryLoadCeiling = double.MaxValue,
+        });
+        var kept = new List<byte[]>();
+        for (var commit = 0; commit < 120; commit++)
+        {
+            for (var i = 0; i < 20; i++)
+                await table.Writer.UpsertAsync(new Row(i, $"v{commit}"));
+            await table.Writer.CommitAsync();
+            kept.Clear();
+            for (var i = 0; i < 32; i++)
+                kept.Add(new byte[64 << 10]); // 2 MB that has nothing to do with the table
+            await Task.Delay(20);
+        }
+        Assert.Equal(0, table.Writer.Pacing.Steps);
+
+        // And a load that follows the trickle is paced as any other.
+        await LoadAsync(table, 1_000, 20_000, 500);
+        Assert.True(table.Writer.Pacing.Steps > 0, "a load after a trickle asked for no young collection");
+    }
+
+    [Fact]
+    public async Task Tables_loading_at_once_share_one_pace()
+    {
+        // Each writer measures the same process-wide allocation: without one shared
+        // mark, N tables loading together ask for N collections per step.
+        var pacing = new TableLoadPacing { LargeAfterChanges = 1_000, StepBytes = 4 << 20, MemoryLoadCeiling = double.MaxValue };
+        var tables = Enumerable.Range(0, 4).Select(_ => Table(pacing)).ToArray();
+        var before = GC.GetTotalAllocatedBytes(precise: true);
+        for (var id = 0; id < 40_000; id++)
+        {
+            foreach (var table in tables)
+                await table.Writer.UpsertAsync(new Row(id, new string('x', 200)));
+            if ((id + 1) % 500 == 0)
+                foreach (var table in tables)
+                    await table.Writer.CommitAsync();
+        }
+        var allocated = GC.GetTotalAllocatedBytes(precise: true) - before;
+        var steps = tables.Sum(table => table.Writer.Pacing.Steps);
+        Assert.True(steps > 0);
+        Assert.True(steps <= allocated / pacing.StepBytes + 1,
+            $"{steps} young collections asked for over {allocated >> 20} MB allocated, at a step of {pacing.StepBytes >> 20} MB");
+    }
+
+    [Fact]
     public async Task Above_the_memory_ceiling_nothing_is_asked_for()
     {
         // A ceiling of zero: memory is always above it. The collector's answer to a
