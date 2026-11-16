@@ -366,6 +366,24 @@ public sealed record PipelineCircuitOptions
     /// is the node's <see cref="ServiceOptions.MaxEventTimeAhead"/>. Set it for a
     /// pipeline whose event time is rightly in the future — a settlement date, say.</summary>
     public TimeSpan? MaxEventTimeAhead { get; init; }
+
+    /// <summary>The most state entries this pipeline may hold, over all its stores, as the
+    /// node counts them for <see cref="PipelineStatus"/> (<c>stateEntries</c>). Past it the
+    /// pipeline is <see cref="PipelineState.Failed"/> with a reason that names the limit,
+    /// and nothing else on the node is touched; it is not retried, because a restart
+    /// resumes the same state. Null (the default) is no limit: the growth flag
+    /// (<see cref="ServiceOptions.StateGrowthAlarmAfter"/>) still applies either way.</summary>
+    public long? MaxStateEntries { get; init; }
+}
+
+/// <summary>A pipeline's state passed <see cref="PipelineCircuitOptions.MaxStateEntries"/>.</summary>
+public sealed class StateLimitExceededException(string pipeline, long entries, long limit)
+    : Exception($"Pipeline '{pipeline}' holds {entries:N0} state entries, more than its limit of {limit:N0} (circuit.maxStateEntries). " +
+                "It is not restarted, since it would resume the same state: raise the limit by a replace that keeps the state, or reset it.")
+{
+    public string Pipeline { get; } = pipeline;
+    public long Entries { get; } = entries;
+    public long Limit { get; } = limit;
 }
 
 /// <summary>

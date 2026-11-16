@@ -425,6 +425,7 @@
           h('div', { class: 'fields' },
             propertyField('circuit-workers', { name: 'workers', jsonType: 'number', minimum: 1, description: 'Threads the circuit runs on. Changing it on a deployed pipeline needs a reset.', default: '1' }, sp.circuit.workers, set(sp.circuit, 'workers')),
             propertyField('circuit-checkpoint', { name: 'checkpointInterval', jsonType: 'number', minimum: 1, description: 'Steps between checkpoints.', default: '1' }, sp.circuit.checkpointInterval, set(sp.circuit, 'checkpointInterval')),
+            propertyField('circuit-max-state', { name: 'maxStateEntries', jsonType: 'number', minimum: 1, description: 'The most state entries the pipeline may hold, counted as its page shows them. Past it the pipeline is failed, and nothing else on the node is touched. Empty for no limit.' }, sp.circuit.maxStateEntries, set(sp.circuit, 'maxStateEntries')),
             propertyField('circuit-errors', { name: 'errorPolicy', jsonType: 'string', values: ['Fault', 'DeadLetter'], required: true, description: 'A record an operator throws on faults the pipeline, or is dropped to the dead letters.' }, sp.circuit.errorPolicy || 'Fault', set(sp.circuit, 'errorPolicy')),
             propertyField('spec-desired', { name: 'desired', jsonType: 'string', values: ['Running', 'Stopped'], required: true, description: 'Whether it starts once deployed.' }, sp.desired || 'Running', set(sp, 'desired'))),
           (sp.circuit.errorPolicy === 'DeadLetter' || sp.deadLetters) && h('div', { class: 'slot' },

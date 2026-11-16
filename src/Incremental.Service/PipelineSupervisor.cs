@@ -418,6 +418,7 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 var size = provider.EstimateSize();
                 (stateEntries, stateBytes) = (size.Entries, size.EstimatedBytes);
                 NoteGrowth(runtime, provider, size, now);
+                NoteLimit(runtime, generation, size.Entries);
             }
             catch (ObjectDisposedException)
             {
@@ -455,6 +456,19 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
                 context.Events.Publish("pipeline", runtime.Id, $"state no longer growing: {size.Entries:N0} entries");
                 break;
         }
+    }
+
+    /// <summary>A running generation whose state has passed the spec's
+    /// <see cref="PipelineCircuitOptions.MaxStateEntries"/> is faulted, from the count just
+    /// read: its watcher tears it down and <see cref="HandleFault"/> makes the pipeline
+    /// Failed. Only the generation this node leads with; a standby's count is not acted on.</summary>
+    private void NoteLimit(PipelineRuntime runtime, Generation? generation, long entries)
+    {
+        if (generation is null || generation.Stopping || !Leads)
+            return;
+        if (runtime.Spec.Circuit.MaxStateEntries is not { } limit || entries <= limit)
+            return;
+        generation.Faulted.TrySetResult(new StateLimitExceededException(runtime.Id, entries, limit));
     }
 
     /// <summary>How often a pipeline that keeps dropping late records says so again.</summary>
@@ -577,6 +591,8 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
             throw ServiceException.Invalid("circuit.workers must be at least 1.");
         if (spec.Circuit.MaxEventTimeAhead is { } ahead && ahead < TimeSpan.Zero)
             throw ServiceException.Invalid("circuit.maxEventTimeAhead must not be negative.");
+        if (spec.Circuit.MaxStateEntries is { } most && most < 1)
+            throw ServiceException.Invalid("circuit.maxStateEntries must be at least 1.");
         spec = spec with { Version = context.Plugins.ResolveVersion(spec.Plugin, spec.Version) };
         return (spec, await context.Plugins.AcquireAsync(spec.Plugin, spec.Version, cancellationToken).ConfigureAwait(false));
     }
@@ -2353,6 +2369,12 @@ internal sealed class PipelineSupervisor(ServiceContext context) : IPipelineSupe
         else
             _logger.LogError(ex, "Pipeline {Pipeline} generation {Generation}: {During}; it will be tried again", runtime.Id, runtime.Spec.Generation, during);
         var prefix = during is null ? "" : during + ": ";
+        if (ex is StateLimitExceededException)
+        {
+            // A restart resumes the same state and would pass the limit again at once.
+            Set(runtime, PipelineState.Failed, prefix + ex.Message);
+            return;
+        }
         if (ex is ServiceException { Code: "too-many-plugin-versions" })
         {
             Set(runtime, PipelineState.Failed, prefix + ex.Message);

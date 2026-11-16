@@ -36,13 +36,16 @@ public sealed class PipelineTestHarness : IAsyncDisposable
     private readonly CancellationTokenSource _stop = new();
     private readonly string _id;
     private readonly InMemoryCheckpointStorageProvider _storage;
+    private readonly long? _maxStateEntries;
+    private StateLimitExceededException? _overLimit;
 
     /// <summary>Starts describing a harness for the definition class
     /// <typeparamref name="TDefinition"/>.</summary>
     public static Builder For<TDefinition>() where TDefinition : class, new() => new(typeof(TDefinition));
 
-    private PipelineTestHarness(string id, Circuit circuit, PipelineBuilder pipeline, JsonSerializerOptions json, InMemoryCheckpointStorageProvider storage)
+    private PipelineTestHarness(string id, Circuit circuit, PipelineBuilder pipeline, JsonSerializerOptions json, InMemoryCheckpointStorageProvider storage, long? maxStateEntries)
     {
+        _maxStateEntries = maxStateEntries;
         _id = id;
         _storage = storage;
         _circuit = circuit;
@@ -173,10 +176,14 @@ public sealed class PipelineTestHarness : IAsyncDisposable
     /// since the last one. It returns when the sinks have the step's output and the dead
     /// letters are in <see cref="DeadLetters"/>. A record that faults the circuit — an
     /// exception under the <c>Fault</c> policy, a retraction on an append sink — is thrown
-    /// from here.
+    /// from here. So is <see cref="StateLimitExceededException"/> when the state passes
+    /// <see cref="Builder.MaxStateEntries"/>, after the step, and from every later step:
+    /// a node would have failed the pipeline.
     /// </summary>
     public async Task StepAsync(CancellationToken cancellationToken = default)
     {
+        if (_overLimit is not null)
+            throw _overLimit;
         // More than one step of the circuit where an input holds a record back for the
         // next: a keyed input that forgets its final rows never runs two records of one
         // key in a step (KeyedInputStream.WithEventTime). A running pipeline's pump does
@@ -184,6 +191,9 @@ public sealed class PipelineTestHarness : IAsyncDisposable
         do
             await _circuit.StepAsync(cancellationToken).ConfigureAwait(false);
         while (_circuit.HasPendingInput);
+
+        if (_maxStateEntries is { } limit && StateSize.Entries is var entries && entries > limit)
+            throw _overLimit = new StateLimitExceededException(_id, entries, limit);
     }
 
     private async Task StartAsync()
@@ -279,6 +289,7 @@ public sealed class PipelineTestHarness : IAsyncDisposable
         private int _workers = 1;
         private RecordErrorPolicy _errorPolicy = RecordErrorPolicy.Fault;
         private TimeSpan? _maxEventTimeAhead = new ServiceOptions().MaxEventTimeAhead;
+        private long? _maxStateEntries;
         private TimeProvider _clock = TimeProvider.System;
         private IServiceProvider? _services;
         private ILoggerFactory? _logging;
@@ -347,6 +358,18 @@ public sealed class PipelineTestHarness : IAsyncDisposable
             return this;
         }
 
+        /// <summary>The most state entries the pipeline may hold, as a spec's
+        /// <c>circuit.maxStateEntries</c>: a step after which <see cref="StateSize"/> holds
+        /// more throws <see cref="StateLimitExceededException"/>, as a node would fail the
+        /// pipeline. Null (the default) for no limit.</summary>
+        public Builder MaxStateEntries(long? limit)
+        {
+            if (limit is < 1)
+                throw new ArgumentOutOfRangeException(nameof(limit), limit, "circuit.maxStateEntries must be at least 1.");
+            _maxStateEntries = limit;
+            return this;
+        }
+
         /// <summary>The clock <see cref="MaxEventTimeAhead"/> is judged against; the
         /// system's unless set.</summary>
         public Builder Clock(TimeProvider clock)
@@ -411,7 +434,7 @@ public sealed class PipelineTestHarness : IAsyncDisposable
             binding.Build(pipeline, settings);
             foreach (var fill in _fills)
                 await fill().ConfigureAwait(false);
-            var harness = new PipelineTestHarness(id, circuit.Build(), pipeline, json, storage);
+            var harness = new PipelineTestHarness(id, circuit.Build(), pipeline, json, storage, _maxStateEntries);
             await harness.StartAsync().ConfigureAwait(false);
             return harness;
         }
