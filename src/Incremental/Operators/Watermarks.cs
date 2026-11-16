@@ -100,7 +100,9 @@ internal sealed class WatermarkClock(int workers)
     /// <summary>Adds the clock's state to a checkpoint's offsets marker: the frozen
     /// watermark, each source's max event time seen (the maximum across workers — which
     /// worker saw it does not matter to <see cref="Freeze"/>), and each named partition's
-    /// max and whether it is idle (<see cref="OffsetKeys.WatermarkPartition"/>). A source's value still unset is
+    /// max and whether it is idle (<see cref="OffsetKeys.WatermarkPartition"/>). Without
+    /// <paramref name="partitionTimes"/> (format level 1) a source that has partitions
+    /// writes its one time as the least over them. A source's value still unset is
     /// left out; a partition named and not yet heard from is written, as
     /// <see cref="long.MinValue"/>, because that it was named is state.
     /// Called by the coordinator between steps, after <see cref="Freeze"/>.</summary>
@@ -123,14 +125,18 @@ internal sealed class WatermarkClock(int workers)
                 }
                 else
                 {
-                    // Below format level 2 the checkpoint has one time per source, and a
-                    // build of that level takes it for the newest event time the source
-                    // has read from any partition: that is what it is given. Such a build
-                    // resumes as it always did; this one, resuming the same checkpoint,
-                    // holds the watermark where it was committed until its source has
-                    // named the partitions again and each has brought a record or is idle.
-                    foreach (var (_, time) in partitions)
-                        maxSeen = Math.Max(maxSeen, time.MaxSeenTicks);
+                    // Below format level 2 the checkpoint has one time per source. It is
+                    // the source's time as the watermark is made from it (TimeOf: the least
+                    // over the partitions that count; nothing while one of them has brought
+                    // no record) — not the newest read from any partition. Whoever resumes
+                    // the checkpoint puts this in the source's one slot and may freeze on
+                    // it before the source has named a partition (a step for another input
+                    // or a table's change comes first): the newest partition's time there
+                    // would move the watermark past a partition that is behind and make
+                    // its backlog late. With the least, no build can claim more than was
+                    // committed. The cost is the bound on a time ahead, which is measured
+                    // from this after such a resume and not from the newest seen.
+                    maxSeen = TimeOf(_trackers[t], out _);
                 }
             }
             if (maxSeen != long.MinValue)

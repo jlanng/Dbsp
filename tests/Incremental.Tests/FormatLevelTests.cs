@@ -320,8 +320,8 @@ public class FormatLevelTests
     public async Task A_leader_that_does_not_raise_writes_what_a_build_from_before_partition_times_reads()
     {
         // Level 1 is state manifest format 7 and a marker with one time per source: the
-        // newest across the source's partitions, which is what such a build would have
-        // written there.
+        // least across the source's partitions, the time the committed watermark was
+        // made from, so that no build resuming it claims more.
         var log = new InMemoryStateChangelog(partitions: 2);
         var batches = Workload(seed: 7, steps: 12);
         var deployment = new Deployment(log, batches);
@@ -334,8 +334,9 @@ public class FormatLevelTests
         Assert.StartsWith("format=7\n", node.State.CommittedManifest("local"));
         var offsets = node.State.CommittedOffsets;
         Assert.DoesNotContain(offsets.Keys, key => key.Contains("#m") || key.Contains("#i"));
-        var newest = batches.Take((int)node.CommittedStep).SelectMany(batch => batch).Max(e => e.At.UtcTicks);
-        Assert.Equal(newest, offsets["$watermark#s0"]);
+        var least = batches.Take((int)node.CommittedStep).SelectMany(batch => batch)
+            .GroupBy(e => e.Key % Partitions).Min(partition => partition.Max(e => e.At.UtcTicks));
+        Assert.Equal(least, offsets["$watermark#s0"]);
         Assert.Contains("$watermark", offsets.Keys);
 
         // Raised, the next checkpoint is format 8 with the partitions' times beside it.
@@ -344,6 +345,87 @@ public class FormatLevelTests
         Assert.StartsWith("format=8\n", node.State.CommittedManifest("local"));
         Assert.Contains("$watermark#s0#m0", node.State.CommittedOffsets.Keys);
         await node.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task A_level_1_checkpoint_resumed_holds_its_watermark_through_a_step_that_comes_before_the_partitions_are_named()
+    {
+        // Partition 0 is behind the others (a backlog), the deployment is at level 1, and
+        // the pipeline has a second input: a step for it runs on the new leader before
+        // the first input's source has named its partitions again. The checkpoint's one
+        // time per source must not let that step claim more than was committed.
+        var log = new InMemoryStateChangelog(partitions: 2);
+
+        (ChangelogStorage Storage, Circuit Circuit, InputStream<Ev> A, InputStream<Ev> B, Output<Ev> Passed) Build()
+        {
+            var storage = ChangelogStorage.Follow(log, new ChangelogStorageOptions { Formats = new PersistedFormat() });
+            var builder = new CircuitBuilder(new CircuitOptions
+            {
+                AutoStep = false,
+                Storage = storage.Pipeline(PipelineId),
+                CheckpointInterval = 1,
+            });
+            var a = builder.Input<Ev>("a");
+            var b = builder.Input<Ev>("b");
+            var passed = a.WithEventTime(e => e.At, Lateness).ToOutput();
+            b.ToOutput();
+            return (storage, builder.Build(), a, b, passed);
+        }
+
+        var first = Build();
+        await first.Storage.PromoteAsync().WaitAsync(Timeout);
+        first.Circuit.Start();
+        var input = first.Circuit.Handle(first.A);
+        for (var partition = 0; partition < Partitions; partition++)
+            await input.ExpectPartitionAsync(partition);
+        await input.SendAsync(new Ev(1, 0, 100_000, 1), 1, 0, 0);
+        await input.SendAsync(new Ev(2, 1, 600_000, 1), 1, 1, 0);
+        await input.SendAsync(new Ev(3, 2, 600_000, 1), 1, 2, 0);
+        await first.Circuit.StepAsync().WaitAsync(Timeout);
+        Assert.Equal(T0.AddSeconds(98), first.Circuit.CurrentWatermark);
+        var committed = first.Storage.Pipeline(PipelineId).CommittedOffsets;
+        Assert.StartsWith("format=7\n", first.Storage.Pipeline(PipelineId).CommittedManifest("local"));
+        Assert.DoesNotContain(committed.Keys, key => key.Contains("#m") || key.Contains("#i"));
+
+        // What the one key says is the source's time as the watermark was made from it:
+        // the least over its partitions. A build from before partitions resumes on it at
+        // the committed watermark too, instead of jumping to the newest partition's.
+        Assert.Equal(T0.AddSeconds(100).UtcTicks, committed["$watermark#s0"]);
+
+        var second = Build();
+        await second.Storage.PromoteAsync().WaitAsync(Timeout);
+        second.Circuit.Start();
+        Assert.Equal(T0.AddSeconds(98), second.Circuit.CurrentWatermark);
+
+        // The other input's record steps the circuit first.
+        await second.Circuit.Handle(second.B).SendAsync(new Ev(10, 0, 0, 1), 1, 0, 0);
+        await second.Circuit.StepAsync().WaitAsync(Timeout);
+        Assert.Equal(T0.AddSeconds(98), second.Circuit.CurrentWatermark);
+
+        // Then the source connects, and partition 0's backlog is read: none of it late.
+        input = second.Circuit.Handle(second.A);
+        for (var partition = 0; partition < Partitions; partition++)
+            await input.ExpectPartitionAsync(partition);
+        await input.SendAsync(new Ev(4, 0, 200_000, 1), 1, 0, 1);
+        await input.SendAsync(new Ev(5, 0, 300_000, 1), 1, 0, 2);
+        await second.Circuit.StepAsync().WaitAsync(Timeout);
+        Assert.Equal(0, second.Circuit.LateRecords);
+        var passed = new List<int>();
+        while (second.Circuit.Handle(second.Passed).Reader.TryRead(out var delta))
+            passed.AddRange(delta.Select(entry => entry.Value.Id));
+        Assert.Equal([4, 5], passed.Order());
+        Assert.Equal(T0.AddSeconds(98), second.Circuit.CurrentWatermark);
+
+        try
+        {
+            await first.Circuit.DisposeAsync().AsTask().WaitAsync(Timeout);
+        }
+        catch (Exception ex) when (ex is ChangelogFencedException || ex.InnerException is ChangelogFencedException || ex is AggregateException)
+        {
+        }
+        await second.Circuit.DisposeAsync().AsTask().WaitAsync(Timeout);
+        await first.Storage.DisposeAsync().AsTask().WaitAsync(Timeout);
+        await second.Storage.DisposeAsync().AsTask().WaitAsync(Timeout);
     }
 
     [Fact]
