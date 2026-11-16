@@ -314,3 +314,14 @@ connector*.
   Run with the connector stack up (`docker compose --profile connectors up -d`, which
   now starts MinIO on `localhost:9000`):
   `dotnet test --project tests/Incremental.Service.Tests -- --filter-class "*FileConnectorTests"`.
+
+## 2026-11-16, round five — the small items and the documentation (K5, K7, K8, K9)
+
+`docs/design/enrichment-service.md`, *As built*, S9, *The small items and the round's
+documentation*.
+
+- `2026-11-16-k-small-items.txt` — K7 before and after on the example (the replaced
+  node's `fail` and `crit` lines, the restarted node's `previous`), the Kafka smoke under
+  a given prefix and refused on one in use, CI's refusal of the broker-failure job and
+  that job emulated on the `kafka3` profile, and the suites' counts at the end of the
+  round.

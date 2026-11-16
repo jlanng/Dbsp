@@ -1,0 +1,67 @@
+Round five, step "docs and small items" (K5, K7, K8, K9, documentation), 2026-11-16.
+docs/design/enrichment-service.md, As built, S9, "The small items and the round's documentation".
+Machine: 4 cores, the connector stack up (docker compose --profile connectors up -d).
+
+== K7, before (commit 0153b1d) ==
+Example on Kafka, two processes, prefix kseven:
+  dotnet Incremental.EnrichmentService.dll --kafka --node a --prefix kseven --port 5280 --probe-port 5290 --peer-probe-port 5291 --data <dir-a>
+  dotnet Incremental.EnrichmentService.dll --kafka --node b --prefix kseven --port 5281 --probe-port 5291 --peer-probe-port 5290 --data <dir-b> --no-prepare
+  then POST /admin/api/node/takeover?confirm=<standby> (header X-Incremental-Admin: 1), alternating, seven takeovers.
+The replaced node's log, each time (a.log, first takeover):
+  fail: Incremental.Kafka[0]  rdkafka#producer-3 ADDPARTS: [thrd:main]: TxnCoordinator/1: Failed to add partition "kseven.leader" [0] to transaction: Broker: Producer attempted an operation with an old epoch
+  crit: Incremental.Kafka[0]  rdkafka#producer-3 TXNERR: [thrd:main]: Fatal transaction error: Failed to add partitions to transaction: Local: This instance has been fenced by a newer instance (_FENCED)
+  crit: Incremental.Kafka[0]  rdkafka#producer-3 FATAL: [thrd:main]: Fatal error: Local: This instance has been fenced by a newer instance: ...
+  fail: Incremental.Kafka[0]  Kafka producer error Local_Fenced: Failed to add partitions to transaction: ...
+  warn: Incremental.Service.Node[0]  Service node a is Fenced; it will not lead again in this process
+  fail: Incremental.Circuit[0]  Circuit large-trades faulted on step 3105; terminal ... ChangelogFencedException  (and one for each of the other five running pipelines)
+The restarted node a (GET /admin/api/node): leadership { role: Standby, term: 0 }, lastTakeover null:
+the UI reads "This node has not led"; on the leader's page the peer's term reads "none: a standby that has not led since it started".
+
+== K7, after (this step) ==
+Same set-up, prefix kseven3, six takeovers (b, a, b, a, b, a):
+  grep -c '^fail\|^crit' a.log b.log  ->  0 and 0
+  warn lines of Incremental.Service.Node: only "persisted formats raised from level 1 to level 2" (the node's own
+  line about the replacement is at Information for a manual takeover, below the example's console level).
+  GET node on the restarted b: status.leadership.previous = { term: 6, replacedBy: a, replacedByTerm: 7, reason: manual }
+Tests: KafkaLeadershipTests.A_leader_replaced_at_an_operators_word_logs_no_error_and_started_again_says_it_led (3 of 3 runs alone,
+and in the suite), KafkaLeadershipTests.The_clients_lines_about_a_fence_are_told_from_others (the lines above, verbatim),
+ObservabilityTests.A_circuit_stopped_by_a_fenced_changelog_is_not_logged_as_an_error,
+InProcessSupervisorTests.A_replaced_node_and_a_resigned_one_come_back_in_the_process_as_the_ready_standby.
+Note: in the first suite run the leadership test waited for the client to report the fence and timed out: the leader topic told
+the stalled node first and its writer never met the fence in the client. The test no longer depends on which comes first.
+
+== K5 and K8 ==
+  dotnet Incremental.EnrichmentService.dll --headless --kafka --prefix ktest8     -> exit 0, 69 claims, among them:
+    ok  the run's topics are under the prefix 'ktest8', the one given with --prefix: trades and quotes
+    ok  on Kafka the starting spec for trade-enrichment binds 'trades' to a Kafka topic left to fill in — not to the generated
+        feed nor to an in-process memory log, which nothing here writes — and the trade feed named by hand is refused at the
+        dry run; filled in with the trades topic, it passes
+  kafka-topics.sh --create --topic kbusy.trades; then --headless --kafka --prefix kbusy:
+    0. The prefix 'kbusy' given with --prefix already has 1 topic(s) (kbusy.trades…).
+       The smoke removes everything under its prefix when it ends, so it does not run on one in use: ...
+    exit 1; kbusy.trades still listed afterwards.
+Test: KafkaServiceTests.On_kafka_a_starting_spec_binds_no_input_to_an_in_process_memory_log; SeamTests' template test unchanged (memory still offered in memory).
+
+== CI ==
+gh workflow run CI --ref enrichment-service -f broker_tests=true  -> run 43801138956, every job:
+  "The job was not started because recent account payments have failed or your spending limit needs to be increased."
+The pushes of this step (43799860922, 43800384484, 43800804212, 43801058256, ...) were refused the same way.
+
+== The broker-failure job, emulated here (Debug build) ==
+docker compose --profile kafka3 up -d; INCREMENTAL_KAFKA_BOOTSTRAP=localhost:9192,localhost:9292,localhost:9392
+INCREMENTAL_KAFKA_REPLICATION=3 INCREMENTAL_KAFKA_BROKERS=incremental-kafka3-1-1,incremental-kafka3-2-1,incremental-kafka3-3-1
+  dotnet test --project tests/Incremental.Service.Tests -- --filter-method '*broker*'     total 7, passed 7, skipped 0 (8 min 46 s)
+  dotnet test --project tests/Incremental.Kafka.Tests -- --filter-method '*ABrokerLost*'  total 2, passed 2, skipped 0
+
+== Checks at the end of the step ==
+dotnet build                                    0 warnings, 0 errors
+tests/Incremental.Tests                         761 total, 760 passed, 1 skipped (the opt-in soak)
+tests/Incremental.Kafka.Tests                   165 total, 163 passed, 2 skipped (*ABrokerLost*, kafka3 only)
+tests/Incremental.Service.Tests                 337 total, 329 passed, 8 skipped (six broker tests; two admin UI tests: no Chrome);
+                                                the two-build test ran against 9de8da9 (INCREMENTAL_OLDER_BUILD). One failure in the
+                                                suite run (InProcessSupervisorTests: an assertion of this step that was wrong — a node
+                                                that leads again was expected to keep its earlier replacement) was fixed and the class
+                                                re-run: 1 of 1, twice.
+Pipelines.Tests                                 21 of 21
+smokes: --headless 54 claims; --nodes 2 69; --kafka 69 (with a kill -9); TradeEnrichment 13: all hold
+benchmarks -- --assert                          all 10 performance contracts hold

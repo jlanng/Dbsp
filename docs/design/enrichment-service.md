@@ -8095,3 +8095,125 @@ without Chrome; the two-build test ran against 9de8da9), `Incremental.Kafka.Test
 (156, the two `*ABrokerLost*` skipped), the Kafka smoke 69 claims; smokes in memory 54
 and two nodes 69; `Pipelines.Tests` 21 of 21; the package packs. `Incremental.Tests` and
 `benchmarks -- --assert` were not run: nothing in `src/Incremental` changed.
+
+#### The small items and the round's documentation (K5, K7, K8, K9)
+
+**K7: a takeover an operator asks for.** Reproduced first on the example (two processes
+on the connector stack, six manual takeovers): each replaced node wrote the Kafka
+client's fence as `fail` and `crit` lines (`ADDPARTS … old epoch`, `TXNERR … _FENCED`,
+`FATAL … fenced by a newer instance`, `Kafka producer error Local_Fenced`) and one
+`fail` per pipeline (`Circuit … faulted … ChangelogFencedException`), and a node started
+again said it had never led (term 0; the UI's *This node has not led*). Built:
+
+- *The fence is not an error.* `KafkaLog` logs the client's lines about this writer's
+  fence at Information (`IsFenceMessage`: *fenced by a newer instance*, `_FENCED`, *an
+  operation with an old epoch*, and the fenced error codes); a circuit stopped by
+  `ChangelogFencedException` says so at Information. The node's own line names who took
+  over, under which term and why, at Information when an operator asked and as a
+  warning otherwise (it waits up to two seconds, after its circuits are down, for the
+  leader topic to say).
+- *A node started again knows the term it led.* Nothing of the replaced process
+  survives its restart, so the evidence is in the leader topic: a new writer's term and
+  heartbeat records carry `Replaced`, `ReplacedTerm` and `Reason` (the writer it read as
+  the last term's, and the leadership's reason: `manual`, `silence`, …) — members a
+  reader skips, so the leader topic stays outside format levels. A node that reads a
+  record naming itself as replaced has `LeadershipStatus.Previous`; the service maps it
+  to `NodeLeadershipStatus.Previous` (`GET node`: `status.leadership.previous`), the in-memory
+  backend gives the same from `InMemoryServiceCluster.LastDeposed` (manual takeovers and
+  step-downs), and the cluster page shows *Led before* and, under *Last takeover*, *This
+  node has not led since it started* with the term it led.
+- Checked on the example again: no `fail` or `crit` line in either node's log over six
+  takeovers, and the restarted node's `previous` was the term it had led
+  (`runs/2026-11-16-k-small-items.txt`). Tests: `KafkaLeadershipTests.A_leader_replaced_at_an_operators_word…`
+  (no Error or above on the replaced node, `Previous` before and after a restart, and
+  the other way round), `…The_clients_lines_about_a_fence_are_told_from_others` (the
+  lines of the example's run, verbatim), `ObservabilityTests.A_circuit_stopped_by_a_fenced_changelog…`,
+  and `InProcessSupervisorTests` (`previous` through the admin API after a manual
+  takeover, and `resigned` after a step-down).
+
+**K5: a feed that is empty on Kafka.** The example registered its generated trade feed,
+instrument feed and directories in every mode, and on Kafka nothing feeds them, so the
+deploy form's template bound `trades` to `trade-feed` and the dry run passed it. They
+are now registered in memory only, and a spec that names them on Kafka is refused at the
+dry run. That alone would have left the template on the `memory` connector, which on a
+deployment of processes is just as empty: a template binds no input to `memory` on a
+backend that is not `InProcess` (a new member of `IServiceBackend`, true for the
+in-memory backend), and binds it instead to `kafka` with its required config left to
+fill in, `valid` false and a note saying so. `memory` stays among the slot's connectors.
+Tests: `KafkaServiceTests.On_kafka_a_starting_spec_binds_no_input_to_an_in_process_memory_log`
+and, in the Kafka smoke, a claim that replaces the two template claims of the in-memory
+smoke (the template's `trades` is a topic to fill in, `trade-feed` is refused, the
+template filled with the trades topic passes).
+
+**K8: the Kafka smoke and `--prefix`.** `--headless --kafka --prefix p` runs under `p`
+(it used a fresh `smoke…` prefix whatever was given). Since the smoke removes everything
+under its prefix when it ends, a given prefix that already has topics is refused before
+anything is made or removed. A claim checks the run's topics are under the prefix; CI's
+`connector-stack` job passes `--prefix ci<run id>`. Shown by two runs: under `ktest8`,
+69 claims; under `kbusy` with a topic already there, refused with exit 1 and the topic
+left.
+
+**K9: the guide.** About ninety lines of measurement narrative went from
+`docs/enrichment-service.md`: what a figure was before a fix, which review found it,
+runs counted one by one (the broker table's rows for the client's default settings and
+for the fourth review's build, the keyed-input and partition measurements, the state
+log's figures, the history of the fetch queues, the allocator and the collector). What
+an operator acts on stayed: the settings, what each costs and the figures to size by.
+This record is unchanged.
+
+**The Kubernetes recipe** (D13) is in the guide's *Operating it*: the host under
+`NodeSupervisor.RunAsync` as the container's entry point, because the kubelet's
+back-off does not tell exit codes apart; a `StatefulSet` of two pods whose names are the
+node ids; `startupProbe` and `livenessProbe` on `/health/live`; `readinessProbe` on
+`/health/ready?warm=true`, new in this step: on a standby it is ready only once a
+takeover would be warm, so `RollingUpdate` with `OrderedReady` never stops the leader
+before its standby can take its place; a `PodDisruptionBudget` of one; a spread over
+zones. Tested: `WarmStandbyTests` (the gate closed while a standby builds, open once
+warm, a leader always) and `AdminApiTests` (the route outside the loopback rule). Not
+run on EKS (D7).
+
+**The documentation.** *Open for James* begins with *Decided*: the thirteen decisions
+with their dates (D1–D13). The items they settle carry *Decided …* in place (1, 4, 5,
+25, 30, 33, 47, 48, 50, 51, 59, 63, 67, 69, 81). *Decide before production* became
+*Before production*: each item with what settled it and what is still to do. The guide,
+the README, `docs/intro.md` and `CLAUDE.md` were read against round five's commits since
+9de8da9 and this section: the README and the intro gained format levels and rolling
+upgrades, event time per partition and the bound on the future, the state limit, the
+record formats and the S3 package where they still said S3 was five methods to write; the
+guide's limits no longer say a late record is dropped without a record (it is counted:
+D12) or that an idle input stalls a topic's watermark; `CLAUDE.md` has the invariants
+for the fence and the replaced writer, the template and `memory`, and the smoke's prefix.
+
+**Left.**
+
+- *CI did not run.* The broker-failure job was started by hand
+  (`gh workflow run CI --ref enrichment-service -f broker_tests=true`, run 43801138956)
+  and refused, as every push of this round: *recent account payments have failed or
+  your spending limit needs to be increased*. The job was emulated here (below).
+- *The client's fence lines are only as stable as librdkafka's wording.* They are told
+  apart by text; a client version that words them otherwise logs them at its own level
+  again. The test holds the wording of this run.
+- *Who replaced a node* is one generation deep: the leader topic names the writer the
+  current one replaced, so a node started again after a second takeover in between
+  learns nothing of its term. A node of a build before this step writes no `Replaced`.
+- *A fence met in a transaction* delays the replaced node's exit by up to two seconds
+  while it waits for the leader topic to say who replaced it.
+- *Admin UI.* `views.js` gained a row and a sentence; the two Chrome tests skip here,
+  and no browser was available to look at it.
+
+#### Where the branch stands at the end of round five's build steps
+
+The plan's table (*Where the branch stands*, at `0a08a27`), for the head of this step;
+the runs are in `runs/2026-11-16-k-small-items.txt`.
+
+| Check | Result |
+|---|---|
+| `dotnet build` | 0 warnings, 0 errors |
+| `tests/Incremental.Tests` | 761 total, 760 passed, 1 skipped (the opt-in soak) |
+| `tests/Incremental.Kafka.Tests` | 165 total, 163 passed, 2 skipped (the two `*ABrokerLost*`, which need `kafka3`) |
+| `tests/Incremental.Service.Tests` | 337 total, 329 passed, 8 skipped (the six broker tests; the two admin UI tests, no Chrome here); the two-build test ran against 9de8da9 |
+| `examples/…/Pipelines.Tests` | 21 of 21 |
+| Example smokes | in memory 54 claims, two nodes 69, Kafka with a `kill -9` 69, trade enrichment 13: all hold |
+| `benchmarks -- --assert` | all 10 performance contracts hold |
+| The broker-failure job, emulated on `kafka3` | the service's broker tests 7 of 7, `*ABrokerLost*` 2 of 2 |
+| CI | not run: every push of round five and the broker-failure job started by hand (run 43801138956) were refused for the account's billing |
