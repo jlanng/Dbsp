@@ -7,3 +7,5 @@
 2026-11-16T00:43:43.2355382Z rolling upgrade: the older build started after the raise called itself warm, took over and stopped both pipelines as NeedsReset (format=8 refused); this build took over again and the sinks equal the model
 2026-11-16T00:47:47.8643171Z rolling upgrade from the build before format levels: 3200 trades through 4 takeovers between the two builds, sinks equal to the model at each of 8 stages; level raised to 2 only with both nodes this build
 2026-11-16T00:47:56.1179751Z rolling upgrade: the older build started after the raise called itself warm, took over and stopped both pipelines as NeedsReset (format=8 refused); this build took over again and the sinks equal the model
+2026-11-16T01:06:02.3309205Z rolling upgrade from the build before format levels: 3200 trades through 4 takeovers between the two builds, sinks equal to the model at each of 8 stages; level raised to 2 only with both nodes this build
+2026-11-16T01:06:10.2404325Z rolling upgrade: the older build started after the raise called itself warm, took over and stopped both pipelines as NeedsReset (format=8 refused); this build took over again and the sinks equal the model

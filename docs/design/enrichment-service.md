@@ -7704,6 +7704,13 @@ builds.
   without probes and with different builds are therefore protected only by
   `HoldFormatLevel`; the guide says so. A raise by an operator's command instead of a
   setting was not built.
+- *One refusal can still come after the fence.* A node that read the leader topic's
+  tail, found a level it reads, and is then overtaken by a raise before its
+  `InitTransactions` lands learns of the level only with the term — after it has
+  fenced the leader. It then fails its takeover and exits 5; a node of the level takes
+  over. It needs a raise and a takeover by a lower node within the same moment, and
+  the leader raises only for a standby that reads the level, so the lower node would
+  have to be a third one. Not built against, not tested.
 - *The leader asks one standby.* The service has two nodes. A third process that reads
   the logs — nothing in the service is one — would not be asked.
 - *What a level does not name.* Behaviour that differs between builds with no format
