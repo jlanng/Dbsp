@@ -1550,7 +1550,8 @@ understood to stamp an object with the time its upload began, so a writer whose 
 take long needs a `settle` that covers them; and S3 lists in the order of the keys'
 UTF-8 bytes, which is the connector's order for every name unless it mixes characters
 beyond U+FFFF with ones from U+E000 to U+FFFF. Give the node's role `s3:ListBucket`,
-`s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on the prefix, and give the bucket
+`s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and `s3:AbortMultipartUpload` on the
+prefix, and give the bucket
 a lifecycle rule that removes incomplete multipart uploads (an abort that fails leaves
 one, which no listing shows). `ServiceUrl` and `ForcePathStyle` point it at an
 S3-compatible store instead.
@@ -1867,10 +1868,11 @@ with `FileSinkFormat` and compared too: every alert once, every dropped record t
 On Kafka the first node runs under its supervisor, the kill is of the node alone, and
 the last claim is that it came back as a warm standby without anybody starting it; with
 two nodes in memory the last claim is the same, of the supervisor in the process.
-A claim that does not hold exits 1 (55 claims in memory, 70 with two nodes, 69 on
+A claim that does not hold exits 1 (54 claims in memory, 69 with two nodes, 69 on
 Kafka). CI runs the two in-memory ones on every build, and the Kafka one in a job of its
 own that starts the connector stack from `docker-compose.yml` and also runs the Kafka
-and Kafka-backed service tests, failing if any of them was skipped
+and Kafka-backed service tests, failing unless exactly the three-broker tests were
+skipped — 2 of the Kafka tests and 6 of the service tests
 (`.github/workflows/ci.yml`, job `connector-stack`). The tests that stop, kill and
 freeze brokers need three of them and run in a fourth job, started by hand:
 `gh workflow run CI --ref <branch> -f broker_tests=true`.
@@ -3071,8 +3073,8 @@ the limit is judged on that reading, never by walking the state. When a reading 
 above the limit the pipeline is `Failed`, with the reason *holds N state entries, more
 than its limit of M (circuit.maxStateEntries)*, a fault of type
 `StateLimitExceededException` on its page, and the usual `pipeline.faults` count.
-Nothing else on the node is touched: its neighbours, the tables and the node's health
-go on as they were. It is not retried, because a restart resumes the same state and
+Its neighbours and the tables go on as they were; the node reports itself `Degraded`
+with the reason `pipeline-failed`, as for any failed pipeline. It is not retried, because a restart resumes the same state and
 would pass the limit again at once. To go on: replace the spec with a higher limit
 and `state=keep` (it starts on its state), or reset it (`state=reset`), or fix the
 definition — what the flag above says is usually the reason.
@@ -3096,8 +3098,8 @@ test to the limit a spec will set: a step after which the state holds more throw
 only for the table `Join`, `LeftJoin` and `Lookup`; an aggregate over facts keeps a
 total per key, which is bounded by the keys. A keyed input with no event time has no
 expiry: its rows go only when the source deletes them (*Open for James* 69 in the
-design document has the options). Nothing limits a pipeline's state by count: the flag
-says it grows, and stops nothing.
+design document has the options). The flag says a pipeline's state grows and stops
+nothing; only `circuit.maxStateEntries` stops it, and only where a spec sets it.
 
 ## Sizing a node
 

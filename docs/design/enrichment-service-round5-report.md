@@ -6,6 +6,14 @@ Round five, the last, carried out the plan in
 `origin/enrichment-service`. The record of what was built and measured is S9 in
 [enrichment-service.md](enrichment-service.md); run records are in [runs/](runs/).
 
+> **Since this report (2026-11-16).** GitHub billing was restored and CI ran green on
+> `217c345` with `broker_tests=true`, unchanged: build-and-test, perf-contracts,
+> connector-stack (Kafka 164 of 166, service 331 of 337, the skips being exactly the
+> three-broker tests, so the S3 tests on MinIO and the admin UI tests ran) and the broker
+> job (7 of 7, 2 of 2). No fix to `ci.yml` was needed. The guide corrections of item 7
+> were then made. That closes *What remains* 1 and 7 and the first qualification below;
+> the rest of the report stands as written.
+
 ## Where the branch stands
 
 The last critic's verdict: the product can be built on this branch as it stands. Three
