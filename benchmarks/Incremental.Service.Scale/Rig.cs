@@ -97,10 +97,20 @@ internal sealed class Rig(Arguments arguments)
         args.AddRange(Security.Forward(arguments));
         if (arguments.Text("--client") is { Length: > 0 } client)
             args.AddRange(["--client", client]);
-        var node = new NodeProcess(id, args, Path.Combine(_work, $"{id}-{_nodes.Count}.stderr.log"), GcSettings.Environment(arguments.Text("--gc", "node")));
+        var node = new NodeProcess(id, args, Path.Combine(_work, $"{id}-{_nodes.Count}.stderr.log"), NodeEnvironment());
         lock (_nodes)
             _nodes.Add(node);
         return node;
+    }
+
+    /// <summary>The nodes' environment: the collector's settings, and with
+    /// <c>--no-pacing</c> the table written without load pacing (the "before" of item 61).</summary>
+    private Dictionary<string, string> NodeEnvironment()
+    {
+        var environment = new Dictionary<string, string>(GcSettings.Environment(arguments.Text("--gc", "node")));
+        if (arguments.Has("--no-pacing"))
+            environment[PartiesTable.NoPacingVariable] = "1";
+        return environment;
     }
 
     public async Task<int> RunAsync()
@@ -109,6 +119,7 @@ internal sealed class Rig(Arguments arguments)
         Say($"prefix {_prefix}; work directory {_work}");
         Note("config", $"rows={_rows} stateKeys={_stateKeys} pipelines={_pipelines} (joins={_joins}, aggregates={_aggregates}) " +
                        $"rate={_rate}/s churn={_churn} rows/s replication={_replication} takeoverAfter={_takeoverAfterMs} ms bootstrap={_bootstrap}");
+        Note("config.load-pacing", arguments.Has("--no-pacing") ? "off" : "on");
         Note("config.gc", string.Join(" ", GcSettings.Environment(arguments.Text("--gc", "node")).Select(e => $"{e.Key}={e.Value}")));
         var ports = FreePorts(3);
         var producerBuilder = new ProducerBuilder<byte[], byte[]>(Client(new ProducerConfig { LingerMs = 5, CompressionType = CompressionType.Lz4 }));
@@ -136,9 +147,17 @@ internal sealed class Rig(Arguments arguments)
                 new TableSpec { Name = Reference.Parties.Name, Definition = typeof(PartiesTable).FullName! }, Json), "declared");
             _phase = "load";
             var loadClock = Stopwatch.StartNew();
-            await a.RunAsync($"load 0 {_rows} {arguments.Number("--load-batch", 20_000)} 0", "loaded");
+            var load = await a.RunAsync($"load 0 {_rows} {arguments.Number("--load-batch", 20_000)} 0", "loaded");
             Note("table.load", loadClock.ElapsedMilliseconds, "ms");
             Note("table.load.rows-per-second", (long)(_rows / loadClock.Elapsed.TotalSeconds));
+            // The leader's longest stop while it loaded: what a standby would have seen of
+            // its heartbeat (TakeoverAfter is --takeover-after-ms).
+            Note("leader.load.longest-stall", load.GetProperty("longestStallMs").GetDouble(), "ms");
+            Note("leader.load.gen2-collections", load.GetProperty("gen2").GetInt64());
+            Note("leader.load.gc-pause-total", load.GetProperty("pauseMs").GetDouble(), "ms");
+            Note("leader.load.last-full-blocking-pause", load.GetProperty("lastFullBlockingPauseMs").GetDouble(), "ms");
+            if (load.TryGetProperty("paced", out var paced) && paced.ValueKind == JsonValueKind.Object)
+                Note("leader.load.paced", $"{paced.GetProperty("steps").GetInt64()} young collections asked for, {paced.GetProperty("ms").GetDouble():F0} ms in them, {paced.GetProperty("skipped").GetInt64()} not asked for (memory above the ceiling)");
             var loaded = await a.StatusAsync();
             Running("leader.after-load", loaded.GetProperty("memory"));
             var afterLoad = await a.GcAsync();
@@ -155,6 +174,13 @@ internal sealed class Rig(Arguments arguments)
             {
                 Note("broker.table-bytes", tableBytes / 1048576, "MB");
                 Note("broker.table-bytes-per-row", tableBytes / _rows, "bytes");
+            }
+
+            if (arguments.Has("--load-only"))
+            {
+                // The load and nothing after it: what item 61 is about, at a size this
+                // machine can hold once without the state and the standby.
+                return 0;
             }
 
             // A second, small table filled the other way: by the kafka loader from a topic,

@@ -27,6 +27,8 @@ Option[] run =
     new("--steady-seconds", "N", "Length of the steady load (30)."),
     new("--load-batch", "N", "Rows per table write while loading."),
     new("--single", null, "One node only: no standby, no failover."),
+    new("--no-pacing", null, "Load the table without the writer's load pacing (what item 61 measured)."),
+    new("--load-only", null, "Stop after the table's load: one node, the load's time and the leader's longest stop."),
     new("--memory-only", null, "Stop after the steady load: memory figures, no failover."),
     new("--trim", null, "At the end of the steady load, ask the C allocator how much it holds free and have it give that back."),
     new("--age", "N[,generation]", "At the end of the steady load, have each node collect N times (generation 0 unless said) and say what the collector then holds."),

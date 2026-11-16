@@ -44,6 +44,7 @@ internal static class NodeHost
                 Console.Out.WriteLine(JsonSerializer.Serialize(line, json));
         }
 
+        GcLog.Started ??= new GcLog();
         try
         {
             var lifetime = new Lifetime();
@@ -250,6 +251,12 @@ internal static class NodeHost
                             long from = long.Parse(parts[0], CultureInfo.InvariantCulture), count = long.Parse(parts[1], CultureInfo.InvariantCulture);
                             int batch = int.Parse(parts[2], CultureInfo.InvariantCulture), revision = int.Parse(parts[3], CultureInfo.InvariantCulture);
                             var writer = node.Tables.Get<long, Party>(Reference.Parties.Name).Writer;
+                            // What the load cost the node in stops: the stall meter from
+                            // here, and the collections that ran meanwhile.
+                            Stalls.Mark();
+                            var gen2Before = GC.CollectionCount(2);
+                            var pauseBefore = GC.GetTotalPauseDuration();
+                            var blockingBefore = GC.GetGCMemoryInfo(GCKind.FullBlocking).Index;
                             var clock = System.Diagnostics.Stopwatch.StartNew();
                             for (long id = from, staged = 0; id < from + count; id++)
                             {
@@ -257,7 +264,19 @@ internal static class NodeHost
                                 if (++staged % batch == 0 || id == from + count - 1)
                                     await writer.CommitAsync();
                             }
-                            Emit("loaded", new { rows = count, ms = clock.ElapsedMilliseconds });
+                            var blocking = GC.GetGCMemoryInfo(GCKind.FullBlocking);
+                            Emit("loaded", new
+                            {
+                                rows = count,
+                                ms = clock.ElapsedMilliseconds,
+                                longestStallMs = Stalls.SinceMark,
+                                gen2 = GC.CollectionCount(2) - gen2Before,
+                                pauseMs = Math.Round((GC.GetTotalPauseDuration() - pauseBefore).TotalMilliseconds),
+                                // The last full blocking collection, if one ran during the load.
+                                lastFullBlockingPauseMs = blocking.Index > blockingBefore && blocking.PauseDurations.Length > 0
+                                    ? Math.Round(blocking.PauseDurations[0].TotalMilliseconds) : 0,
+                                paced = new { steps = writer.Pacing.Steps, skipped = writer.Pacing.Skipped, ms = Math.Round(writer.Pacing.Collecting.TotalMilliseconds) },
+                            });
                             break;
                         }
                         case "churn":
@@ -568,4 +587,69 @@ internal static class Security
         arguments.Has("--oauth")
             ? ["--oauth", arguments.Text("--oauth"), "--oauth-lifetime-seconds", arguments.Number("--oauth-lifetime-seconds", 20).ToString(CultureInfo.InvariantCulture)]
             : [];
+}
+
+/// <summary>Every collection of the oldest generation, and every pause longer than
+/// 200 ms, written to the node's stderr with the runtime's reason and kind: what a
+/// stall in the figures was. Kinds: 0 blocking, 1 background, 2 foreground (a young
+/// collection inside a background one).</summary>
+internal sealed class GcLog : System.Diagnostics.Tracing.EventListener
+{
+    private readonly Dictionary<string, long> _large = [];
+    private long _largeTicks;
+    private int _lastDepth = -1, _lastReason = -1, _lastType = -1;
+    private uint _lastCount;
+
+    public static GcLog? Started;
+
+    protected override void OnEventSourceCreated(System.Diagnostics.Tracing.EventSource source)
+    {
+        if (source.Name == "Microsoft-Windows-DotNETRuntime")
+            EnableEvents(source, Environment.GetEnvironmentVariable("SCALE_GC_EVERY") == "1" ? System.Diagnostics.Tracing.EventLevel.Verbose : System.Diagnostics.Tracing.EventLevel.Informational, (System.Diagnostics.Tracing.EventKeywords)0x1);
+    }
+
+    protected override void OnEventWritten(System.Diagnostics.Tracing.EventWrittenEventArgs e)
+    {
+        switch (e.EventName)
+        {
+            case "GCAllocationTick_V4" or "GCAllocationTick_V3":
+            {
+                var kind = Convert.ToInt32(e.Payload![1], CultureInfo.InvariantCulture);
+                if (kind == 1)
+                {
+                    var name = e.Payload[e.PayloadNames!.IndexOf("TypeName")]?.ToString() ?? "?";
+                    var size = e.PayloadNames.IndexOf("ObjectSize") is >= 0 and var i ? Convert.ToInt64(e.Payload[i], CultureInfo.InvariantCulture) : 0;
+                    lock (_large)
+                    {
+                        _large[name] = _large.GetValueOrDefault(name) + 1;
+                        if (++_largeTicks % 500 == 0)
+                            Console.Error.WriteLine("loh " + string.Join(", ", _large.OrderByDescending(p => p.Value).Take(8).Select(p => $"{p.Key}={p.Value}")) + $" last={size}");
+                    }
+                }
+                break;
+            }
+            case "GCStart_V2":
+                _lastCount = Convert.ToUInt32(e.Payload![0], CultureInfo.InvariantCulture);
+                _lastDepth = Convert.ToInt32(e.Payload[1], CultureInfo.InvariantCulture);
+                _lastReason = Convert.ToInt32(e.Payload[2], CultureInfo.InvariantCulture);
+                _lastType = Convert.ToInt32(e.Payload[3], CultureInfo.InvariantCulture);
+                if (_lastDepth == 2)
+                    Console.Error.WriteLine($"gc {DateTime.UtcNow:HH:mm:ss.fff} #{_lastCount} gen2 reason={_lastReason} type={_lastType} heap={GC.GetTotalMemory(false) / 1048576} MB");
+                break;
+            case "GCHeapStats_V2":
+            {
+                // The end of a collection: its pauses, as the runtime counts them.
+                var info = GC.GetGCMemoryInfo(GCKind.Any);
+                if (Environment.GetEnvironmentVariable("SCALE_GC_EVERY") == "1")
+                {
+                    var g = info.GenerationInfo;
+                    Console.Error.WriteLine($"gcend {DateTime.UtcNow:HH:mm:ss.fff} #{info.Index} gen{info.Generation} conc={info.Concurrent} pause={(info.PauseDurations.Length > 0 ? info.PauseDurations[0].TotalMilliseconds : 0):F0} heap={info.HeapSizeBytes >> 20} committed={info.TotalCommittedBytes >> 20} frag={info.FragmentedBytes >> 20} g0={g[0].SizeAfterBytes >> 20}/{g[0].SizeBeforeBytes >> 20} g1={g[1].SizeAfterBytes >> 20}/{g[1].SizeBeforeBytes >> 20} g2={g[2].SizeAfterBytes >> 20}/{g[2].SizeBeforeBytes >> 20} loh={g[3].SizeAfterBytes >> 20}/{g[3].SizeBeforeBytes >> 20} promoted={info.PromotedBytes >> 20} load={info.MemoryLoadBytes >> 20}/{info.HighMemoryLoadThresholdBytes >> 20} total={info.TotalAvailableMemoryBytes >> 20}");
+                }
+                foreach (var pause in info.PauseDurations)
+                    if (pause.TotalMilliseconds > 200)
+                        Console.Error.WriteLine($"gc {DateTime.UtcNow:HH:mm:ss.fff} pause {pause.TotalMilliseconds:F0} ms in #{info.Index} gen{info.Generation} concurrent={info.Concurrent} compacted={info.Compacted} heap={info.HeapSizeBytes / 1048576} MB load={info.MemoryLoadBytes / 1048576} MB of {info.HighMemoryLoadThresholdBytes / 1048576}");
+                break;
+            }
+        }
+    }
 }

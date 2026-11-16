@@ -29,6 +29,11 @@ public sealed class SharedTableOptions
     /// the largest one it has built, so a snapshot goes in as many modest versions rather
     /// than one the size of the table.</summary>
     public int ReplaceChunkRows { get; init; } = 4096;
+
+    /// <summary>How the writer paces a large load so that the collector never stops the
+    /// process for long (<see cref="TableLoadPacing"/>); null leaves the collector to
+    /// itself.</summary>
+    public TableLoadPacing? LoadPacing { get; init; } = TableLoadPacing.Default;
 }
 
 /// <summary>
@@ -120,7 +125,7 @@ public sealed class SharedTable<TKey, TRow> : ITableNode, IAsyncDisposable
         Epoch = log?.Epoch ?? Guid.NewGuid().ToString("N");
         _tail = new TableVersion<TKey, TRow>[Math.Min(_options.TailVersions, 16)];
         _tailSuperseded = new int[_tail.Length];
-        Writer = new TableWriter<TKey, TRow>(this, log);
+        Writer = new TableWriter<TKey, TRow>(this, log, _options.LoadPacing);
     }
 
     /// <summary>Opens a table over a change log: restores the log's current rows, version and
@@ -1093,11 +1098,19 @@ public sealed class TableWriter<TKey, TRow>
         }
     }
 
-    internal TableWriter(SharedTable<TKey, TRow> table, ITableLog<TKey, TRow>? log)
+    internal TableWriter(SharedTable<TKey, TRow> table, ITableLog<TKey, TRow>? log, TableLoadPacing? pacing)
     {
         _table = table;
         _log = log;
+        _pacer = pacing is null ? null : new LoadPacer(pacing);
     }
+
+    // Null when the table's options turn pacing off. Called under the commit gate.
+    private readonly LoadPacer? _pacer;
+
+    /// <summary>What pacing large loads has done (<see cref="SharedTableOptions.LoadPacing"/>);
+    /// all zero when pacing is off.</summary>
+    public TableLoadPacingStats Pacing => _pacer?.Stats ?? default;
 
     /// <summary>Starts the replay positions at a restored table's committed offsets.</summary>
     internal void SeedPositions(IReadOnlyDictionary<int, long> offsets)
@@ -1345,6 +1358,8 @@ public sealed class TableWriter<TKey, TRow>
         }
 
         _table.Publish(version, countDelta);
+        // After the version is visible: a step of pacing never delays what readers see.
+        _pacer?.Committed(version.Changes.Count);
         return version.Version;
     }
 

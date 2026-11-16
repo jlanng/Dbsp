@@ -1,5 +1,6 @@
 using System.Globalization;
 using Incremental.Service;
+using Incremental.Tables;
 
 [assembly: IncrementalContract]
 
@@ -61,7 +62,16 @@ public sealed class PartiesTable : TableDefinition<long, Party>
 
     public override string Name => "parties";
     public override long KeyOf(Party row) => row.Id;
-    protected override void Configure(TableBuilder<long, Party> table) => table.Index(ByLei);
+    /// <summary>Set in a node's environment by the rig's <c>--no-pacing</c>: the table is
+    /// loaded without <see cref="SharedTableOptions.LoadPacing"/>.</summary>
+    public const string NoPacingVariable = "SCALE_NO_LOAD_PACING";
+
+    protected override void Configure(TableBuilder<long, Party> table)
+    {
+        table.Index(ByLei);
+        if (Environment.GetEnvironmentVariable(NoPacingVariable) == "1")
+            table.Options = new SharedTableOptions { LoadPacing = null };
+    }
 }
 
 public static class Reference
