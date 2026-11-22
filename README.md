@@ -948,8 +948,10 @@ nuget.org readme is the `README.md` beside its project.
 
 To release: set `<Version>` in `src/Directory.Build.props`, merge to `main`, and push the
 tag `v<Version>`. `.github/workflows/release.yml` builds, tests, packs, restores the
-packages into a clean project and runs it, then pushes to nuget.org (repository secret
-`NUGET_API_KEY`) and makes the GitHub release. Run by hand it stops before the push.
+packages into a clean project and runs it, then pushes to nuget.org and makes the GitHub
+release. Run by hand it stops before the push. No API key is stored: the push uses
+nuget.org's trusted publishing, which needs a policy there naming this repository and
+`release.yml`, and the repository variable `NUGET_USER` (the nuget.org user name).
 
 ## Running with Redis
 

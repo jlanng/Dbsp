@@ -5,8 +5,11 @@ name: Release
 #   git tag v0.2.0 && git push origin v0.2.0
 #
 # The tag must equal <Version> in src/Directory.Build.props, on a commit of main.
-# Needs the repository secret NUGET_API_KEY (a nuget.org key allowed to push the four
-# package ids below). Run by hand (workflow_dispatch) it does everything but push: the
+# No API key is stored: nuget.org's trusted publishing gives this workflow a key that
+# lasts an hour, in exchange for GitHub's own token for the run. It needs a trusted
+# publishing policy on nuget.org naming this repository and this file (release.yml), and
+# the repository variable NUGET_USER, the nuget.org user name (not the email) that owns
+# the policy. Run by hand (workflow_dispatch) it does everything but push: the
 # packages are left as an artifact to look at.
 #
 # The service's packages (Dbsp.Service*) are not released yet; add them to
@@ -28,6 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write   # the GitHub release
+      id-token: write   # GitHub's token for the run, which nuget.org exchanges for a key
     services:
       redis:
         image: redis:7-alpine
@@ -125,10 +129,16 @@ jobs:
           path: |
             artifacts/packages/*.nupkg
             artifacts/packages/*.snupkg
+      - name: Log in to nuget.org
+        if: github.ref_type == 'tag'
+        id: nuget
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USER }}
       - name: Push to nuget.org
         if: github.ref_type == 'tag'
         env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          NUGET_API_KEY: ${{ steps.nuget.outputs.NUGET_API_KEY }}
         run: |
           dotnet nuget push "artifacts/packages/*.nupkg" \
             --source https://api.nuget.org/v3/index.json \
