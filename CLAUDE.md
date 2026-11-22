@@ -847,7 +847,14 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     `CallerName` hook, then the authenticated identity, then the name a caller states in
     `X-Incremental-Operator` (recorded as `name (self-declared)`), then `local`.
 - Public API is fluent delegates with LINQ-dialect names (`Select`/`Where`/`GroupBy`),
-  intentionally not LINQ/expression trees. The 0.2 surface is specced in `docs/intro.md`:
+  intentionally not LINQ/expression trees. The 0.2 surface is described in `docs/intro.md`:
   windows exist only on groupings of an `EventTimeStream`; grouping types are staging types
   (no output/projection); outputs are unnamed definitions redeemed via `circuit.Handle`;
   table-shaped outputs bootstrap consumers automatically (batch zero = current state).
+- Packaging (`src/Directory.Build.props`): one `<Version>` for every package; a package
+  depends on exactly that version of another (`PinProjectReferenceVersions`), because
+  they reach each other's internals. A package's nuget.org readme is the `README.md`
+  beside its project, with absolute links only (nuget.org renders no relative link or
+  image); a project without one ships the repository's. Released by tag
+  (`.github/workflows/release.yml`, `v<Version>`): the four library packages; the
+  service's are packed by CI and not released.

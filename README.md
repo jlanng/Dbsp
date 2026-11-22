@@ -925,14 +925,28 @@ its own project; `docs/intro.md` has them under *Running it fast*.
 
 ## Packaging
 
-MIT-licensed (see `LICENSE`). The five shipped libraries (`Incremental`,
-`Incremental.Storage.Redis`, `Incremental.Kafka`, `Incremental.Hosting` — generic-host
-and DI integration, see *Hosting it* in `docs/intro.md` — and `Incremental.Service`, see
-*Running many pipelines* there) multi-target **net8.0 and net10.0** and carry full NuGet
-metadata — `dotnet pack` produces consumable packages with XML docs, SourceLink, and
-symbol packages (not yet published to nuget.org; consume by project reference or a local
-feed). The only runtime dependency of the core library is
-`Microsoft.Extensions.Logging.Abstractions`.
+MIT-licensed (see `LICENSE`). Version 0.2.0. Four packages are released to nuget.org —
+`Incremental`, `Incremental.Storage.Redis`, `Incremental.Kafka` and `Incremental.Hosting`
+(generic-host and DI integration, see *Hosting it* in `docs/intro.md`):
+
+```sh
+dotnet add package Incremental
+```
+
+The service's five (`Incremental.Service`, `.Abstractions`, `.Testing`, `.Admin`, `.S3`;
+see *Running many pipelines* in `docs/intro.md`) are packed by CI and not released yet:
+consume them by project reference or a local feed. All nine multi-target **net8.0 and
+net10.0** and carry full NuGet metadata, XML docs, SourceLink and symbol packages. The
+only runtime dependency of the core library is `Microsoft.Extensions.Logging.Abstractions`.
+
+The packages are built together and each depends on exactly the version of the others it
+was built with (`[0.2.0]`): use one version of all of them. Each released package's
+nuget.org readme is the `README.md` beside its project.
+
+To release: set `<Version>` in `src/Directory.Build.props`, merge to `main`, and push the
+tag `v<Version>`. `.github/workflows/release.yml` builds, tests, packs, restores the
+packages into a clean project and runs it, then pushes to nuget.org (repository secret
+`NUGET_API_KEY`) and makes the GitHub release. Run by hand it stops before the push.
 
 ## Running with Redis
 

@@ -24,7 +24,8 @@ internal interface ITransportDiagnostics
 /// </summary>
 internal sealed class CircuitDiagnostics : IDisposable
 {
-    public static readonly Meter Meter = new("Incremental", "0.1.0");
+    public static readonly Meter Meter = new("Incremental",
+        typeof(CircuitDiagnostics).Assembly.GetName().Version?.ToString(3)); // the package's <Version>
 
     private static readonly Counter<long> Steps = Meter.CreateCounter<long>(
         "incremental.circuit.steps", "{step}", "Steps completed.");

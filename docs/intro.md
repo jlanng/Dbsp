@@ -1,8 +1,8 @@
 # An introduction to Incremental
 
-> **Status:** this document describes the 0.2 API surface, which is being built. It doubles as
-> the design spec for that surface; sections marked **TODO** are intentionally thin for now.
-> The appendix mapping 0.1 → 0.2 will be deleted once the migration lands.
+> **Status:** this document describes the API of version 0.2, the first published release.
+> Notes marked **Not yet** name things the library does not do. It is a 0.x release: the
+> API may change between minor versions.
 
 Incremental is a stream processing library for .NET in the style of
 [DBSP](https://arxiv.org/abs/2203.16684): you declare a dataflow over your data once, feed it
@@ -189,13 +189,13 @@ time-based:
   `CircuitOptions.MaxEventTimeAhead` is set: a record further ahead than that of the
   node's clock (and of the newest event time its input has brought) is then a record in
   error, a dead letter or a fault as the circuit's `ErrorPolicy` says, and moves nothing.
-  The bound is applied by the input, so it needs the declaration to be on the input
-  (**TODO:** late-event side-channel — design pending);
+  The bound is applied by the input, so it needs the declaration to be on the input.
+  (**Not yet:** an output of the late records themselves — they are counted, not delivered);
 - `circuit.CurrentWatermark` exposes the current value for monitoring.
 
 Because the watermark is the minimum across sources, an **idle source stalls it** — windows
-stop closing and state stops evicting until that source advances. (**TODO:** idleness
-handling for a whole source — timeout/mark-idle design pending.)
+stop closing and state stops evicting until that source advances. (**Not yet:** a way to
+mark a whole source idle. A source's *partitions* can be idle, below.)
 
 **Partitions.** Declared on an input itself (`input.WithEventTime(…, lateness)`, not after a
 `Select`), event time is kept per partition of the input's source where the source names
@@ -278,7 +278,22 @@ Custom aggregates plug in via `Aggregate(IAggregateFunction<…>)`, or
 `AggregateLinear(ILinearAggregate<…>)` when the aggregate is a homomorphism over weights
 (cheaper: no per-key group state).
 
-> **TODO:** worked custom-aggregate example (e.g. HDR percentile sketch).
+A linear aggregate is three members — no per-key group is stored, just one accumulator,
+and a retraction arrives as a negative weight and folds in:
+
+```csharp
+public readonly record struct FeeStats(long Orders, decimal Gross, decimal Fees);
+
+public sealed class FeeTakeAggregate : ILinearAggregate<EnrichedOrder, FeeStats>
+{
+    public FeeStats Zero { get; } = new(0, 0m, 0m);
+    public FeeStats Map(EnrichedOrder value, long weight) => new(weight, value.Amount * weight, value.Fee * weight);
+    public FeeStats Combine(FeeStats left, FeeStats right) =>
+        new(left.Orders + right.Orders, left.Gross + right.Gross, left.Fees + right.Fees);
+}
+```
+
+(`examples/Incremental.Showcase/Aggregates.cs` has this one and two more.)
 
 ## Joins
 
@@ -300,8 +315,8 @@ special case — it is just another stream — and `LeftJoin`/`FullJoin`/`AntiJo
 outer and negative cases. When an instrument row is *upserted*, the old enriched rows are
 retracted and new ones asserted automatically — historical results re-attribute themselves.
 
-> **TODO:** windowed / interval joins (stream-stream within a time bound) — not yet designed;
-> today this is manual via the escape hatches.
+> **Not yet:** windowed / interval joins (stream-stream within a time bound). Today this is
+> manual, via the escape hatches.
 
 ### Joining shared tables
 
@@ -655,8 +670,8 @@ for anything with an unbounded keyspace. `Current()` is taken on demand — noth
 the full result per update — and yields each row once with its `Weight` rather than
 duplicating multi-weight rows.
 
-> **TODO:** point-lookup views (query a key's current value without materializing the whole
-> result) — design pending.
+> **Not yet:** point-lookup views (query a key's current value without materializing the
+> whole result).
 
 ## Records that cannot be processed
 
@@ -1164,7 +1179,8 @@ builder.Services
     .AddIncremental<PageAnalytics>()
     .BindConfiguration("Incremental:PageAnalytics")          // Workers, capacities, CheckpointInterval, …
     .Configure((o, sp) => o.Storage = new RedisStorageProvider(
-        sp.GetRequiredService<IConnectionMultiplexer>(), "page-analytics"))
+        sp.GetRequiredService<IConnectionMultiplexer>(),
+        new RedisStorageOptions { KeyPrefix = "page-analytics" }))
     .AddOutputConsumer<LeaderboardPublisher, WindowedValue<string, long>>(d => d.TopPages)
     .AddHealthCheck();
 ```
@@ -1569,9 +1585,10 @@ operators on their own, without the service.
 What is built and what is not is in
 [design/enrichment-service.md](design/enrichment-service.md), *As built*.
 
-> **TODO:** cluster deployment (multi-process exchange over a transport), checkpoint
-> operations guide, observability/metrics reference. The engine supports all three today;
-> consumer-facing docs pending.
+Three things the engine does are described in the [README](../README.md) and not here:
+running one circuit across processes (*Cross-process exchange*), what a checkpoint commits
+and how a restart resumes (*Checkpointing and exactly-once restart*), and the logs and
+metrics a circuit emits (*Observability*).
 
 ## Escape hatches
 
@@ -1602,66 +1619,3 @@ for the cases the paved road doesn't cover:
 
 These are documented in the API reference rather than here; if you find yourself reaching for
 them routinely, that's design feedback we want to hear.
-
----
-
-## Appendix: mapping from the 0.1 surface *(delete after migration)*
-
-`CircuitBuilder`/`Circuit`/`CircuitOptions` keep their names (a `Dataflow` rename was
-considered and rejected: TPL Dataflow owns that word in .NET).
-
-| 0.1 | 0.2 |
-| --- | --- |
-| `Map` / `Filter` / `FlatMap` | `Select` / `Where` / `SelectMany` |
-| `Plus` | `Concat` (duplicate-preserving, matching LINQ `Concat`) |
-| `Minus` / `Negate` | kept, advanced (**not** renamed `Except` — LINQ semantics differ) |
-| `WithWatermark(sel, allowedLateness)` | `WithEventTime(sel, lateness)` → `EventTimeStream<T>` |
-| `IndexBy(key)` → `KeyedZStream` | `GroupBy(key)` → `GroupedZStream` (staging; exchange insertion unchanged) |
-| `TumblingWindow`/`HoppingWindow` on raw streams | removed; windows live on event-timed groupings only |
-| `SessionWindow(sel, key, gap)` | `GroupBy(key).SessionWindow(gap)` |
-| manual `IndexBy(w => (w.WindowStart, key))` + `WithEviction` | implicit in `GroupBy(…).XWindow(…)` |
-| `WithEviction(closesAt)` | `EvictWhen(closesAt)` (escape hatch) |
-| `WindowCloses()` | `OnClose()` on windowed results (emit-on-close, no flapping) |
-| `Output(name)` + `circuit.Output<T>(name)` | `ToOutput()` + `circuit.Handle(def)` (outputs unnamed) |
-| `Output(name, snapshot: true)` | automatic on table-shaped outputs (`ToOutput(bootstrap: false)` to opt out) |
-| `circuit.Input<T>(name)` string lookup | `circuit.Handle(def)` |
-| `OutputHandle.ReadAllAsync()` | `OutputHandle.Changes()` (single consumer, enforced) |
-| hand-rolled integration loops | `MaterializeInMemory()` (opt-in, cost in the name) |
-| `MapValues` / `Values` | kept on keyed/windowed results |
-
-Implementation notes (not consumer-facing):
-
-- The execution model is untouched: same operators, same exchange/barrier discipline, same
-  storage and checkpoint machinery. This is a surface rewrite that compiles to the same
-  graph. `EventTimeStream` needs no engine change: it carries the timestamp selector at
-  build time and applies it at the window site (which is why `Select` drops it — the
-  selector no longer typechecks against the reshaped record).
-- `GroupBy` must carry the exchange + stable-hash discipline of `IndexBy` unchanged.
-- Windowed **aggregation** routes by the user key only (all windows of a key on one worker;
-  eviction worker-local). Window-collapsing regroupings — `TopK`, window-sticky `GroupBy` —
-  re-exchange keyed by the window, so `DateTimeOffset` is part of the stable-hash contract,
-  and each window's ranking work lands on a single worker (as in 0.1's LogAnalytics example).
-- Table-shaped outputs' automatic resync builds on 0.1's `SnapshotOperator` (checkpointed
-  view state). The opt-out lives at `ToOutput`, not at `Changes()`: snapshot state must
-  exist *before* a crash to serve the resync after it, so it cannot be a subscribe-time
-  choice. Stream-shaped outputs never maintain it — the integrated result of an append-only
-  stream is unbounded.
-- Restructuring changes positional store names → bump the state-manifest format version
-  (no deployed checkpoints exist; the bump is hygiene).
-- Decisions settled during implementation: windowed rows are the flat
-  `WindowedValue<TKey,TValue>` record and unwindowed keyed rows stay
-  `KeyedValue<TKey,TValue>` (their equality and serialized shape are public contract, see
-  "Your records are the contract"); the composite state key is `WindowKey<TKey>` and
-  window-collapsing ops route by `WindowBounds` (both public — they name checkpointed
-  state); the event-timed types are `EventTimeStream<T>` / `GroupedEventTimeStream<TKey,T>`;
-  `TopK` output shapes are unchanged; `GroupedZStream.Distinct()` returns keyed rows
-  (continue with `.Grouped()` for a distinct count).
-- Still open: the spelling for collapsing a windowed result to the window alone
-  (aggregate-of-aggregates — window-sticky `GroupBy` to a unit key works but is ugly;
-  `TopK` doesn't need it, it ranks per window natively); keyed-input snapshot sync (retract
-  keys a full-table re-feed omits); watermark
-  idleness for a circuit's own inputs (the service's Kafka sources have it per
-  partition, `Runtime/InputEventTime.cs`); whether required input names can go too — today they are the durable
-  key for checkpointed source offsets (a reference dies with the process, positional
-  identity would re-bind offsets across topology edits), but a derived-with-optional-pin
-  scheme like store naming may be possible.
