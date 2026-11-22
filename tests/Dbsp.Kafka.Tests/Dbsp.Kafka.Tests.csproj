@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <OutputType>Exe</OutputType>
+    <!-- As in Dbsp.Tests: threading TestContext's token through every call is noise. -->
+    <NoWarn>$(NoWarn);xUnit1051</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Npgsql" Version="10.0.3" />
+    <PackageReference Include="xunit.v3" Version="4.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Dbsp\Dbsp.csproj" />
+    <ProjectReference Include="..\..\src\Dbsp.Kafka\Dbsp.Kafka.csproj" />
+    <!-- The failover app is launched as real processes (KafkaFailoverProcessTests); the
+         reference makes it build first, and the scenario is shared as source. -->
+    <ProjectReference Include="..\Dbsp.Kafka.FailoverApp\Dbsp.Kafka.FailoverApp.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Dbsp.Kafka.FailoverApp\FailoverScenario.cs" Link="FailoverScenario.cs" />
+  </ItemGroup>
+
+</Project>

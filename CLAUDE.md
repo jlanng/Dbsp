@@ -1,11 +1,11 @@
-# Incremental
+# Dbsp
 
 DBSP-style incremental stream processing library for .NET (libraries multi-target
 net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
 
 ## Commands
 - Build: `dotnet build`
-- Test: `dotnet test --project tests/Incremental.Tests` (xunit v3 on Microsoft.Testing.Platform,
+- Test: `dotnet test --project tests/Dbsp.Tests` (xunit v3 on Microsoft.Testing.Platform,
   opted in by `global.json` — hence `--project`; Redis tests skip unless `docker compose up -d` has run)
 - CI (`.github/workflows/ci.yml`): three jobs on every push; a fourth, `broker-failures`
   (the service's six broker tests and `KafkaPartitionWatermarkTests`' two on the `kafka3`
@@ -20,8 +20,8 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   waits until the sink's write has returned (`SinkAtRestAsync`). One that reads the
   whole process's heap goes in the `measured alone` collection. A hook sets what the
   test reads before the count the test waits on.
-- Kafka tests: `dotnet test --project tests/Incremental.Kafka.Tests` — integration tests of
-  `Incremental.Kafka` against the connector stack (start it first, below): the logs,
+- Kafka tests: `dotnet test --project tests/Dbsp.Kafka.Tests` — integration tests of
+  `Dbsp.Kafka` against the connector stack (start it first, below): the logs,
   leadership, sources, sinks, and CDC from Postgres through Debezium. Tests skip, not fail,
   when what they need is unreachable — the broker for most, Postgres and Kafka Connect
   too for `DebeziumCdcTests`; a handful need nothing and always run. Two
@@ -29,35 +29,32 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   connector stack, which is the count CI's `connector-stack` job holds the project to. Each test uses its
   own topic prefix (and its own Postgres tables, slot and connector). About five minutes
   (measured 4 min 58 s for its 166 tests): size a timeout to that.
-  `INCREMENTAL_KAFKA_BOOTSTRAP` points them at another broker. `KafkaFailoverProcessTests`
-  launch `tests/Incremental.Kafka.FailoverApp` as real processes and kill, stop and
+  `DBSP_KAFKA_BOOTSTRAP` points them at another broker. `KafkaFailoverProcessTests`
+  launch `tests/Dbsp.Kafka.FailoverApp` as real processes and kill, stop and
   command them; measured numbers go to `measurements.log` beside the test assembly.
 - After a mutation script has restored a source file, touch it (or the next build keeps
   the mutated binary: the restored file is older than the output it produced).
-- Service tests: `dotnet test --project tests/Incremental.Service.Tests` — about five
+- Service tests: `dotnet test --project tests/Dbsp.Service.Tests` — about five
   minutes with the connector stack up (measured 4 min 40 s), far less without it: the Kafka-backed classes
   (`KafkaService*Tests`) skip when the broker is unreachable, the CDC one also without
   Postgres and Connect. They load real plugin assemblies from
-  `tests/Incremental.Service.TestPlugins/*/bin` and launch
-  `tests/Incremental.Service.FailoverApp` as real processes, both of which a solution build
+  `tests/Dbsp.Service.TestPlugins/*/bin` and launch
+  `tests/Dbsp.Service.FailoverApp` as real processes, both of which a solution build
   produces (the test project references them build-order only). The Kafka classes share
   one non-parallel collection; measured failover times go to `measurements.log` beside
-  the test assembly. One test runs this build against the build from before format
-  levels and skips without it: `git worktree add --detach <dir> 9de8da9`, build
-  `<dir>/tests/Incremental.Service.FailoverApp` and
-  `<dir>/tests/Incremental.Service.TestPlugins/Acme.Pipelines` (the plugin both builds
-  run, compiled before the abstractions package; `PluginTests` loads it too), and set
-  `INCREMENTAL_OLDER_BUILD` to its `Incremental.Service.FailoverApp.dll` (CI's
-  `connector-stack` does). Run it, and
-  `RollingUpgradeTests`, after changing anything a node persists.
-- Admin UI: `dotnet run --project tests/Incremental.Service.AdminHost` serves a node with
+  the test assembly. Run `RollingUpgradeTests` after changing anything a node persists.
+  (There is no test against a real older build: the project was renamed from
+  `Incremental` before its first release, and no build from before the rename shares
+  an assembly name, a namespace or a plugin with this one. The first released version
+  is the first a two-build test can be written against.)
+- Admin UI: `dotnet run --project tests/Dbsp.Service.AdminHost` serves a node with
   tables, pipelines and a generator at http://127.0.0.1:5180/admin/ (`-- --nodes 2` adds a
   standby on 5181; `--read-only`, `--no-rows`, `--port`;
-  `--ui-dir src/Incremental.Service.Admin/wwwroot` serves the UI's files from the checkout,
+  `--ui-dir src/Dbsp.Service.Admin/wwwroot` serves the UI's files from the checkout,
   so an edit is a browser reload away). The admin API's tests (`AdminApiTests`) run that
   host on a free port. With two nodes a node that loses the leadership is started again
   in the process (`DemoOptions.SuperviseNodes`), as in the example's `--nodes 2`.
-- Enrichment service example: `dotnet run --project examples/Incremental.EnrichmentService`
+- Enrichment service example: `dotnet run --project examples/Dbsp.EnrichmentService`
   serves one in-memory node with the admin UI at http://127.0.0.1:5180/admin/ and its sinks
   at `/views` (`-- --nodes 2`: a standby on 5181). `-- --kafka --node a` and
   `-- --kafka --node b` are two processes on the connector stack (reference data in
@@ -68,7 +65,7 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   exits 1 on a claim that does not hold — run it after changing the service. CI runs the two
   in-memory ones (job `build-and-test`) and the Kafka one (job `connector-stack`, which starts
   the compose stack and fails if a Kafka or service test was skipped). `-- --ui-dir
-  src/Incremental.Service.Admin/wwwroot` serves the admin UI from the checkout.
+  src/Dbsp.Service.Admin/wwwroot` serves the admin UI from the checkout.
   `-- --otlp` exports both meters over OTLP (`OTEL_EXPORTER_OTLP_ENDPOINT`); the example is
   the only project that references OpenTelemetry. To leave it running in the background,
   run the built binary and stop it with SIGTERM (a backgrounded `dotnet run` ignores SIGINT).
@@ -79,32 +76,32 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   state is bounded by event time, not by the generator). On Kafka the trades and quotes
   topics have three partitions (`KafkaStack.FeedPartitions`).
   The definitions' own tests are `dotnet test --project
-  examples/Incremental.EnrichmentService/Pipelines.Tests` (xunit v3 on
+  examples/Dbsp.EnrichmentService/Pipelines.Tests` (xunit v3 on
   `PipelineTestHarness`; under a second, and CI runs them).
-- Trade enrichment on shared tables: `dotnet run --project examples/Incremental.TradeEnrichment`
+- Trade enrichment on shared tables: `dotnet run --project examples/Dbsp.TradeEnrichment`
   prints a narrative of thirteen checked claims and exits 1 if one is wrong (`-- --trades N`).
 - Service guide: `docs/enrichment-service.md`. Its C# blocks are regions of the example's
   sources (`// <snippet:name>` … `// </snippet:name>`, quoted under
-  `<!-- snippet: path#name -->`); `DocSnippetTests` in `tests/Incremental.Service.Tests`
+  `<!-- snippet: path#name -->`); `DocSnippetTests` in `tests/Dbsp.Service.Tests`
   fails when a block and its region differ or a C# block has no source. Edit the source,
   then copy the region into the document.
 - Connector stack: `docker compose --profile connectors up -d` adds Kafka (`localhost:9092`), Postgres with
-  logical decoding (`localhost:5432`, user/password/db `incremental`), Debezium's Kafka
-  Connect (`localhost:8083`) and MinIO (`http://localhost:9000`, `incremental` /
-  `incremental-secret`; the image is Pigsty's build of the MinIO server, MinIO's own
+  logical decoding (`localhost:5432`, user/password/db `dbsp`), Debezium's Kafka
+  Connect (`localhost:8083`) and MinIO (`http://localhost:9000`, `dbsp` /
+  `dbsp-secret`; the image is Pigsty's build of the MinIO server, MinIO's own
   images being no longer published). Plain `docker compose up -d` stays Redis-only.
   `S3FileConnectorTests` run the files connector's tests on the S3 store against that
-  MinIO (`INCREMENTAL_S3_ENDPOINT` points them elsewhere) and skip without it; CI's
+  MinIO (`DBSP_S3_ENDPOINT` points them elsewhere) and skip without it; CI's
   `connector-stack` job counts them among the service tests whose skips it holds to six.
 - Three brokers: `docker compose --profile kafka3 up -d` (replication factor 3,
   `min.insync.replicas` 2, on `localhost:9192,localhost:9292,localhost:9392`; no volume;
   fixed addresses on a network of their own, 10.89.93.0/24 — a container cluster whose
   brokers change address or look each other up by name stalls for reasons that are not
   Kafka's, see durability-and-standby.md, *As built: broker failures*).
-  Run the Kafka and service tests against it with `INCREMENTAL_KAFKA_BOOTSTRAP` set to
-  those three and `INCREMENTAL_KAFKA_REPLICATION=3`; the CDC tests skip there (Kafka
+  Run the Kafka and service tests against it with `DBSP_KAFKA_BOOTSTRAP` set to
+  those three and `DBSP_KAFKA_REPLICATION=3`; the CDC tests skip there (Kafka
   Connect writes to the single broker). With
-  `INCREMENTAL_KAFKA_BROKERS=incremental-kafka3-1-1,incremental-kafka3-2-1,incremental-kafka3-3-1`
+  `DBSP_KAFKA_BROKERS=dbsp-kafka3-1-1,dbsp-kafka3-2-1,dbsp-kafka3-3-1`
   as well, six tests in `KafkaServiceProcessTests` stop, kill and freeze those containers
   under a running pipeline (every broker shut down in turn, and killed in turn; one
   broker lost; a takeover with one down; 70 s without a quorum; one broker gone for
@@ -115,18 +112,18 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   70 s without a quorum, which is under the transaction timeout — that the
   leadership did not move; each run's line goes to `measurements.log` and its record to
   `broker-runs.jsonl` beside the test assembly (the sink's longest silence, the longest a
-  trade took, who led). `INCREMENTAL_KAFKA_BROKER` (0–2), `INCREMENTAL_KAFKA_FAULT`
-  (`kill`, `pause`, `stop`), `INCREMENTAL_KAFKA_AWAY_SECONDS` and
-  `INCREMENTAL_KAFKA_ZONE_MINUTES` choose what the one-broker and the minutes-long tests
-  do; `INCREMENTAL_KAFKA_OUTAGE_SECONDS` and
-  `INCREMENTAL_KAFKA_TRANSACTION_TIMEOUT_SECONDS` set the no-quorum test's outage and
+  trade took, who led). `DBSP_KAFKA_BROKER` (0–2), `DBSP_KAFKA_FAULT`
+  (`kill`, `pause`, `stop`), `DBSP_KAFKA_AWAY_SECONDS` and
+  `DBSP_KAFKA_ZONE_MINUTES` choose what the one-broker and the minutes-long tests
+  do; `DBSP_KAFKA_OUTAGE_SECONDS` and
+  `DBSP_KAFKA_TRANSACTION_TIMEOUT_SECONDS` set the no-quorum test's outage and
   the nodes' transaction timeout (60 with the default outage is an outage past the
   timeout, where the leader usually ends and only "nothing lost" is required;
-  `INCREMENTAL_KAFKA_FAULT=pause` freezes its two brokers instead of stopping them);
-  `INCREMENTAL_KAFKA_BROKER_AFTER_MS` kills the takeover test's broker that long after
+  `DBSP_KAFKA_FAULT=pause` freezes its two brokers instead of stopping them);
+  `DBSP_KAFKA_BROKER_AFTER_MS` kills the takeover test's broker that long after
   the leader instead of before it;
-  `INCREMENTAL_NODE_LOGS=<dir>`, `INCREMENTAL_LOG_LEVEL=Debug` and
-  `INCREMENTAL_KAFKA_CLIENT="debug=eos,protocol"` keep each node's Kafka client
+  `DBSP_NODE_LOGS=<dir>`, `DBSP_LOG_LEVEL=Debug` and
+  `DBSP_KAFKA_CLIENT="debug=eos,protocol"` keep each node's Kafka client
   log in a file, which is how a stall is read (add `broker` to the debug list only
   with brokers that are stopped, not killed: a standby logs every refused connection,
   gigabytes a minute).
@@ -136,25 +133,25 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   (`localhost:9492`, SASL/OAUTHBEARER with unsigned tokens, deny-by-default ACLs). Only
   the scale rig talks to it (`--oauth`); its README has the commands. Remove it with
   `docker compose rm -sf kafka-sasl`.
-- Examples: `dotnet run --project examples/Incremental.Example`,
-  `dotnet run --project examples/Incremental.LogAnalytics [-- --redis]`
-- Showcase (the all-features demo): `dotnet run --project examples/Incremental.Showcase`
+- Examples: `dotnet run --project examples/Dbsp.Example`,
+  `dotnet run --project examples/Dbsp.LogAnalytics [-- --redis]`
+- Showcase (the all-features demo): `dotnet run --project examples/Dbsp.Showcase`
   serves a web app on http://localhost:5170. Flags: `--port`, `--no-open`, `--redis`,
   `--workers N`, `--nodes N` (`--cluster` is an alias for `--nodes 2`).
   `-- --headless` runs every tab unattended and exits non-zero if a verified act fails —
   that is the smoke test. `Microsoft.NET.Sdk.Web` plus the library projects; no NuGet packages of its own. The live
-  circuit runs under `Incremental.Hosting` — one generic host per generation, because the
+  circuit runs under `Dbsp.Hosting` — one generic host per generation, because the
   crash act kills it; the scaling and cluster acts build theirs by hand (throwaway / not hostable). Tab 5
   measures worker-count scaling and can relaunch the process into another topology; run it
   `-c Release` if the throughput column is the point (Debug flattens it).
-- Benchmarks: `dotnet run -c Release --project benchmarks/Incremental.Benchmarks -- --filter '*'`
+- Benchmarks: `dotnet run -c Release --project benchmarks/Dbsp.Benchmarks -- --filter '*'`
   (BenchmarkDotNet); `-- --assert` runs the CI performance contracts — scaling-ratio
   assertions (delta cost vs state size), which is what `.github/workflows/ci.yml` gates on;
   `-- --log-sizes` prints bytes per row of the Kafka logs' record format (JSON vs the dense
   codec, raw and compressed)
-- Service scale rig: build `benchmarks/Incremental.Service.Scale` in Release and run the
-  built binary — `dotnet Incremental.Service.Scale.dll run --rows 1000000 --state-keys 1000000
-  --broker-container incremental-kafka-1` from its output directory. Two node processes
+- Service scale rig: build `benchmarks/Dbsp.Service.Scale` in Release and run the
+  built binary — `dotnet Dbsp.Service.Scale.dll run --rows 1000000 --state-keys 1000000
+  --broker-container dbsp-kafka-1` from its output directory. Two node processes
   on Kafka, a wide table shared by twenty pipelines, large state, then a cold standby,
   `kill -9`, a manual takeover and a node from nothing, each timed by stage; about three
   minutes at a million rows, and it needs the memory (its README says how much). Run it
@@ -163,11 +160,11 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   after the steady load (memory figures, no failover); `--load-only` after the table's
   load (one node: the load's time and the leader's longest stall, `--no-pacing` for
   the writer without load pacing); `--gc` overrides the nodes'
-  collector settings (`node`, the default, is `src/Incremental.Service/Node.Gc.props`;
+  collector settings (`node`, the default, is `src/Dbsp.Service/Node.Gc.props`;
   `round2`, `stock`, or `name=value` pairs); the working set over time is in
   `<out>.timeline.tsv`. Run it after changing what a node holds or how it gives memory
   back.
-- Throughput rig: `dotnet run -c Release --project benchmarks/Incremental.Torture -- --workers 4`
+- Throughput rig: `dotnet run -c Release --project benchmarks/Dbsp.Torture -- --workers 4`
   runs the showcase pipeline flat out over a sliding order population and reports records/s,
   the process CPU split (workers vs GC), and allocation per record (`--alloc-types` for a
   histogram by type; `--processes N` for the cluster wire path). Its README carries the
@@ -226,7 +223,7 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     keep that property in step with the worker count the example's `CircuitOptions` actually
     uses. The torture rig deliberately opts out so its published numbers stay stock-GC.
     A service node is another kind of process (many one-worker circuits over gigabytes
-    that stay): its settings are `src/Incremental.Service/Node.Gc.props`, which the
+    that stay): its settings are `src/Dbsp.Service/Node.Gc.props`, which the
     enrichment example and the scale rig import — eight heaps (four in the example),
     and deliberately no `ConserveMemory` (measured: 0.3 GB at a million rows, nothing
     at five, and it asks for full blocking collections). Change them only with the
@@ -235,7 +232,7 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   (compiled per type from the same structural rules as `StableHash`), with a JSON fallback for
   types it cannot round-trip and a format byte on every frame. Redis state serialization is
   still JSON and must stay so — it is a persisted format.
-- Durable logs on Kafka (`src/Incremental.Kafka`, docs/design/durability-and-standby.md).
+- Durable logs on Kafka (`src/Dbsp.Kafka`, docs/design/durability-and-standby.md).
   Everything durable goes through the one transactional producer a `KafkaLog` owns —
   never produce outside it, or fencing no longer covers the write. A commit fails only as
   fenced (`KafkaLogFencedException`: the writer is finished) or as aborted
@@ -359,7 +356,7 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   collection. A table loader is the table's writer: leader only. Sinks get an idempotent
   producer of their own unless given the log's (`KafkaSinkOptions.Log`); nothing else may
   create a producer — except the service's blob store, whose records are content-addressed
-  (see `Incremental.Service` below).
+  (see `Dbsp.Service` below).
 - Leadership (`KafkaLeadership`) lives in Kafka only. The log writer heartbeats to
   `{p}.leader` in every transaction and when idle; a standby takes over on silence. Safety
   is fencing, never the election or the probe. Every node starts as a standby; `Fenced`
@@ -553,10 +550,9 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   - The leader topic's records and the probe's detail line carry the level and so are
     outside it: format byte 1 for good, and only new members a reader skips
     (`LeaderRecord.Format`, `;fmt=`). An absent level is level 1.
-  - Level 1 is what the build before round five wrote (commit 9de8da9); a build from
-    before levels cannot say what it reads, and is the "older build" of
-    `KafkaServiceProcessTests`' two-build test (`INCREMENTAL_OLDER_BUILD`, which CI's
-    `connector-stack` builds from history). A reader exists only for a format that
+  - Level 1 is what the build before round five wrote (commit 9de8da9, when the
+    project was still named `Incremental`); a build from before levels cannot say
+    what it reads. A reader exists only for a format that
     holds what the newer one needs: a format-6 checkpoint of an event-time pipeline
     stays refused at every level.
   - `FormatLevel.Proving` (byte `0x7E` in front of every state-log value and table-log
@@ -605,12 +601,12 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   Dropping a record is only correct if its retraction is dropped too — stateless operators
   get that from deterministic delegates, stateful ones must record the drop in their state.
   Null checks on generic values go through `RecordErrors.IsNull` (`is null` boxes).
-- `Incremental.Hosting` (generic host + DI) is a separate package so the core keeps its one
+- `Dbsp.Hosting` (generic host + DI) is a separate package so the core keeps its one
   dependency. A hosted circuit is keyed by its definition class (`CircuitHost<TDefinition>`);
   the host supervises on `Circuit.Completion`. Shutdown order is the invariant: drain the
   circuit first, with consumers and views still reading, and stop those after — an unread
   output blocks the drain. Clustered circuits are not hostable yet.
-- `Incremental.Service` (docs/design/enrichment-service.md, *As built*) is one circuit per
+- `Dbsp.Service` (docs/design/enrichment-service.md, *As built*) is one circuit per
   pipeline over shared tables held by a registry, with the catalog — itself a shared table —
   as the only record of what exists. Its rules:
   - Everything durable or about roles goes through `IServiceBackend`; outside
@@ -667,7 +663,7 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   - Dead letters with a sink bound (`PipelineSpec.DeadLetters`) are an acknowledged
     output: nothing acknowledges a batch before the sink has it, and a sink that fails
     faults the pipeline — never drop to the ring and carry on.
-  - `PipelineTestHarness` (package `Incremental.Service.Testing`) builds a definition
+  - `PipelineTestHarness` (package `Dbsp.Service.Testing`) builds a definition
     through the same `DefinitionBinding` and `PipelineBinding` as the supervisor; keep
     it so, or its tests stop meaning what a deploy would do. Its `StateSize` is the checkpoint store's committed count, by store;
     every example definition has a test that its state returns to a bound under a long feed.
@@ -707,19 +703,21 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   - A manifest's `MainAssembly` is a file within the package and `AssemblyName` the
     assembly's simple name; they differ, so never derive one from the other. Which
     reference goes to the host is `HostAssemblies.Provides`: contracts first, then the
-    assemblies whose types cross the boundary (`Incremental*`, `Microsoft.Extensions.*`,
+    assemblies whose types cross the boundary (`Dbsp*`, `Microsoft.Extensions.*`,
     the framework — not the Kafka client, whose types reach no plugin), then by version.
-  - What a plugin compiles against is `Incremental` and `Incremental.Service.Abstractions`
+  - What a plugin compiles against is `Dbsp` and `Dbsp.Service.Abstractions`
     (the definition interfaces, `PipelineBuilder`, table definitions, `IRecordFormat`),
-    and its tests `Incremental.Service.Testing`. The abstractions reference only the
+    and its tests `Dbsp.Service.Testing`. The abstractions reference only the
     core, and nothing public in them or in the harness names a type of the service's
-    runtime, `Incremental.Hosting`, `Incremental.Kafka` or `Confluent.Kafka`:
+    runtime, `Dbsp.Hosting`, `Dbsp.Kafka` or `Confluent.Kafka`:
     `PluginBoundaryTests` walks both surfaces and every plugin's references. The
     service's half of a builder is internal (`IPipelineBinder`, implemented by
     `PipelineBinding`); a new builder method goes on the facade and the binder, never
-    exposes a service type. A type moved out of `Incremental.Service` keeps a
-    `TypeForwardedTo` there for good (`TypeForwards.cs`): a stored plugin compiled
-    before the move finds it only through the forward.
+    exposes a service type. From the first release on, a type moved out of an
+    assembly keeps a `TypeForwardedTo` there for good: a stored plugin compiled
+    before the move finds it only through the forward. (The forwards for the move
+    into the abstractions went with the rename from `Incremental`: no plugin from
+    before it loads.)
   - A record format (`IRecordFormat`, `AddRecordFormat`) is made once per service by
     `KafkaConnections.Format`, never held in a static, and asked for codecs only when
     a slot's connector starts or a loader runs; a codec belongs to the source or sink
@@ -739,7 +737,7 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   - The evidence for keep-or-reset is `StateShape`: text only, never a `Type`, so it
     outlives the plugin version it was read from. It compares what state stores hold
     (`CircuitBuilder.DescribeState`), not what the assembly declares.
-  - `ServiceMeter` (the meter `Incremental.Service`): tags are `node`, `pipeline`, `table`
+  - `ServiceMeter` (the meter `Dbsp.Service`): tags are `node`, `pipeline`, `table`
     and the closed sets `state`, `role`, `stage`, `part` — nothing unbounded, nothing from a
     record. Gauges read the snapshot a node refreshes once a second; a callback must not
     touch a circuit, a table or the backend.
@@ -779,8 +777,8 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     warning and a `Waiting` state, never a refusal or a fault of the files paths. The `files` source holds one line of at most
     `maxLineLength` characters; its ordinals only rise, past anything a checkpoint may
     hold of a half-sent name (`FilePosition.Next`).
-  - The S3 store (`src/Incremental.Service.S3`, `S3ObjectStore`, `AddS3ObjectStore`) is
-    an optional package: `Incremental.Service` never references it or the AWS SDK. It
+  - The S3 store (`src/Dbsp.Service.S3`, `S3ObjectStore`, `AddS3ObjectStore`) is
+    an optional package: `Dbsp.Service` never references it or the AWS SDK. It
     keeps `IObjectStore`'s contract with S3's own means, and each must stay: a page is
     one `ListObjectsV2` (`StartAfter`, `MaxKeys`), never a whole listing; an object
     appears only by a `PutObject` or `CompleteMultipartUpload` sent after the write's
@@ -803,9 +801,9 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     (`PipelineSupervisor.WarmAsync`, `ServiceOptions.WarmStandbyPipelines`) and a
     takeover starts it (`TakeWarm`): a takeover must not do work that grows with a
     pipeline's state. `WarmStandbyTests` holds the ratio; the scale rig
-    (`benchmarks/Incremental.Service.Scale`) measures it. A standby's build is contained
+    (`benchmarks/Dbsp.Service.Scale`) measures it. A standby's build is contained
     like everything else of a pipeline's: it never makes the node unready or fails it.
-- `Incremental.Service.Admin` (the JSON API and the embedded UI). Its rules:
+- `Dbsp.Service.Admin` (the JSON API and the embedded UI). Its rules:
   - Nothing is returned unbounded: every list goes through `Page`/`Newest` and every
     `limit` is clamped to `MaxRows`. The event feed is one bounded drop-oldest queue per
     client, a cap on clients and a write timeout; a frame is serialized once for all.
@@ -845,7 +843,7 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
     `If-Match: "0"` and a replace the generation it replaces.
   - Who made a change comes from `AdminSecurity.Caller` and nowhere else: the host's
     `CallerName` hook, then the authenticated identity, then the name a caller states in
-    `X-Incremental-Operator` (recorded as `name (self-declared)`), then `local`.
+    `X-Dbsp-Operator` (recorded as `name (self-declared)`), then `local`.
 - Public API is fluent delegates with LINQ-dialect names (`Select`/`Where`/`GroupBy`),
   intentionally not LINQ/expression trees. The 0.2 surface is described in `docs/intro.md`:
   windows exist only on groupings of an `EventTimeStream`; grouping types are staging types

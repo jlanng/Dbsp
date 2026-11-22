@@ -1,0 +1,35 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <OutputType>Exe</OutputType>
+    <!-- xUnit1051 wants TestContext.Current.CancellationToken threaded into every call that
+         takes a token — hundreds of Insert/Step/Read calls in short tests that read as usage
+         examples. The suite runs in seconds, so responsive cancellation isn't worth the noise. -->
+    <NoWarn>$(NoWarn);xUnit1051</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="CsCheck" Version="4.9.1" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
+    <PackageReference Include="xunit.v3" Version="4.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Dbsp\Dbsp.csproj" />
+    <ProjectReference Include="..\..\src\Dbsp.Hosting\Dbsp.Hosting.csproj" />
+    <ProjectReference Include="..\..\src\Dbsp.Storage.Redis\Dbsp.Storage.Redis.csproj" />
+    <!-- Build-order only: MultiProcessClusterTests launches the host as child processes. -->
+    <ProjectReference Include="..\Dbsp.ClusterHost\Dbsp.ClusterHost.csproj" ReferenceOutputAssembly="false" />
+    <!-- Source-shared with the host so the scenario and reference run can never drift. -->
+    <Compile Include="..\Dbsp.ClusterHost\ClusterScenario.cs" Link="ClusterScenario.cs" />
+  </ItemGroup>
+
+</Project>

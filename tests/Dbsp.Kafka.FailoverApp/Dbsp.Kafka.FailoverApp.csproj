@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Dbsp\Dbsp.csproj" />
+    <ProjectReference Include="..\..\src\Dbsp.Kafka\Dbsp.Kafka.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)../../tests/Shared/CommandLine.cs" Link="CommandLine.cs" />
+  </ItemGroup>
+
+</Project>

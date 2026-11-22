@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Dbsp.Service.Admin</PackageId>
+    <Description>The admin surface of Dbsp.Service: a JSON API over a service node (leadership, tables, pipelines, plugins, dead letters, audit, a server-sent event feed) and a web UI on top of it, both mounted with one call. ASP.NET Core only; the UI is hand-written HTML, CSS and JavaScript embedded in the assembly, with no build step and no network requests of its own.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="..\Dbsp.Service\Dbsp.Service.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="wwwroot\**\*" LogicalName="admin/%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Dbsp.Service.Tests" />
+  </ItemGroup>
+
+</Project>

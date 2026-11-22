@@ -1,0 +1,274 @@
+namespace Dbsp.Tests;
+
+/// <summary>
+/// Single-worker circuits driven with AutoStep = false, so each test controls step
+/// boundaries and can assert exact per-step deltas (via the raw <c>Reader</c>; keyed
+/// outputs opt out of bootstrap so the graph carries no snapshot state the assertions
+/// don't exercise).
+/// </summary>
+public class CircuitTests
+{
+    private static CircuitBuilder ManualBuilder() =>
+        new(new CircuitOptions { AutoStep = false });
+
+    [Fact]
+    public async Task Select_and_where_transform_deltas()
+    {
+        var builder = ManualBuilder();
+        var numbers = builder.Input<int>("numbers");
+        var result = numbers
+            .Where(n => n % 2 == 0)
+            .Select(n => n * 10)
+            .ToOutput();
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var input = circuit.Handle(numbers);
+        var output = circuit.Handle(result);
+
+        await input.InsertAsync(1);
+        await input.InsertAsync(2);
+        await input.InsertAsync(4);
+        await circuit.StepAsync();
+
+        var delta = await output.Reader.ReadAsync();
+        Assert.Equal(1, delta.WeightOf(20));
+        Assert.Equal(1, delta.WeightOf(40));
+        Assert.Equal(2, delta.DistinctCount);
+    }
+
+    [Fact]
+    public async Task Join_is_incremental_across_steps()
+    {
+        var builder = ManualBuilder();
+        var orders = builder.Input<(int OrderId, int CustomerId)>("orders");
+        var customers = builder.Input<(int Id, string Name)>("customers");
+
+        var joinedDef = orders.GroupBy(o => o.CustomerId)
+            .Join(customers.GroupBy(c => c.Id), (_, order, customer) => (order.OrderId, customer.Name))
+            .ToOutput();
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var ordersIn = circuit.Handle(orders);
+        var customersIn = circuit.Handle(customers);
+        var joined = circuit.Handle(joinedDef);
+
+        // Left side arrives first: no matches yet, so no delta is published.
+        await ordersIn.InsertAsync((100, 1));
+        await circuit.StepAsync();
+
+        // The matching right side arrives a step later and joins against integrated state.
+        await customersIn.InsertAsync((1, "ada"));
+        await circuit.StepAsync();
+        var delta = await joined.Reader.ReadAsync();
+        Assert.Equal(1, delta.WeightOf((100, "ada")));
+
+        // A second order joins immediately.
+        await ordersIn.InsertAsync((101, 1));
+        await circuit.StepAsync();
+        delta = await joined.Reader.ReadAsync();
+        Assert.Equal(1, delta.WeightOf((101, "ada")));
+
+        // Deleting the customer retracts every joined row.
+        await customersIn.RemoveAsync((1, "ada"));
+        await circuit.StepAsync();
+        delta = await joined.Reader.ReadAsync();
+        Assert.Equal(-1, delta.WeightOf((100, "ada")));
+        Assert.Equal(-1, delta.WeightOf((101, "ada")));
+    }
+
+    [Fact]
+    public async Task Count_retracts_stale_results()
+    {
+        var builder = ManualBuilder();
+        var words = builder.Input<string>("words");
+        var countsDef = words
+            .GroupBy(w => w)
+            .Count()
+            .ToOutput(bootstrap: false);
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var input = circuit.Handle(words);
+        var output = circuit.Handle(countsDef);
+
+        await input.InsertAsync("a");
+        await circuit.StepAsync();
+        var delta = await output.Reader.ReadAsync();
+        Assert.Equal(1, delta.WeightOf(new KeyedValue<string, long>("a", 1)));
+
+        await input.InsertAsync("a");
+        await circuit.StepAsync();
+        delta = await output.Reader.ReadAsync();
+        Assert.Equal(-1, delta.WeightOf(new KeyedValue<string, long>("a", 1)));
+        Assert.Equal(1, delta.WeightOf(new KeyedValue<string, long>("a", 2)));
+
+        await input.RemoveAsync("a");
+        await circuit.StepAsync();
+        delta = await output.Reader.ReadAsync();
+        Assert.Equal(-1, delta.WeightOf(new KeyedValue<string, long>("a", 2)));
+        Assert.Equal(1, delta.WeightOf(new KeyedValue<string, long>("a", 1)));
+    }
+
+    [Fact]
+    public async Task Sum_is_linear_and_retracts_a_vanished_group()
+    {
+        var builder = ManualBuilder();
+        var orders = builder.Input<(string Region, int Amount)>("orders");
+        var revenueDef = orders
+            .GroupBy(o => o.Region)
+            .Sum(o => o.Amount)
+            .ToOutput(bootstrap: false);
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var input = circuit.Handle(orders);
+        var output = circuit.Handle(revenueDef);
+
+        await input.InsertAsync(("emea", 10));
+        await input.InsertAsync(("emea", 5));
+        await circuit.StepAsync();
+        var delta = await output.Reader.ReadAsync();
+        Assert.Equal(1, delta.WeightOf(new KeyedValue<string, int>("emea", 15)));
+
+        await input.RemoveAsync(("emea", 5));
+        await circuit.StepAsync();
+        delta = await output.Reader.ReadAsync();
+        Assert.Equal(-1, delta.WeightOf(new KeyedValue<string, int>("emea", 15)));
+        Assert.Equal(1, delta.WeightOf(new KeyedValue<string, int>("emea", 10)));
+
+        // The last row disappears: the result is retracted, not reported as 0. The row
+        // count in the linear state is what detects this — the accumulator alone cannot.
+        await input.RemoveAsync(("emea", 10));
+        await circuit.StepAsync();
+        delta = await output.Reader.ReadAsync();
+        Assert.Equal(-1, delta.WeightOf(new KeyedValue<string, int>("emea", 10)));
+        Assert.Equal(1, delta.DistinctCount);
+    }
+
+    [Fact]
+    public async Task Sum_overflow_faults_the_step_instead_of_wrapping()
+    {
+        var builder = ManualBuilder();
+        var orders = builder.Input<(string Key, int Amount)>("orders");
+        orders.GroupBy(o => o.Key)
+            .Sum(o => o.Amount)
+            .ToOutput(bootstrap: false);
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var input = circuit.Handle(orders);
+
+        await input.InsertAsync(("a", int.MaxValue));
+        await input.InsertAsync(("a", 1));
+        await Assert.ThrowsAsync<OverflowException>(() => circuit.StepAsync());
+        Assert.NotNull(circuit.Fault);
+    }
+
+    [Fact]
+    public async Task Long_sum_overflow_faults_the_step_instead_of_wrapping()
+    {
+        var builder = ManualBuilder();
+        var orders = builder.Input<(string Key, long Amount)>("orders");
+        orders.GroupBy(o => o.Key)
+            .Sum(o => o.Amount)
+            .ToOutput(bootstrap: false);
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var input = circuit.Handle(orders);
+
+        await input.InsertAsync(("a", long.MaxValue));
+        await circuit.StepAsync();
+        await input.InsertAsync(("a", 1L));
+        await Assert.ThrowsAsync<OverflowException>(() => circuit.StepAsync());
+        Assert.NotNull(circuit.Fault);
+    }
+
+    [Fact]
+    public async Task Min_recovers_after_deleting_the_minimum()
+    {
+        var builder = ManualBuilder();
+        var readings = builder.Input<(string Key, int Value)>("readings");
+        var minimumsDef = readings
+            .GroupBy(r => r.Key)
+            .Min(r => r.Value)
+            .ToOutput(bootstrap: false);
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var input = circuit.Handle(readings);
+        var output = circuit.Handle(minimumsDef);
+
+        await input.InsertAsync(("k", 5));
+        await input.InsertAsync(("k", 3));
+        await circuit.StepAsync();
+        var delta = await output.Reader.ReadAsync();
+        Assert.Equal(1, delta.WeightOf(new KeyedValue<string, int>("k", 3)));
+
+        // Deleting the current minimum is the classic non-invertible case: the operator must
+        // consult the remaining group state to find the new minimum.
+        await input.RemoveAsync(("k", 3));
+        await circuit.StepAsync();
+        delta = await output.Reader.ReadAsync();
+        Assert.Equal(-1, delta.WeightOf(new KeyedValue<string, int>("k", 3)));
+        Assert.Equal(1, delta.WeightOf(new KeyedValue<string, int>("k", 5)));
+    }
+
+    [Fact]
+    public async Task Distinct_collapses_duplicates_and_tracks_presence()
+    {
+        var builder = ManualBuilder();
+        var values = builder.Input<string>("values");
+        var distinctDef = values.Distinct().ToOutput();
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var input = circuit.Handle(values);
+        var output = circuit.Handle(distinctDef);
+
+        await input.InsertAsync("x");
+        await input.InsertAsync("x");
+        await circuit.StepAsync();
+        var delta = await output.Reader.ReadAsync();
+        Assert.Equal(1, delta.WeightOf("x"));
+
+        // Removing one copy leaves the value present: no delta at all.
+        await input.RemoveAsync("x");
+        await circuit.StepAsync();
+        Assert.False(output.Reader.TryRead(out _));
+
+        // Removing the last copy retracts it.
+        await input.RemoveAsync("x");
+        await circuit.StepAsync();
+        delta = await output.Reader.ReadAsync();
+        Assert.Equal(-1, delta.WeightOf("x"));
+    }
+
+    [Fact]
+    public async Task Full_input_channel_suspends_the_producer()
+    {
+        var builder = new CircuitBuilder(new CircuitOptions
+        {
+            AutoStep = false,
+            InputChannelCapacity = 2,
+        });
+        var numbers = builder.Input<int>("numbers");
+        numbers.ToOutput();
+
+        await using var circuit = builder.Build();
+        circuit.Start();
+        var input = circuit.Handle(numbers);
+
+        await input.InsertAsync(1);
+        await input.InsertAsync(2);
+
+        // The channel is full: the third write must not complete until a step drains it.
+        var blocked = input.InsertAsync(3);
+        Assert.False(blocked.IsCompleted);
+
+        await circuit.StepAsync();
+        await blocked;
+    }
+}

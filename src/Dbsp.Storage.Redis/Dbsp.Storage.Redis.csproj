@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Dbsp.Storage.Redis</PackageId>
+    <Description>Redis-backed storage provider for Dbsp: operator state in Redis hashes with atomic checkpoints (state + input offsets in one MULTI/EXEC) for exactly-once restart.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Dbsp\Dbsp.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="StackExchange.Redis" Version="3.3.1" />
+  </ItemGroup>
+
+</Project>

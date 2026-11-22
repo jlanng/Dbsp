@@ -1,3 +1,7 @@
+# The project name is fixed so that container names (dbsp-kafka-1, …) do not follow the
+# name of the directory the repository is checked out in.
+name: dbsp
+
 services:
   redis:
     image: redis:7-alpine
@@ -60,13 +64,13 @@ services:
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_USER: incremental
-      POSTGRES_PASSWORD: incremental
-      POSTGRES_DB: incremental
+      POSTGRES_USER: dbsp
+      POSTGRES_PASSWORD: dbsp
+      POSTGRES_DB: dbsp
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U incremental -d incremental"]
+      test: ["CMD-SHELL", "pg_isready -U dbsp -d dbsp"]
       interval: 2s
       timeout: 2s
       retries: 15
@@ -85,7 +89,7 @@ services:
       - "8083:8083"
     environment:
       BOOTSTRAP_SERVERS: kafka:19092
-      GROUP_ID: incremental-connect
+      GROUP_ID: dbsp-connect
       CONFIG_STORAGE_TOPIC: connect-configs
       OFFSET_STORAGE_TOPIC: connect-offsets
       STATUS_STORAGE_TOPIC: connect-status
@@ -96,9 +100,9 @@ services:
       retries: 30
 
   # An S3-compatible object store for the files connector's S3 store
-  # (src/Incremental.Service.S3): its tests and the files connector's tests run against
-  # it. From the host: http://localhost:9000, access key `incremental`, secret
-  # `incremental-secret` (throwaway). The tests make their own bucket. The image is the
+  # (src/Dbsp.Service.S3): its tests and the files connector's tests run against
+  # it. From the host: http://localhost:9000, access key `dbsp`, secret
+  # `dbsp-secret` (throwaway). The tests make their own bucket. The image is the
   # MinIO server as Pigsty builds it: MinIO's own images are no longer published to
   # Docker Hub or Quay. MinIO is S3's API, not S3: real S3 is not checked here.
   minio:
@@ -108,8 +112,8 @@ services:
     ports:
       - "9000:9000"
     environment:
-      MINIO_ROOT_USER: incremental
-      MINIO_ROOT_PASSWORD: incremental-secret
+      MINIO_ROOT_USER: dbsp
+      MINIO_ROOT_PASSWORD: dbsp-secret
     volumes:
       - minio-data:/data
     healthcheck:
@@ -124,8 +128,8 @@ services:
   # min.insync.replicas 2, so one broker can be stopped and writes with acks=all carry on,
   # and a second cannot. From the host: localhost:9192,localhost:9292,localhost:9392. Point
   # the tests at it with
-  #   INCREMENTAL_KAFKA_BOOTSTRAP=localhost:9192,localhost:9292,localhost:9392 INCREMENTAL_KAFKA_REPLICATION=3
-  # (and INCREMENTAL_KAFKA_BROKERS, the three container names, for the tests that stop one).
+  #   DBSP_KAFKA_BOOTSTRAP=localhost:9192,localhost:9292,localhost:9392 DBSP_KAFKA_REPLICATION=3
+  # (and DBSP_KAFKA_BROKERS, the three container names, for the tests that stop one).
   # No volume: the data goes with the containers. Plaintext, local development only.
   # Each broker has a fixed address on a network of their own. Without one a container
   # that is killed and started again comes back at a new address, and the other brokers
@@ -202,7 +206,7 @@ services:
   # JWTs (the broker's default validator accepts them — a development setting, and the
   # reason this must never be a production one); a session ends with its token, so a
   # client has to refresh and re-authenticate. Access is denied unless an ACL allows it:
-  # benchmarks/Incremental.Service.Scale/README.md has the ACLs a service node needs and
+  # benchmarks/Dbsp.Service.Scale/README.md has the ACLs a service node needs and
   # the command that grants them. The listeners between containers stay plaintext, and
   # whatever arrives on them (ANONYMOUS) is a super user: that is how the ACLs are set.
   kafka-sasl:

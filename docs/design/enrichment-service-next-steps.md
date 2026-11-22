@@ -18,9 +18,9 @@ independently of the agents that did the work:
 | Check | Result |
 |---|---|
 | `dotnet build` | 0 warnings, 0 errors |
-| `tests/Incremental.Tests` | 717 total, 716 passed, 1 skipped (the opt-in soak) |
-| `tests/Incremental.Kafka.Tests` | 150 of 150 |
-| `tests/Incremental.Service.Tests` | 260 total, 254 passed, 6 skipped (the three-broker tests) |
+| `tests/Dbsp.Tests` | 717 total, 716 passed, 1 skipped (the opt-in soak) |
+| `tests/Dbsp.Kafka.Tests` | 150 of 150 |
+| `tests/Dbsp.Service.Tests` | 260 total, 254 passed, 6 skipped (the three-broker tests) |
 | `examples/…/Pipelines.Tests` | 18 of 18 |
 | Example smokes | in memory 55 claims, two nodes 70, Kafka with a `kill -9` 69, trade enrichment 13: all hold |
 | `benchmarks -- --assert` | all 10 performance contracts hold |
@@ -64,12 +64,12 @@ Decided 2026-11-15:
 Each of these is a decision above turned into work.
 
 - **B1. An abstractions package for plugin authors** [11, 20].
-  `Incremental.Service.Abstractions` holds the definition interfaces, the builder
+  `Dbsp.Service.Abstractions` holds the definition interfaces, the builder
   surface a definition sees and the table definitions; a testing package holds
   `PipelineTestHarness`. A plugin project then compiles without seeing hosting or Kafka
   types. Nothing is published, so the break costs this repository only. Done when the
   example's plugins, the test plugins and `Pipelines.Tests` reference only the new
-  packages, a test fails if a plugin-facing type drags in `Incremental.Kafka` or the
+  packages, a test fails if a plugin-facing type drags in `Dbsp.Kafka` or the
   hosting assemblies, and the plugin unload test still passes when run alone.
 - **B2. Paced bulk loads** [61]. A load of five million rows stopped the leader for
   about 2 s in one blocking collection; a standby takes over after 3 s. The table writer

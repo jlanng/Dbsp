@@ -1,0 +1,53 @@
+<Solution>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/Dbsp.Benchmarks/Dbsp.Benchmarks.csproj" />
+    <Project Path="benchmarks/Dbsp.Service.Scale/Dbsp.Service.Scale.csproj" />
+    <Project Path="benchmarks/Dbsp.Torture/Dbsp.Torture.csproj" />
+  </Folder>
+  <Folder Name="/benchmarks/plugins/">
+    <Project Path="benchmarks/Dbsp.Service.Scale/Contracts/Scale.Contracts.csproj" />
+    <Project Path="benchmarks/Dbsp.Service.Scale/Pipelines/Scale.Pipelines.csproj" />
+  </Folder>
+  <Folder Name="/examples/">
+    <Project Path="examples/Dbsp.EnrichmentService/Dbsp.EnrichmentService.csproj" />
+    <Project Path="examples/Dbsp.Example/Dbsp.Example.csproj" />
+    <Project Path="examples/Dbsp.LogAnalytics/Dbsp.LogAnalytics.csproj" />
+    <Project Path="examples/Dbsp.Showcase/Dbsp.Showcase.csproj" />
+    <Project Path="examples/Dbsp.TaxiAnalytics/Dbsp.TaxiAnalytics.csproj" />
+    <Project Path="examples/Dbsp.TradeEnrichment/Dbsp.TradeEnrichment.csproj" />
+  </Folder>
+  <Folder Name="/examples/plugins/">
+    <Project Path="examples/Dbsp.EnrichmentService/Contracts/Enrichment.Contracts.csproj" />
+    <Project Path="examples/Dbsp.EnrichmentService/Pipelines.Tests/Enrichment.Pipelines.Tests.csproj" />
+    <Project Path="examples/Dbsp.EnrichmentService/Pipelines.V2/Enrichment.Pipelines.V2.csproj" />
+    <Project Path="examples/Dbsp.EnrichmentService/Pipelines/Enrichment.Pipelines.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Dbsp.Hosting/Dbsp.Hosting.csproj" />
+    <Project Path="src/Dbsp.Kafka/Dbsp.Kafka.csproj" />
+    <Project Path="src/Dbsp.Service.Admin/Dbsp.Service.Admin.csproj" />
+    <Project Path="src/Dbsp.Service/Dbsp.Service.csproj" />
+    <Project Path="src/Dbsp.Service.Abstractions/Dbsp.Service.Abstractions.csproj" />
+    <Project Path="src/Dbsp.Service.S3/Dbsp.Service.S3.csproj" />
+    <Project Path="src/Dbsp.Service.Testing/Dbsp.Service.Testing.csproj" />
+    <Project Path="src/Dbsp.Storage.Redis/Dbsp.Storage.Redis.csproj" />
+    <Project Path="src/Dbsp/Dbsp.csproj" />
+  </Folder>
+  <Folder Name="/tests/plugins/">
+    <Project Path="tests/Dbsp.Service.TestPlugins/Acme.Contracts/Acme.Contracts.csproj" />
+    <Project Path="tests/Dbsp.Service.TestPlugins/Acme.Desks/Acme.Desks.csproj" />
+    <Project Path="tests/Dbsp.Service.TestPlugins/Acme.Pipelines.V2/Acme.Pipelines.V2.csproj" />
+    <Project Path="tests/Dbsp.Service.TestPlugins/Acme.Pipelines/Acme.Pipelines.csproj" />
+    <Project Path="tests/Dbsp.Service.TestPlugins/Acme.RefData/Acme.RefData.csproj" />
+    <Project Path="tests/Dbsp.Service.TestPlugins/Acme.Venues/Acme.Venues.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Dbsp.ClusterHost/Dbsp.ClusterHost.csproj" />
+    <Project Path="tests/Dbsp.Kafka.FailoverApp/Dbsp.Kafka.FailoverApp.csproj" />
+    <Project Path="tests/Dbsp.Kafka.Tests/Dbsp.Kafka.Tests.csproj" />
+    <Project Path="tests/Dbsp.Service.AdminHost/Dbsp.Service.AdminHost.csproj" />
+    <Project Path="tests/Dbsp.Service.FailoverApp/Dbsp.Service.FailoverApp.csproj" />
+    <Project Path="tests/Dbsp.Service.Tests/Dbsp.Service.Tests.csproj" />
+    <Project Path="tests/Dbsp.Tests/Dbsp.Tests.csproj" />
+  </Folder>
+</Solution>

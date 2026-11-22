@@ -30,40 +30,40 @@ jobs:
       - name: Build
         run: dotnet build -c Release
       - name: Test
-        run: dotnet test --project tests/Incremental.Tests -c Release --no-build
+        run: dotnet test --project tests/Dbsp.Tests -c Release --no-build
       # No broker in CI: the integration tests skip, and the ones that need none
       # (SnapshotCutTests) run.
       - name: Test Kafka
-        run: dotnet test --project tests/Incremental.Kafka.Tests -c Release --no-build
+        run: dotnet test --project tests/Dbsp.Kafka.Tests -c Release --no-build
       # In memory throughout: the service's tests need no broker. They load real plugin
       # assemblies from the test plugin projects' output directories, which the build made.
       - name: Test Service
-        run: dotnet test --project tests/Incremental.Service.Tests -c Release --no-build
+        run: dotnet test --project tests/Dbsp.Service.Tests -c Release --no-build
       # The example plugin's own tests: its definitions on PipelineTestHarness, as a
       # plugin author would write them.
       - name: Test example pipelines
-        run: dotnet test --project examples/Incremental.EnrichmentService/Pipelines.Tests -c Release --no-build
+        run: dotnet test --project examples/Dbsp.EnrichmentService/Pipelines.Tests -c Release --no-build
       # The smoke tests that need no broker. Each drives the example through its admin API
       # (or prints its narrative), checks every claim against a model and exits 1 on one
       # that does not hold. A few seconds each.
       - name: Smoke, enrichment service on one in-memory node
-        run: dotnet run -c Release --no-build --project examples/Incremental.EnrichmentService -- --headless
+        run: dotnet run -c Release --no-build --project examples/Dbsp.EnrichmentService -- --headless
       - name: Smoke, enrichment service on two in-memory nodes with a takeover
-        run: dotnet run -c Release --no-build --project examples/Incremental.EnrichmentService -- --headless --nodes 2
+        run: dotnet run -c Release --no-build --project examples/Dbsp.EnrichmentService -- --headless --nodes 2
       - name: Smoke, trade enrichment on shared tables
-        run: dotnet run -c Release --no-build --project examples/Incremental.TradeEnrichment
+        run: dotnet run -c Release --no-build --project examples/Dbsp.TradeEnrichment
       # Validates the NuGet packaging (metadata, XML docs, SourceLink, symbols) on every build.
       - name: Pack
         run: |
-          dotnet pack src/Incremental -c Release --no-build -o artifacts/packages
-          dotnet pack src/Incremental.Storage.Redis -c Release --no-build -o artifacts/packages
-          dotnet pack src/Incremental.Hosting -c Release --no-build -o artifacts/packages
-          dotnet pack src/Incremental.Kafka -c Release --no-build -o artifacts/packages
-          dotnet pack src/Incremental.Service.Abstractions -c Release --no-build -o artifacts/packages
-          dotnet pack src/Incremental.Service -c Release --no-build -o artifacts/packages
-          dotnet pack src/Incremental.Service.Testing -c Release --no-build -o artifacts/packages
-          dotnet pack src/Incremental.Service.S3 -c Release --no-build -o artifacts/packages
-          dotnet pack src/Incremental.Service.Admin -c Release --no-build -o artifacts/packages
+          dotnet pack src/Dbsp -c Release --no-build -o artifacts/packages
+          dotnet pack src/Dbsp.Storage.Redis -c Release --no-build -o artifacts/packages
+          dotnet pack src/Dbsp.Hosting -c Release --no-build -o artifacts/packages
+          dotnet pack src/Dbsp.Kafka -c Release --no-build -o artifacts/packages
+          dotnet pack src/Dbsp.Service.Abstractions -c Release --no-build -o artifacts/packages
+          dotnet pack src/Dbsp.Service -c Release --no-build -o artifacts/packages
+          dotnet pack src/Dbsp.Service.Testing -c Release --no-build -o artifacts/packages
+          dotnet pack src/Dbsp.Service.S3 -c Release --no-build -o artifacts/packages
+          dotnet pack src/Dbsp.Service.Admin -c Release --no-build -o artifacts/packages
       - name: Upload packages
         uses: actions/upload-artifact@v7
         with:
@@ -98,38 +98,26 @@ jobs:
       - name: Test Kafka against the broker
         run: |
           set -o pipefail
-          dotnet test --project tests/Incremental.Kafka.Tests -c Release --no-build | tee kafka-tests.log
+          dotnet test --project tests/Dbsp.Kafka.Tests -c Release --no-build | tee kafka-tests.log
           # The summary's lines carry colour codes on a runner: taken out before the match.
           # Two, exactly: KafkaPartitionWatermarkTests' two that kill and freeze a broker,
           # which need three of them (the broker-failures job runs those).
           sed 's/\x1b\[[0-9;]*m//g' kafka-tests.log | grep -Eq '^\s*skipped: 2\s*$'
-      # The last commit before state manifest format 8 and format levels: the "older
-      # build" of KafkaServiceProcessTests' rolling upgrade (docs/enrichment-service.md,
-      # Upgrading the nodes).
-      - name: Build the node from before format levels
-        run: |
-          git worktree add --detach "$RUNNER_TEMP/older" 9de8da9
-          dotnet build "$RUNNER_TEMP/older/tests/Incremental.Service.FailoverApp"
-          # Its plugin, compiled against Incremental.Service before the abstractions: what
-          # both builds run in the two-build test, and what PluginTests loads on this build.
-          dotnet build "$RUNNER_TEMP/older/tests/Incremental.Service.TestPlugins/Acme.Pipelines"
       - name: Test Service against the broker
-        env:
-          INCREMENTAL_OLDER_BUILD: ${{ runner.temp }}/older/tests/Incremental.Service.FailoverApp/bin/Debug/net10.0/Incremental.Service.FailoverApp.dll
         run: |
           set -o pipefail
-          dotnet test --project tests/Incremental.Service.Tests -c Release --no-build | tee service-tests.log
+          dotnet test --project tests/Dbsp.Service.Tests -c Release --no-build | tee service-tests.log
           # Six, exactly: the tests that stop, kill and freeze brokers, which need three of
           # them (the kafka3 compose profile, not started here). The S3 store's tests
           # skip without MinIO, so a seventh skip fails here too.
           sed 's/\x1b\[[0-9;]*m//g' service-tests.log | grep -Eq '^\s*skipped: 6\s*$'
       - name: Smoke, enrichment service on Kafka with a killed leader
-        run: dotnet run -c Release --no-build --project examples/Incremental.EnrichmentService -- --headless --kafka --prefix ci${{ github.run_id }}
+        run: dotnet run -c Release --no-build --project examples/Dbsp.EnrichmentService -- --headless --kafka --prefix ci${{ github.run_id }}
       - name: Measured failover times
         if: always()
         run: |
-          cat tests/Incremental.Kafka.Tests/bin/Release/net10.0/measurements.log || true
-          cat tests/Incremental.Service.Tests/bin/Release/net10.0/measurements.log || true
+          cat tests/Dbsp.Kafka.Tests/bin/Release/net10.0/measurements.log || true
+          cat tests/Dbsp.Service.Tests/bin/Release/net10.0/measurements.log || true
       - name: Container logs
         if: failure()
         run: |
@@ -164,25 +152,25 @@ jobs:
         run: dotnet build -c Release
       - name: Broker-failure tests
         env:
-          INCREMENTAL_KAFKA_BOOTSTRAP: localhost:9192,localhost:9292,localhost:9392
-          INCREMENTAL_KAFKA_REPLICATION: 3
-          INCREMENTAL_KAFKA_BROKERS: incremental-kafka3-1-1,incremental-kafka3-2-1,incremental-kafka3-3-1
-          INCREMENTAL_NODE_LOGS: ${{ runner.temp }}/node-logs
+          DBSP_KAFKA_BOOTSTRAP: localhost:9192,localhost:9292,localhost:9392
+          DBSP_KAFKA_REPLICATION: 3
+          DBSP_KAFKA_BROKERS: dbsp-kafka3-1-1,dbsp-kafka3-2-1,dbsp-kafka3-3-1
+          DBSP_NODE_LOGS: ${{ runner.temp }}/node-logs
         run: |
           set -o pipefail
-          dotnet test --project tests/Incremental.Service.Tests -c Release --no-build -- --filter-method "*broker*" | tee broker-tests.log
+          dotnet test --project tests/Dbsp.Service.Tests -c Release --no-build -- --filter-method "*broker*" | tee broker-tests.log
           # Here the brokers are there to be stopped: a skip means the run proved nothing.
           sed 's/\x1b\[[0-9;]*m//g' broker-tests.log | grep -Eq '^\s*skipped: 0\s*$'
           # A broker lost under a topic of several partitions: the watermark waits for
           # the partitions that have no leader, and their records are not late.
-          dotnet test --project tests/Incremental.Kafka.Tests -c Release --no-build -- --filter-method "*ABrokerLost*" | tee kafka-broker-tests.log
+          dotnet test --project tests/Dbsp.Kafka.Tests -c Release --no-build -- --filter-method "*ABrokerLost*" | tee kafka-broker-tests.log
           sed 's/\x1b\[[0-9;]*m//g' kafka-broker-tests.log | grep -Eq '^\s*skipped: 0\s*$'
       - name: What the runs measured
         if: always()
         run: |
-          cat tests/Incremental.Service.Tests/bin/Release/net10.0/measurements.log || true
-          cat tests/Incremental.Service.Tests/bin/Release/net10.0/broker-runs.jsonl || true
-          cat tests/Incremental.Kafka.Tests/bin/Release/net10.0/measurements.log || true
+          cat tests/Dbsp.Service.Tests/bin/Release/net10.0/measurements.log || true
+          cat tests/Dbsp.Service.Tests/bin/Release/net10.0/broker-runs.jsonl || true
+          cat tests/Dbsp.Kafka.Tests/bin/Release/net10.0/measurements.log || true
       - name: Node logs
         if: failure()
         uses: actions/upload-artifact@v7
@@ -208,4 +196,4 @@ jobs:
         with:
           dotnet-version: 10.0.x
       - name: Assert performance contracts
-        run: dotnet run -c Release --project benchmarks/Incremental.Benchmarks -- --assert
+        run: dotnet run -c Release --project benchmarks/Dbsp.Benchmarks -- --assert

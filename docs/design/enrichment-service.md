@@ -18,7 +18,7 @@ The first application is enrichment as a service: pipelines defined at runtime b
 each one circuit, joining streams against a few large reference tables that most pipelines
 share. The library has the parts — shared tables, `Join`/`Lookup`/`ToTable`, acknowledged
 sinks, the changelog storage, the Kafka logs, leadership, sources — and the failover app
-(`tests/Incremental.Kafka.FailoverApp/Program.cs`) shows how to wire them by hand for one
+(`tests/Dbsp.Kafka.FailoverApp/Program.cs`) shows how to wire them by hand for one
 fixed circuit. What is missing is everything that makes the set of tables and pipelines
 *change while the process runs* and *survive on another node*:
 
@@ -41,7 +41,7 @@ is another repository; this one provides the packages it builds on.
 ```
                        ┌──────────────────────── ServiceNode ────────────────────────┐
  admin API / UI ─────▶ │  Catalog (what is deployed)        Leadership (who leads)   │
- (Incremental.         │     │                                                       │
+ (Dbsp.         │     │                                                       │
   Service.Admin)       │     ├─▶ PluginCatalog   contract context + one ALC/version  │
                        │     ├─▶ TableRegistry   SharedTable per table, loaders, trim│
                        │     └─▶ PipelineSupervisor   one circuit per pipeline        │
@@ -70,15 +70,15 @@ Two rules run through the whole design and are stated once here:
 
 | Project | Targets | Depends on | Holds |
 |---|---|---|---|
-| `src/Incremental.Service.Abstractions` | net8.0; net10.0 | Incremental | what a plugin compiles against: the definition interfaces, `PipelineBuilder`, table definitions, the record format seam (round five, B1) |
-| `src/Incremental.Service` | net8.0; net10.0 | Incremental, Incremental.Hosting, Incremental.Kafka, the abstractions | everything below except HTTP |
-| `src/Incremental.Service.Testing` | net8.0; net10.0 | Incremental.Service | `PipelineTestHarness` |
-| `src/Incremental.Service.S3` | net8.0; net10.0 | Incremental.Service, `AWSSDK.S3` | `S3ObjectStore` and `AddS3ObjectStore`: the `files` connector on a bucket (round five, B5); tested against MinIO, not Amazon S3 |
-| `src/Incremental.Service.Admin` | net8.0; net10.0 | Incremental.Service, `FrameworkReference Microsoft.AspNetCore.App` | JSON API, health endpoints, embedded UI |
-| `tests/Incremental.Service.Tests` | net10.0 | both, xunit v3 | Kafka tests skip like `tests/Incremental.Kafka.Tests/KafkaEnv.cs` |
+| `src/Dbsp.Service.Abstractions` | net8.0; net10.0 | Dbsp | what a plugin compiles against: the definition interfaces, `PipelineBuilder`, table definitions, the record format seam (round five, B1) |
+| `src/Dbsp.Service` | net8.0; net10.0 | Dbsp, Dbsp.Hosting, Dbsp.Kafka, the abstractions | everything below except HTTP |
+| `src/Dbsp.Service.Testing` | net8.0; net10.0 | Dbsp.Service | `PipelineTestHarness` |
+| `src/Dbsp.Service.S3` | net8.0; net10.0 | Dbsp.Service, `AWSSDK.S3` | `S3ObjectStore` and `AddS3ObjectStore`: the `files` connector on a bucket (round five, B5); tested against MinIO, not Amazon S3 |
+| `src/Dbsp.Service.Admin` | net8.0; net10.0 | Dbsp.Service, `FrameworkReference Microsoft.AspNetCore.App` | JSON API, health endpoints, embedded UI |
+| `tests/Dbsp.Service.Tests` | net10.0 | both, xunit v3 | Kafka tests skip like `tests/Dbsp.Kafka.Tests/KafkaEnv.cs` |
 
-`Incremental.Service` does not use `CircuitHost<TDefinition>`: that type is keyed by a
-compile-time class (`src/Incremental.Hosting/CircuitHost.cs`), and a pipeline here is
+`Dbsp.Service` does not use `CircuitHost<TDefinition>`: that type is keyed by a
+compile-time class (`src/Dbsp.Hosting/CircuitHost.cs`), and a pipeline here is
 known only at runtime. It keeps the Hosting reference for the generic-host packages and
 follows the same shutdown rule (drain the circuit while consumers still read).
 
@@ -139,7 +139,7 @@ public sealed record LeadershipCallbacks(
     Func<PeerInfo> DescribeSelf);                        // what this node answers a peer's probe with
 ```
 
-`NodeRole` is `Incremental.Kafka`'s enum, reused. The status is the service's own record:
+`NodeRole` is `Dbsp.Kafka`'s enum, reused. The status is the service's own record:
 the in-memory backend has no heartbeats, lease or state-partition offsets, and making it
 invent them would have the UI special-case invented numbers. `Kafka` is null there and the
 UI hides that panel.
@@ -211,7 +211,7 @@ reconstructs the service from it and from nothing else.
 > `svc.catalog`, opened on the backend's table log like any other table. On Kafka that is
 > `{p}.table.svc.catalog.rows` (compacted) and `.changes`, written through the log's one
 > transactional producer, so fencing covers every catalog write, and a standby follows it
-> with `SharedTable.FollowAsync`. It needs no new code in `Incremental.Kafka`. The
+> with `SharedTable.FollowAsync`. It needs no new code in `Dbsp.Kafka`. The
 > in-memory backend gets the same behaviour, fencing included, from `InMemoryTableLog`.
 > Table names starting `svc.` are reserved.
 
@@ -282,7 +282,7 @@ arbitrary hosts or paths, and cannot express MSK's IAM authentication, which is 
 belong to the host, registered once under a name:
 
 ```csharp
-services.AddIncrementalService(…)
+services.AddDbspService(…)
     .AddKafkaConnection("msk-main", sp => new KafkaConnection
     {
         BootstrapServers = "…",
@@ -538,7 +538,7 @@ because both become directory names.
 
 **Two kinds**, told apart by an assembly attribute:
 
-- A **contract assembly** (`[assembly: IncrementalContract]`) holds `TableDefinition`s and
+- A **contract assembly** (`[assembly: DbspContract]`) holds `TableDefinition`s and
   the row and key types of shared tables. It is loaded **once per process**, into one
   non-collectible context, and never unloaded.
 - A **pipeline assembly** holds pipeline definitions. Each version is loaded into its
@@ -546,7 +546,7 @@ because both become directory names.
 
 **Type sharing, exactly.** A pipeline context resolves an assembly name in this order:
 (1) a loaded contract assembly, by simple name, *even if the plugin ships its own copy*;
-(2) the host's own — `Incremental*`, `Microsoft.Extensions.*`, the
+(2) the host's own — `Dbsp*`, `Microsoft.Extensions.*`, the
 framework — from the default context, whatever the plugin ships; (3) any other assembly
 the host carries, from the default context, if the host's version is at least the one
 referenced or the plugin ships none; (4) anything else privately, through
@@ -1078,7 +1078,7 @@ h.Table(Tables.Instruments).Upsert(renamed); await h.CommitTablesAsync();
 h.DeadLetters; h.Shape;
 ```
 
-The harness is in `Incremental.Service.Testing` (in `Incremental.Service` until round
+The harness is in `Dbsp.Service.Testing` (in `Dbsp.Service` until round
 five's B1), runs one definition on an in-memory provider
 with the `memory` connector on every slot, and is built on the same dry run and
 generation code the supervisor uses, so a definition that passes it binds the way it
@@ -1186,7 +1186,7 @@ is at fault steps it down by hand.
 **Graceful shutdown.** The generic host stops services in reverse order, so the web
 server stops first; the admin package ends every SSE response on
 `IHostApplicationLifetime.ApplicationStopping`, or Kestrel would wait on an open event
-stream until the timeout (`examples/Incremental.Showcase/Program.cs` documents the
+stream until the timeout (`examples/Dbsp.Showcase/Program.cs` documents the
 trap). Then, if and only if the node's role is `Leader` (a fenced node's `StopAsync`
 also runs, and `StepDownAsync` throws there) and the peer answers as a standby, it steps
 down: `StopLeadingAsync` stops loaders and sources and every pipeline in stop order and
@@ -1196,7 +1196,7 @@ takes over without waiting out `TakeoverAfter`. With no standby answering it sto
 pipelines the same way and does not resign. Then tables, storage, leadership and
 backend are disposed. What has not drained is abandoned and replayed by the successor.
 The README says to raise `HostOptions.ShutdownTimeout` above its 30 s default when
-sinks are slow; `AddIncrementalService` logs a warning at start when it is below
+sinks are slow; `AddDbspService` logs a warning at start when it is below
 `StopTimeout + AbandonTimeout + 5 s`.
 
 **Health.** `NodeHealth` is computed from the status, never from whether pipelines exist:
@@ -1226,12 +1226,12 @@ important part of it must outlive a failover.
   letters at no more than one line per pipeline per 10 s with a count (Warning).
 - *Not kept across failover:* the dead-letter ring, fault lists, `Failed`, and the
   metrics rings. A new leader starts those empty. The durable forms are the `deadLetters`
-  slot, the logs and a metrics collector on the `Incremental.Service` meter.
+  slot, the logs and a metrics collector on the `Dbsp.Service` meter.
 
 **DI.**
 
 ```csharp
-builder.Services.AddIncrementalService(o =>
+builder.Services.AddDbspService(o =>
     {
         o.PluginDirectory = "plugins"; o.CacheDirectory = "cache";
         o.AdvertisedAdminUrl = "http://node-a:5180/admin";
@@ -1249,19 +1249,19 @@ builder.Services.AddIncrementalService(o =>
     .AddSinkConnector("my-db", sp => …);
 ```
 
-`AddIncrementalService` registers `ServiceNode` as a singleton and as a hosted service;
+`AddDbspService` registers `ServiceNode` as a singleton and as a hosted service;
 `ITableRegistry`, `IPipelineSupervisor`, `IPluginCatalog` and `ServiceMetrics` resolve
 from it. `ServiceOptions` binds from configuration. `AdvertisedAdminUrl` is what
-`node/leader` publishes; `Incremental.Service` knows nothing about HTTP, so the host sets
+`node/leader` publishes; `Dbsp.Service` knows nothing about HTTP, so the host sets
 it, and the admin package fills it from `IServerAddressesFeature` when it is unset and
 exactly one address is bound.
 
 ## Admin API and UI
 
 ```csharp
-builder.Services.AddIncrementalServiceAdmin(o => { o.ExposeRowData = true; });
-app.MapIncrementalServiceAdmin("/admin");                  // UI at /admin, API at /admin/api
-app.MapIncrementalServiceHealth("/health");                // /health/live, /health/ready, /health/status
+builder.Services.AddDbspServiceAdmin(o => { o.ExposeRowData = true; });
+app.MapDbspServiceAdmin("/admin");                  // UI at /admin, API at /admin/api
+app.MapDbspServiceHealth("/health");                // /health/live, /health/ready, /health/status
 ```
 
 **Security posture.**
@@ -1295,7 +1295,7 @@ public sealed class ServiceAdminOptions
   reach that name**; the option's documentation says so in those words, and the README's
   two-node section shows a minimal policy, which any cross-host use needs.
 - **Mutations** need `Content-Type: application/json` (a zip for an upload) and the header
-  `X-Incremental-Admin: 1`. A browser will not send that cross-site without a preflight
+  `X-Dbsp-Admin: 1`. A browser will not send that cross-site without a preflight
   the API never answers, which is what stops a page on the operator's machine from
   posting to loopback.
 - **Mutations are conditional and confirmed.** A pipeline mutation carries
@@ -1359,15 +1359,15 @@ Every list is bounded by `MaxRows` or by what is deployed. Each SSE connection h
 bounded queue of 64 events that drops the oldest: a slow browser loses ticks, not the
 server's memory.
 
-**Where the numbers come from.** `ServiceMetrics` (in `Incremental.Service`, so a host
-without the admin package has it too) attaches one `MeterListener` to the `Incremental`
-meter (`src/Incremental/Diagnostics/CircuitDiagnostics.cs`) and keeps, per `circuit` tag,
+**Where the numbers come from.** `ServiceMetrics` (in `Dbsp.Service`, so a host
+without the admin package has it too) attaches one `MeterListener` to the `Dbsp`
+meter (`src/Dbsp/Diagnostics/CircuitDiagnostics.cs`) and keeps, per `circuit` tag,
 two fixed rings: 60 one-second slots and 60 one-minute slots, so the last hour is there
 for someone paged late. Anything longer is a collector's job.
 
 | Shown | Source |
 |---|---|
-| steps, step latency | `incremental.circuit.steps`, `…step_duration` (count, sum, max per slot) |
+| steps, step latency | `dbsp.circuit.steps`, `…step_duration` (count, sum, max per slot) |
 | records in | `…records`; per source: the connector's `SourceStats` |
 | records out | counted per batch in the supervisor's delivery wrapper (upserts, deletes, appends) |
 | sink-ack wait | `…sink_ack_wait` |
@@ -1382,13 +1382,13 @@ for someone paged late. Anything longer is a collector's job.
 There are no per-operator record counts: the core does not count them, and adding a
 counter to every operator's loop is a hot-path cost this design does not take. The graph
 is the circuit's static shape with dead-letter counts on the operators that have them.
-The service publishes its own meter, `Incremental.Service`, for collectors: pipeline state
+The service publishes its own meter, `Dbsp.Service`, for collectors: pipeline state
 and restarts, sink and source records, table rows, version and loader lag, node role,
 standby lag, live plugin contexts, and the log writer's counters above.
 
 **UI.** Hand-written `index.html`, `app.css`, `app.js`, embedded as resources and served
 by a small endpoint (no file-provider package, no build step), in the manner of
-`examples/Incremental.Showcase/wwwroot/index.html`. Hash-routed views: overview (node
+`examples/Dbsp.Showcase/wwwroot/index.html`. Hash-routed views: overview (node
 banner with health and reasons, counts, event feed), tables (list, detail with stats,
 loader, readers with time until cut loose, row sample, key and index lookup), pipelines
 (list with sparklines and `blockedOn`; detail with state, actions, the graph as inline
@@ -1419,7 +1419,7 @@ built. C1 is the large one and is built and tested first.
 
 ## Reference examples
 
-**(a) `examples/Incremental.TradeEnrichment`, moved onto shared tables.** In process, no
+**(a) `examples/Dbsp.TradeEnrichment`, moved onto shared tables.** In process, no
 docker, no service packages. Instruments, traders, desks and counterparties become
 `SharedTable`s; `trader-desks` is a derived table written by a small circuit (`ToTable`);
 the trade circuit uses `Join` for the columns that must be corrected retroactively and
@@ -1430,7 +1430,7 @@ the lookup. `--ticks` and `--blotter` keep working for CI. This is shared-tables
 step 7 example. It depends on nothing in the service and is built **first**, with S0: it
 is the cheapest check that the core's table seams (C4, index reads) are right.
 
-**(b) `examples/Incremental.EnrichmentService`.** Five projects:
+**(b) `examples/Dbsp.EnrichmentService`.** Five projects:
 
 - `Contracts` — a contract assembly: `Instrument`, `Counterparty`, `TraderDesk`, their
   `TableDefinition`s (instruments with an `IndexDefinition` on ISIN), a static `Tables`.
@@ -1443,7 +1443,7 @@ is the cheapest check that the core's table seams (C4, index reads) are right.
   row) and one that is not (the grouping key of `desk-exposure`), so the replace act
   shows `keep` succeeding and `state-choice-required` then `reset`.
 - `Pipelines.Tests` — tests of the definitions with `PipelineTestHarness`.
-- the host — `Microsoft.NET.Sdk.Web`, `AddIncrementalService`, the admin UI on
+- the host — `Microsoft.NET.Sdk.Web`, `AddDbspService`, the admin UI on
   `http://localhost:5180`, a data generator, and **two adapters written the way the
   owner's will be**: `GeneratedRefDataSource : ITableSource` in two forms — one stamps
   positions and resumes from `Table.CommittedOffsets`, one has no positions and calls
@@ -1508,8 +1508,8 @@ Each stage mutation-checks its own list: break the behaviour, see a test fail, r
   when the standby takes over; health for an empty leader, a degraded one, a standby.
   The test harness, used by these tests.
 - **S2, Kafka.** The S1 node tests against the broker; catalog and blob restore by a cold
-  node; and two real processes of a test host (`tests/Incremental.Service.FailoverApp`, in
-  the manner of `tests/Incremental.Kafka.FailoverApp`) with a Kafka source, a table
+  node; and two real processes of a test host (`tests/Dbsp.Service.FailoverApp`, in
+  the manner of `tests/Dbsp.Kafka.FailoverApp`) with a Kafka source, a table
   loader, 20 tables, two pipelines and Kafka sinks: kill -9 the leader, the standby leads
   within a bound, sinks equal the model, counts prove nothing was skipped; a pipeline
   deployed just before the kill exists on the survivor; step down hands over without the
@@ -1527,7 +1527,7 @@ Each stage mutation-checks its own list: break the behaviour, see a test fail, r
 ## Build order
 
 0. **S0 — core seams, the spike, example (a).** C1 to C7 with their tests in
-   `tests/Incremental.Tests`; the unload spike, whose result fixes whether pipeline
+   `tests/Dbsp.Tests`; the unload spike, whose result fixes whether pipeline
    contexts are collectible; example (a). Hands on: the core API the service is written
    against, and a decision on *Open for James* 1 before the standby half of the
    supervisor exists.
@@ -1776,8 +1776,8 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
 10. *Moot (built, S6).* **An incompatible `keep` rolls back and reports.** *Alternative:* leave the pipeline
     stopped in `NeedsReset` — simpler, and a tenant's mistaken deploy takes their
     pipeline down until someone chooses. (Built in S6.)
-11. *Built in round five (B1, S9).* **Plugin authors reference `Incremental.Service`** (compile time only).
-    *Alternative:* a third package, `Incremental.Service.Abstractions`, holding the
+11. *Built in round five (B1, S9).* **Plugin authors reference `Dbsp.Service`** (compile time only).
+    *Alternative:* a third package, `Dbsp.Service.Abstractions`, holding the
     definition interfaces, `PipelineBuilder`'s surface, `TableDefinition` and the test
     harness's surface, so plugin projects do not see Kafka or hosting types. The
     alternative is what is built: plugins compile against the core and the abstractions
@@ -1817,10 +1817,10 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     *Alternative:* a reserved slot name under `sinks`. One list fewer in the spec; a
     definition could then never name a slot `deadLetters`, and every place that walks a
     definition's sinks would have to step over one that is not the definition's.
-20. *Built in round five (B1, S9): the harness is the package `Incremental.Service.Testing`.*
-    **`PipelineTestHarness` ships inside `Incremental.Service`**, namespace
-    `Incremental.Service.Testing` (S6). *Alternative:* a package
-    `Incremental.Service.Testing`. It would keep about 350 lines of test-only surface
+20. *Built in round five (B1, S9): the harness is the package `Dbsp.Service.Testing`.*
+    **`PipelineTestHarness` ships inside `Dbsp.Service`**, namespace
+    `Dbsp.Service.Testing` (S6). *Alternative:* a package
+    `Dbsp.Service.Testing`. It would keep about 350 lines of test-only surface
     out of the service's assembly, at the cost of one more package to version and of
     `InternalsVisibleTo` for it; the harness references no test framework, so the
     service gains no dependency by carrying it.
@@ -1897,8 +1897,8 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
 33. *Decided 2026-11-14 (D7): checked on AWS later, if at all.* **A refused group lookup is passed over, and no permission on a group is asked
     for** (S6). The broker's authorizer logs each refusal, about one a second per
     consumer. *Alternative:* require `Describe` on the three group names
-    (`{prefix}.reader`, `{prefix}.svc.blobs.{node}`, `incremental.source`): a quiet
-    log, one more permission to get wrong, and `incremental.source` is not under the
+    (`{prefix}.reader`, `{prefix}.svc.blobs.{node}`, `dbsp.source`): a quiet
+    log, one more permission to get wrong, and `dbsp.source` is not under the
     deployment's prefix.
 34. *Moot for the broker tests (a CI job started by hand, 74); the SASL run is still not in CI.* **The broker-stopping tests and the SASL run are not in CI.** They need three
     brokers whose containers the test may kill, take about ten minutes, and have run
@@ -2027,7 +2027,7 @@ is still not in CI), 37 (the idle commit is what happens, S7), 39 (superseded by
     client fewer to recover, and a sink write that commits with its checkpoint; a sink
     on another cluster cannot use it, and a large step's sink records then ride in the
     writer's transaction.
-50. *Decided 2026-11-15 (D13): production is EKS; the guide has the recipe.* **`NodeSupervisor` is in `Incremental.Service` and the example uses it by default
+50. *Decided 2026-11-15 (D13): production is EKS; the guide has the recipe.* **`NodeSupervisor` is in `Dbsp.Service` and the example uses it by default
     on Kafka** (S7). *Alternative:* document the contract only and leave restarting to
     the platform, as before; then the example, the rig and the tests each need
     something that restarts a node, which is how round two came to run without one.
@@ -2374,7 +2374,7 @@ Each build step records here what it built and where it departs from the text ab
 
 When S1 started, nothing of S0 was in the tree: no core change, no spike, no example. S1
 is written against the core, so the seams it could not do without were built first, in
-the core, with their tests (`tests/Incremental.Tests/ChangelogReleaseTests.cs`, 5 tests).
+the core, with their tests (`tests/Dbsp.Tests/ChangelogReleaseTests.cs`, 5 tests).
 The rest of S0 is still to do.
 
 | | Built | As |
@@ -2433,8 +2433,8 @@ designed as.
 
 ### S1 — the service core on the in-memory backend
 
-`src/Incremental.Service` (net8.0; net10.0; packed in CI), `tests/Incremental.Service.Tests`
-(34 tests, in memory) and `tests/Incremental.Service.TestPlugins` (five small projects:
+`src/Dbsp.Service` (net8.0; net10.0; packed in CI), `tests/Dbsp.Service.Tests`
+(34 tests, in memory) and `tests/Dbsp.Service.TestPlugins` (five small projects:
 two contract assemblies, two builds of one pipeline plugin under one assembly name, and a
 second pipeline plugin; built, never referenced, loaded from their output directories).
 
@@ -2533,10 +2533,10 @@ second pipeline plugin; built, never referenced, loaded from their output direct
   being refused for this reason). Specs are now compared in a canonical form: no
   insignificant whitespace, members in name order.
 - *`Tables` as the name of a contract's static class* collides with the namespace
-  `Incremental.Tables` for code inside an `Incremental.*` namespace (the tests alias it).
+  `Dbsp.Tables` for code inside an `Dbsp.*` namespace (the tests alias it).
   Plugin authors in their own namespaces are not affected.
 
-**Tests** (`dotnet test --project tests/Incremental.Service.Tests`, 34, about 4 s). The
+**Tests** (`dotnet test --project tests/Dbsp.Service.Tests`, 34, about 4 s). The
 five the step was asked for by name: twelve pipelines sharing a 200,000-row table (results
 against a model, the delivered strings reference-equal to the table's rows, and heap
 growth under half of one copy of the table); a pipeline deployed, replaced by reset,
@@ -2600,8 +2600,8 @@ files from it, and leads when the leader is killed, resigns or is taken over.
 |---|---|
 | `KafkaBackend.cs` | `KafkaServiceBackendOptions`, `KafkaServiceBackend`, the leadership over `KafkaLeadership`, the blob topic (`KafkaBlobStore`) |
 | `KafkaConnectors.cs` | `KafkaConnection`, `KafkaConnections`, the `kafka` connector, the `kafka` and `debezium` table loaders |
-| `tests/Incremental.Service.FailoverApp` | one node as a real process: `AddIncrementalService`, `UseKafkaBackend`, a contract compiled in, a plugin directory; commands on stdin, events on stdout |
-| `tests/Incremental.Service.Tests` | `KafkaServiceTests` (8), `KafkaServiceCdcTests` (1), `KafkaServiceProcessTests` (2) — all skipped without a broker — and `LeaderWatchTests` (2, in memory) |
+| `tests/Dbsp.Service.FailoverApp` | one node as a real process: `AddDbspService`, `UseKafkaBackend`, a contract compiled in, a plugin directory; commands on stdin, events on stdout |
+| `tests/Dbsp.Service.Tests` | `KafkaServiceTests` (8), `KafkaServiceCdcTests` (1), `KafkaServiceProcessTests` (2) — all skipped without a broker — and `LeaderWatchTests` (2, in memory) |
 
 **As designed.** The catalog is `svc.catalog` on the log's transactional producer, so a
 deposed leader's catalog write is refused by the broker; tables are `KafkaTableLog`s,
@@ -2619,7 +2619,7 @@ standby). K1 and K2 are built as specified.
    it first in `StartAsync`. `INodeLeadership.PeerExpected` — whether a second node was
    configured at all (Kafka: `PeerProbe` is set; in memory: the cluster has another node).
    `KafkaLeadershipDetail` gained `Fault` (why the node is fenced, as text).
-2. **Two more changes to `Incremental.Kafka`, both found by measuring.** They are in the
+2. **Two more changes to `Dbsp.Kafka`, both found by measuring.** They are in the
    log's shared short-read consumer (a table's head, the last term), which a node uses
    once or twice per table, one read at a time:
    - *It no longer waits out its own long poll.* A short read stops at the end of a
@@ -2808,7 +2808,7 @@ markers in the two sink topics, and the mutation is killed.
 
 ### S3 — the admin API and UI
 
-`src/Incremental.Service.Admin` (net8.0; net10.0; `FrameworkReference`
+`src/Dbsp.Service.Admin` (net8.0; net10.0; `FrameworkReference`
 Microsoft.AspNetCore.App and nothing else; packed in CI): the JSON API under
 `{prefix}/api`, the health endpoints, and the UI — six hand-written files embedded in the
 assembly (`wwwroot/index.html`, `app.css`, `app.js`, `actions.js`, `views.js`, `shell.js`),
@@ -2817,11 +2817,11 @@ no build step, no request to anywhere but the API beside them.
 | File | Holds |
 |---|---|
 | `ServiceAdminOptions.cs` | the switches |
-| `AdminExtensions.cs` | `AddIncrementalAdmin`, `MapIncrementalAdmin`, `MapIncrementalHealth`, the health check, the embedded files and their headers |
+| `AdminExtensions.cs` | `AddDbspAdmin`, `MapDbspAdmin`, `MapDbspHealth`, the health check, the embedded files and their headers |
 | `AdminSecurity.cs` | the loopback rule, the mutation rule, the one error shape, the filter every endpoint runs under |
 | `AdminApi.cs` | the endpoints and what they return |
 | `AdminEvents.cs` | the server-sent event hub |
-| `tests/Incremental.Service.AdminHost` | one or two nodes in a process on the in-memory backend with the UI mounted: three tables, eight pipelines (one that fails, one that dead-letters, one stopped, one of sixty operators), a generator. The API's tests run against it; `dotnet run --project tests/Incremental.Service.AdminHost` is how to look at the UI |
+| `tests/Dbsp.Service.AdminHost` | one or two nodes in a process on the in-memory backend with the UI mounted: three tables, eight pipelines (one that fails, one that dead-letters, one stopped, one of sixty operators), a generator. The API's tests run against it; `dotnet run --project tests/Dbsp.Service.AdminHost` is how to look at the UI |
 
 **What S3 added outside its package** (each the smallest change found; the first two are
 the rest of C3 and C4):
@@ -2830,11 +2830,11 @@ the rest of C3 and C4):
 |---|---|---|
 | C3, the graph half | `CircuitBuilder` | `Describe()`: `CircuitGraph` — every node (id, kind, state name, inputs, exchange, name, error policy), every output (stream, acknowledged, table) and every loop — read from the builder, before or after `Build()`, claiming nothing. The store names `Build()` would mint, and so the pre-stop state check, are still not built |
 | C4 | `TableSnapshot` | `RowsBy<TIndexKey>(index, key)` |
-| | `Incremental.Service` | `ServiceMetrics` (`ServiceNode.Metrics`), as designed in *Where the numbers come from* but for the service's own meter; `ITableRegistry.ReadRows`, `StatsAsync`, `Spec`; `TableStats.IndexKeyTypes`; `IPipelineSupervisor.DescribeAsync` (a dry run with its graph), `Graph(id)`, `RedactedSpec(id)`, `DeadLettersBefore`; `PipelineStatus.History` (the last 32 transitions on this node); `IPluginCatalog.RescanAsync` and `Manifest`; `ServiceNode.Options` |
+| | `Dbsp.Service` | `ServiceMetrics` (`ServiceNode.Metrics`), as designed in *Where the numbers come from* but for the service's own meter; `ITableRegistry.ReadRows`, `StatsAsync`, `Spec`; `TableStats.IndexKeyTypes`; `IPipelineSupervisor.DescribeAsync` (a dry run with its graph), `Graph(id)`, `RedactedSpec(id)`, `DeadLettersBefore`; `PipelineStatus.History` (the last 32 transitions on this node); `IPluginCatalog.RescanAsync` and `Manifest`; `ServiceNode.Options` |
 
 **Departures from the text above.**
 
-1. **Names.** `AddIncrementalAdmin`, `MapIncrementalAdmin`, `MapIncrementalHealth` (the
+1. **Names.** `AddDbspAdmin`, `MapDbspAdmin`, `MapDbspHealth` (the
    step was asked for under these names), not `…ServiceAdmin` / `…ServiceHealth`.
 2. **Every list is paged**, not only bounded: `skip` and `limit` on tables, pipelines and
    plugins (`{ total, skip, limit, next, items }`), `before`/`after` and `limit` on the
@@ -2860,7 +2860,7 @@ the rest of C3 and C4):
    operators from the meter, only from the ring.
 6. **`ServiceMetrics` counts a circuit only on the node that runs it.** Two nodes in one
    process hear each other's measurements; the listener asks the supervisor whether this
-   node runs, or is starting, that pipeline. Its `Incremental.Service` meter for
+   node runs, or is starting, that pipeline. Its `Dbsp.Service` meter for
    collectors is not built; nor are queue-depth and watermark-lag gauges in the rings, or
    the log writer's counters (`KafkaServiceBackend.Log` has them).
 7. **`AdvertisedAdminUrl` is not filled from the server's addresses.** A first leader
@@ -2879,8 +2879,8 @@ the rest of C3 and C4):
     and were exercised only as far as the in-memory backend produces them, which is not
     at all. That pass is still owed.
 
-**Tests** (`tests/Incremental.Service.Tests`: `AdminApiTests`, 18, and `SeamTests`, 5, in
-memory; `tests/Incremental.Tests/DescribeTests`, 3). The API tests run a real Kestrel on a
+**Tests** (`tests/Dbsp.Service.Tests`: `AdminApiTests`, 18, and `SeamTests`, 5, in
+memory; `tests/Dbsp.Tests/DescribeTests`, 3). The API tests run a real Kestrel on a
 free loopback port, because the loopback rule reads the connection's address: bounds and
 paging of every list and of row reads; the error shape of every kind of refusal; the
 loopback rule (forwarded headers, host names, `AllowedHosts`) and health outside it; an
@@ -2943,10 +2943,10 @@ topology reachable and selectable by keyboard. Screenshots are in `docs/images/a
 
 **What S4 must know.**
 
-- Mount with `services.AddIncrementalAdmin(o => …)` and `app.MapIncrementalAdmin("/admin")`,
-  `app.MapIncrementalHealth("/health")`. The example should set `ExposeRowData`,
+- Mount with `services.AddDbspAdmin(o => …)` and `app.MapDbspAdmin("/admin")`,
+  `app.MapDbspHealth("/health")`. The example should set `ExposeRowData`,
   `AllowPluginUpload` and `AdvertisedAdminUrl`, and for `--nodes 2` give each node its own
-  port and `ExitOnLeadershipLoss = false` (`tests/Incremental.Service.AdminHost/DemoHost.cs`
+  port and `ExitOnLeadershipLoss = false` (`tests/Dbsp.Service.AdminHost/DemoHost.cs`
   does all of this and is small enough to copy from).
 - A `memory` log keeps every record: a generator that runs for hours should upsert over a
   bounded key space into keyed inputs, as the admin host's does.
@@ -2955,11 +2955,11 @@ topology reachable and selectable by keyboard. Screenshots are in `docs/images/a
 
 ### S4 — the examples and the guide
 
-Built: `examples/Incremental.TradeEnrichment` on shared tables,
-`examples/Incremental.EnrichmentService` (a host, a contract assembly, a plugin in two
+Built: `examples/Dbsp.TradeEnrichment` on shared tables,
+`examples/Dbsp.EnrichmentService` (a host, a contract assembly, a plugin in two
 versions), [`docs/enrichment-service.md`](../enrichment-service.md), and
-`DocSnippetTests`. No change to the core, to `Incremental.Kafka`, to `Incremental.Service`
-or to `Incremental.Service.Admin`: the examples found nothing in them that had to move.
+`DocSnippetTests`. No change to the core, to `Dbsp.Kafka`, to `Dbsp.Service`
+or to `Dbsp.Service.Admin`: the examples found nothing in them that had to move.
 
 **Departures from *Reference examples*.**
 
@@ -2974,7 +2974,7 @@ or to `Incremental.Service.Admin`: the examples found nothing in them that had t
   end to end.
 - *The host project is in the example's root directory*, with the contract and plugin
   projects beneath it (`DefaultItemExcludes` keeps their files out of it), so that
-  `dotnet run --project examples/Incremental.EnrichmentService` works. The plugin is
+  `dotnet run --project examples/Dbsp.EnrichmentService` works. The plugin is
   copied to `plugins/enrichment.pipelines/` beside the host — one package directory,
   not `plugins/v1/` — and version 2 is a zip in `plugin-packages/`, because a plugin
   directory holding both versions would import both at first lead.
@@ -3033,7 +3033,7 @@ total 444 ms); in the Kafka smoke, 3.1 s from the kill to ready. A graceful stop
 leader (SIGTERM) to the other node Leader: 0.9 s. The whole Kafka smoke, including
 preparing Postgres, the connector and the topics and removing them: 18 s.
 
-**Tests.** `DocSnippetTests` (five cases) in `tests/Incremental.Service.Tests`, which is
+**Tests.** `DocSnippetTests` (five cases) in `tests/Dbsp.Service.Tests`, which is
 now 75 tests. The smokes are the examples' own: TradeEnrichment checks 12 claims; the
 service example 30 on one node, 38 with an in-memory takeover, 37 on Kafka with a kill.
 Each was run to exit 0 — the in-memory forms twenty times over without a failure, the
@@ -3216,12 +3216,12 @@ the departures from the design above are marked as such.
 
 - Core: `TableSnapshot.RowsBy(index, key, skip, take, out total)` — a page of an index
   read. The existing overload materialises every row under the key.
-- `Incremental.Kafka`: `KafkaLeadership.StepDownCoreAsync` closes the writer and ends
+- `Dbsp.Kafka`: `KafkaLeadership.StepDownCoreAsync` closes the writer and ends
   `Fenced` when the resignation cannot be committed for a reason other than fencing. It
   had left the role `Leader` with the writer heartbeating for a node whose circuits
   were stopped. **Not tested:** it needs a resignation transaction aborted past the
   retry limit, which nothing here can provoke; the existing step-down tests pass.
-- `Incremental.Kafka`: `KafkaConnectClient.ResetOffsetsAsync` (stop the connector,
+- `Dbsp.Kafka`: `KafkaConnectClient.ResetOffsetsAsync` (stop the connector,
   delete its offsets). The example's `--clean` calls it: Connect keeps a deleted
   connector's offsets, and the next connector of that name took no snapshot.
 - Example: the MSK snippet sets the token refresh on the admin client too; the `View`
@@ -3232,7 +3232,7 @@ and `AdminApiTests`, one in `DebeziumCdcTests` (a connector removed with its off
 created again under its name snapshots again — it times out without the reset), one in
 the core's `DescribeTests`. The races are run in rounds (a dry run against a first
 deploy 200 times, an action against a removal 60, a table removal against a deploy 150).
-`Incremental.Service.Tests` is 104 tests.
+`Dbsp.Service.Tests` is 104 tests.
 
 **Mutation checks.** 34, all killed: the 33 listed in the scratch scripts (each
 re-check under the queue; the retry as a plain start, on a leader and at takeover; a
@@ -3313,7 +3313,7 @@ layout marker and no `confirmed` generation to keep followers in step):
    `state-incompatible` saying the change was rolled back and what state the pipeline is
    in; the event ring gets `rolled back to the spec of generation N: …` (the fact before
    the colon, so it survives `ExposeRowData` off); `PipelineStatus.RolledBack` holds the
-   record until the next deploy; `incremental.service.pipeline.rollbacks` counts it.
+   record until the next deploy; `dbsp.service.pipeline.rollbacks` counts it.
 5. A leader that dies after 2 leaves `Previous` in the catalog. Its successor starts the
    new spec, meets the same mismatch — it is a property of the state, not of the node —
    and rolls back itself. A leader that dies after 4's commit leaves the old spec. So a
@@ -3409,7 +3409,7 @@ a store holds is a generic argument of the store, tuples and anonymous types inc
 and no longer shown.
 
 **A meter for a monitoring system (G11).** `ServiceMeter`, the meter
-`Incremental.Service`: 22 instruments — the node's role, term, health, standby readiness
+`Dbsp.Service`: 22 instruments — the node's role, term, health, standby readiness
 and state lag; the catalog version; takeovers and a histogram of their duration by
 stage; pipelines by state, and per pipeline whether it is up, source lag, checkpoint age,
 sink-ack wait, dead letters, faults, restarts and roll-backs; tables by state, and per
@@ -3425,7 +3425,7 @@ only: a standby's pipelines are `Unbuilt`, and an alert on `up == 0` must not fi
 there. The memory connector's sources now report lag.
 
 The example exports both meters over OTLP with `--otlp` (snippet `monitoring`, quoted in
-the guide). Checked end to end against a local HTTP sink: all sixteen `incremental.service.*`
+the guide). Checked end to end against a local HTTP sink: all sixteen `dbsp.service.*`
 instruments that have a value on a lone in-memory leader arrived at `/v1/metrics`, with
 the core's ten.
 
@@ -3496,7 +3496,7 @@ the old spec running on the new leader; `NeedsReset` with no retries), `StateSha
 (3), `MeterTests` (3, with a `MeterListener`: every gauge on a leader and on a standby,
 the counters and the takeover histogram, the role moving at a takeover, and every tag
 key in the allowed set), `MemoryLogTests` (2), three in `AdminApiTests` and more in its
-standby test. `Incremental.Service.Tests` is 120 tests. The example's smoke test has two
+standby test. `Dbsp.Service.Tests` is 120 tests. The example's smoke test has two
 more claims (the evidence reads `unchanged`; the template deploys as offered).
 
 **Mutation checks.** 25, all killed (`scratchpad/r2/mutations.py`): the tombstone
@@ -3585,8 +3585,8 @@ were to drop to the ring and carry on (loses the one class of record with no oth
 trace, which is what the gap was) and to retry for ever (a pipeline that looks healthy
 and has stopped).
 
-**The harness (G6).** `Incremental.Service.Testing.PipelineTestHarness`, in the
-`Incremental.Service` assembly. It goes through `DefinitionBinding` and
+**The harness (G6).** `Dbsp.Service.Testing.PipelineTestHarness`, in the
+`Dbsp.Service` assembly. It goes through `DefinitionBinding` and
 `PipelineBuilder` — the supervisor's own path — with a manual-stepping circuit over an
 in-memory checkpoint store, so a step returns only when the sinks (the memory
 connector's) and the dead-letter reader have acknowledged. Tables are `SharedTable`s
@@ -3652,7 +3652,7 @@ solution and in CI.
 `FileRecord`, `ObjectStores`; `PipelineSpec.DeadLetters` and `.DeadLetterSlot`,
 `DeadLetterEnvelope`, `DeadLetterSinkStatus`, `PipelineStatus.DeadLetterSink`;
 `SourceStats.At`; `ServiceOptions.SinkDelivery`;
-`Incremental.Service.Testing.PipelineTestHarness` (and its `Builder`) and
+`Dbsp.Service.Testing.PipelineTestHarness` (and its `Builder`) and
 `HarnessTable<TKey, TRow>`. Admin API: `deadLetterSink` on a pipeline, `at` on a
 source, `deadLetters` in a spec. Example: `--poison`; the contract's `Quote`,
 `WatchlistEntry`, `WatchlistTable`.
@@ -3814,8 +3814,8 @@ place, records and batches stored, a write in flight, failed writes and the last
 
 **CI (G13).** `build-and-test` runs the two in-memory smokes and `TradeEnrichment`
 after the tests. A new job, `connector-stack`, starts `docker compose --profile
-connectors up -d --wait`, builds, runs `Incremental.Kafka.Tests` and
-`Incremental.Service.Tests` and fails if either reports a skipped test, runs the Kafka
+connectors up -d --wait`, builds, runs `Dbsp.Kafka.Tests` and
+`Dbsp.Service.Tests` and fails if either reports a skipped test, runs the Kafka
 smoke under a prefix of the run's id, prints the measured failover times and takes the
 stack down. **It has not run on GitHub.** What was checked here: the file's structure
 by a script (no YAML library or `actionlint` on this machine), `docker compose config`,
@@ -3900,7 +3900,7 @@ policy is unchanged and `The_UI_is_served_whole…` passes.
 
 #### Scale and a production-shaped Kafka: G1, G12
 
-**The rig (G1).** `benchmarks/Incremental.Service.Scale` (its README has the options):
+**The rig (G1).** `benchmarks/Dbsp.Service.Scale` (its README has the options):
 two real node processes on the Kafka backend, Release build, a table of wide rows (21
 columns, about 520 bytes of JSON, one index) shared by twenty pipelines from a plugin —
 two that join keyed orders to the table (two state entries per order), two that keep a
@@ -4088,17 +4088,17 @@ moments before the kill, and all of them when `WarmStandbyPipelines` is off.
 **Three brokers (G12).** `docker compose --profile kafka3` is three brokers in KRaft mode
 on ports 9192, 9292 and 9392, replication factor 3, `min.insync.replicas` 2, no volume,
 kept out of the default profiles. The test projects take the replication factor from
-`INCREMENTAL_KAFKA_REPLICATION` (the two failover apps read it too), and the CDC tests
+`DBSP_KAFKA_REPLICATION` (the two failover apps read it too), and the CDC tests
 skip when the broker under test is not the one Kafka Connect writes to. Against it:
 
 | | |
 |---|---|
-| `tests/Incremental.Kafka.Tests` | 108 passed, 4 skipped (three CDC; one that needs the log cleaner) |
-| `tests/Incremental.Service.Tests` | 166 tests with the four broker tests below: in the last full run 164 passed, 1 skipped (CDC) and 1 failed — the rolling-restart test, on a check of its own that named the leader before a takeover had finished. That check and the same one in the outage test were corrected, and the six process tests then passed |
+| `tests/Dbsp.Kafka.Tests` | 108 passed, 4 skipped (three CDC; one that needs the log cleaner) |
+| `tests/Dbsp.Service.Tests` | 166 tests with the four broker tests below: in the last full run 164 passed, 1 skipped (CDC) and 1 failed — the rolling-restart test, on a check of its own that named the leader before a takeover had finished. That check and the same one in the outage test were corrected, and the six process tests then passed |
 | the scale rig, 200,000 rows, replication 3 | the run passes: takeover after the decision 0.99 s (fence 0.67), first record in the last sink 4.6 s after `kill -9`, a takeover by hand 0.6 s of silence in a sink; the table loaded at 112,000 rows/s (three replicas, acks from two) |
 
 Four new tests in `KafkaServiceProcessTests` stop and start the broker containers
-(`INCREMENTAL_KAFKA_BROKERS` names them; skipped without it). Each runs two node
+(`DBSP_KAFKA_BROKERS` names them; skipped without it). Each runs two node
 processes, a Kafka-loaded table and a plugin pipeline between two topics, with trades
 produced throughout, and ends by comparing the sink topic with the model.
 
@@ -4241,8 +4241,8 @@ Amazon MSK*); the IAM column is a translation and has not been run.
 - Service: `ServiceOptions.WarmStandbyPipelines`; `PipelineStartTimings` and
   `PipelineStatus.LastStart`; `StandbyReadiness.PipelinesToBuild` and the not-warm
   reason `pipeline-building`. `PipelineState.Built` is now used.
-- Compose profiles `kafka3` and `kafka-sasl`; `INCREMENTAL_KAFKA_REPLICATION` and
-  `INCREMENTAL_KAFKA_BROKERS` for the tests; `benchmarks/Incremental.Service.Scale`.
+- Compose profiles `kafka3` and `kafka-sasl`; `DBSP_KAFKA_REPLICATION` and
+  `DBSP_KAFKA_BROKERS` for the tests; `benchmarks/Dbsp.Service.Scale`.
 
 **Tests.** Core, `ChangelogLayoutTests` (7): the format with and without a layout, read
 back as one state; an announcement that moves neither sequence nor offsets and is
@@ -4614,7 +4614,7 @@ new leader's own checkpoints carry the watermark on from where the old one's sto
 event-time pipelines: the others read it like any execution.
 
 **Performance** (the core's hot path changed: every evicting operator's tracker).
-The torture rig (`benchmarks/Incremental.Torture`, Release, `--workers 4 --seconds 20
+The torture rig (`benchmarks/Dbsp.Torture`, Release, `--workers 4 --seconds 20
 --warmup 8`, a 13th-gen i7-13700H; the showcase graph on the heap provider) was run
 before and after, interleaved, four times each:
 
@@ -4685,7 +4685,7 @@ fencing the successor; the successor then ended like any fenced node.
 
 **What was built.**
 
-- **`KafkaClientDefaults`** (`src/Incremental.Kafka`): the settings every Kafka client
+- **`KafkaClientDefaults`** (`src/Dbsp.Kafka`): the settings every Kafka client
   of the library and the service starts from — the log's producer, consumers and admin
   client, `KafkaSource`, the Kafka sinks, the blob store — applied before the caller's
   `ClientConfig`. Reconnect delay at most 1 s (was 10), socket timeout 6 s (was 60;
@@ -4706,7 +4706,7 @@ fencing the successor; the successor then ended like any fenced node.
   and does not take over from a leader that answers its probe while a partition of the
   log has no leader or too few replicas in sync (`TakeoversHeld`), nor for two takeover
   timeouts after the brokers last said so, which is the leader's time to be heard.
-- **`NodeSupervisor`** (`src/Incremental.Service`): the restart contract a node needs,
+- **`NodeSupervisor`** (`src/Dbsp.Service`): the restart contract a node needs,
   as a call at the top of `Main` — the program runs itself as a child and starts it
   again after every exit but 0 and 2. The example's Kafka mode uses it (off with
   `--no-supervise`), the scale rig's nodes run under it (`node --supervise`), and so do
@@ -4718,15 +4718,15 @@ fencing the successor; the successor then ended like any fenced node.
   a reader of the sink that times its longest silence and the longest a trade took from
   the input's acknowledgement to its row; the cluster asked broker by broker before the
   next fault; a killed broker left dead for fifteen seconds; one test that loses one
-  broker (killed, frozen or stopped — `INCREMENTAL_KAFKA_FAULT`) and asserts that the
+  broker (killed, frozen or stopped — `DBSP_KAFKA_FAULT`) and asserts that the
   leadership did not move; one that keeps a broker away for minutes and kills the
   leader half way. Each run writes a record to `broker-runs.jsonl`. On a cluster
   started a moment ago they first run a throwaway transaction, so that
   `__transaction_state` exists to be waited for (H4).
 
-**Public API added.** `Incremental.Kafka`: `KafkaClientDefaults` (`Settings`,
+**Public API added.** `Dbsp.Kafka`: `KafkaClientDefaults` (`Settings`,
 `Apply`); `KafkaLogNotAcquiredException`; `KafkaLog.WriterResets`;
-`KafkaLeadership.TakeoversAbandoned` and `TakeoversHeld`. `Incremental.Service`:
+`KafkaLeadership.TakeoversAbandoned` and `TakeoversHeld`. `Dbsp.Service`:
 `NodeSupervisor` (`RunAsync`, `IsSupervised`, `EnvironmentVariable`) and
 `NodeSupervisorOptions`; backend counters `writerResets`, `takeoversAbandoned`,
 `takeoversHeld` in `GET node`; error code `takeover-lost`. Internal seams for tests:
@@ -4881,9 +4881,9 @@ environment variables:
 
 | command | result |
 |---|---|
-| `dotnet test --project tests/Incremental.Service.Tests -- --filter-method "*broker*"`, first thing on the new cluster | 7 of 7 passed, none skipped, 7 min 15 s (the six broker tests and one whose name has the word) |
-| `dotnet test --project tests/Incremental.Kafka.Tests` | 126 total: 121 passed, 4 skipped (three need Kafka Connect, one needs the log cleaner to have run), **1 failed** — `A_row_too_large_for_one_record…` read a table's head in the instant after its commit returned and found the version before it. That is the flake round two saw once: a transaction's markers trail its commit, by longer on three brokers. The test now waits for the version to be readable. Two more full runs after that: 122 passed and 4 skipped; 123 passed and 3 skipped |
-| `dotnet test --project tests/Incremental.Service.Tests` | 194 total: 193 passed, 1 skipped (CDC), 0 failed, 10 min 33 s — the six broker tests among them, and `Dead_letters_go_to_a_topic…` under its new rule |
+| `dotnet test --project tests/Dbsp.Service.Tests -- --filter-method "*broker*"`, first thing on the new cluster | 7 of 7 passed, none skipped, 7 min 15 s (the six broker tests and one whose name has the word) |
+| `dotnet test --project tests/Dbsp.Kafka.Tests` | 126 total: 121 passed, 4 skipped (three need Kafka Connect, one needs the log cleaner to have run), **1 failed** — `A_row_too_large_for_one_record…` read a table's head in the instant after its commit returned and found the version before it. That is the flake round two saw once: a transaction's markers trail its commit, by longer on three brokers. The test now waits for the version to be readable. Two more full runs after that: 122 passed and 4 skipped; 123 passed and 3 skipped |
+| `dotnet test --project tests/Dbsp.Service.Tests` | 194 total: 193 passed, 1 skipped (CDC), 0 failed, 10 min 33 s — the six broker tests among them, and `Dead_letters_go_to_a_topic…` under its new rule |
 
 Before this step the first of these failed after three minutes at its own precondition
 (it waited for the replicas of `__transaction_state`, which a new cluster does not have
@@ -5088,7 +5088,7 @@ start and are retried, as before; only the files paths have a waiting state.
   selection (read from the new options before they are moved into the page), a
   checkbox's or radio's `checked`, and a field's `value` unless it has the focus. The
   deploy form can no longer show one definition and deploy another.
-- The morph test (`AdminUiMorphTests`, `tests/Incremental.Service.Tests/Ui/`) runs ten
+- The morph test (`AdminUiMorphTests`, `tests/Dbsp.Service.Tests/Ui/`) runs ten
   cases in a headless Chrome with the UI's own `app.js` and no package: it starts the
   browser with `--dump-dom` and reads the result the page writes. It is skipped where no
   Chrome or Chromium is found; GitHub's Ubuntu runner has one. Against the morph from
@@ -5264,7 +5264,7 @@ young collections in 30 s is the collector's own doing.
   (`KafkaLogOptions.FetchBufferKilobytes`) were run at 2 MB for most of this step and
   put back to 8: over five runs each a table of a million rows restored in 4.3–6.0 s
   at 2 MB and in 3.9–5.0 s at 8, and a node holds those queues only while it restores.
-- *`MemoryKeeper`* (`src/Incremental.Service/MemoryKeeper.cs`), run by every node every
+- *`MemoryKeeper`* (`src/Dbsp.Service/MemoryKeeper.cs`), run by every node every
   `ServiceOptions.ReleaseUnusedMemoryEvery` (30 s), one per process. It asks glibc for
   `mallinfo2` and, with 64 MB or more free, calls `malloc_trim(0)`; on another C
   library it finds no such function and does nothing, for good. And it ages the
@@ -5276,7 +5276,7 @@ young collections in 30 s is the collector's own doing.
   up to ten — and starts afresh when the excess is gone. The decision is a class of
   its own (`CollectorAgeing`) so that it is tested without a heap. It never asks for a
   full collection.
-- *The node's collector settings* in one file, `src/Incremental.Service/Node.Gc.props`
+- *The node's collector settings* in one file, `src/Dbsp.Service/Node.Gc.props`
   (server, concurrent, not adaptive, eight heaps; conserve-memory deliberately not
   set, item 58), imported by the
   scale rig and by the example (with four heaps; it had one).
@@ -5287,7 +5287,7 @@ young collections in 30 s is the collector's own doing.
   the step marker as recovered, under its own manifest. A follower that reads that
   commit drops its own copy, as it does for any checkpoint under its layout.
 - *What a node holds, said by the node.*
-  - `Incremental.Diagnostics.ObjectSize` (internal): what an object costs on the heap,
+  - `Dbsp.Diagnostics.ObjectSize` (internal): what an object costs on the heap,
     by reading its fields — headers, strings at two bytes a character, arrays, what
     the references lead to, each object once per walk; the empty string and a
     collection's comparer left out as shared, and a walk ended at 4,096 objects so
@@ -5312,7 +5312,7 @@ young collections in 30 s is the collector's own doing.
     (live at the last collection, fragmented, not the collector's, the pause share of
     the last minute, the collector's settings) and carried in the peer probe,
     `ServiceNode.MemoryRelease`.
-  - Meter: `incremental.service.table.memory` (tag `part`: rows, indexes, history),
+  - Meter: `dbsp.service.table.memory` (tag `part`: rows, indexes, history),
     `pipeline.state_entries`, `pipeline.state_memory`, `process.working_set`,
     `process.gc.live`, `process.gc.committed`, `process.other`,
     `process.gc.pause_ratio`.
@@ -5663,7 +5663,7 @@ into its 60 s timeout, twenty seconds after the brokers were back, was aborted, 
 was tried again — that time the abort was accepted.
 
 At 70 s the leadership moved in two runs of three, and in neither by the standby's
-choice. The logs of both (kept by `INCREMENTAL_NODE_LOGS`; not in the repository) read
+choice. The logs of both (kept by `DBSP_NODE_LOGS`; not in the repository) read
 the same way. Sixty seconds into the outage the leader's transaction times out in its
 client (`… message(s) timed out … requires epoch bump`). Its abort is then refused —
 `INVALID_TXN_STATE` in the stopped run, sixteen seconds after the brokers had been
@@ -5763,7 +5763,7 @@ they say so, and the two rows the review could not reproduce are replaced by the
 above. The engine design's account of the 70-second outage is rewritten from them.
 
 **Public API added.** Core: none (`EvictionTracker.Forget` and the store's bound are
-internal). `Incremental.Kafka`: `LeadershipStatus.TakeoverFailed`. `Incremental.Service`:
+internal). `Dbsp.Kafka`: `LeadershipStatus.TakeoverFailed`. `Dbsp.Service`:
 `NodeLeadershipStatus.TakeoverFailed`; `ConnectorDescription.Reads`. Behaviour that
 changed: a `files` input on a `files` sink's prefix, and a sink onto a prefix an input
 reads, are refused where they were accepted; a node whose own takeover failed exits 5
@@ -5778,7 +5778,7 @@ A following table's `LagVersions` is null while its log does not say where it en
 
 **Tests.**
 
-- Core (`tests/Incremental.Tests`): `DeadlineStoreTests` — a store that is written and
+- Core (`tests/Dbsp.Tests`): `DeadlineStoreTests` — a store that is written and
   never taken from keeps its queue to the size of its map (removals in and out of
   order, keys that only move); a warm standby's queues after 3,000 steps of opening
   and closing windows; the estimate counts the queue it has. `EventTimeRestartTests` —
@@ -5791,7 +5791,7 @@ A following table's `LagVersions` is null while its log does not say where it en
   within 2 % of its writer's figure, and holds every row under the row's own key, as a
   follower does; a selector that has changed since the rows were written leaves the
   log's keys.
-- Kafka (`tests/Incremental.Kafka.Tests`, one broker): a takeover that hears the
+- Kafka (`tests/Dbsp.Kafka.Tests`, one broker): a takeover that hears the
   leader once it has taken the log goes through, at `initialised` and at `term-read`;
   a takeover given up for a heard leader holds nothing back and one lost to a fence
   waits; a leader heard while the standby was asking the brokers is not taken over
@@ -5800,7 +5800,7 @@ A following table's `LagVersions` is null while its log does not say where it en
   brokers look like with two gone; a broker id nobody has is a second and a half of
   silence; what counts as a broker's answer when the question fails (an error the
   broker sent does, one the client made up and a wait that ran out do not).
-- Service (`tests/Incremental.Service.Tests`): an input onto what a `files` sink
+- Service (`tests/Dbsp.Service.Tests`): an input onto what a `files` sink
   writes is refused and so is a sink onto what an input reads (prefix above, own
   spec, dead-letter slot, suffix); the `changes` format through two pipelines with
   the objects handed on; `settle` with the store's clock six seconds and an hour
@@ -5879,8 +5879,8 @@ directories (`mutations.txt`, `core.py`, `svc.py` and the second session's
   two seconds on a slow machine would have left the next takeover a consumer that
   knows no topic. A read its caller calls off now keeps the consumer
   (`KafkaLog.ShortReadAsync`); a read that failed still does not.
-- **`A_takeover_with_one_broker_down…` takes `INCREMENTAL_KAFKA_FAULT` and
-  `INCREMENTAL_KAFKA_BROKER`** and records the broker's roles; its default is what it
+- **`A_takeover_with_one_broker_down…` takes `DBSP_KAFKA_FAULT` and
+  `DBSP_KAFKA_BROKER`** and records the broker's roles; its default is what it
   did before (broker 2 shut down 1.5 s before the kill).
 
 **Left undone.**
@@ -5947,14 +5947,14 @@ open window: two minutes of trades (the seeded `openSeconds`, 120), eight entrie
 2 × 4 × 50 × 120 = 48,000 — at about 310 bytes an entry, 14.9 MB. Twice the entries per
 trade of before, because every operator keeps a deadline beside each record; level
 from the second minute on, where before was 120,200 at ten minutes and gaining 12,000 a
-minute. `examples/Incremental.TradeEnrichment` is not a service and runs a fixed
+minute. `examples/Dbsp.TradeEnrichment` is not a service and runs a fixed
 narrative: its state is the live book (7,688 entries for 1,920 live trades at its
 end), bounded by the source's deletes — a cancellation, a settlement — which its new
 seventh act shows by settling the book and finding the state empty. It keeps its
 "every trade they ever did" semantics on purpose and says, at its top, that a feed of
 trades that are never deleted needs `EvictWhenFinal`.
 
-**The engine** (`src/Incremental`):
+**The engine** (`src/Dbsp`):
 
 - `GroupedEventTimeStream.EvictWhenFinal()` returns `FinalizingGroupedStream`, a staging
   type that offers only what honours it: the table `Join` and `LeftJoin` (primary key
@@ -5986,7 +5986,7 @@ ring of sixteen samples per pipeline fed once a second by the sampler with the e
 count it already reads for the gauges. Flagged when, across the period, no sample fell
 and at least twelve of fifteen rose; a fall clears it. `PipelineStatus.StateGrowingSince`,
 the event (`state growing: … without falling once …`, and `state no longer growing`),
-the gauge `incremental.service.pipeline.state_growing`, `stateGrowingSince` in the admin
+the gauge `dbsp.service.pipeline.state_growing`, `stateGrowingSince` in the admin
 API, a *growing* badge in the pipelines list, a notice on the pipeline's state card and
 an entry on the overview's attention list.
 
@@ -6222,7 +6222,7 @@ straight after the writer's first commit. With nothing else running here the end
 behind a commit that had returned in 33 of 400 tries, and never 0 after an acquisition
 (0 of 40); with the broker held to 0.3 of a processor, 98 of 400 and 5 of 40. The test
 now waits for the end to pass the term. The other reads of an end in
-`tests/Incremental.Kafka.Tests` were read through: each is behind a new writer's
+`tests/Dbsp.Kafka.Tests` were read through: each is behind a new writer's
 `InitTransactions`, which waits for the markers, or already waits.
 
 **A topic made a moment ago can be unknown.** Sixty topics created and asked about at
@@ -6357,7 +6357,7 @@ leader's heartbeat was late enough for the standby to take over — which is wha
 test is there to catch, and in a deployment the two nodes do not share processors.
 Not fixed: Open for James 75.
 
-**With the broker starved.** The whole of `tests/Incremental.Kafka.Tests` with the
+**With the broker starved.** The whole of `tests/Dbsp.Kafka.Tests` with the
 broker held to 0.3 of a processor, far below a runner: 131 of 134 passed in 6 min
 40 s, and the three that failed each read a clock — a leader stopped inside a
 transaction replaced in 2,408 ms against a bound of three takeover timeouts
@@ -6420,8 +6420,8 @@ suite in all, four of them red, each in the table above. Besides those: the
 broker-free classes on two other processors with three busy loops beside them, 15 of
 15 on f2e5ceb before that loop was stopped; `WarmStandbyTests` under the same load,
 28 of 34 before its fix and 34 of 34 after; the two-node in-memory smoke under it, 25
-of 25. On the final tree, once each: `tests/Incremental.Tests` 709 of 710 (one opt-in
-skip), `tests/Incremental.Kafka.Tests` 134 of 134, the example's `Pipelines.Tests` 17
+of 25. On the final tree, once each: `tests/Dbsp.Tests` 709 of 710 (one opt-in
+skip), `tests/Dbsp.Kafka.Tests` 134 of 134, the example's `Pipelines.Tests` 17
 of 17, the four smokes (55, 69 and 69 claims, and the narrative's 13). Records:
 `docs/design/runs/2026-11-14-j3-local.txt`.
 
@@ -6450,7 +6450,7 @@ of 17, the four smokes (55, 69 and 69 claims, and the narrative's 13). Records:
   is otherwise 20 to 220) was not traced further than the guide's account of it and
   was not worked around.
 - The core's Redis tests skip when Redis does not answer their first connection in
-  time, and two did in one run of `tests/Incremental.Tests` pinned to sixteen cores
+  time, and two did in one run of `tests/Dbsp.Tests` pinned to sixteen cores
   beside other work here (3 skipped instead of 1). The `build-and-test` job does not
   count skips; it was not looked into.
 - **Not explained.** Three of the Kafka tests' 354 two-table takeovers on the runners
@@ -6598,12 +6598,12 @@ Test host: `DemoOptions.SuperviseNodes`, `DemoNode : IAsyncDisposable`. UI: `gri
   watching, the resigned node could be started again in the moment before the program
   ends. It is disposed with the others; nothing was seen go wrong in the runs made.
 
-**Numbers.** On the final tree: build 0 warnings; `tests/Incremental.Tests` 710, 709
-passed, 1 skipped; `tests/Incremental.Kafka.Tests` 134/134; `tests/Incremental.Service.Tests`
+**Numbers.** On the final tree: build 0 warnings; `tests/Dbsp.Tests` 710, 709
+passed, 1 skipped; `tests/Dbsp.Kafka.Tests` 134/134; `tests/Dbsp.Service.Tests`
 253, 247 passed, 6 skipped (the kafka3 broker tests); `Pipelines.Tests` 17/17. Smokes:
 `--headless` 55 claims, `--headless --nodes 2` 70, `--headless --kafka` 69 (2.8 s from
 the kill to b leading), `TradeEnrichment` 13; all exit 0. `benchmarks -- --assert` was
-not run: `src/Incremental` was not touched.
+not run: `src/Dbsp` was not touched.
 
 **Left undone.**
 
@@ -6849,9 +6849,9 @@ record if that record was a takeover timeout old or more when it was read. The b
 `transactionTimeout`. Test seams (internal): `HeartbeatDating`,
 `KafkaLeadership.Heard(record, now)`, `KafkaLog.ShortReadLeadersFor`,
 `ShortReadLeadersAsked`. The failover app takes
-`INCREMENTAL_KAFKA_TRANSACTION_TIMEOUT_SECONDS`.
+`DBSP_KAFKA_TRANSACTION_TIMEOUT_SECONDS`.
 
-**Tests.** Kafka (`tests/Incremental.Kafka.Tests`, one broker, or none for the first):
+**Tests.** Kafka (`tests/Dbsp.Kafka.Tests`, one broker, or none for the first):
 `HeartbeatDatingTests` — a record that waited to be readable is dated when it was
 written; a date is never after the reading nor before the writing (2,000 records,
 prompt and late); what a starting watch reads is dated now; a new term and a clock
@@ -6893,12 +6893,12 @@ results were in the session's scratch directory (`mut.py`, `mut2.py`), not the
 repository.
 
 **Numbers.** On the final tree: `dotnet build --no-incremental` 0 warnings;
-`tests/Incremental.Tests` 710, 709 passed, 1 skipped; `tests/Incremental.Kafka.Tests`
-146/146 (134 before this step); `tests/Incremental.Service.Tests` 253, 247 passed, 6
+`tests/Dbsp.Tests` 710, 709 passed, 1 skipped; `tests/Dbsp.Kafka.Tests`
+146/146 (134 before this step); `tests/Dbsp.Service.Tests` 253, 247 passed, 6
 skipped — the broker tests, run on `kafka3` as above; `Pipelines.Tests` 17/17. Smokes:
 `--headless` 55 claims, `--headless --nodes 2` 70, `--headless --kafka` 69 (2.8 s from
 the kill to b leading), `TradeEnrichment` 13; all exit 0. `benchmarks -- --assert` was
-not run: `src/Incremental` was not touched. Two of the new tests were then made to
+not run: `src/Dbsp` was not touched. Two of the new tests were then made to
 tolerate a machine too slow for their clocks, and the Kafka project ran again: 146/146.
 
 **Deviations.**
@@ -7009,11 +7009,11 @@ late records: a live leader's shown 7.1 to 14.5 s late by a broker's loss and 83
 late after the outage, with the leadership where it was.
 
 *Numbers on the final tree.* `dotnet build --no-incremental` 0 warnings;
-`tests/Incremental.Tests` 710, 709 passed, 1 skipped; `tests/Incremental.Kafka.Tests` 147/147 (146 before:
-the new test); `tests/Incremental.Service.Tests` 253, 247 passed, 6 skipped — the six skipped are the
+`tests/Dbsp.Tests` 710, 709 passed, 1 skipped; `tests/Dbsp.Kafka.Tests` 147/147 (146 before:
+the new test); `tests/Dbsp.Service.Tests` 253, 247 passed, 6 skipped — the six skipped are the
 broker tests, run as above; `Pipelines.Tests` 17/17. Smokes: `--headless` 55 claims,
 `--headless --nodes 2` 70, `--headless --kafka` 69 (3.1 s from the kill to b leading),
-`TradeEnrichment` 13; all exit 0. `benchmarks -- --assert` was not run: `src/Incremental`
+`TradeEnrichment` 13; all exit 0. `benchmarks -- --assert` was not run: `src/Dbsp`
 is untouched.
 
 #### The fourth review's findings
@@ -7074,9 +7074,9 @@ That is what event time with a lateness means, and round four's `trade-enrichmen
 it on without saying it of first-time trades or of what moves the watermark. Now the
 drop is counted: `WatermarkOperator` counts the insertions it drops (per worker, summed
 by `WatermarkClock.LateRecords`; a retraction behind the watermark is not another late
-record), `Circuit.LateRecords` and the counter `incremental.circuit.late_records` carry
+record), `Circuit.LateRecords` and the counter `dbsp.circuit.late_records` carry
 it, and the service adds it up per pipeline: `PipelineStatus.LateRecords` and
-`Watermark`, the counter `incremental.service.pipeline.late_records`, an event when it
+`Watermark`, the counter `dbsp.service.pipeline.late_records`, an event when it
 starts and at most every ten minutes while it goes on, a notice on the pipeline's page,
 `PipelineTestHarness.LateRecords`. The definition's comment, its `openSeconds`
 description and the guide say that a trade is late by its time alone, that the
@@ -7113,7 +7113,7 @@ ridden the outage out. Two causes, both fixed (`KafkaLeadership.HeldByBrokersAsy
   The time now counts from the first answer that is not a hold.
 
 On the three-broker profile after both (the no-quorum test with
-`INCREMENTAL_KAFKA_FAULT=pause`, which the test now takes): two of three frozen for
+`DBSP_KAFKA_FAULT=pause`, which the test now takes): two of three frozen for
 45 s, five runs, and for 70 s, three runs — the leader kept term 1 in all eight, no
 process ended, the sink was silent 45.8 to 46.7 s and 71.1 to 72.0 s (the outage and
 about a second: frozen brokers have nothing to re-register), the standby held 2 to 9
@@ -7121,7 +7121,7 @@ times and answered its status in 20 ms to 2.0 s. Tests:
 `KafkaLeadershipTests.At_the_ceiling_a_standby_does_not_take_over_while_the_brokers_do_not_answer_and_waits_for_the_leader_when_they_do`
 (the answer arrives after a wait longer than the leader's grace), and the mapping in
 `What_the_brokers_say_about_writing…`. A debug line at each question
-(`INCREMENTAL_LOG_LEVEL=Debug`) says what was answered and how long ago the standby
+(`DBSP_LOG_LEVEL=Debug`) says what was answered and how long ago the standby
 was last held, which is how the second cause was read.
 
 **7. A takeover called off for a heard leader had already fenced that leader**
@@ -7291,10 +7291,10 @@ than its window):
 #### The fourth review's step: what it added, changed and left
 
 **Public API added.** Core: `Circuit.LateRecords` and the counter
-`incremental.circuit.late_records`. Service: `PipelineStatus.StateGrowth`
+`dbsp.circuit.late_records`. Service: `PipelineStatus.StateGrowth`
 (`PipelineStateGrowth`), `PipelineStatus.LateRecords` and `Watermark`,
 `PipelineTestHarness.LateRecords`, the counter
-`incremental.service.pipeline.late_records`. Admin JSON, on a pipeline: `stateGrowth`,
+`dbsp.service.pipeline.late_records`. Admin JSON, on a pipeline: `stateGrowth`,
 `lateRecords`, `watermark`, `build`. Kafka: `KafkaClientDefaults.Settings` has
 `enable.sparse.connections` (applied to admin clients only). Test seams, internal:
 `KafkaLog.InitTransactionsSlice`, `BeforeWritePathQuestion`, `Unasked`,
@@ -7333,8 +7333,8 @@ than its window):
   half still moved the leadership, and those records are kept.
 
 **Numbers on the final tree.** `dotnet build --no-incremental`: 0 warnings.
-`tests/Incremental.Tests` 717, 716 passed, 1 skipped (710 before the step: seven new);
-`tests/Incremental.Kafka.Tests` 150 of 150 (147: three new); `tests/Incremental.Service.Tests`
+`tests/Dbsp.Tests` 717, 716 passed, 1 skipped (710 before the step: seven new);
+`tests/Dbsp.Kafka.Tests` 150 of 150 (147: three new); `tests/Dbsp.Service.Tests`
 260, 254 passed, 6 skipped — the broker tests, run below (253: seven new);
 `Pipelines.Tests` 18 of 18 (17). Smokes: `--headless` 55 claims, `--headless --nodes 2`
 70, `--headless --kafka` 69 (2.8 s from the kill to b leading), `TradeEnrichment` 13;
@@ -7714,7 +7714,7 @@ builds.
   over again, goes on at level 2 although the older leader announced none, and the
   sinks equal the model. Four whole runs, all passed
   (`docs/design/runs/2026-11-16-b6-rolling-upgrade.measurements.log`). The test skips
-  without `INCREMENTAL_OLDER_BUILD`; CI's `connector-stack` builds the older node from
+  without `DBSP_OLDER_BUILD`; CI's `connector-stack` builds the older node from
   history and sets it.
 - *Two nodes of this build at different levels*, in one process on Kafka
   (`RollingUpgradeTests`, for 1 → 2 and for 2 → proving): the same upgrade with a
@@ -7897,23 +7897,23 @@ pipeline can pass it by a second's growth before it is stopped. The admin UI tes
 were not run (no Chrome here); `forms.js` gained one field.
 
 **Checks at the end of the step** (commit `2e9f326` plus docs): `dotnet build` 0
-warnings, 0 errors; `Incremental.Tests` 760 (759 passed, the soak skipped);
-`Incremental.Kafka.Tests` 158 (156, the two `*ABrokerLost*` skipped on one broker);
-`Incremental.Service.Tests` 269 (260 passed; skipped: the six broker tests, the two
-admin UI tests without Chrome, the two-build test without `INCREMENTAL_OLDER_BUILD` —
+warnings, 0 errors; `Dbsp.Tests` 760 (759 passed, the soak skipped);
+`Dbsp.Kafka.Tests` 158 (156, the two `*ABrokerLost*` skipped on one broker);
+`Dbsp.Service.Tests` 269 (260 passed; skipped: the six broker tests, the two
+admin UI tests without Chrome, the two-build test without `DBSP_OLDER_BUILD` —
 nothing persisted changed); `Pipelines.Tests` 21 of 21; smokes in memory 54 claims,
 two nodes 69, Kafka 69; trade enrichment 13; `benchmarks -- --assert` all 10 hold.
 
 #### Packages for plugin authors and a record format seam (B1, B4)
 
-**B1, what a plugin compiles against.** Two new packages. `Incremental.Service.Abstractions`
+**B1, what a plugin compiles against.** Two new packages. `Dbsp.Service.Abstractions`
 references the core and nothing else, and holds the definition interfaces and
 `PipelineAttribute`, `PipelineBuilder`, `TableDefinition`/`ITableDefinition`/
 `IndexDefinition`/`TableBuilder`, the two marker attributes, `ServiceException` and
 `StateLimitExceededException` (the harness throws both), the slot and shape records
 (`PipelineShape` and its parts), and B4's `IRecordFormat`. The namespace stays
-`Incremental.Service`, so no plugin source changed: only project files.
-`Incremental.Service.Testing` holds `PipelineTestHarness`; it references the service,
+`Dbsp.Service`, so no plugin source changed: only project files.
+`Dbsp.Service.Testing` holds `PipelineTestHarness`; it references the service,
 because it runs the service's own binding code, but what it hands a test is the core's,
 the abstractions' and its own.
 
@@ -7925,12 +7925,12 @@ two service-typed hooks became one visitor (`ITableDefinitionInternal.Accept`), 
 the registry uses to open a handle and to ask a loader for a source.
 
 The example's three plugin projects, the six test plugins and the scale rig's two
-reference `Incremental` and the abstractions only (`Plugin.props`, the test plugins'
-`Directory.Build.props`); `Pipelines.Tests` references `Incremental.Service.Testing`
+reference `Dbsp` and the abstractions only (`Plugin.props`, the test plugins'
+`Directory.Build.props`); `Pipelines.Tests` references `Dbsp.Service.Testing`
 and the plugin's own projects. `PluginBoundaryTests` (16) is the check: every type a
 public or protected member of the two packages names comes from the core, the two
 packages, the logging abstractions or the framework; everything the abstractions load,
-all the way down, is none of `Incremental.Service`, `.Admin`, `.Kafka`, `.Hosting`,
+all the way down, is none of `Dbsp.Service`, `.Admin`, `.Kafka`, `.Hosting`,
 `Confluent.Kafka`, `Microsoft.Extensions.Hosting*`, ASP.NET; each plugin assembly's
 metadata references (and `Enrichment.Pipelines.Tests.dll`'s) are none of those; and the
 project files say so. Made to fail by a public property of type `KafkaRecord` in the
@@ -7938,15 +7938,15 @@ abstractions (`runs/2026-11-16-b1-b4-checks.txt`, case 1).
 
 *The boundary.* `HostAssemblies.AlwaysShared` no longer lists `Confluent.Kafka`: no
 plugin-facing type names it, so a plugin that ships a newer Kafka client of its own for a
-client of its own gets its copy, by the version rule. `Incremental*` stays always the
+client of its own gets its copy, by the version rule. `Dbsp*` stays always the
 host's — a plugin that loaded its own copy of the service would hold a second service's
 types and statics — and the unload test passes alone as before.
 
 *Plugins built before.* A stored plugin version compiled against the old
-`Incremental.Service` names `IPipelineDefinition` and the rest in that assembly. The
+`Dbsp.Service` names `IPipelineDefinition` and the rest in that assembly. The
 service now carries a `TypeForwardedTo` for each moved type (`TypeForwards.cs`), so such
 a plugin loads and runs unchanged. Shown by a new `PluginTests` test that imports the
-build-before-levels' own `Acme.Pipelines` (`INCREMENTAL_OLDER_BUILD`), runs it and sees
+build-before-levels' own `Acme.Pipelines` (`DBSP_OLDER_BUILD`), runs it and sees
 it unload, and that fails without the forwards (case 2); and by the two-build test,
 which now runs that older plugin on both builds — the realistic case, since a
 deployment's plugins predate its upgrade. CI builds the older plugin in its worktree.
@@ -7995,22 +7995,22 @@ is not (case 3). The third checks the names `AddRecordFormat` refuses.
   documentation and the guide say what a format may keep; the unload test proves the
   service's half with a format that obeys.
 - *The harness's old home.* A test project compiled against the harness inside
-  `Incremental.Service` must be rebuilt against `Incremental.Service.Testing` (no source
+  `Dbsp.Service` must be rebuilt against `Dbsp.Service.Testing` (no source
   change): the service cannot forward to a package that depends on it.
 - *Admin UI.* Not touched; the two UI tests were skipped (no Chrome), as before.
 
 **Checks at the end of the step** (commit of this part): `dotnet build` 0 warnings,
-0 errors; `Incremental.Service.Tests` 289 (281 passed; skipped: the six broker tests on
+0 errors; `Dbsp.Service.Tests` 289 (281 passed; skipped: the six broker tests on
 one broker, the two admin UI tests without Chrome — the two-build test ran, with the
-older build's plugin); `Incremental.Kafka.Tests` 158 (156, the two `*ABrokerLost*`
+older build's plugin); `Dbsp.Kafka.Tests` 158 (156, the two `*ABrokerLost*`
 skipped on one broker); `Pipelines.Tests` 21 of 21; smokes in memory 54 claims, two nodes
-69, Kafka 69. `Incremental.Tests` and `benchmarks -- --assert` were not run: nothing in
-`src/Incremental` changed. The three packages pack (`dotnet pack`, CI's packaging step
+69, Kafka 69. `Dbsp.Tests` and `benchmarks -- --assert` were not run: nothing in
+`src/Dbsp` changed. The three packages pack (`dotnet pack`, CI's packaging step
 now packs the two new ones).
 
 #### An S3 object store for the files connector (B5)
 
-**What was built.** `src/Incremental.Service.S3`, an optional package: `S3ObjectStore`
+**What was built.** `src/Dbsp.Service.S3`, an optional package: `S3ObjectStore`
 (an `IObjectStore` over a bucket and a key prefix that is the store's root) and
 `AddS3ObjectStore(name, S3ObjectStoreOptions)` on the service builder. It references the
 service and `AWSSDK.S3` (4.0.104.4); the service references neither, so the AWS SDK
@@ -8095,12 +8095,12 @@ all 44 S3 tests skip.
 
 **Checks at the end of the step** (`runs/2026-11-16-b5-s3-checks.txt`): `dotnet build`
 0 warnings, 0 errors (Debug and Release); the files connector's tests 92 of 92 (46 on
-each store); CI's `connector-stack` job emulated here — `Incremental.Service.Tests` 336
+each store); CI's `connector-stack` job emulated here — `Dbsp.Service.Tests` 336
 (328 passed; skipped the six broker tests on one broker and the two admin UI tests
-without Chrome; the two-build test ran against 9de8da9), `Incremental.Kafka.Tests` 158
+without Chrome; the two-build test ran against 9de8da9), `Dbsp.Kafka.Tests` 158
 (156, the two `*ABrokerLost*` skipped), the Kafka smoke 69 claims; smokes in memory 54
-and two nodes 69; `Pipelines.Tests` 21 of 21; the package packs. `Incremental.Tests` and
-`benchmarks -- --assert` were not run: nothing in `src/Incremental` changed.
+and two nodes 69; `Pipelines.Tests` 21 of 21; the package packs. `Dbsp.Tests` and
+`benchmarks -- --assert` were not run: nothing in `src/Dbsp` changed.
 
 #### The small items and the round's documentation (K5, K7, K8, K9)
 
@@ -8215,9 +8215,9 @@ the runs are in `runs/2026-11-16-k-small-items.txt`.
 | Check | Result |
 |---|---|
 | `dotnet build` | 0 warnings, 0 errors |
-| `tests/Incremental.Tests` | 761 total, 760 passed, 1 skipped (the opt-in soak) |
-| `tests/Incremental.Kafka.Tests` | 165 total, 163 passed, 2 skipped (the two `*ABrokerLost*`, which need `kafka3`) |
-| `tests/Incremental.Service.Tests` | 337 total, 8 skipped (the six broker tests; the two admin UI tests, no Chrome here); the two-build test ran against 9de8da9. **Not a whole passing run:** the suite run of this step had one failure, an `InProcessSupervisorTests` assertion added in the step that was wrong; it was removed (5eb5ca0) and only that class run again, 1 of 1, twice. This row first read "329 passed", which with 8 skipped leaves no room for the failure the run record reports (C2 below). The suite was run whole after the review's fixes: 329 passed, none failed |
+| `tests/Dbsp.Tests` | 761 total, 760 passed, 1 skipped (the opt-in soak) |
+| `tests/Dbsp.Kafka.Tests` | 165 total, 163 passed, 2 skipped (the two `*ABrokerLost*`, which need `kafka3`) |
+| `tests/Dbsp.Service.Tests` | 337 total, 8 skipped (the six broker tests; the two admin UI tests, no Chrome here); the two-build test ran against 9de8da9. **Not a whole passing run:** the suite run of this step had one failure, an `InProcessSupervisorTests` assertion added in the step that was wrong; it was removed (5eb5ca0) and only that class run again, 1 of 1, twice. This row first read "329 passed", which with 8 skipped leaves no room for the failure the run record reports (C2 below). The suite was run whole after the review's fixes: 329 passed, none failed |
 | `examples/…/Pipelines.Tests` | 21 of 21 |
 | Example smokes | in memory 54 claims, two nodes 69, Kafka with a `kill -9` 69, trade enrichment 13: all hold |
 | `benchmarks -- --assert` | all 10 performance contracts hold |
@@ -8332,7 +8332,7 @@ suite was run whole on the code after these fixes: 337 total, 329 passed, none f
 Kafka tests and for the service tests. Measured whole on the connector stack: 4 min
 58 s and 4 min 40 s. CLAUDE.md says about five minutes for each.
 
-**Not explained.** In the first whole run of `tests/Incremental.Tests` after the fixes,
+**Not explained.** In the first whole run of `tests/Dbsp.Tests` after the fixes,
 `TableJoinTests.Completing_every_input_ends_an_auto_stepping_circuit_though_its_table_never_completes`
 timed out (its consumer waited 20 s for the output to end). It passed alone three
 times of three and in every whole run after (the count is in the run record). Nothing
@@ -8344,9 +8344,9 @@ recorded here as seen, not as fixed.
 | Check | Result |
 |---|---|
 | `dotnet build` | 0 warnings, 0 errors |
-| `tests/Incremental.Tests` | 765 total, 764 passed, 1 skipped (the opt-in soak); one earlier run had the failure under *Not explained* |
-| `tests/Incremental.Kafka.Tests` | 166 total, 164 passed, 2 skipped (the two `*ABrokerLost*`, which need `kafka3`); 4 min 58 s |
-| `tests/Incremental.Service.Tests` | 337 total, 329 passed, none failed, 8 skipped (the six broker tests; the two admin UI tests, no Chrome here), in one run; the two-build test ran against 9de8da9; 4 min 40 s |
+| `tests/Dbsp.Tests` | 765 total, 764 passed, 1 skipped (the opt-in soak); one earlier run had the failure under *Not explained* |
+| `tests/Dbsp.Kafka.Tests` | 166 total, 164 passed, 2 skipped (the two `*ABrokerLost*`, which need `kafka3`); 4 min 58 s |
+| `tests/Dbsp.Service.Tests` | 337 total, 329 passed, none failed, 8 skipped (the six broker tests; the two admin UI tests, no Chrome here), in one run; the two-build test ran against 9de8da9; 4 min 40 s |
 | `examples/…/Pipelines.Tests` | 21 of 21 |
 | Example smokes | in memory 54 claims, two nodes 69, Kafka with a `kill -9` 69, trade enrichment 13: all hold |
 | `benchmarks -- --assert` | all 10 performance contracts hold |

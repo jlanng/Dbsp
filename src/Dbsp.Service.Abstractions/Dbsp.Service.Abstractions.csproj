@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Dbsp.Service.Abstractions</PackageId>
+    <RootNamespace>Dbsp.Service</RootNamespace>
+    <Description>What a plugin of the Dbsp enrichment service compiles against: the pipeline definition interfaces, the builder a definition's Build is given, table definitions for contract assemblies, and the record format seam of the Kafka connectors. Nothing of hosting, Kafka or the service's runtime.</Description>
+  </PropertyGroup>
+
+  <!-- Only the core. A reference added here reaches every plugin: PluginBoundaryTests
+       fails when one of the service's hosting or Kafka assemblies does. -->
+  <ItemGroup>
+    <ProjectReference Include="..\Dbsp\Dbsp.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Dbsp.Service" />
+    <InternalsVisibleTo Include="Dbsp.Service.Testing" />
+    <InternalsVisibleTo Include="Dbsp.Service.Tests" />
+  </ItemGroup>
+
+</Project>

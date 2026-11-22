@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Dbsp.Service</PackageId>
+    <Description>The generic parts of an enrichment service on Dbsp: a table registry over shared tables, a supervisor that runs one circuit per pipeline and deploys, replaces and restarts them while the others run, pipeline definitions loaded from plugin assemblies at runtime, a catalog of what is deployed, and one node object that ties them to a leader/standby backend.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Dbsp\Dbsp.csproj" />
+    <ProjectReference Include="..\Dbsp.Hosting\Dbsp.Hosting.csproj" />
+    <ProjectReference Include="..\Dbsp.Kafka\Dbsp.Kafka.csproj" />
+    <ProjectReference Include="..\Dbsp.Service.Abstractions\Dbsp.Service.Abstractions.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Dbsp.Service.Tests" />
+    <InternalsVisibleTo Include="Dbsp.Service.Admin" />
+    <InternalsVisibleTo Include="Dbsp.Service.Testing" />
+  </ItemGroup>
+
+</Project>

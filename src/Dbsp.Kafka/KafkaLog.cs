@@ -1,0 +1,2399 @@
+using System.Collections.Concurrent;
+using System.Text.Json;
+using Confluent.Kafka;
+using Confluent.Kafka.Admin;
+using Dbsp.Storage;
+using Microsoft.Extensions.Logging;
+
+namespace Dbsp.Kafka;
+
+/// <summary>
+/// One process's connection to the Kafka topics that hold its durable state: the state
+/// changelog (<see cref="State"/>) and the logs of its shared tables
+/// (<see cref="OpenTableLogAsync"/>). See <c>docs/design/durability-and-standby.md</c>.
+/// <para>
+/// Everything is written through <b>one transactional producer</b>. Checkpoint commits and
+/// table versions hand their records to a single writer thread and wait; the thread puts
+/// whatever is waiting into one Kafka transaction (group commit), so each commit lands
+/// whole or not at all and many concurrent commits cost one transaction.
+/// </para>
+/// <para>
+/// A log starts as a reader: it can restore and follow, which is all a standby does.
+/// <see cref="AcquireWriterAsync"/> makes it the writer by initialising the shared
+/// <c>transactional.id</c>, which fences whichever process held it before — that process's
+/// next write fails with <see cref="KafkaLogFencedException"/> and it can never commit
+/// again. A log that is fenced while it is still becoming the writer has committed nothing
+/// and is not finished: it goes back to reading, with a new client, and may try again
+/// (<see cref="KafkaLogNotAcquiredException"/>). <see cref="ChangelogStorage.OpenAsync"/> and <see cref="ChangelogStorage.PromoteAsync"/>
+/// acquire the writer through <see cref="State"/>; a process that opens tables first calls
+/// <see cref="AcquireWriterAsync"/> itself.
+/// </para>
+/// </summary>
+public sealed class KafkaLog : IAsyncDisposable
+{
+    /// <summary>The first byte of every record value this package writes: JSON, UTF-8.
+    /// A later format (the dense codec) takes another value and can be introduced per
+    /// topic without rewriting history.</summary>
+    internal const byte JsonFormat = 1;
+
+    private static readonly byte[] TermKey = "term"u8.ToArray();
+    private static readonly byte[] HeartbeatKey = "heartbeat"u8.ToArray();
+
+    private readonly KafkaLogOptions _options;
+    private readonly IAdminClient _admin;
+    // Replaced when an acquisition of the writer is lost (ResetWriter): a client that has
+    // been fenced, or has begun initialising its transactional id, cannot be used again.
+    private IProducer<byte[], byte[]> _producer;
+    private int _producerGeneration;
+    private long _writerResets;
+    private bool _acquiring;
+    private readonly TopicPartition _leaderPartition;
+
+    // The writer thread's inbox. Unbounded as a collection, bounded by its users: every
+    // committer waits for its one commit, so the depth is at most the number of committers.
+    private readonly BlockingCollection<LogCommit> _queue = new(new ConcurrentQueue<LogCommit>());
+    private readonly CancellationTokenSource _stop = new();
+    private readonly object _gate = new();
+    private Thread? _writerThread;
+    private Task? _acquire;
+    private bool _initialised;
+    private bool _closed;
+    private int _readers;
+    private int _disposed;
+
+    private volatile bool _isWriter;
+    private volatile KafkaLogFencedException? _fenced;
+    private readonly TaskCompletionSource _whenFenced = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private long _term;
+
+    // The highest leader term this process has read from the leader topic, in any role.
+    private long _termSeen;
+
+    /// <summary>Tells the log of a leader term read from the leader topic: a floor under
+    /// the term a later takeover by this process may find.</summary>
+    internal void NoteTermSeen(long term)
+    {
+        long seen;
+        while ((seen = Interlocked.Read(ref _termSeen)) < term)
+            Interlocked.CompareExchange(ref _termSeen, term, seen);
+    }
+
+    // The highest format level a writer has announced in the leader topic, as far as this
+    // process has read it; 0 before any.
+    private int _formatSeen;
+
+    /// <summary>Tells the log of a format level a writer announced in the leader topic.</summary>
+    internal void NoteFormatSeen(int level)
+    {
+        int seen;
+        while ((seen = Volatile.Read(ref _formatSeen)) < level)
+            Interlocked.CompareExchange(ref _formatSeen, level, seen);
+    }
+
+    /// <summary>The persisted formats of this log's node (<see cref="KafkaLogOptions.Formats"/>).</summary>
+    public PersistedFormat Formats => _options.Formats;
+
+    /// <summary>The highest format level this process has read from the leader topic: what
+    /// the logs are written at. 0 when no writer has announced one — every writer so far
+    /// was built before levels and writes <see cref="FormatLevel.Base"/>.</summary>
+    public int FormatLevelSeen => Volatile.Read(ref _formatSeen);
+
+    // What this writer announces: Formats.Writes, or the level a raise is making durable.
+    private int _formatAnnounced;
+    private readonly SemaphoreSlim _raising = new(1, 1);
+
+    /// <summary>
+    /// Raises the level this writer writes (<see cref="PersistedFormat.Writes"/>) to
+    /// <paramref name="level"/>: commits a heartbeat that announces it, and only then
+    /// lets anything be written under it. So every reader of the logs is told of a level
+    /// before it meets a record of it, and a writer that is fenced before the
+    /// announcement is committed has written nothing of the level. Writer only; a level
+    /// at or below the current one does nothing. Never lowered.
+    /// </summary>
+    /// <exception cref="FormatLevelException">This node does not read the level.</exception>
+    public async Task RaiseFormatAsync(int level, CancellationToken cancellationToken = default)
+    {
+        Formats.RequireReads(level);
+        if (!IsWriter)
+            throw new InvalidOperationException("This Kafka log is not the writer, so it cannot raise the format level.");
+        await _raising.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (level <= Formats.Writes)
+                return;
+            Volatile.Write(ref _formatAnnounced, level);
+            var commit = new LogCommit();
+            commit.Add(_leaderPartition, HeartbeatKey, HeartbeatValue(resigned: false));
+            await EnqueueAsync(commit).ConfigureAwait(false);
+            NoteFormatSeen(level);
+            Formats.Raise(level);
+            _options.Logger?.LogInformation(
+                "Kafka log {Prefix}: format level raised to {Level}; everything written from here is of that level.",
+                _options.TopicPrefix, level);
+        }
+        finally
+        {
+            _raising.Release();
+        }
+    }
+
+    private int FormatAnnounced => Math.Max(Volatile.Read(ref _formatAnnounced), Formats.Writes);
+
+    private long _heartbeatSequence;
+    private long _idleHeartbeats;
+    private long _inTransactionHeartbeats;
+    private long _consumersCreated;
+    private long _readerRecordsTaken;
+    private long _lastTransactionTicks;
+    private long _transactions;
+    private long _aborted;
+    private long _commits;
+    private long _records;
+
+    private KafkaLog(KafkaLogOptions options)
+    {
+        _options = options;
+        _leaderPartition = new TopicPartition(options.TopicPrefix + ".leader", 0);
+
+        var adminConfig = KafkaClientDefaults.Apply(new AdminClientConfig { BootstrapServers = options.BootstrapServers });
+        Apply(adminConfig);
+        var adminBuilder = new AdminClientBuilder(adminConfig)
+            .SetLogHandler((_, message) => Log(message))
+            .SetErrorHandler((_, error) => LogError("admin", error));
+        options.ConfigureAdmin?.Invoke(adminBuilder);
+        _admin = adminBuilder.Build();
+
+        _producer = CreateProducer();
+
+        State = new KafkaStateChangelog(this);
+    }
+
+    private IProducer<byte[], byte[]> CreateProducer()
+    {
+        var options = _options;
+        var generation = Volatile.Read(ref _producerGeneration);
+        var producerConfig = KafkaClientDefaults.Apply(new ProducerConfig
+        {
+            BootstrapServers = options.BootstrapServers,
+            TransactionalId = options.EffectiveTransactionalId,
+            TransactionTimeoutMs = (int)options.TransactionTimeout.TotalMilliseconds,
+            CompressionType = options.Compression,
+            // A transaction is flushed by its commit, so lingering only delays the first
+            // batches of a large one; a little lets them fill.
+            LingerMs = 1,
+        });
+        Apply(producerConfig);
+        var producerBuilder = new ProducerBuilder<byte[], byte[]>(producerConfig)
+            .SetLogHandler((_, message) => Log(message))
+            .SetErrorHandler((_, error) =>
+            {
+                LogError("producer", error);
+                // A fence can arrive between transactions; say so at once instead of at the
+                // next commit. Not for a client this log has already replaced: its end is
+                // not this writer's — and which client is the log's is looked at under the
+                // lock that replaces it. This callback and the exception from the call that
+                // failed are raised by the same event on two threads; looked at out here,
+                // a client that was current a moment ago marked the log fenced after
+                // ResetWriter had put it back to reading.
+                if (error.IsFatal)
+                    MarkFenced(new KafkaException(error), ofGeneration: generation);
+            });
+        options.ConfigureProducer?.Invoke(producerBuilder);
+        return producerBuilder.Build();
+    }
+
+    /// <summary>
+    /// Connects to the cluster and makes sure <c>{prefix}.state</c> and
+    /// <c>{prefix}.leader</c> exist with the right shape, creating them if they do not. An
+    /// existing state topic whose partition count differs from
+    /// <see cref="KafkaLogOptions.StatePartitions"/>, or that is not compacted, is refused.
+    /// The log returned is a reader; nothing is fenced yet.
+    /// </summary>
+    public static async Task<KafkaLog> ConnectAsync(KafkaLogOptions options, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        options.Validate();
+        var log = new KafkaLog(options);
+        try
+        {
+            await log.EnsureTopicAsync(
+                log.State.Topic, options.StatePartitions, CompactedConfig(options, options.StateTopicConfig),
+                fixedPartitions: true, cancellationToken).ConfigureAwait(false);
+            // Two keys, rewritten every second: roll segments hourly so the cleaner keeps
+            // the topic at a few megabytes instead of a week of heartbeats.
+            await log.EnsureTopicAsync(
+                log._leaderPartition.Topic, 1,
+                CompactedConfig(options, new Dictionary<string, string> { ["segment.ms"] = "3600000" }),
+                fixedPartitions: true, cancellationToken).ConfigureAwait(false);
+            return log;
+        }
+        catch
+        {
+            await log.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    public KafkaLogOptions Options => _options;
+
+    /// <summary>The state changelog over <c>{prefix}.state</c>: pass it to
+    /// <see cref="ChangelogStorage.OpenAsync"/> (the active) or
+    /// <see cref="ChangelogStorage.Follow"/> (the standby).</summary>
+    public KafkaStateChangelog State { get; }
+
+    /// <summary>Whether this process holds the writer and has not lost it.</summary>
+    public bool IsWriter => _isWriter && _fenced is null;
+
+    /// <summary>The leader term this log writes under: one more than the last writer's.
+    /// 0 until <see cref="AcquireWriterAsync"/> has completed.</summary>
+    public long Term => Interlocked.Read(ref _term);
+
+    /// <summary>Whether the writer has been fenced or has failed fatally.</summary>
+    public bool IsFenced => _fenced is not null;
+
+    /// <summary>Why the writer is finished; null while it is not.</summary>
+    internal KafkaLogFencedException? FencedBy => _fenced;
+
+    /// <summary>The writer ended by <see cref="ResignAsync"/>, not by being fenced.</summary>
+    internal bool HasResigned { get; private set; }
+
+    /// <summary>Completes when the writer is fenced or fails fatally: the signal for the
+    /// process to stop being the active. Never faults.</summary>
+    public Task WhenFenced => _whenFenced.Task;
+
+    /// <summary>This process's name in the leader topic: <see cref="KafkaLogOptions.NodeId"/>.</summary>
+    public string NodeId => _options.EffectiveNodeId;
+
+    /// <summary>The leader topic, <c>{prefix}.leader</c>: one partition holding the term
+    /// (key <c>term</c>) and the writer's heartbeat (key <c>heartbeat</c>).</summary>
+    public string LeaderTopic => _leaderPartition.Topic;
+
+    internal TopicPartition LeaderPartition => _leaderPartition;
+
+    /// <summary>How long ago the last transaction this log committed was begun — a commit,
+    /// or the heartbeat an idle writer commits every
+    /// <see cref="KafkaLogOptions.HeartbeatInterval"/>. Null on a reader and once fenced. Local elapsed
+    /// time; it is what the delivery lease is measured from. On Linux it is read from a
+    /// clock that keeps counting while the machine is suspended (<c>CLOCK_BOOTTIME</c>), so a
+    /// leader that slept through its lease does not wake up still holding it.</summary>
+    public TimeSpan? SinceLastTransaction =>
+        IsWriter ? TimeSpan.FromMilliseconds(LeaseClock.Milliseconds - Interlocked.Read(ref _lastTransactionTicks)) : null;
+
+    /// <summary>Transactions that carried nothing but a heartbeat, committed because the
+    /// writer was idle. Not counted in <see cref="TransactionsCommitted"/>.</summary>
+    public long IdleHeartbeats => Interlocked.Read(ref _idleHeartbeats);
+
+    /// <summary>Heartbeats written inside a transaction that was still being produced or
+    /// flushed when another was due: what tells a standby that a long commit is a live
+    /// leader and not a dead one.</summary>
+    public long InTransactionHeartbeats => Interlocked.Read(ref _inTransactionHeartbeats);
+
+    /// <summary>Consumer clients this log has built. For tests.</summary>
+    internal long ConsumersCreated => Interlocked.Read(ref _consumersCreated);
+
+    /// <summary>Records the follower threads have taken from their clients, whether or not
+    /// anything has read them yet. For tests.</summary>
+    internal long ReaderRecordsTaken => Interlocked.Read(ref _readerRecordsTaken);
+
+    /// <summary>Kafka transactions committed by this log that carried at least one commit.</summary>
+    public long TransactionsCommitted => Interlocked.Read(ref _transactions);
+
+    /// <summary>Kafka transactions this log aborted (and retried or failed).</summary>
+    public long TransactionsAborted => Interlocked.Read(ref _aborted);
+
+    /// <summary>Commits completed: checkpoint commits and table versions. Under load this
+    /// exceeds <see cref="TransactionsCommitted"/>, and the ratio is the group commit.</summary>
+    public long CommitsCompleted => Interlocked.Read(ref _commits);
+
+    /// <summary>Records written by committed transactions.</summary>
+    public long RecordsWritten => Interlocked.Read(ref _records);
+
+    // ── tables ─────────────────────────────────────────────────────────────────────────
+
+    // Table name → the open of its log, running or done. Holding the task rather than the
+    // result is what makes two opens of one name share a single open (and a single epoch).
+    private readonly Dictionary<string, Task> _tables = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Opens the log of the shared table <paramref name="name"/>: the topics
+    /// <c>{prefix}.table.{name}.changes</c> (one partition, the version history) and
+    /// <c>{prefix}.table.{name}.rows</c> (compacted, the current rows), created if they do
+    /// not exist. Pass the result to <c>SharedTable.OpenAsync</c> (the active) or
+    /// <c>SharedTable.FollowAsync</c> (the standby). The same instance is returned for the
+    /// same name, and concurrent calls for one name share one open.
+    /// <para>
+    /// A table's identity (its epoch) is written by the writer the first time the table is
+    /// opened. On a reader this call therefore waits until the active has opened the table
+    /// at least once.
+    /// </para>
+    /// </summary>
+    public async Task<KafkaTableLog<TKey, TRow>> OpenTableLogAsync<TKey, TRow>(string name, CancellationToken cancellationToken = default)
+        where TKey : notnull
+        where TRow : class
+    {
+        ArgumentException.ThrowIfNullOrEmpty(name);
+        if (!IsTopicSafe(name))
+            throw new ArgumentException(
+                $"Table name '{name}' is not usable in a topic name: use letters, digits, '.', '_' and '-'.", nameof(name));
+        while (true)
+        {
+            Task<KafkaTableLog<TKey, TRow>> open;
+            var mine = false;
+            lock (_gate)
+            {
+                ObjectDisposedException.ThrowIf(_closed, this);
+                if (_tables.TryGetValue(name, out var existing))
+                {
+                    open = existing as Task<KafkaTableLog<TKey, TRow>>
+                        ?? throw new InvalidOperationException(
+                            $"Table log '{name}' is already open in this process with different key or row types.");
+                }
+                else
+                {
+                    open = Task.Run(() => KafkaTableLog<TKey, TRow>.OpenAsync(this, name, cancellationToken), CancellationToken.None);
+                    _tables[name] = open;
+                    mine = true;
+                }
+            }
+
+            try
+            {
+                return await open.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // A failed open is forgotten, so the next call tries again.
+                if (open.IsCompleted)
+                {
+                    lock (_gate)
+                    {
+                        if (_tables.TryGetValue(name, out var current) && ReferenceEquals(current, open))
+                            _tables.Remove(name);
+                    }
+                }
+
+                // Another caller's open, ended by that caller's cancellation: not this one's.
+                if (!mine && ex is OperationCanceledException && !cancellationToken.IsCancellationRequested)
+                    continue;
+                throw;
+            }
+        }
+    }
+
+    // ── becoming the writer ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Makes this process the one writer of every topic under the prefix. It initialises
+    /// the shared <c>transactional.id</c>: when that returns, the previous writer's open
+    /// transaction has been aborted or has finished committing, and nothing it does
+    /// afterwards can commit. Then it reads the last leader term and commits the next one.
+    /// Safe to call more than once; later calls return the first one's result. A failed or
+    /// cancelled call leaves the log a reader and can be repeated.
+    /// <para>
+    /// A call that is fenced before it completes — another process initialised the
+    /// transactional id while this one was still reading the term or committing its own —
+    /// fails with <see cref="KafkaLogNotAcquiredException"/>, and so does a cancelled one
+    /// that had begun: the log is a reader again, with a new client, because the old one
+    /// is finished or would go on initialising behind the caller's back and fence a writer
+    /// later. Only a log that has been the writer ends as
+    /// <see cref="KafkaLogFencedException"/>.
+    /// </para>
+    /// </summary>
+    public Task AcquireWriterAsync(CancellationToken cancellationToken = default) =>
+        AcquireWriterUnlessAsync(CancellationToken.None, cancellationToken);
+
+    /// <summary>
+    /// <see cref="AcquireWriterAsync"/> for a caller that may find the
+    /// acquisition is not needed after all (a standby that hears its leader):
+    /// <paramref name="whileFree"/> calls it off for as long as that costs nothing, which
+    /// is until the first request for the transactional id may have left this process.
+    /// The coordinator fences the previous writer on that request — at once if it has a
+    /// transaction open, which it aborts under a new epoch while this process is still
+    /// told to wait — so from the first call of <c>InitTransactions</c> an acquisition
+    /// that stopped would leave the log with no writer at all: the token is no longer
+    /// looked at, and the call goes on to commit its term.
+    /// <paramref name="cancellationToken"/> is the caller going away, and ends the call
+    /// at any point.
+    /// </summary>
+    internal Task AcquireWriterUnlessAsync(CancellationToken whileFree, CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_closed, this);
+            if (_fenced is { } fenced)
+                return Task.FromException(new KafkaLogFencedException(fenced.Message, fenced.InnerException));
+            if (_acquire is { IsCompleted: false } or { IsCompletedSuccessfully: true })
+                return _acquire;
+            return _acquire = Task.Run(() => AcquireAsync(cancellationToken, whileFree), CancellationToken.None);
+        }
+    }
+
+    /// <summary>Completes when no acquisition of the writer is running: at once if none
+    /// is. It starts none and never faults.</summary>
+    internal Task WhenAcquisitionSettlesAsync()
+    {
+        Task? acquire;
+        lock (_gate)
+            acquire = _acquire;
+        return acquire is null ? Task.CompletedTask : acquire.ContinueWith(static _ => { }, TaskScheduler.Default);
+    }
+
+    /// <summary>How many times an acquisition of the writer was lost and the log went back
+    /// to being a reader with a new client.</summary>
+    public long WriterResets => Interlocked.Read(ref _writerResets);
+
+    /// <summary>Called at points of an acquisition, with the point's name (<c>begin</c>:
+    /// nothing has been asked of the brokers yet; <c>slice</c>: a call of
+    /// <c>InitTransactions</c> has run out of its time with the request under way;
+    /// <c>initialised</c>: the transactional id is this process's; <c>term-read</c>: the
+    /// last term is known and this process's is about to be committed). For tests:
+    /// throwing here, or fencing the log from another, is an acquisition that is lost
+    /// where a real one can be.</summary>
+    internal Action<string>? WhileAcquiring { get; set; }
+
+    /// <summary>How long one call of <c>InitTransactions</c> is given before the
+    /// acquisition looks at its tokens again. For tests: a short one runs out while the
+    /// coordinator is still aborting the previous writer's transaction.</summary>
+    internal TimeSpan InitTransactionsSlice { get; set; } = TimeSpan.FromSeconds(1);
+
+    private async Task AcquireAsync(CancellationToken cancellationToken, CancellationToken whileFree)
+    {
+        ThrowIfFenced();
+        var began = false;
+        lock (_gate)
+            _acquiring = true;
+        try
+        {
+            await AcquireCoreAsync(() => began = true, cancellationToken, whileFree).ConfigureAwait(false);
+        }
+        catch (TransactionTimeoutRefusedException ex) when (Volatile.Read(ref _disposed) == 0)
+        {
+            // The brokers will not have this log's transaction timeout. The client calls
+            // that fatal and would answer every later call with it — as a fence, which it
+            // is not: nobody took anything. A new client, and the refusal by its name; the
+            // caller may try again and will be told the same until the setting or the
+            // brokers' limit has changed.
+            ResetWriter();
+            throw new KafkaLogException(ex.Message, ex.InnerException);
+        }
+        catch (Exception ex) when (!_isWriter && began && Volatile.Read(ref _disposed) == 0
+            && (ex is KafkaLogFencedException || (ex is OperationCanceledException && !_stop.IsCancellationRequested)))
+        {
+            // Nothing of this process's was committed, so nothing has to be given up: the
+            // log goes back to reading. The client does not: fenced, it is finished; and
+            // cancelled part-way, it would carry on initialising the transactional id by
+            // itself and fence whoever leads when it gets there.
+            ResetWriter();
+            _options.Logger?.LogWarning(ex, "Kafka log {Prefix}: the writer was not acquired; the log reads on with a new client.", _options.TopicPrefix);
+            throw new KafkaLogNotAcquiredException(
+                ex is KafkaLogFencedException
+                    ? $"The writer was not acquired: another process initialised transactional.id '{_options.EffectiveTransactionalId}' first ({ex.Message}). This log is a reader again."
+                    : "The writer was not acquired: the attempt was abandoned. This log is a reader again.",
+                ex);
+        }
+        finally
+        {
+            lock (_gate)
+                _acquiring = false;
+        }
+    }
+
+    /// <summary>The brokers answered <c>InitProducerId</c> with
+    /// <c>INVALID_TRANSACTION_TIMEOUT</c>; <see cref="AcquireAsync"/> turns it into a
+    /// plain <see cref="KafkaLogException"/> once the client has been replaced.</summary>
+    private sealed class TransactionTimeoutRefusedException(string message, Exception inner) : Exception(message, inner);
+
+    /// <summary>Back to a reader after a lost acquisition: a new client, nothing marked.</summary>
+    private void ResetWriter()
+    {
+        IProducer<byte[], byte[]> old;
+        lock (_gate)
+        {
+            old = _producer;
+            Interlocked.Increment(ref _producerGeneration);
+            _producer = CreateProducer();
+            _initialised = false;
+            _fenced = null;
+        }
+        Interlocked.Increment(ref _writerResets);
+
+        // Disposing a transactional client can wait on its brokers; nobody waits for it.
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                old.Dispose();
+            }
+            catch (Exception)
+            {
+            }
+        });
+    }
+
+    private async Task AcquireCoreAsync(Action begun, CancellationToken cancellationToken, CancellationToken whileFree)
+    {
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+
+        // Before anything that fences: a node that cannot read what the logs are written
+        // at must not take them from one that can.
+        // A process that follows the leader topic has heard the level; one that has heard
+        // nothing — no leadership watches for it, or every writer so far was built before
+        // levels — reads the topic's tail first. Only then: takeovers are timed, and a
+        // standby that has heard pays nothing here.
+        if (FormatLevelSeen == 0)
+            await ReadLastTermAsync(cancellationToken).ConfigureAwait(false);
+        Volatile.Write(ref _replaced, null);
+        Formats.RequireReads(FormatLevelSeen);
+        if (!_initialised)
+        {
+            begun();
+            WhileAcquiring?.Invoke("begin");
+            var asked = false;
+            while (true)
+            {
+                // The acquisition can be called off for nothing (whileFree) only before
+                // the first call below. That call sends InitProducerId, and the
+                // coordinator's answer to it, when the previous writer has a transaction
+                // open, is to raise the epoch and abort that transaction — the writer is
+                // fenced there and then — and to tell this client to ask again until the
+                // abort is done. So a call that has run out of its time has, as a rule,
+                // fenced the writer already: called off between two slices, the takeover
+                // left a fenced leader and a standby that had stood down (three times of
+                // three when a leader was heard in that second). Once asked, it goes
+                // through.
+                if (!asked)
+                    whileFree.ThrowIfCancellationRequested();
+                cancellationToken.ThrowIfCancellationRequested();
+                _stop.Token.ThrowIfCancellationRequested();
+                try
+                {
+                    // Resumable: a call that times out is retried and carries on where the
+                    // last one stopped. In slices, so that a caller going away stops soon.
+                    asked = true;
+                    _producer.InitTransactions(InitTransactionsSlice);
+                    break;
+                }
+                catch (KafkaRetriableException)
+                {
+                    WhileAcquiring?.Invoke("slice");
+                }
+                catch (KafkaException ex) when (ex.Error.Code == ErrorCode.InvalidTransactionTimeout)
+                {
+                    // Before the fence below: the client flags this one fatal too.
+                    throw new TransactionTimeoutRefusedException(
+                        $"The brokers refuse a transaction timeout of {_options.TransactionTimeout} for transactional.id " +
+                        $"'{_options.EffectiveTransactionalId}': it is above their transaction.max.timeout.ms. Lower " +
+                        "KafkaLogOptions.TransactionTimeout or raise the brokers' limit; until then this log cannot be the writer.", ex);
+                }
+                catch (KafkaException ex) when (IsFencing(ex))
+                {
+                    throw MarkFenced(ex);
+                }
+                catch (KafkaException ex)
+                {
+                    throw new KafkaLogException(
+                        $"Could not initialise transactional.id '{_options.EffectiveTransactionalId}': {ex.Error.Reason}", ex);
+                }
+            }
+            _initialised = true;
+        }
+        begun();
+        WhileAcquiring?.Invoke("initialised");
+
+        // Long past the point of no return for whileFree (the first InitTransactions
+        // call): the previous writer is fenced. Nothing below looks at that token — a
+        // call that stopped here because its caller had changed its mind would leave a
+        // fenced writer and no other.
+        //
+        // Every earlier writer's transactions are decided now, so the leader topic's last
+        // term is final.
+        var initialised = clock.Elapsed;
+
+        // Terms never fall. This process may have read a term from the leader topic
+        // already (a standby follows it); a read now that finds a lower one, or none in a
+        // topic that holds records, was answered from a partition whose end is not yet
+        // what it will be — its leader was elected a moment ago, with a broker down. Taken
+        // at its word, the new writer would announce a term that has been used.
+        var floor = Interlocked.Read(ref _termSeen);
+        var deadline = Environment.TickCount64 + (long)_options.OperationTimeout.TotalMilliseconds;
+        long last;
+        string? lastNode;
+        while (true)
+        {
+            (last, lastNode) = await ReadLastTermAndNodeAsync(cancellationToken).ConfigureAwait(false);
+            if (last >= floor && (last > 0
+                    || await UncommittedEndOffsetAsync(_leaderPartition, cancellationToken).ConfigureAwait(false)
+                    == await EndOffsetAsync(_leaderPartition, cancellationToken).ConfigureAwait(false)))
+                break;
+            if (Environment.TickCount64 > deadline)
+            {
+                var committed = await EndOffsetAsync(_leaderPartition, cancellationToken).ConfigureAwait(false);
+                var written = await UncommittedEndOffsetAsync(_leaderPartition, cancellationToken).ConfigureAwait(false);
+                var first = await StartOffsetAsync(_leaderPartition, cancellationToken).ConfigureAwait(false);
+                throw new KafkaLogException(
+                    $"The last leader term could not be read from '{_leaderPartition.Topic}': it gave {last}, and this process has read term {floor} " +
+                    $"(the topic starts at {first}, its committed end is {committed} and its end {written}). The topic's end is not settled; " +
+                    "the takeover can be tried again.");
+            }
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        }
+        var term = last + 1;
+        var termRead = clock.Elapsed;
+
+        // Who this writer replaces, carried in every record it writes to the leader topic:
+        // the one place a node that was replaced and has started again can learn that it
+        // led, and until when (KafkaLeadership.Status.Previous).
+        if (last > 0 && lastNode is not null && lastNode != NodeId)
+            Volatile.Write(ref _replaced, new ReplacedWriter(lastNode, last, TakeoverReason));
+
+        // The level the last writer wrote at is this one's to go on from: it is never
+        // lowered, and it is raised only by RaiseFormatAsync. A writer that announced none
+        // was built before levels and wrote the base level. Read with the term, so a
+        // writer that was not heard by this process is not missed; a level this node does
+        // not read ends the acquisition — after the fence, which is why it is checked
+        // before it too, from what was heard.
+        // What this node has itself read of a level in the logs counts too: a writer from
+        // before levels that led for a moment in between announced none.
+        Formats.Raise(Math.Max(FormatLevel.Base, Math.Max(FormatLevelSeen, Formats.Seen)));
+        Volatile.Write(ref _formatAnnounced, Formats.Writes);
+        WhileAcquiring?.Invoke("term-read");
+        cancellationToken.ThrowIfCancellationRequested();
+        ThrowIfFenced();
+
+        // The term is committed here and not by the writer thread, which does not exist
+        // until this process is the writer: an acquisition that is lost has then nothing
+        // to stop and nothing queued.
+        var commit = new LogCommit();
+        commit.Add(_leaderPartition, TermKey,
+            JsonSerializer.SerializeToUtf8Bytes(WithReplaced(new LeaderRecord(term, NodeId, DateTimeOffset.UtcNow, Format: FormatAnnounced))).Prefixed(JsonFormat));
+        Execute([commit]);
+        await commit.Completion.Task.ConfigureAwait(false);
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_closed, this);
+            if (_fenced is { } fenced)
+                throw new KafkaLogFencedException(fenced.Message, fenced.InnerException);
+            Interlocked.Exchange(ref _term, term);
+            _isWriter = true;
+            _writerThread = new Thread(WriterLoop) { IsBackground = true, Name = "dbsp-kafka-writer" };
+            _writerThread.Start();
+        }
+        _options.Logger?.LogInformation(
+            "Kafka log {Prefix}: writer acquired as term {Term}: transactional.id initialised in {InitMs} ms, last term read in {ReadMs} ms, term committed in {CommitMs} ms",
+            _options.TopicPrefix, term, (long)initialised.TotalMilliseconds, (long)(termRead - initialised).TotalMilliseconds,
+            (long)(clock.Elapsed - termRead).TotalMilliseconds);
+    }
+
+    /// <summary>A record of the leader topic. Under the key <c>term</c>: written once by
+    /// each new writer, in its first transaction. Under the key <c>heartbeat</c>: rewritten
+    /// in every transaction, and once per heartbeat interval by an idle writer. Terms never
+    /// fall along the topic, so the last record carries the current one.
+    /// <c>Resigned</c>: the writer stepped down after this record and will write no more.
+    /// <c>Format</c>: the format level the writer writes (<see cref="PersistedFormat"/>);
+    /// 0 from a writer built before levels, which writes <see cref="FormatLevel.Base"/>.
+    /// A build from before levels ignores the member.
+    /// <c>Replaced</c>, <c>ReplacedTerm</c> and <c>Reason</c>: the writer this one took the
+    /// log over from, the term it led, and why the takeover happened (<c>manual</c>,
+    /// <c>silence</c>, …); absent from a first writer, from a node that took over from
+    /// itself and from a build before them. Members a reader skips, like <c>Format</c>.</summary>
+    internal sealed record LeaderRecord(long Term, string? Node, DateTimeOffset At, long Sequence = 0, bool Resigned = false, int Format = 0)
+    {
+        public string? Replaced { get; init; }
+        public long ReplacedTerm { get; init; }
+        public string? Reason { get; init; }
+    }
+
+    /// <summary>The writer this log's writer replaced, as its term record says.</summary>
+    internal sealed record ReplacedWriter(string Node, long Term, string? Reason);
+
+    private ReplacedWriter? _replaced;
+
+    /// <summary>Why the acquisition under way was begun, set by the leadership before it
+    /// acquires (<c>manual</c>, <c>silence</c>, <c>ceiling</c>, <c>resigned</c>); written
+    /// with the replaced writer into the leader topic.</summary>
+    internal string? TakeoverReason { get; set; }
+
+    private LeaderRecord WithReplaced(LeaderRecord record) =>
+        Volatile.Read(ref _replaced) is { } replaced
+            ? record with { Replaced = replaced.Node, ReplacedTerm = replaced.Term, Reason = replaced.Reason }
+            : record;
+
+    /// <summary>Parses a leader-topic record; null for one this version does not know.</summary>
+    internal static (LeaderRecord Record, bool IsHeartbeat)? ParseLeaderRecord(ConsumeResult<byte[], byte[]> record)
+    {
+        if (record.Message.Value is not { Length: > 1 } value || value[0] != JsonFormat || record.Message.Key is not { } key)
+            return null;
+        var heartbeat = key.AsSpan().SequenceEqual(HeartbeatKey);
+        if (!heartbeat && !key.AsSpan().SequenceEqual(TermKey))
+            return null;
+        return JsonSerializer.Deserialize<LeaderRecord>(value.AsSpan(1)) is { } parsed ? (parsed, heartbeat) : null;
+    }
+
+    /// <summary>The last term in the leader topic, 0 when there is none. Terms never fall
+    /// and every heartbeat carries one, so the tail of the topic is enough; the window
+    /// widens only when the tail holds nothing readable (aborted transactions).</summary>
+    private async Task<long> ReadLastTermAsync(CancellationToken cancellationToken) =>
+        (await ReadLastTermAndNodeAsync(cancellationToken).ConfigureAwait(false)).Term;
+
+    /// <summary><see cref="ReadLastTermAsync"/>, with the node that wrote the last term's
+    /// records.</summary>
+    private async Task<(long Term, string? Node)> ReadLastTermAndNodeAsync(CancellationToken cancellationToken)
+    {
+        var end = await EndOffsetAsync(_leaderPartition, cancellationToken).ConfigureAwait(false);
+        if (end == 0)
+            return (0, null);
+        var start = await StartOffsetAsync(_leaderPartition, cancellationToken).ConfigureAwait(false);
+        return await ShortReadAsync(consumer =>
+        {
+            for (long window = 32; ; window *= 16)
+            {
+                var from = Math.Max(start, end - window);
+                var term = 0L;
+                string? node = null;
+                AssignForShortRead(consumer, new TopicPartitionOffset(_leaderPartition, from));
+                ReadTo(consumer, end, record =>
+                {
+                    if (ParseLeaderRecord(record) is { } parsed)
+                    {
+                        if (parsed.Record.Term >= term)
+                            (term, node) = (parsed.Record.Term, parsed.Record.Node);
+                        NoteFormatSeen(parsed.Record.Format);
+                    }
+                }, cancellationToken);
+                if (term > 0 || from == start)
+                    return (term, node);
+            }
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    // ── stepping down, being deposed ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// Gives the writer up for good: commits a last heartbeat marked as a resignation —
+    /// which tells a standby it may take over now rather than after a silence — and closes
+    /// the writer. Commit everything that should be durable first; afterwards every write
+    /// through this log fails with <see cref="KafkaLogFencedException"/>, and
+    /// <see cref="WhenFenced"/> completes. The process is expected to exit and return as a
+    /// standby.
+    /// </summary>
+    public async Task ResignAsync()
+    {
+        if (!IsWriter)
+            throw new InvalidOperationException("This Kafka log is not the writer, so it has nothing to resign.");
+        var commit = new LogCommit { Resigns = true };
+        commit.Add(_leaderPartition, HeartbeatKey, HeartbeatValue(resigned: true));
+        await EnqueueAsync(commit).ConfigureAwait(false);
+    }
+
+    /// <summary>Ends the writer because this process has learnt, from something other than
+    /// a failed write, that it is no longer the active (a higher term in the leader topic,
+    /// a takeover that could not be completed). Heartbeats stop at once.</summary>
+    internal void Depose(string reason) => MarkFenced(new KafkaLogFencedException(reason), reason);
+
+    private byte[] HeartbeatValue(bool resigned) => JsonSerializer.SerializeToUtf8Bytes(
+        WithReplaced(new LeaderRecord(Term, NodeId, DateTimeOffset.UtcNow, Interlocked.Increment(ref _heartbeatSequence), resigned, FormatAnnounced))).Prefixed(JsonFormat);
+
+    // ── the writer thread: group commit ────────────────────────────────────────────────
+
+    /// <summary>Hands one atomic set of records to the writer thread and completes when the
+    /// transaction carrying it has committed. It fails as
+    /// <see cref="KafkaLogFencedException"/> (the writer is finished) or as
+    /// <see cref="KafkaLogException"/> (aborted; nothing of it is readable; the writer
+    /// carries on) and in no other way.</summary>
+    internal Task CommitAsync(LogCommit commit) => EnqueueAsync(commit);
+
+    private Task EnqueueAsync(LogCommit commit)
+    {
+        lock (_gate)
+        {
+            if (_fenced is { } fenced)
+                return Task.FromException(new KafkaLogFencedException(fenced.Message, fenced.InnerException));
+            if (_closed)
+                return Task.FromException(new KafkaLogFencedException("The Kafka log has been disposed; nothing more can be written through it."));
+            if (!_isWriter)
+                return Task.FromException(new InvalidOperationException(
+                    "This Kafka log is not the writer: it is a reader (a standby). Call KafkaLog.AcquireWriterAsync, or promote " +
+                    "the ChangelogStorage over it, before writing."));
+            _queue.Add(commit);
+        }
+        return commit.Completion.Task;
+    }
+
+    private void WriterLoop()
+    {
+        var batch = new List<LogCommit>();
+        var token = _stop.Token;
+        try
+        {
+            while (true)
+            {
+                batch.Clear();
+                if (!_queue.TryTake(out var first, HeartbeatWait(), token))
+                {
+                    // Idle. A visible heartbeat means "the active can still commit", so it
+                    // is a transaction like any other — and it is how a writer fenced while
+                    // idle finds out.
+                    if (_isWriter && _fenced is null)
+                        IdleHeartbeat();
+                    continue;
+                }
+                batch.Add(first);
+                var records = batch[0].Records.Count;
+
+                // Group commit: everything that queued while the last transaction was in
+                // flight goes into this one.
+                if (_options.GroupCommitLinger > TimeSpan.Zero)
+                {
+                    var until = Environment.TickCount64 + (long)_options.GroupCommitLinger.TotalMilliseconds;
+                    while (records < _options.MaxTransactionRecords
+                        && Environment.TickCount64 is var now && now < until
+                        && _queue.TryTake(out var lingered, (int)(until - now), token))
+                    {
+                        batch.Add(lingered);
+                        records += lingered.Records.Count;
+                    }
+                }
+                while (records < _options.MaxTransactionRecords && _queue.TryTake(out var next))
+                {
+                    batch.Add(next);
+                    records += next.Records.Count;
+                }
+
+                try
+                {
+                    Execute(batch);
+                }
+                catch (KafkaLogFencedException ex)
+                {
+                    foreach (var commit in batch)
+                        commit.Completion.TrySetException(new KafkaLogFencedException(ex.Message, ex.InnerException));
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            MarkFenced(ex);
+        }
+        finally
+        {
+            var closed = new KafkaLogFencedException(
+                _fenced?.Message ?? "The Kafka log was disposed while this write was waiting; whether it committed is unknown.",
+                _fenced?.InnerException);
+            foreach (var commit in batch)
+                commit.Completion.TrySetException(closed);
+            lock (_gate)
+                _closed = true;
+            while (_queue.TryTake(out var orphan))
+                orphan.Completion.TrySetException(closed);
+        }
+    }
+
+    /// <summary>Called on the writer thread before each transaction. For tests: blocking
+    /// here is a writer that has stalled without being fenced.</summary>
+    internal Action? BeforeTransaction { get; set; }
+
+    private int HeartbeatWait()
+    {
+        var interval = (long)_options.HeartbeatInterval.TotalMilliseconds;
+        if (!_isWriter)
+            return (int)interval;
+        return (int)Math.Clamp(interval - (LeaseClock.Milliseconds - Interlocked.Read(ref _lastTransactionTicks)), 1, interval);
+    }
+
+    private void IdleHeartbeat()
+    {
+        try
+        {
+            if (TryRunTransaction([], out _, out var error))
+                Interlocked.Increment(ref _idleHeartbeats);
+            else
+                _options.Logger?.LogWarning(error, "Kafka heartbeat transaction aborted; the next one is due in {Interval}.", _options.HeartbeatInterval);
+        }
+        catch (KafkaLogFencedException)
+        {
+            // Marked; WhenFenced has completed.
+        }
+    }
+
+    /// <summary>Commits <paramref name="batch"/>, completing every commit in it. Throws
+    /// <see cref="KafkaLogFencedException"/> when the writer is finished, with the commits
+    /// not yet completed left for the caller to fail.</summary>
+    private void Execute(List<LogCommit> batch)
+    {
+        var attempt = 0;
+        while (batch.Count > 0)
+        {
+            _stop.Token.ThrowIfCancellationRequested();
+            if (_fenced is { } fenced)
+                throw fenced;
+
+            if (TryRunTransaction(batch, out var culprit, out var error))
+            {
+                Interlocked.Increment(ref _transactions);
+                var resigned = false;
+                foreach (var commit in batch)
+                    resigned |= commit.Resigns;
+                if (resigned)
+                {
+                    HasResigned = true;
+                    MarkFenced(
+                        new KafkaLogFencedException("stepped down"),
+                        "This process stepped down as the active (KafkaLog.ResignAsync); nothing more can be written through this log.");
+                }
+                foreach (var commit in batch)
+                {
+                    Interlocked.Add(ref _records, commit.Records.Count);
+                    Interlocked.Increment(ref _commits);
+                    commit.Completion.TrySetResult();
+                }
+                return;
+            }
+
+            Interlocked.Increment(ref _aborted);
+            if (culprit is not null)
+            {
+                // One commit's own record was refused by the client (too large, say). The
+                // transaction is aborted for everyone; only that commit fails, the rest go
+                // again.
+                culprit.Completion.TrySetException(Aborted(error!));
+                batch.Remove(culprit);
+                continue;
+            }
+
+            if (++attempt > _options.MaxAbortRetries)
+            {
+                if (batch.Count == 1)
+                {
+                    batch[0].Completion.TrySetException(Aborted(error!));
+                    return;
+                }
+
+                // The batch will not commit as a whole. Whatever is wrong may belong to one
+                // commit, so each gets its own transaction and its own verdict.
+                foreach (var commit in batch.ToArray())
+                    Execute([commit]);
+                return;
+            }
+            _options.Logger?.LogWarning(error, "Kafka transaction aborted (attempt {Attempt}); retrying.", attempt);
+            _stop.Token.WaitHandle.WaitOne(Math.Min(50 * attempt, 1000));
+        }
+    }
+
+    private static KafkaLogException Aborted(Exception error) => new(
+        "The Kafka transaction carrying this write was aborted, so nothing of it is readable: " +
+        ((error as KafkaException)?.Error.Reason ?? error.Message), error);
+
+    /// <summary>One Kafka transaction. True: committed. False: aborted cleanly, with the
+    /// reason in <paramref name="error"/> and, when the client refused one commit's own
+    /// record, that commit in <paramref name="culprit"/>. Throws when the writer is finished.</summary>
+    private bool TryRunTransaction(List<LogCommit> batch, out LogCommit? culprit, out Exception? error)
+    {
+        culprit = null;
+        error = null;
+        BeforeTransaction?.Invoke();
+        var began = LeaseClock.Milliseconds;
+        try
+        {
+            _producer.BeginTransaction();
+        }
+        catch (KafkaException ex)
+        {
+            // Fenced, fatal, or the producer is in a state this loop did not leave it in.
+            throw MarkFenced(ex);
+        }
+
+        var tracked = false;
+        LogCommit? producing = null;
+        try
+        {
+            // The heartbeat goes first, so that a resignation riding in this transaction
+            // is the record that stays. Before the first term is committed there is no
+            // term to announce, and the term record is the sign of life.
+            if (_isWriter)
+                Produce(_leaderPartition, new Message<byte[], byte[]> { Key = HeartbeatKey, Value = HeartbeatValue(resigned: false) }, null);
+
+            // A transaction's heartbeat is readable only once it commits, so a long one
+            // would read as silence. While this one is being produced and flushed, another
+            // heartbeat goes into it every half interval: unreadable until the commit, but
+            // each moves the leader topic's end, which is what a standby checks before it
+            // decides the leader is gone (KafkaLeadership.NoteProgressAsync). Not after a
+            // resignation, which must stay the last heartbeat in the transaction.
+            var beatEvery = Math.Max(1, (long)_options.HeartbeatInterval.TotalMilliseconds / 2);
+            var lastBeat = Environment.TickCount64;
+            var beats = _isWriter;
+            var produced = 0;
+            foreach (var commit in batch)
+            {
+                producing = commit;
+                tracked |= commit.TrackIndex >= 0;
+                beats &= !commit.Resigns;
+                for (var i = 0; i < commit.Records.Count; i++)
+                {
+                    Produce(commit, i);
+                    if ((++produced & 255) == 0)
+                    {
+                        WhileProducing?.Invoke();
+                        if (beats)
+                            BeatIfDue(beatEvery, ref lastBeat);
+                    }
+                }
+            }
+            producing = null;
+
+            // What CommitTransaction would flush anyway, flushed here in slices so that the
+            // heartbeats continue. What is left for the commit is one round trip.
+            var flushing = System.Diagnostics.Stopwatch.StartNew();
+            var said = 0L;
+            while (_fenced is null && _producer.Flush(TimeSpan.FromMilliseconds(Math.Min(beatEvery, 250))) > 0)
+            {
+                _stop.Token.ThrowIfCancellationRequested();
+                if (beats)
+                    BeatIfDue(beatEvery, ref lastBeat);
+                if (flushing.ElapsedMilliseconds / 5000 > said)
+                {
+                    said = flushing.ElapsedMilliseconds / 5000;
+                    _options.Logger?.LogWarning(
+                        "Kafka transaction has been waiting {Seconds} s for the brokers to take its records.", (long)flushing.Elapsed.TotalSeconds);
+                }
+            }
+        }
+        catch (KafkaException ex)
+        {
+            if (IsFencing(ex))
+                throw MarkFenced(ex);
+
+            // Only an error that is about the record itself names a culprit. Anything else
+            // — above all Local_State, which every Produce throws once an earlier record's
+            // delivery has failed and put the transaction in its abortable state — says
+            // nothing about the commit that happened to be producing: the batch goes
+            // again, and the retries single the real cause out.
+            culprit = IsRecordRefusal(ex) ? producing : null;
+            error = ex;
+            Abort(ex);
+            return false;
+        }
+
+        if (FailTransaction?.Invoke(batch) == true)
+        {
+            error = new KafkaException(new Error(ErrorCode.Local_Fail, "The transaction was aborted by the test's fault injection."));
+            Abort();
+            return false;
+        }
+
+        var committing = System.Diagnostics.Stopwatch.StartNew();
+        while (true)
+        {
+            try
+            {
+                _producer.CommitTransaction(TimeSpan.FromSeconds(5));
+                break;
+            }
+            catch (KafkaRetriableException ex)
+            {
+                // Resumable, and the outcome is still open: keep asking. If the broker
+                // gives up on the transaction first, the next answer is a fence or an abort.
+                _stop.Token.ThrowIfCancellationRequested();
+
+                // A commit that does not come back is a leader that looks dead to its
+                // standby: say what it is waiting for.
+                _options.Logger?.LogWarning(
+                    "Kafka transaction commit has not completed after {Seconds} s ({Code}: {Reason}); still asking.",
+                    (long)committing.Elapsed.TotalSeconds, ex.Error.Code, ex.Error.Reason);
+            }
+            catch (KafkaTxnRequiresAbortException ex)
+            {
+                error = ex;
+                Abort(ex);
+                return false;
+            }
+            catch (KafkaException ex)
+            {
+                if (IsFencing(ex))
+                    throw MarkFenced(ex);
+
+                // Neither retriable nor a clean "abort me". An abort that succeeds settles
+                // it as not committed; one that fails ends the writer (Abort throws).
+                error = ex;
+                Abort(ex);
+                return false;
+            }
+        }
+
+        // Delivery reports are served by the client's poll thread and may trail the commit;
+        // a tracked offset has to be there before the commit completes.
+        if (tracked)
+            _producer.Flush(TimeSpan.FromSeconds(10));
+
+        // Measured from before the transaction began: a standby cannot have seen this
+        // heartbeat earlier than that, so a lease counted from here ends before the
+        // standby's silence does.
+        Interlocked.Exchange(ref _lastTransactionTicks, began);
+        return true;
+    }
+
+    /// <summary>Called on the writer thread with a transaction's commits once its records
+    /// are with the brokers. For tests: returning true aborts the transaction, as a broker
+    /// that refuses it would — the writer stays usable and the commits go again or fail
+    /// as aborted.</summary>
+    internal Func<IReadOnlyList<LogCommit>, bool>? FailTransaction { get; set; }
+
+    /// <summary>Called on the writer thread after every 256 records of a transaction. For
+    /// tests: sleeping here is a commit that takes long to produce.</summary>
+    internal Action? WhileProducing { get; set; }
+
+    private void BeatIfDue(long every, ref long last)
+    {
+        var now = Environment.TickCount64;
+        if (now - last < every)
+            return;
+        last = now;
+        Produce(_leaderPartition, new Message<byte[], byte[]> { Key = HeartbeatKey, Value = HeartbeatValue(resigned: false) }, null);
+        Interlocked.Increment(ref _inTransactionHeartbeats);
+    }
+
+    /// <summary>Whether a <c>Produce</c> failed because of the record it was given, as
+    /// opposed to the state of the producer or of the transaction.</summary>
+    internal static bool IsRecordRefusal(KafkaException exception) =>
+        exception.Error.Code is ErrorCode.MsgSizeTooLarge
+            or ErrorCode.Local_UnknownPartition or ErrorCode.Local_UnknownTopic or ErrorCode.Local_InvalidArg;
+
+    private void Produce(LogCommit commit, int index)
+    {
+        var record = commit.Records[index];
+        var message = new Message<byte[], byte[]> { Key = record.Key!, Value = record.Value!, Headers = record.Headers };
+        Produce(record.Target, message, index == commit.TrackIndex ? commit.OnDelivered : null);
+    }
+
+    private void Produce(TopicPartition target, Message<byte[], byte[]> message, Action<DeliveryReport<byte[], byte[]>>? handler)
+    {
+        while (true)
+        {
+            try
+            {
+                _producer.Produce(target, message, handler);
+                return;
+            }
+            catch (ProduceException<byte[], byte[]> ex) when (ex.Error.Code == ErrorCode.Local_QueueFull)
+            {
+                // The client's send queue is full of this transaction: let it drain.
+                _stop.Token.ThrowIfCancellationRequested();
+                _producer.Poll(TimeSpan.FromMilliseconds(20));
+            }
+        }
+    }
+
+    /// <summary>Aborts the open transaction. <paramref name="because"/> is what made
+    /// the abort necessary: if the abort itself fails, that is the cause worth reading.</summary>
+    private void Abort(KafkaException? because = null)
+    {
+        while (true)
+        {
+            try
+            {
+                _producer.AbortTransaction(TimeSpan.FromSeconds(5));
+                return;
+            }
+            catch (KafkaRetriableException)
+            {
+                _stop.Token.ThrowIfCancellationRequested();
+            }
+            catch (KafkaException ex)
+            {
+                // The transaction could not be aborted, so its outcome is not known here.
+                throw MarkFenced(ex, because is null || IsFencing(ex)
+                    ? null
+                    : $"The Kafka log's producer has failed and cannot write again ({ex.Error.Reason}); the transaction was being aborted " +
+                      $"because of: {because.Error.Code}: {because.Error.Reason}");
+            }
+        }
+    }
+
+    /// <summary>How Confluent.Kafka reports a fenced producer, as observed against Kafka
+    /// 3.9 with client 2.16: <c>Local_Fenced</c>, flagged fatal, from
+    /// <c>BeginTransaction</c>, <c>CommitTransaction</c> and <c>AbortTransaction</c> — but
+    /// <i>not</i> flagged fatal on the <c>ProduceException</c> a later <c>Produce</c>
+    /// throws, so the code is checked as well as the flag.</summary>
+    internal static bool IsFencing(KafkaException exception) =>
+        exception.Error.IsFatal
+        || exception.Error.Code is ErrorCode.Local_Fenced or ErrorCode.ProducerFenced or ErrorCode.Local_Fatal;
+
+    private KafkaLogFencedException MarkFenced(Exception cause, string? message = null, int? ofGeneration = null)
+    {
+        bool completes;
+        KafkaLogFencedException fencedNow;
+        lock (_gate)
+        {
+            // News from a client this log has replaced since (ResetWriter) is not news
+            // about this log.
+            if (ofGeneration is { } generation && generation != _producerGeneration)
+                return new KafkaLogFencedException(cause.Message, cause);
+            completes = _isWriter || !_acquiring;
+            if (_fenced is null)
+            {
+                var taken = cause is KafkaException { Error.Code: ErrorCode.Local_Fenced or ErrorCode.ProducerFenced };
+                var reason = (cause as KafkaException)?.Error.Reason ?? cause.Message;
+                _fenced = new KafkaLogFencedException(
+                    message ?? (taken
+                        ? $"Another process has initialised transactional.id '{_options.EffectiveTransactionalId}' and taken the log over ({reason})."
+                        : $"The Kafka log's producer has failed and cannot write again ({reason})."),
+                    cause);
+            }
+            fencedNow = _fenced;
+        }
+        // A fence met while acquiring is not the end of a writer: there was none yet
+        // (AcquireAsync puts the log back to reading).
+        if (completes)
+            _whenFenced.TrySetResult();
+        return fencedNow;
+    }
+
+    private void ThrowIfFenced()
+    {
+        if (_fenced is { } fenced)
+            throw new KafkaLogFencedException(fenced.Message, fenced.InnerException);
+    }
+
+    // ── topics ─────────────────────────────────────────────────────────────────────────
+
+    internal static bool IsTopicSafe(string text)
+    {
+        foreach (var c in text)
+        {
+            if (!(char.IsAsciiLetterOrDigit(c) || c is '.' or '_' or '-'))
+                return false;
+        }
+        return text.Length > 0;
+    }
+
+    /// <summary>The topic setting that lets a replica that is not in sync lead a
+    /// partition whose in-sync replicas are all gone — and lose what they had committed.</summary>
+    public const string UncleanElection = "unclean.leader.election.enable";
+
+    internal static Dictionary<string, string> CompactedConfig(KafkaLogOptions options, IReadOnlyDictionary<string, string> extra)
+    {
+        var config = new Dictionary<string, string>
+        {
+            ["cleanup.policy"] = "compact",
+            ["delete.retention.ms"] = ((long)options.DeleteRetention.TotalMilliseconds).ToString(),
+        };
+        foreach (var (key, value) in extra)
+            config[key] = value;
+        return config;
+    }
+
+    /// <summary>Creates <paramref name="topic"/>, or checks the one that exists: its cleanup
+    /// policy must be the one asked for, and with <paramref name="fixedPartitions"/> its
+    /// partition count too. Returns the topic's partition count.</summary>
+    internal async Task<int> EnsureTopicAsync(
+        string topic, int partitions, Dictionary<string, string> config, bool fixedPartitions, CancellationToken cancellationToken)
+    {
+        // Everything this log writes is committed state: a partition that has lost every
+        // replica in sync must wait for one of them, not go on from a replica that is
+        // behind. That is Kafka's own default and not every cluster's (Amazon MSK's
+        // default configuration turns unclean election on for clusters without tiered
+        // storage), so the topics say it themselves. A caller's own topic settings win.
+        config.TryAdd(UncleanElection, "false");
+
+        // Asked again while the brokers cannot say: a cluster between controllers answers
+        // nothing for some seconds, and a node that starts just then — one its supervisor
+        // has restarted in the middle of a broker fault — must not end for it. A request
+        // that timed out may have created the topic; the next one then finds it there.
+        var deadline = Environment.TickCount64 + (long)_options.OperationTimeout.TotalMilliseconds;
+        while (true)
+        {
+            try
+            {
+                await _admin.CreateTopicsAsync(
+                    [new TopicSpecification { Name = topic, NumPartitions = partitions, ReplicationFactor = _options.ReplicationFactor, Configs = config }],
+                    new CreateTopicsOptions { RequestTimeout = _options.OperationTimeout, OperationTimeout = _options.OperationTimeout })
+                    .WaitAsync(cancellationToken).ConfigureAwait(false);
+                await LeadersKnownAsync(topic, partitions, cancellationToken).ConfigureAwait(false);
+                return partitions;
+            }
+            catch (CreateTopicsException ex) when (ex.Results.All(r => r.Error.Code == ErrorCode.TopicAlreadyExists))
+            {
+                break;
+            }
+            catch (CreateTopicsException ex) when (ex.Results.All(r => IsTransient(new KafkaException(r.Error))) && Environment.TickCount64 < deadline)
+            {
+            }
+            catch (CreateTopicsException ex)
+            {
+                throw new KafkaLogException($"Could not create topic '{topic}': {ex.Results[0].Error.Reason}", ex);
+            }
+            catch (KafkaException ex) when (IsTransient(ex) && Environment.TickCount64 < deadline)
+            {
+            }
+            await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+        }
+
+        var actual = await RetryAsync(async attempt =>
+        {
+            var described = await _admin.DescribeTopicsAsync(
+                TopicCollection.OfTopicNames([topic]), new DescribeTopicsOptions { RequestTimeout = attempt })
+                .ConfigureAwait(false);
+            return described.TopicDescriptions[0].Partitions.Count;
+        }, cancellationToken, topic).ConfigureAwait(false);
+        if (fixedPartitions && actual != partitions)
+            throw new KafkaLogException(
+                $"Topic '{topic}' has {actual} partition(s) and this log is configured for {partitions}. The count can never change: " +
+                "records are placed by it. Configure the log with the topic's count, or use a different topic prefix.");
+
+        var wanted = config["cleanup.policy"];
+        var configs = await RetryAsync(attempt => _admin.DescribeConfigsAsync(
+            [new ConfigResource { Type = ResourceType.Topic, Name = topic }],
+            new DescribeConfigsOptions { RequestTimeout = attempt }), cancellationToken, topic).ConfigureAwait(false);
+        if (configs[0].Entries.TryGetValue("cleanup.policy", out var policy) && policy.Value != wanted)
+            throw new KafkaLogException(
+                $"Topic '{topic}' has cleanup.policy={policy.Value}; this log needs cleanup.policy={wanted}. " +
+                "It was not created by this library, or was altered since.");
+        return actual;
+    }
+
+    /// <summary>
+    /// After creating a topic: asks for its metadata until every partition has a leader,
+    /// which also puts that answer into the admin client's cache. Without it the cache
+    /// can keep the answer from the instant of creation — no leader yet — and the first
+    /// call that needs a leader (the table's head, a partition's end) waits out a request
+    /// timeout on it. On one broker a new topic has its leaders at once; on three it
+    /// takes some milliseconds, and every table opened on new topics paid for it.
+    /// Best effort: a caller that still meets a missing leader retries.
+    /// </summary>
+    private async Task LeadersKnownAsync(string topic, int partitions, CancellationToken cancellationToken)
+    {
+        var deadline = Environment.TickCount64 + (long)_options.OperationTimeout.TotalMilliseconds;
+        while (Environment.TickCount64 < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                var metadata = await Task.Run(() => _admin.GetMetadata(topic, TimeSpan.FromSeconds(5)), cancellationToken).ConfigureAwait(false);
+                var found = metadata.Topics.FirstOrDefault(t => t.Topic == topic);
+                if (found is { Error.IsError: false } && found.Partitions.Count >= partitions && found.Partitions.All(p => p.Leader >= 0))
+                    return;
+            }
+            catch (KafkaException)
+            {
+            }
+            await Task.Delay(20, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>The partition count of a topic this log does not own (a sink's).</summary>
+    internal Task<int> PartitionCountAsync(string topic, CancellationToken cancellationToken) =>
+        RetryAsync(async attempt =>
+        {
+            var described = await _admin.DescribeTopicsAsync(
+                TopicCollection.OfTopicNames([topic]), new DescribeTopicsOptions { RequestTimeout = attempt })
+                .ConfigureAwait(false);
+            return described.TopicDescriptions[0].Partitions.Count;
+        }, cancellationToken, topic);
+
+    // ── reading ────────────────────────────────────────────────────────────────────────
+
+    /// <summary>The end of committed data in a partition (its last stable offset).</summary>
+    internal Task<long> EndOffsetAsync(TopicPartition partition, CancellationToken cancellationToken) =>
+        ListOffsetAsync(partition, OffsetSpec.Latest(), cancellationToken);
+
+    /// <summary>The end of everything written to a partition, an open transaction's records
+    /// included (its high watermark).</summary>
+    internal Task<long> UncommittedEndOffsetAsync(TopicPartition partition, CancellationToken cancellationToken) =>
+        ListOffsetAsync(partition, OffsetSpec.Latest(), cancellationToken, IsolationLevel.ReadUncommitted);
+
+    /// <summary>The ends of committed data of several partitions, in one request.</summary>
+    internal Task<long[]> EndOffsetsAsync(IReadOnlyList<TopicPartition> partitions, CancellationToken cancellationToken) =>
+        RetryAsync(async attempt =>
+        {
+            var result = await _admin.ListOffsetsAsync(
+                partitions.Select(p => new TopicPartitionOffsetSpec { TopicPartition = p, OffsetSpec = OffsetSpec.Latest() }),
+                new ListOffsetsOptions { IsolationLevel = IsolationLevel.ReadCommitted, RequestTimeout = attempt })
+                .ConfigureAwait(false);
+            var ends = new long[partitions.Count];
+            foreach (var info in result.ResultInfos)
+            {
+                var at = info.TopicPartitionOffsetError;
+                for (var i = 0; i < ends.Length; i++)
+                {
+                    if (partitions[i].Topic == at.Topic && partitions[i].Partition == at.Partition)
+                        ends[i] = OffsetOf(at);
+                }
+            }
+            return ends;
+        }, cancellationToken, [.. partitions.Select(p => p.Topic)]);
+
+    /// <summary>The first offset a partition still holds.</summary>
+    internal Task<long> StartOffsetAsync(TopicPartition partition, CancellationToken cancellationToken) =>
+        ListOffsetAsync(partition, OffsetSpec.Earliest(), cancellationToken);
+
+    private Task<long> ListOffsetAsync(
+        TopicPartition partition, OffsetSpec spec, CancellationToken cancellationToken,
+        IsolationLevel isolation = IsolationLevel.ReadCommitted) =>
+        RetryAsync(async attempt =>
+        {
+            var result = await _admin.ListOffsetsAsync(
+                [new TopicPartitionOffsetSpec { TopicPartition = partition, OffsetSpec = spec }],
+                new ListOffsetsOptions { IsolationLevel = isolation, RequestTimeout = attempt })
+                .ConfigureAwait(false);
+            return OffsetOf(result.ResultInfos[0].TopicPartitionOffsetError);
+        }, cancellationToken, partition.Topic);
+
+    /// <summary>
+    /// The offset a <c>ListOffsets</c> answer carries for one partition — or its error,
+    /// thrown. The client reports a partition it could not ask (its leader is down and no
+    /// other is elected yet) inside the answer, with the offset left unset, and does not
+    /// throw: read as it stands that is offset −1001, which every caller here would take
+    /// for "nothing was ever written". A takeover with a broker down then found no last
+    /// term (and announced one that had been used) and no head for a table that had one.
+    /// Thrown, it is a failure that passes, and the call is made again.
+    /// </summary>
+    internal static long OffsetOf(TopicPartitionOffsetError answer)
+    {
+        if (answer.Error is { IsError: true } error)
+            throw new KafkaException(error);
+        if (answer.Offset.Value < 0)
+            throw new KafkaException(new Error(ErrorCode.LeaderNotAvailable, $"No offset was given for {answer.TopicPartition}."));
+        return answer.Offset.Value;
+    }
+
+    // ── can anything be committed at all ───────────────────────────────────────────────
+
+    /// <summary>What the brokers say about writing to this log's topics.</summary>
+    internal enum WritePath
+    {
+        /// <summary>The brokers answered and the answer says nothing either way: a topic
+        /// described without its partitions, a question this node may not ask.</summary>
+        Unknown,
+
+        /// <summary>No broker answered the question in its time: the brokers are not
+        /// there for this node, whatever they are for others. Nothing can be committed
+        /// through brokers that do not answer, so to a standby that has reached its
+        /// ceiling this is no better news than <see cref="Unwritable"/>.</summary>
+        Unreachable,
+
+        /// <summary>The leader topic's partition, and the partition that holds this
+        /// log's transactional id, have a leader that answers and enough replicas in
+        /// sync that answer.</summary>
+        Writable,
+
+        /// <summary>One of them has no leader, or a leader that does not answer, or
+        /// fewer replicas in sync that answer than <c>min.insync.replicas</c>: no
+        /// process can commit through this log now.</summary>
+        Unwritable,
+    }
+
+    /// <summary>For tests: answers <see cref="ProbeWritePathAsync"/> instead of the brokers.</summary>
+    internal Func<(WritePath Path, string? Why)>? WritePathOverride { get; set; }
+
+    /// <summary>For tests: says whether a broker answers, instead of asking it.</summary>
+    internal Func<int, bool>? BrokerAnswersOverride { get; set; }
+
+    /// <summary>For tests: called with the topic before its metadata is asked for.
+    /// Throwing here is that question failing, as it does when no broker answers it.</summary>
+    internal Action<string>? BeforeWritePathQuestion { get; set; }
+
+    private readonly Dictionary<string, int> _minInSync = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Asks the brokers whether a commit through this log could succeed right now, by any
+    /// process: whether the leader topic's partition and the transaction coordinator's
+    /// partition for this log's transactional id each have a leader that answers and at
+    /// least <c>min.insync.replicas</c> replicas in sync that answer. A standby asks
+    /// before it takes over from a leader that is alive and silent
+    /// (<see cref="KafkaLeadership"/>): if the answer is <see cref="WritePath.Unwritable"/>
+    /// the leader's silence is the brokers', and a takeover would only wait in the same
+    /// place.
+    /// <para>
+    /// Who leads a partition and who is in sync is the cluster's metadata, which is as
+    /// stale as its controller: a broker that died less than its session timeout ago is
+    /// still listed, and with no controller quorum — two of three brokers lost at once —
+    /// nothing is ever taken off the lists, which then say that all is well for as long
+    /// as the outage lasts. So the lists are not believed by themselves: each broker
+    /// they name is asked something directly (its own configuration, which only that
+    /// broker can answer), and one that does not answer does not count. The metadata is
+    /// asked of any broker and not of the controller, which may be what is missing.
+    /// </para>
+    /// Never throws.
+    /// </summary>
+    internal async Task<(WritePath Path, string? Why)> ProbeWritePathAsync(CancellationToken cancellationToken)
+    {
+        if (WritePathOverride is { } injected)
+            return injected();
+        try
+        {
+            if (await UnwritableAsync(_leaderPartition.Topic, _ => 0, cancellationToken).ConfigureAwait(false) is { } why)
+                return (WritePath.Unwritable, why);
+        }
+        catch (Exception ex) when (ex is KafkaException or TimeoutException or OperationCanceledException or InvalidOperationException)
+        {
+            return (Unasked(ex), ex.Message);
+        }
+
+        try
+        {
+            // The coordinator of a transactional id is the leader of one partition of
+            // __transaction_state, chosen as the Java client chooses it. A node that may
+            // not describe that topic learns nothing here, which is not a "no".
+            if (await UnwritableAsync(
+                    "__transaction_state", count => (JavaHash(_options.EffectiveTransactionalId) & 0x7fffffff) % count, cancellationToken)
+                .ConfigureAwait(false) is { } why)
+                return (WritePath.Unwritable, why);
+        }
+        catch (Exception ex) when (ex is KafkaException or TimeoutException or OperationCanceledException or InvalidOperationException)
+        {
+        }
+        return (WritePath.Writable, null);
+    }
+
+    /// <summary>What a question about the write path that failed says: silence — a wait
+    /// that ran out, a request the client gave up, no broker to send it to — is
+    /// <see cref="WritePath.Unreachable"/>; an error a broker sent, or an answer that
+    /// could not be read, is <see cref="WritePath.Unknown"/>. Brokers that have stopped
+    /// answering without closing their connections (a frozen zone) are silence: the
+    /// metadata request sits on one of them until its time is up, and the admin client
+    /// has no socket timeout to move it to another.</summary>
+    internal static WritePath Unasked(Exception failure) =>
+        failure is InvalidOperationException || AnsweredWith(failure) ? WritePath.Unknown : WritePath.Unreachable;
+
+    /// <summary>Why one partition of <paramref name="topic"/> cannot be written; null if it can.</summary>
+    private async Task<string?> UnwritableAsync(string topic, Func<int, int> partitionOf, CancellationToken cancellationToken)
+    {
+        var timeout = TimeSpan.FromSeconds(2);
+        BeforeWritePathQuestion?.Invoke(topic);
+
+        // Any broker's word (a Metadata request), not the controller's: a cluster that has
+        // lost its controller quorum never answers what is asked of the controller, and
+        // that is one of the states this is here to recognise.
+        var metadata = await Task.Run(() => _admin.GetMetadata(topic, timeout), cancellationToken)
+            .WaitAsync(timeout * 2, cancellationToken).ConfigureAwait(false);
+        var described = metadata.Topics.FirstOrDefault(t => t.Topic == topic);
+        if (described is null || described.Error.IsError || described.Partitions.Count == 0)
+            throw new InvalidOperationException($"Topic '{topic}' was described without partitions ({described?.Error.Reason ?? "it is not in the answer"}).");
+        var index = partitionOf(described.Partitions.Count);
+        var partition = described.Partitions.FirstOrDefault(p => p.PartitionId == index)
+            ?? throw new InvalidOperationException($"Topic '{topic}' was described without partition {index}.");
+        if (partition.Leader < 0)
+            return WhyUnwritable(topic, index, partition.Leader, partition.InSyncReplicas, new HashSet<int>(), null);
+
+        // The lists name brokers; whether each is there is asked of the broker itself.
+        var listed = partition.InSyncReplicas.Append(partition.Leader).Distinct().ToArray();
+        var asked = await Task.WhenAll(listed.Select(broker => BrokerAnswersAsync(broker, cancellationToken))).ConfigureAwait(false);
+        var answering = listed.Where((_, i) => asked[i]).ToHashSet();
+
+        // The minimum is the topic's configuration, which is asked of the controller: it
+        // is asked once and kept (PrimeWritePathAsync asks it while all is well).
+        var minimum = answering.Contains(partition.Leader) ? await MinInSyncAsync(topic, cancellationToken).ConfigureAwait(false) : null;
+        return WhyUnwritable(topic, index, partition.Leader, partition.InSyncReplicas, answering, minimum);
+    }
+
+    /// <summary>The judgement itself: why a partition with this leader and these replicas
+    /// in sync cannot be written, given which of those brokers answer and the topic's
+    /// <c>min.insync.replicas</c> (null: not known, and then the count is not judged);
+    /// null if it can.</summary>
+    internal static string? WhyUnwritable(
+        string topic, int partition, int leader, IReadOnlyList<int> inSync, IReadOnlySet<int> answering, int? minimum)
+    {
+        if (leader < 0)
+            return $"{topic} [{partition}] has no leader";
+        if (!answering.Contains(leader))
+            return $"{topic} [{partition}] is led by broker {leader}, which does not answer";
+        var there = inSync.Count(answering.Contains);
+        return minimum is { } needed && there < needed
+            ? $"{topic} [{partition}] has {there} replica(s) in sync that answer ({inSync.Count} listed) and needs {needed}"
+            : null;
+    }
+
+    /// <summary><c>min.insync.replicas</c> of <paramref name="topic"/>, asked once and
+    /// kept; null while it cannot be asked.</summary>
+    private async Task<int?> MinInSyncAsync(string topic, CancellationToken cancellationToken)
+    {
+        lock (_minInSync)
+        {
+            if (_minInSync.TryGetValue(topic, out var known))
+                return known;
+        }
+        var timeout = TimeSpan.FromSeconds(2);
+        try
+        {
+            var configs = await _admin.DescribeConfigsAsync(
+                [new ConfigResource { Type = ResourceType.Topic, Name = topic }], new DescribeConfigsOptions { RequestTimeout = timeout })
+                .WaitAsync(timeout * 2, cancellationToken).ConfigureAwait(false);
+            var minimum = configs[0].Entries.TryGetValue("min.insync.replicas", out var entry) && int.TryParse(entry.Value, out var parsed) ? parsed : 1;
+            lock (_minInSync)
+                _minInSync[topic] = minimum;
+            return minimum;
+        }
+        catch (Exception ex) when (ex is KafkaException or TimeoutException or InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Learns, while the brokers can say, what <see cref="ProbeWritePathAsync"/>
+    /// cannot ask in the middle of an outage: the topics' <c>min.insync.replicas</c>.
+    /// A standby calls it when it starts to watch. Never throws.</summary>
+    internal async Task PrimeWritePathAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await MinInSyncAsync(_leaderPartition.Topic, cancellationToken).ConfigureAwait(false);
+            await MinInSyncAsync("__transaction_state", cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    /// <summary>Whether broker <paramref name="broker"/> answers a request that only it
+    /// can answer: a description of its own configuration, which the client sends to
+    /// that broker and to no other. An answer that refuses (a node that may not describe
+    /// brokers) is an answer. Silence for a second and a half is not.</summary>
+    internal async Task<bool> BrokerAnswersAsync(int broker, CancellationToken cancellationToken)
+    {
+        if (BrokerAnswersOverride is { } injected)
+            return injected(broker);
+        var timeout = TimeSpan.FromSeconds(1.5);
+        try
+        {
+            await _admin.DescribeConfigsAsync(
+                [new ConfigResource { Type = ResourceType.Broker, Name = broker.ToString(System.Globalization.CultureInfo.InvariantCulture) }],
+                new DescribeConfigsOptions { RequestTimeout = timeout })
+                .WaitAsync(timeout * 2, cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex) when (ex is KafkaException or TimeoutException)
+        {
+            return AnsweredWith(ex);
+        }
+    }
+
+    /// <summary>Whether a question that failed was all the same answered by the broker
+    /// it was put to: an error the broker sent (it refuses, it does not know the
+    /// resource) is the broker speaking; an error the client made up for it (a
+    /// transport failure, a request that timed out in the client) and a wait that
+    /// ran out are silence.</summary>
+    internal static bool AnsweredWith(Exception failure) => failure switch
+    {
+        DescribeConfigsException described => described.Results.Any(result => result.Error.IsBrokerError),
+        KafkaException kafka => kafka.Error.IsBrokerError,
+        _ => false,
+    };
+
+    /// <summary><c>String.hashCode</c> as Java computes it: what the brokers place a
+    /// transactional id by.</summary>
+    internal static int JavaHash(string text)
+    {
+        var hash = 0;
+        foreach (var c in text)
+            hash = unchecked(31 * hash + c);
+        return hash;
+    }
+
+    internal Task DeleteRecordsBeforeAsync(TopicPartition partition, long offset, CancellationToken cancellationToken) =>
+        RetryAsync(async attempt =>
+        {
+            await _admin.DeleteRecordsAsync(
+                [new TopicPartitionOffset(partition, offset)],
+                new DeleteRecordsOptions { RequestTimeout = attempt, OperationTimeout = attempt })
+                .ConfigureAwait(false);
+            return true;
+        }, cancellationToken, partition.Topic);
+
+    /// <summary>Runs an admin call, retrying the failures a cluster produces while a topic
+    /// is new or a partition's leader is moving, for up to the operation timeout.</summary>
+    private Task<T> RetryAsync<T>(Func<TimeSpan, Task<T>> call, CancellationToken cancellationToken, params string[] topics) =>
+        RetryTransientAsync(call, _options.OperationTimeout, cancellationToken, () => RefreshMetadata(_admin, topics),
+            _options.Logger is null ? null : (attempt, given, took, ex) => _options.Logger.LogDebug(
+                "Kafka log {Prefix}: an admin call for {Topics} failed on attempt {Attempt} after {Ms} ms of the {Given} ms it was given ({Code}: {Reason}); it is made again",
+                _options.TopicPrefix, string.Join(",", topics), attempt + 1, (long)took.TotalMilliseconds, (long)given.TotalMilliseconds, PartitionError(ex).Code, PartitionError(ex).Reason));
+
+    /// <summary>The error worth reading in an admin call's failure: for a
+    /// <c>ListOffsets</c> answer the client's own exception says only "check the
+    /// partitions", and what a partition's broker said is inside.</summary>
+    private static Error PartitionError(KafkaException exception) =>
+        exception is ListOffsetsException list
+        && list.Result.ResultInfos.Select(info => info.TopicPartitionOffsetError.Error).FirstOrDefault(error => error.IsError) is { } inner
+            ? inner
+            : exception.Error;
+
+    /// <summary>Asks the cluster for the topics' metadata through <paramref name="admin"/>,
+    /// which puts what it answers into that client's cache. Failures are the next
+    /// attempt's to report.</summary>
+    internal static void RefreshMetadata(IAdminClient admin, IEnumerable<string> topics)
+    {
+        foreach (var topic in topics.Distinct(StringComparer.Ordinal))
+        {
+            try
+            {
+                admin.GetMetadata(topic, TimeSpan.FromSeconds(5));
+            }
+            catch (KafkaException)
+            {
+            }
+        }
+    }
+
+    /// <summary>
+    /// As the other overload, giving each attempt its own request timeout
+    /// (<see cref="AttemptTimeout"/>: half a second for the first, doubling to two seconds
+    /// and staying there for the first six, then longer; never past what is left of
+    /// <paramref name="timeout"/>) and running <paramref name="betweenAttempts"/> after a
+    /// failure that passes. An
+    /// admin call that needs a partition's leader (<c>ListOffsets</c>, <c>DeleteRecords</c>)
+    /// takes it from the client's metadata cache. On a cluster of several brokers a topic
+    /// created a moment ago can be in that cache with no leader — the answer at the instant
+    /// of creation — and the call then waits out its whole request timeout for a refresh
+    /// nothing triggers, and fails with "No leaders found". Asked again it finds the same
+    /// cache. So an attempt is short, and between attempts the topics' metadata is asked
+    /// for outright, which replaces the cached answer. Given the whole operation timeout,
+    /// the first attempt used all of it: on three brokers one test in five of
+    /// <c>Dbsp.Kafka.Tests</c> failed that way after 30 s.
+    /// <para>
+    /// An attempt that begins while a partition has no leader runs its whole time even
+    /// if the partition gets one meanwhile — the new leader is only seen by the refresh
+    /// between attempts — so an attempt's length is what a call can lose after the
+    /// brokers are whole again. Doubling without a stop made that four and then eight
+    /// seconds just when a broker's loss is being settled (nine seconds, the brokers'
+    /// session timeout): a takeover's table stage took 15.6 s where the partition had
+    /// its leader back after about nine.
+    /// </para>
+    /// </summary>
+    internal static async Task<T> RetryTransientAsync<T>(
+        Func<TimeSpan, Task<T>> call, TimeSpan timeout, CancellationToken cancellationToken, Action? betweenAttempts = null,
+        Action<int, TimeSpan, TimeSpan, KafkaException>? onRetry = null)
+    {
+        var deadline = Environment.TickCount64 + (long)timeout.TotalMilliseconds;
+        for (var attempt = 0; ; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var left = TimeSpan.FromMilliseconds(Math.Max(100, deadline - Environment.TickCount64));
+            var mine = AttemptTimeout(attempt);
+            var given = mine < left ? mine : left;
+            var began = Environment.TickCount64;
+            try
+            {
+                return await call(given).WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (KafkaException ex) when (IsTransient(ex) && Environment.TickCount64 < deadline)
+            {
+                onRetry?.Invoke(attempt, given, TimeSpan.FromMilliseconds(Environment.TickCount64 - began), ex);
+                if (betweenAttempts is not null)
+                    await Task.Run(betweenAttempts, cancellationToken).ConfigureAwait(false);
+                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>The request timeout of attempt <paramref name="attempt"/> (from 0) of
+    /// <see cref="RetryTransientAsync{T}(Func{TimeSpan,Task{T}},TimeSpan,CancellationToken,Action?,Action{int,TimeSpan,TimeSpan,KafkaException}?)"/>:
+    /// 0.5 s, 1 s, then 2 s for four attempts — some ten seconds in which a call loses at
+    /// most two after a partition has its leader again — and then 4 s and 8 s, for a
+    /// broker that is there and slow.</summary>
+    internal static TimeSpan AttemptTimeout(int attempt) => TimeSpan.FromMilliseconds(
+        attempt < 6 ? Math.Min(500 << attempt, 2000) : 2000 << Math.Min(attempt - 5, 2));
+
+    /// <summary>Runs <paramref name="call"/>, and again every 100 ms while it fails in a way
+    /// that passes (<see cref="IsTransient"/>), until <paramref name="timeout"/> has gone
+    /// by; then the failure is the caller's.</summary>
+    internal static async Task<T> RetryTransientAsync<T>(Func<Task<T>> call, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        var deadline = Environment.TickCount64 + (long)timeout.TotalMilliseconds;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                return await call().WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (KafkaException ex) when (IsTransient(ex) && Environment.TickCount64 < deadline)
+            {
+                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>Whether an admin call failed for a reason that passes: a topic too new for
+    /// the broker asked, a partition between leaders, a broker out of reach.
+    /// <c>Local_NoEnt</c> is the client's own "Failed to query partition leaders: No leaders
+    /// found" — what <c>ListOffsets</c> and <c>DeleteRecords</c> throw, as a plain
+    /// <see cref="KafkaException"/>, when the client's metadata has no leader for a
+    /// partition yet (seen for just-created topics on a busy broker).</summary>
+    internal static bool IsTransient(KafkaException exception)
+    {
+        static bool Transient(ErrorCode code) => code is ErrorCode.UnknownTopicOrPart or ErrorCode.LeaderNotAvailable
+            or ErrorCode.NotLeaderForPartition or ErrorCode.RequestTimedOut or ErrorCode.Local_TimedOut
+            or ErrorCode.Local_Transport or ErrorCode.Local_AllBrokersDown or ErrorCode.NotEnoughReplicas
+            or ErrorCode.NetworkException or ErrorCode.Local_NoEnt or ErrorCode.BrokerNotAvailable
+            or ErrorCode.ReplicaNotAvailable or ErrorCode.KafkaStorageError or ErrorCode.FencedLeaderEpoch
+            or ErrorCode.UnknownLeaderEpoch or ErrorCode.NotController or ErrorCode.Local_WaitCoord
+            // A leader elected a moment ago whose high watermark has not caught up yet:
+            // it will not give an end that could be lower than the one it gave before.
+            or ErrorCode.OffsetNotAvailable or ErrorCode.Local_UnknownPartition or ErrorCode.Local_UnknownTopic;
+
+        return exception switch
+        {
+            ListOffsetsException list => list.Result.ResultInfos.Any(r => Transient(r.TopicPartitionOffsetError.Error.Code)),
+            DescribeTopicsException topics => topics.Results.TopicDescriptions.Any(t => Transient(t.Error.Code)),
+            DescribeConfigsException configs => configs.Results.Any(r => Transient(r.Error.Code)),
+            DeleteRecordsException deletes => deletes.Results.Any(r => Transient(r.Error.Code)),
+            _ => Transient(exception.Error.Code),
+        };
+    }
+
+    /// <summary>A consumer that reads committed records only, from wherever it is assigned;
+    /// it belongs to no group and commits no offsets.</summary>
+    internal IConsumer<byte[], byte[]> CreateConsumer(bool forShortReads = false)
+    {
+        var config = new ConsumerConfig
+        {
+            BootstrapServers = _options.BootstrapServers,
+            GroupId = _options.TopicPrefix + ".reader", // required by the client; never joined
+            EnableAutoCommit = false,
+            EnableAutoOffsetStore = false,
+            IsolationLevel = IsolationLevel.ReadCommitted,
+            EnablePartitionEof = true,
+            // A position that no longer exists is an error, never a silent jump.
+            AutoOffsetReset = AutoOffsetReset.Error,
+            // What a reader that is behind may hold fetched and not yet applied. The
+            // client's own default is 64 MB, per consumer.
+            QueuedMaxMessagesKbytes = _options.FetchBufferKilobytes,
+            // With the buffer full the client postpones its next fetch by this long, and
+            // its default is a second: a restore would be held to one buffer a second.
+            FetchQueueBackoffMs = 10,
+        };
+        // A short read stops at the end of a partition, where the client has already asked
+        // the broker for more: that fetch waits fetch.wait.max.ms (half a second by default)
+        // for data that will not come, and the client sends a broker one fetch at a time —
+        // so the NEXT short read, of another partition, would wait out the previous one's
+        // long poll. With many tables that is half a second each, in a takeover. The short
+        // reader therefore polls briefly; it is assigned only while a read runs.
+        if (forShortReads)
+            config.FetchWaitMaxMs = 5;
+        KafkaClientDefaults.Apply(config);
+        Apply(config);
+        var builder = new ConsumerBuilder<byte[], byte[]>(config)
+            .SetLogHandler((_, message) => Log(message))
+            .SetErrorHandler((_, error) => LogError("consumer", error));
+        _options.ConfigureConsumer?.Invoke(builder);
+        Interlocked.Increment(ref _consumersCreated);
+        return builder.Build();
+    }
+
+    // One consumer for every short read (a table's head, the last term): the reads are
+    // brief and a new client for each costs threads, connections and, on MSK, a TLS and
+    // IAM handshake — per table, per lag sample. Guarded by the gate; rebuilt after a failure.
+    private readonly SemaphoreSlim _shortReadGate = new(1, 1);
+    private IConsumer<byte[], byte[]>? _shortReader;
+    private int _shortReadersCreated;
+
+    /// <summary>How many consumers the short reads have had: one, unless a read failed.
+    /// For tests.</summary>
+    internal int ShortReadersCreated => Volatile.Read(ref _shortReadersCreated);
+
+    /// <summary>Runs <paramref name="read"/> on a thread-pool thread with the log's shared
+    /// short-read consumer, which <paramref name="read"/> assigns itself. One at a time.</summary>
+    internal async Task<T> ShortReadAsync<T>(Func<IConsumer<byte[], byte[]>, T> read, CancellationToken cancellationToken)
+    {
+        var asked = Environment.TickCount64;
+        await _shortReadGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var entered = Environment.TickCount64;
+        try
+        {
+            return await Task.Run(() =>
+            {
+                var began = Environment.TickCount64;
+                if (began - asked > 250)
+                    _options.Logger?.LogDebug(
+                        "Kafka log {Prefix}: a short read waited {GateMs} ms for the reads before it and {ThreadMs} ms for a thread",
+                        _options.TopicPrefix, entered - asked, began - entered);
+                ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+                var consumer = _shortReader;
+                if (consumer is null)
+                {
+                    consumer = _shortReader = CreateConsumer(forShortReads: true);
+                    Interlocked.Increment(ref _shortReadersCreated);
+                }
+                try
+                {
+                    // It is polled only while a read runs, and a read may begin with a
+                    // metadata request: its callbacks (a token refresh) are served first.
+                    consumer.ServeCallbacks();
+                    var result = read(consumer);
+                    consumer.Unassign();
+                    return result;
+                }
+                catch (Exception ex)
+                {
+                    // A read its caller called off (a status that stopped waiting for a
+                    // table's lag) leaves the consumer as a read that ended early does:
+                    // nothing is wrong with it, and it is kept — what it has learnt of
+                    // the topics is what keeps the next reads short, and the next reads
+                    // may be a takeover's, one per table. After anything else the next
+                    // one starts clean, whatever state this one left it in.
+                    var keep = ex is OperationCanceledException && cancellationToken.IsCancellationRequested && !_stop.IsCancellationRequested;
+                    if (keep)
+                    {
+                        try
+                        {
+                            consumer.Unassign();
+                        }
+                        catch (KafkaException)
+                        {
+                            keep = false;
+                        }
+                    }
+                    if (!keep)
+                    {
+                        _shortReader = null;
+                        DisposeShortReader(consumer);
+                    }
+                    throw;
+                }
+            }, CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            _shortReadGate.Release();
+        }
+    }
+
+    // Topics the current short reader has been told the leaders of and when it was last
+    // told, and the admin client that asks for them on its handle. Guarded by the gate.
+    private readonly Dictionary<string, long> _shortReaderTopics = new(StringComparer.Ordinal);
+    private IConsumer<byte[], byte[]>? _shortReaderOfTopics;
+    private IAdminClient? _shortReaderAdmin;
+    private int _shortReadAdminsCreated;
+    private long _shortReadLeadersAsked;
+
+    /// <summary>How old what the short reader knows of a topic's leaders may be before a
+    /// read asks again.</summary>
+    internal static readonly TimeSpan ShortReadLeadersFor = TimeSpan.FromSeconds(1);
+
+    /// <summary>How many times the short reads have asked for a topic's leaders. For tests.</summary>
+    internal long ShortReadLeadersAsked => Interlocked.Read(ref _shortReadLeadersAsked);
+
+    /// <summary>How many admin clients the short reads have made to ask for a topic's
+    /// metadata: at most one for each consumer they have had. For tests.</summary>
+    internal int ShortReadAdminsCreated => Volatile.Read(ref _shortReadAdminsCreated);
+
+    /// <summary>
+    /// Assigns the short reader to <paramref name="position"/>, for a read inside
+    /// <see cref="ShortReadAsync{T}"/>. The first time the consumer is pointed at a topic it
+    /// is first asked for that topic's metadata, and waits for the answer. Without that, a
+    /// consumer that is already running learns a new topic's leader only when the client's
+    /// one-second housekeeping timer next looks — so each short read of a topic the reader
+    /// had not seen took about a second: two per table when a node opens its tables, one
+    /// after another. A new consumer's first assignment does not pay this, which is why
+    /// followers and restores never showed it.
+    /// <para>
+    /// A topic it has seen is asked about again when the answer is more than a second
+    /// old (<see cref="ShortReadLeadersFor"/>). Between reads the consumer is assigned to
+    /// nothing, and what it knows of a topic then goes stale: a partition whose broker
+    /// died while the reader was idle is fetched from that broker first, and the client
+    /// pauses half a second (<c>fetch.error.backoff.ms</c>) before it looks the new
+    /// leader up. The reads this matters to are a takeover's, made the moment the
+    /// brokers have given a dead broker up: the catalog's head once took 0.9 s that way
+    /// (the service design, S8, <i>What a broker's loss costs</i>). This second question
+    /// is not waited on for long and its failure is not the read's.
+    /// </para>
+    /// </summary>
+    internal void AssignForShortRead(IConsumer<byte[], byte[]> consumer, TopicPartitionOffset position)
+    {
+        if (!ReferenceEquals(_shortReaderOfTopics, consumer))
+        {
+            // Another consumer than the last one's (a test's own, or the next after a
+            // read that failed): what the last was told is not what this one knows.
+            try
+            {
+                _shortReaderAdmin?.Dispose();
+            }
+            catch (KafkaException)
+            {
+            }
+            _shortReaderAdmin = null;
+            _shortReaderOfTopics = consumer;
+            _shortReaderTopics.Clear();
+        }
+        var now = Environment.TickCount64;
+        var met = _shortReaderTopics.TryGetValue(position.Topic, out var told);
+        if (!met || now - told > (long)ShortReadLeadersFor.TotalMilliseconds)
+        {
+            // One admin client for the consumer's whole life, never one per question:
+            // disposing an admin client waits for its poll loop, which looks up every
+            // 100 ms, so a client made and disposed here cost a tenth of a second for
+            // each topic the consumer met — one read at a time, a takeover's tables in
+            // turn. (2,164 ms for 21 tables on a runner whose short reader had just been
+            // replaced; 110 to 190 ms when it had met the topics before.)
+            if (_shortReaderAdmin is null)
+            {
+                _shortReaderAdmin = new DependentAdminClientBuilder(consumer.Handle).Build();
+                Interlocked.Increment(ref _shortReadAdminsCreated);
+            }
+            Interlocked.Increment(ref _shortReadLeadersAsked);
+            if (!met)
+                _shortReaderAdmin.GetMetadata(position.Topic, _options.OperationTimeout);
+            else
+            {
+                try
+                {
+                    _shortReaderAdmin.GetMetadata(position.Topic, ShortReadRefreshPatience);
+                }
+                catch (KafkaException)
+                {
+                    // No answer in time: the read goes ahead on what the consumer knows,
+                    // as it did before this question existed, and the next read asks.
+                    now = told;
+                }
+            }
+            _shortReaderTopics[position.Topic] = now;
+        }
+        consumer.Assign(position);
+    }
+
+    /// <summary>How long a read waits for the leaders of a topic its consumer has met
+    /// before. Longer than a round trip to a broker in another zone by two orders of
+    /// magnitude, and short beside the half second a stale leader costs.</summary>
+    private static readonly TimeSpan ShortReadRefreshPatience = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>Disposes the short reader and the admin client that asked on its handle,
+    /// the admin client first: its poll loop reads a queue of the consumer's.</summary>
+    private void DisposeShortReader(IConsumer<byte[], byte[]> consumer)
+    {
+        if (ReferenceEquals(_shortReaderOfTopics, consumer))
+        {
+            _shortReaderOfTopics = null;
+            _shortReaderTopics.Clear();
+            try
+            {
+                _shortReaderAdmin?.Dispose();
+            }
+            catch (KafkaException)
+            {
+            }
+            _shortReaderAdmin = null;
+        }
+        try
+        {
+            consumer.Dispose();
+        }
+        catch (KafkaException)
+        {
+        }
+    }
+
+    /// <summary>Reads an assigned single-partition consumer until it has seen every
+    /// committed record below <paramref name="end"/> (a last stable offset), handing each to
+    /// <paramref name="onRecord"/>. Blocking. Fails if nothing arrives for the operation
+    /// timeout.
+    /// <para>
+    /// The offset just below a last stable offset is always a transaction marker — every
+    /// write to these topics is transactional, and one producer's transactions do not
+    /// overlap — so the read is complete once the record two below the end has been seen.
+    /// Waiting for the client to report the end instead costs a whole empty fetch
+    /// (<c>fetch.wait.max.ms</c>, half a second), which a takeover cannot spare. When the
+    /// records before the end belong to an aborted transaction they are never seen, and the
+    /// end-of-partition event settles it after all.
+    /// </para></summary>
+    internal void ReadTo(
+        IConsumer<byte[], byte[]> consumer, long end, Action<ConsumeResult<byte[], byte[]>> onRecord, CancellationToken cancellationToken) =>
+        ReadTo(consumer, end, record =>
+        {
+            onRecord(record);
+            return false;
+        }, cancellationToken);
+
+    /// <summary>As the other overload, stopping early when <paramref name="onRecord"/>
+    /// returns true.</summary>
+    internal void ReadTo(
+        IConsumer<byte[], byte[]> consumer, long end, Func<ConsumeResult<byte[], byte[]>, bool> onRecord, CancellationToken cancellationToken)
+    {
+        if (end <= 0)
+            return; // nothing was ever committed here
+        var assigned = consumer.Assignment.FirstOrDefault();
+        var position = -1L;
+        var idleSince = Environment.TickCount64;
+        while (position < end - 1)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            _stop.Token.ThrowIfCancellationRequested();
+            var result = consumer.ConsumeAssigned(TimeSpan.FromMilliseconds(100));
+            if (result is null)
+            {
+                if (Environment.TickCount64 - idleSince > (long)_options.OperationTimeout.TotalMilliseconds)
+                    throw new TimeoutException(
+                        $"Reading {consumer.Assignment.FirstOrDefault()} stalled at offset {position} before reaching {end}.");
+                continue;
+            }
+            // The consumer is reused between reads: nothing of an earlier assignment counts.
+            if (assigned is not null && result.TopicPartition != assigned)
+                continue;
+            idleSince = Environment.TickCount64;
+            if (result.IsPartitionEOF)
+            {
+                position = result.Offset.Value;
+                continue;
+            }
+            if (result.Offset.Value >= end)
+                return;
+            if (onRecord(result))
+                return;
+            position = result.Offset.Value + 1;
+        }
+    }
+
+    /// <summary>
+    /// The committed records of one partition from <paramref name="from"/>, in batches, with
+    /// the position after each batch. It never ends by itself: at the end of the partition
+    /// it waits for more. A batch's position is past any transaction markers behind its last
+    /// record once the reader has reached the end, which it reports with an empty batch if
+    /// it has to. Each call runs its own consumer on its own thread, stopped when the
+    /// enumeration is.
+    /// </summary>
+    internal async IAsyncEnumerable<LogBatch> ReadBatchesAsync(
+        TopicPartition partition, Offset from,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var channel = System.Threading.Channels.Channel.CreateBounded<LogBatch>(2);
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _stop.Token);
+        var token = stop.Token;
+        var thread = new Thread(() => ReadLoop(partition, from, channel.Writer, token))
+        {
+            IsBackground = true,
+            Name = $"dbsp-kafka-reader {partition}",
+        };
+        Interlocked.Increment(ref _readers);
+        thread.Start();
+        try
+        {
+            await foreach (var batch in channel.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+                yield return batch;
+
+            // The reader thread ended without a fault: only stopping does that.
+            cancellationToken.ThrowIfCancellationRequested();
+            throw new ObjectDisposedException(nameof(KafkaLog));
+        }
+        finally
+        {
+            stop.Cancel();
+        }
+    }
+
+    private void ReadLoop(
+        TopicPartition partition, Offset from, System.Threading.Channels.ChannelWriter<LogBatch> output, CancellationToken token)
+    {
+        const int MaxBatch = 1024;
+        try
+        {
+            using var consumer = CreateConsumer();
+            consumer.Assign(new TopicPartitionOffset(partition, from));
+            var reported = -1L;
+            while (!token.IsCancellationRequested)
+            {
+                var result = consumer.ConsumeAssigned(TimeSpan.FromMilliseconds(100));
+                if (result is null)
+                {
+                    // Nothing to hand on, but the client may have read on all the same:
+                    // the records of an aborted transaction and its marker are passed
+                    // over inside it, and its position then stands behind them. The
+                    // end-of-partition event would say so too, one empty fetch later —
+                    // fetch.wait.max.ms, half a second — and a takeover that follows a
+                    // leader killed inside a transaction waited for exactly that before
+                    // it could promote the state.
+                    var at = consumer.Position(partition);
+                    if (at != Offset.Unset && at.Value > reported)
+                    {
+                        reported = at.Value;
+                        output.WriteAsync(new LogBatch([], reported), token).AsTask().GetAwaiter().GetResult();
+                    }
+                    continue;
+                }
+
+                var records = new List<ConsumeResult<byte[], byte[]>>();
+                var next = -1L;
+                while (result is not null)
+                {
+                    if (result.IsPartitionEOF)
+                    {
+                        // The end of committed data, past whatever markers follow the last
+                        // record: this is the position a reader "at the end" must report.
+                        next = result.Offset.Value;
+                        break;
+                    }
+                    records.Add(result);
+                    Interlocked.Increment(ref _readerRecordsTaken);
+                    next = result.Offset.Value + 1;
+                    if (records.Count >= MaxBatch)
+                        break;
+                    result = consumer.ConsumeAssigned(TimeSpan.Zero);
+                }
+
+                // Caught up without being told so: when the only offset between the last
+                // record and the end of committed data (as the fetch that brought the
+                // record reported it) is one offset, that offset is the transaction's
+                // marker, and the position is the end. Otherwise the reader would stand one
+                // short of the end until an empty fetch said so, half a second later.
+                if (records.Count > 0 && consumer.GetWatermarkOffsets(partition).High.Value == next + 1)
+                    next++;
+
+                if (records.Count == 0 && next <= reported)
+                    continue;
+                reported = next;
+                output.WriteAsync(new LogBatch(records, next), token).AsTask().GetAwaiter().GetResult();
+            }
+            output.TryComplete();
+        }
+        catch (OperationCanceledException)
+        {
+            output.TryComplete();
+        }
+        catch (Exception ex)
+        {
+            output.TryComplete(ex is ConsumeException consume
+                ? new KafkaLogException($"Reading {partition} failed: {consume.Error.Reason}", consume)
+                : ex);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _readers);
+        }
+    }
+
+    // ── plumbing ───────────────────────────────────────────────────────────────────────
+
+    private void Apply(ClientConfig config)
+    {
+        foreach (var (key, value) in _options.ClientConfig)
+            config.Set(key, value);
+    }
+
+    private void Log(LogMessage message)
+    {
+        if (_options.Logger is not { } logger)
+            return;
+        var level = message.Level switch
+        {
+            SyslogLevel.Emergency or SyslogLevel.Alert or SyslogLevel.Critical => LogLevel.Critical,
+            SyslogLevel.Error => LogLevel.Error,
+            SyslogLevel.Warning => LogLevel.Warning,
+            SyslogLevel.Notice or SyslogLevel.Info => LogLevel.Information,
+            _ => LogLevel.Debug,
+        };
+        if (level > LogLevel.Information && IsFenceMessage(message.Message))
+            level = LogLevel.Information;
+        logger.Log(level, "{Client} {Facility}: {Message}", message.Name, message.Facility, message.Message);
+    }
+
+    private void LogError(string client, Error error) =>
+        _options.Logger?.Log(
+            error.Code is ErrorCode.Local_Fenced or ErrorCode.ProducerFenced or ErrorCode.InvalidProducerEpoch || IsFenceMessage(error.Reason)
+                ? LogLevel.Information
+                : error.IsFatal ? LogLevel.Error : LogLevel.Warning,
+            "Kafka {Client} error {Code}: {Reason}", client, error.Code, error.Reason);
+
+    /// <summary>Whether the client is telling of this writer's fence: another process has
+    /// initialised the transactional id. That is how a leader ends when another node takes
+    /// over — asked for by an operator, or after a silence — and the leadership says it
+    /// once, with who replaced it (KafkaLeadership, the service's node). The client says it
+    /// three to four times as errors and fatal errors; those lines are kept, at
+    /// Information, so that a fence is not read as a failure of the node.</summary>
+    internal static bool IsFenceMessage(string? text) =>
+        text is not null
+        && (text.Contains("fenced by a newer instance", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("_FENCED", StringComparison.Ordinal)
+            || text.Contains("operation with an old epoch", StringComparison.OrdinalIgnoreCase));
+
+    public async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+        lock (_gate)
+            _closed = true;
+        _stop.Cancel();
+
+        if (_acquire is { } acquire)
+            await acquire.ContinueWith(static _ => { }, TaskScheduler.Default).ConfigureAwait(false);
+        if (_writerThread is { } thread)
+            await Task.Run(thread.Join).ConfigureAwait(false);
+        else
+        {
+            var closed = new KafkaLogFencedException("The Kafka log has been disposed; nothing more can be written through it.");
+            while (_queue.TryTake(out var orphan))
+                orphan.Completion.TrySetException(closed);
+        }
+
+        // Readers stop on the same token; give their threads a moment to close their
+        // consumers before the process moves on.
+        for (var i = 0; i < 100 && Volatile.Read(ref _readers) > 0; i++)
+            await Task.Delay(20).ConfigureAwait(false);
+
+        // A short read in flight ends on the stop token; then its consumer can go.
+        if (await _shortReadGate.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false))
+        {
+            if (_shortReader is { } reader)
+                DisposeShortReader(reader);
+            _shortReader = null;
+        }
+
+        await Task.Run(() =>
+        {
+            // An open transaction is left to the broker: it is aborted by the next writer's
+            // InitTransactions, or by the transaction timeout.
+            _producer.Dispose();
+            _admin.Dispose();
+        }).ConfigureAwait(false);
+    }
+}
+
+/// <summary>One atomic set of records on its way to the writer thread.</summary>
+internal sealed class LogCommit
+{
+    public readonly List<LogRecord> Records = [];
+    public readonly TaskCompletionSource Completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>The commit carries the writer's resignation: once it lands, the writer closes.</summary>
+    public bool Resigns;
+
+    /// <summary>Index of the one record whose offset the committer wants, or -1.</summary>
+    public int TrackIndex = -1;
+
+    /// <summary>The tracked record's offset once delivered; -1 until then.</summary>
+    public long TrackedOffset = -1;
+
+    public Action<DeliveryReport<byte[], byte[]>>? OnDelivered;
+
+    public void Add(TopicPartition target, byte[]? key, byte[]? value, Headers? headers = null) =>
+        Records.Add(new LogRecord(target, key, value, headers));
+
+    /// <summary>Asks for the offset of the record added next.</summary>
+    public void TrackNext()
+    {
+        TrackIndex = Records.Count;
+        OnDelivered = report =>
+        {
+            if (!report.Error.IsError)
+                Volatile.Write(ref TrackedOffset, report.Offset.Value);
+        };
+    }
+}
+
+/// <summary>A record to write. A null value is a tombstone. The log's own records always
+/// have a key and no headers; a sink's records (<see cref="KafkaSinkOptions.Log"/>) may
+/// have either.</summary>
+internal readonly record struct LogRecord(TopicPartition Target, byte[]? Key, byte[]? Value, Headers? Headers = null);
+
+/// <summary>Records read from one partition, and the reader's position after them.</summary>
+internal readonly record struct LogBatch(List<ConsumeResult<byte[], byte[]>> Records, long NextOffset);
+
+internal static class ByteExtensions
+{
+    /// <summary>The bytes with a format byte in front.</summary>
+    public static byte[] Prefixed(this byte[] payload, byte format)
+    {
+        var value = new byte[payload.Length + 1];
+        value[0] = format;
+        payload.CopyTo(value, 1);
+        return value;
+    }
+}

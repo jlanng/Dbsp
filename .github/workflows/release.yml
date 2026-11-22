@@ -9,7 +9,7 @@ name: Release
 # package ids below). Run by hand (workflow_dispatch) it does everything but push: the
 # packages are left as an artifact to look at.
 #
-# The service's packages (Incremental.Service*) are not released yet; add them to
+# The service's packages (Dbsp.Service*) are not released yet; add them to
 # PACKAGES when they are.
 on:
   push:
@@ -18,10 +18,10 @@ on:
 
 env:
   PACKAGES: >-
-    Incremental
-    Incremental.Storage.Redis
-    Incremental.Hosting
-    Incremental.Kafka
+    Dbsp
+    Dbsp.Storage.Redis
+    Dbsp.Hosting
+    Dbsp.Kafka
 
 jobs:
   release:
@@ -56,11 +56,11 @@ jobs:
       - name: Build
         run: dotnet build -c Release
       - name: Test
-        run: dotnet test --project tests/Incremental.Tests -c Release --no-build
+        run: dotnet test --project tests/Dbsp.Tests -c Release --no-build
       # No broker here: the integration tests skip. CI's connector-stack job is where
       # they run; release from a commit it has passed.
       - name: Test Kafka
-        run: dotnet test --project tests/Incremental.Kafka.Tests -c Release --no-build
+        run: dotnet test --project tests/Dbsp.Kafka.Tests -c Release --no-build
       - name: Pack
         run: |
           for p in $PACKAGES; do
@@ -102,7 +102,7 @@ jobs:
             echo '</Project>'
           } > Consumer.csproj
           cat > Program.cs <<'EOF'
-          using Incremental;
+          using Dbsp;
 
           var builder = new CircuitBuilder(new CircuitOptions());
           var numbers = builder.Input<int>("numbers");

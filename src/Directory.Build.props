@@ -8,8 +8,8 @@
     <Version>0.2.0</Version>
     <Authors>James Lanng</Authors>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageProjectUrl>https://github.com/jlanng/Incremental</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/jlanng/Incremental</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/jlanng/Dbsp</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/jlanng/Dbsp</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageTags>dbsp;incremental;streaming;dataflow</PackageTags>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>

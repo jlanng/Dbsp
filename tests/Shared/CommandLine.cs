@@ -2,7 +2,7 @@
 // (linked into each project, not a library): usage for --help, and exit code 2 for an
 // option the program does not have. A program that silently ignores a misspelt option
 // runs with a default nobody asked for.
-namespace Incremental.Tools;
+namespace Dbsp.Tools;
 
 /// <summary>One option: its name, the name of its value (null for a switch) and one line of help.</summary>
 internal sealed record Option(string Name, string? Value, string Help);

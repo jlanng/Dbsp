@@ -1,0 +1,60 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>Dbsp.EnrichmentService</RootNamespace>
+    <!-- A node's collector settings (the import below). Four heaps, not the eight a
+         production node would have: this host is run on a laptop, beside a browser. -->
+    <NodeGcHeaps>4</NodeGcHeaps>
+    <!-- The contract and plugin projects live in this directory too; their files are theirs. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);Contracts/**;Pipelines/**;Pipelines.V2/**;Pipelines.Tests/**</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <Import Project="..\..\src\Dbsp.Service\Node.Gc.props" />
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Dbsp.Service\Dbsp.Service.csproj" />
+    <ProjectReference Include="..\..\src\Dbsp.Service.Admin\Dbsp.Service.Admin.csproj" />
+    <ProjectReference Include="Contracts\Enrichment.Contracts.csproj" />
+    <!-- Built, never referenced: the service loads them at runtime. -->
+    <ProjectReference Include="Pipelines\Enrichment.Pipelines.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="Pipelines.V2\Enrichment.Pipelines.V2.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <!-- Only the Kafka mode's reference data needs it: rows are changed in Postgres and reach
+       the tables through Debezium. -->
+  <ItemGroup>
+    <PackageReference Include="Npgsql" Version="10.0.3" />
+  </ItemGroup>
+
+  <!-- Only for the monitoring flag (otlp): the libraries themselves publish plain
+       System.Diagnostics.Metrics meters and reference no exporter. -->
+  <ItemGroup>
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.19.1" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.19.1" />
+  </ItemGroup>
+
+  <!--
+    Plugin packages beside the host:
+      plugins/enrichment.pipelines/            version 1, imported at first lead (ServiceOptions.PluginDirectory)
+      plugin-packages/enrichment.pipelines-v2.zip   version 2, to upload through the admin UI or API
+  -->
+  <Target Name="PlacePluginPackages" AfterTargets="Build">
+    <ItemGroup>
+      <_PluginV1 Include="Pipelines\bin\$(Configuration)\net10.0\Enrichment.Pipelines.*" />
+    </ItemGroup>
+    <RemoveDir Directories="$(OutDir)plugins" />
+    <Copy SourceFiles="@(_PluginV1)" DestinationFolder="$(OutDir)plugins\enrichment.pipelines" />
+    <MakeDir Directories="$(OutDir)plugin-packages;$(IntermediateOutputPath)plugin-v2" />
+    <ItemGroup>
+      <_PluginV2 Include="Pipelines.V2\bin\$(Configuration)\net10.0\Enrichment.Pipelines.*" />
+      <_PluginV2Stale Include="$(IntermediateOutputPath)plugin-v2\*" />
+    </ItemGroup>
+    <Delete Files="@(_PluginV2Stale)" />
+    <Copy SourceFiles="@(_PluginV2)" DestinationFolder="$(IntermediateOutputPath)plugin-v2" />
+    <ZipDirectory SourceDirectory="$(IntermediateOutputPath)plugin-v2" DestinationFile="$(OutDir)plugin-packages\enrichment.pipelines-v2.zip" Overwrite="true" />
+  </Target>
+
+</Project>
