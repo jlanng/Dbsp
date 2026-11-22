@@ -1,10 +1,10 @@
-# An introduction to Incremental
+# An introduction to Dbsp
 
-> **Status:** this document describes the 0.2 API surface, which is being built. It doubles as
-> the design spec for that surface; sections marked **TODO** are intentionally thin for now.
-> The appendix mapping 0.1 → 0.2 will be deleted once the migration lands.
+> **Status:** this document describes the API of version 0.2, the first published release.
+> Notes marked **Not yet** name things the library does not do. It is a 0.x release: the
+> API may change between minor versions.
 
-Incremental is a stream processing library for .NET in the style of
+Dbsp is a stream processing library for .NET in the style of
 [DBSP](https://arxiv.org/abs/2203.16684): you declare a dataflow over your data once, feed it
 a stream of changes, and every derived result — counts, joins, windowed leaderboards — is
 kept up to date by processing **only the changes**, never by recomputing. An update that
@@ -27,7 +27,7 @@ Live page-view analytics: count views per page in 5-second windows, keep the top
 window, tolerate events arriving up to 2 seconds late.
 
 ```csharp
-using Incremental;
+using Dbsp;
 
 var builder = new CircuitBuilder(new CircuitOptions { Workers = 2 });
 
@@ -149,7 +149,7 @@ Deliberate narrowness, and why:
 Method naming follows LINQ where the semantics genuinely match (`Select`, `Where`,
 `SelectMany`, `GroupBy`, `Distinct`): it is the dialect .NET developers already speak, and
 because `ZStream` is not an `IEnumerable`, none of LINQ's own operators apply to it — the
-familiar names bind unambiguously to Incremental's operators. Operations with no LINQ
+familiar names bind unambiguously to Dbsp's operators. Operations with no LINQ
 analogue keep their own names (`WithEventTime`, `TumblingWindow`, `TopK`, `AntiJoin`); where
 LINQ semantics would mislead, the LINQ name is deliberately avoided (z-set subtraction is
 `Minus`, an advanced operator — not `Except`, whose LINQ meaning is distinct set-difference).
@@ -183,19 +183,19 @@ time-based:
 - a window closes when the watermark passes its end; its state is then evicted;
 - events arriving later than the allowed lateness are dropped, whether or not the circuit
   has seen them before — a record is late by its time alone — and counted:
-  `circuit.LateRecords` and the counter `incremental.circuit.late_records` (insertions; the
+  `circuit.LateRecords` and the counter `dbsp.circuit.late_records` (insertions; the
   retraction of a record that is final is dropped and not counted). One record stamped far
   ahead moves the watermark and makes everything behind it late — unless
   `CircuitOptions.MaxEventTimeAhead` is set: a record further ahead than that of the
   node's clock (and of the newest event time its input has brought) is then a record in
   error, a dead letter or a fault as the circuit's `ErrorPolicy` says, and moves nothing.
-  The bound is applied by the input, so it needs the declaration to be on the input
-  (**TODO:** late-event side-channel — design pending);
+  The bound is applied by the input, so it needs the declaration to be on the input.
+  (**Not yet:** an output of the late records themselves — they are counted, not delivered);
 - `circuit.CurrentWatermark` exposes the current value for monitoring.
 
 Because the watermark is the minimum across sources, an **idle source stalls it** — windows
-stop closing and state stops evicting until that source advances. (**TODO:** idleness
-handling for a whole source — timeout/mark-idle design pending.)
+stop closing and state stops evicting until that source advances. (**Not yet:** a way to
+mark a whole source idle. A source's *partitions* can be idle, below.)
 
 **Partitions.** Declared on an input itself (`input.WithEventTime(…, lateness)`, not after a
 `Select`), event time is kept per partition of the input's source where the source names
@@ -278,7 +278,22 @@ Custom aggregates plug in via `Aggregate(IAggregateFunction<…>)`, or
 `AggregateLinear(ILinearAggregate<…>)` when the aggregate is a homomorphism over weights
 (cheaper: no per-key group state).
 
-> **TODO:** worked custom-aggregate example (e.g. HDR percentile sketch).
+A linear aggregate is three members — no per-key group is stored, just one accumulator,
+and a retraction arrives as a negative weight and folds in:
+
+```csharp
+public readonly record struct FeeStats(long Orders, decimal Gross, decimal Fees);
+
+public sealed class FeeTakeAggregate : ILinearAggregate<EnrichedOrder, FeeStats>
+{
+    public FeeStats Zero { get; } = new(0, 0m, 0m);
+    public FeeStats Map(EnrichedOrder value, long weight) => new(weight, value.Amount * weight, value.Fee * weight);
+    public FeeStats Combine(FeeStats left, FeeStats right) =>
+        new(left.Orders + right.Orders, left.Gross + right.Gross, left.Fees + right.Fees);
+}
+```
+
+(`examples/Dbsp.Showcase/Aggregates.cs` has this one and two more.)
 
 ## Joins
 
@@ -300,8 +315,8 @@ special case — it is just another stream — and `LeftJoin`/`FullJoin`/`AntiJo
 outer and negative cases. When an instrument row is *upserted*, the old enriched rows are
 retracted and new ones asserted automatically — historical results re-attribute themselves.
 
-> **TODO:** windowed / interval joins (stream-stream within a time bound) — not yet designed;
-> today this is manual via the escape hatches.
+> **Not yet:** windowed / interval joins (stream-stream within a time bound). Today this is
+> manual, via the escape hatches.
 
 ### Joining shared tables
 
@@ -565,7 +580,7 @@ delivers their batches again. The contract:
   steps — and runs no step while it waits; inputs back up behind it, bounded as ever. At
   `CheckpointInterval = 1` that is one sink round trip per step. To let steps flow between
   commits, raise the interval and set `CheckpointMaxDelay` (below): the replay window is
-  then bounded in time. `incremental.circuit.sink_ack_wait` measures what the waiting
+  then bounded in time. `dbsp.circuit.sink_ack_wait` measures what the waiting
   costs. With manual stepping, a `StepAsync` that commits returns only after the
   acknowledgement, so the consumer must be running concurrently.
 - **A consumer that goes away faults the circuit.** Ending `Batches()` early — cancelling
@@ -655,8 +670,8 @@ for anything with an unbounded keyspace. `Current()` is taken on demand — noth
 the full result per update — and yields each row once with its `Weight` rather than
 duplicating multi-weight rows.
 
-> **TODO:** point-lookup views (query a key's current value without materializing the whole
-> result) — design pending.
+> **Not yet:** point-lookup views (query a key's current value without materializing the
+> whole result).
 
 ## Records that cannot be processed
 
@@ -675,7 +690,7 @@ await foreach (var letter in circuit.DeadLetters.ReadAllAsync())
 
 A `DeadLetter` carries the record, its signed weight, the operator that dropped it (its
 state name: `n3.select`, or `named.enrich.join` if you named it), the exception, and the
-step. `incremental.circuit.dead_letters` counts them, tagged by operator. Override the
+step. `dbsp.circuit.dead_letters` counts them, tagged by operator. Override the
 policy for one operator with `.OnError(…)` on the stream it returns:
 `orders.Select(Parse).OnError(RecordErrorPolicy.DeadLetter)` in a circuit that otherwise
 faults, or `.OnError(RecordErrorPolicy.Fault)` on the one operator that must never drop.
@@ -811,7 +826,7 @@ commit: its next checkpoint throws `ChangelogFencedException`, its circuits faul
 where a circuit is told to "start against an empty state store". Clustered circuits cannot
 use this provider.
 
-**On Kafka.** The `Incremental.Kafka` package supplies both logs. One `KafkaLog` per
+**On Kafka.** The `Dbsp.Kafka` package supplies both logs. One `KafkaLog` per
 process owns the one transactional producer everything durable is written through:
 
 ```csharp
@@ -1061,8 +1076,8 @@ _ = circuit.Handle(enrichedOutput).DeliverToAsync(audit);
 - `KafkaUpsertSink` writes `key → row` and a tombstone for a delete: the shape of a
   compacted topic. A keyed `KafkaSource` in another circuit reads it back as the same
   rows. `KafkaAppendSink` writes one record per appended record.
-- Every record carries the header `incremental.step` (the step's sequence, decimal text)
-  and, with `Term` set, `incremental.term`. Keys are placed as the Java client places
+- Every record carries the header `dbsp.step` (the step's sequence, decimal text)
+  and, with `Term` set, `dbsp.term`. Keys are placed as the Java client places
   them (murmur2), so a key stays in one partition whichever client wrote it. The sink
   does not create its topic.
 - **Delivery is at-least-once**, as for any sink: the batch is acknowledged when every
@@ -1131,12 +1146,12 @@ hexadecimal**, so twelve heaps is `DOTNET_GCHeapCount=c`.
 Every example in this repo ships with this applied; see `examples/Directory.Build.props` and
 the `<CircuitWorkers>` property in each example's `.csproj`. A service node — many
 one-worker circuits over gigabytes of tables and state that stay — is another kind of
-process with settings of its own (`src/Incremental.Service/Node.Gc.props`: eight
+process with settings of its own (`src/Dbsp.Service/Node.Gc.props`: eight
 heaps, not adaptive), measured in [enrichment-service.md](enrichment-service.md#sizing-a-node).
 
 ### Hosting it
 
-Under the generic host — a worker service, an ASP.NET Core app — the `Incremental.Hosting`
+Under the generic host — a worker service, an ASP.NET Core app — the `Dbsp.Hosting`
 package owns the lifecycle. Put the dataflow in a **definition class**: its constructor takes
 the `CircuitBuilder` (any further parameters come from the container), and the inputs and
 outputs you want reachable are its members.
@@ -1161,10 +1176,11 @@ public sealed class PageAnalytics
 }
 
 builder.Services
-    .AddIncremental<PageAnalytics>()
-    .BindConfiguration("Incremental:PageAnalytics")          // Workers, capacities, CheckpointInterval, …
+    .AddDbsp<PageAnalytics>()
+    .BindConfiguration("Dbsp:PageAnalytics")          // Workers, capacities, CheckpointInterval, …
     .Configure((o, sp) => o.Storage = new RedisStorageProvider(
-        sp.GetRequiredService<IConnectionMultiplexer>(), "page-analytics"))
+        sp.GetRequiredService<IConnectionMultiplexer>(),
+        new RedisStorageOptions { KeyPrefix = "page-analytics" }))
     .AddOutputConsumer<LeaderboardPublisher, WindowedValue<string, long>>(d => d.TopPages)
     .AddHealthCheck();
 ```
@@ -1218,7 +1234,7 @@ What the host does for you:
   the thing you wrote. Options are read once, at build — configuration reloads are not
   observed, because a circuit's shape cannot change under it.
 
-`examples/Incremental.LogAnalytics` is this section as a runnable worker service: a producer
+`examples/Dbsp.LogAnalytics` is this section as a runnable worker service: a producer
 `BackgroundService`, a dashboard reading a `View`, and registration order doing the shutdown
 ordering. The definition class is plain: `new PageAnalytics(builder)` works just as well in a test or
 a console app with no container in sight. Clustered circuits are not hostable yet — they
@@ -1226,13 +1242,13 @@ step in explicit lockstep across processes, which needs a host-side stepping pro
 
 ### Running many pipelines
 
-`Incremental.Hosting` runs one circuit whose definition is a class you compiled in.
-`Incremental.Service` is for the other shape: many circuits, deployed and changed while
+`Dbsp.Hosting` runs one circuit whose definition is a class you compiled in.
+`Dbsp.Service` is for the other shape: many circuits, deployed and changed while
 the process runs, joining a few large tables they all share. Each pipeline is one circuit;
 the tables live outside them, once per process.
 
 ```csharp
-builder.Services.AddIncrementalService(o => o.PluginDirectory = "plugins")
+builder.Services.AddDbspService(o => o.PluginDirectory = "plugins")
     .UseInMemoryBackend()                                   // the default; or UseKafkaBackend, below
     .AddObjectStore("refdata", _ => new LocalObjectStore("/var/lib/refdata"))
     .AddContracts(typeof(Instrument).Assembly)              // row types and table definitions
@@ -1240,7 +1256,7 @@ builder.Services.AddIncrementalService(o => o.PluginDirectory = "plugins")
     .AddTable(Tables.Instruments, new TableLoaderSpec("file", "refdata", config));
 ```
 
-A **table** is declared once, in a *contract assembly* (`[assembly: IncrementalContract]`),
+A **table** is declared once, in a *contract assembly* (`[assembly: DbspContract]`),
 as a `TableDefinition<TKey, TRow>`: its name, its key, its indexes. A **pipeline** is a
 definition class; `Build` describes one circuit against named slots:
 
@@ -1319,9 +1335,9 @@ What to know before relying on it:
 - **The dead-letter output is always read**, into a ring of the newest records per
   pipeline, so a circuit under `RecordErrorPolicy.DeadLetter` cannot stall on it.
 - **Plugins are trusted code** loaded into a collectible `AssemblyLoadContext` per
-  version. A plugin compiles against `Incremental` and `Incremental.Service.Abstractions`
+  version. A plugin compiles against `Dbsp` and `Dbsp.Service.Abstractions`
   (definitions, `PipelineBuilder`, table definitions) and nothing of hosting or Kafka.
-  It gets the host's copy of `Incremental*` and of any contract assembly,
+  It gets the host's copy of `Dbsp*` and of any contract assembly,
   even if it ships its own, which is what lets two plugins join one table. Hold nothing
   of a plugin's in a static, and never serialize a plugin's type with a process-wide
   `JsonSerializerOptions` — use the one the slot context gives you — or its version can
@@ -1347,7 +1363,7 @@ same name and address, as the standby.
 losing the first costs seconds. Both are configured alike except for their names:
 
 ```csharp
-builder.Services.AddIncrementalService(o => { o.PluginDirectory = "plugins"; o.CacheDirectory = "/var/cache/enrichment"; })
+builder.Services.AddDbspService(o => { o.PluginDirectory = "plugins"; o.CacheDirectory = "/var/cache/enrichment"; })
     .UseKafkaBackend(new KafkaServiceBackendOptions
     {
         Log = new KafkaLogOptions { BootstrapServers = "…", TopicPrefix = "enrichment", NodeId = "node-a" },
@@ -1450,8 +1466,8 @@ What to know:
   error, not a jump of the watermark.
 - **A spec can cap a pipeline's state**: `circuit.maxStateEntries` fails that pipeline,
   and only it, when its state entries pass the number.
-- **For a monitoring system there is a meter**, `Incremental.Service`
-  (`ServiceMeter.Name`), beside the core's `Incremental`: pipelines by state, per
+- **For a monitoring system there is a meter**, `Dbsp.Service`
+  (`ServiceMeter.Name`), beside the core's `Dbsp`: pipelines by state, per
   pipeline whether it is up, its source lag, checkpoint age, sink-ack wait, dead letters,
   faults, restarts and roll-backs; tables by state with rows, version, follower lag and
   loader lag; the node's role, term, health, standby readiness and state lag; takeovers
@@ -1468,17 +1484,17 @@ What to know:
 
 #### Looking at it: the admin API and UI
 
-`Incremental.Service.Admin` mounts a JSON API and a web UI over the node:
+`Dbsp.Service.Admin` mounts a JSON API and a web UI over the node:
 
 ```csharp
-builder.Services.AddIncrementalAdmin(o =>
+builder.Services.AddDbspAdmin(o =>
 {
     o.ExposeRowData = true;                 // rows, dead-letter records, exception messages
     o.AllowPluginUpload = true;             // code over the API: off unless you say so
     // o.AuthorizationPolicy = "admins";    // without one, loopback requests only
 });
-app.MapIncrementalAdmin("/admin");          // UI at /admin/, API under /admin/api
-app.MapIncrementalHealth("/health");        // /live, /ready, /status: for a load balancer
+app.MapDbspAdmin("/admin");          // UI at /admin/, API under /admin/api
+app.MapDbspHealth("/health");        // /live, /ready, /status: for a load balancer
 ```
 
 - **It is loopback-only until a policy is set.** With no `AuthorizationPolicy` a request
@@ -1491,7 +1507,7 @@ app.MapIncrementalHealth("/health");        // /live, /ready, /status: for a loa
 - **Row data is a switch.** Off, the row endpoints answer 403, and faults, dead letters,
   unreadable records and events come back with the exception's type and not its message:
   a `FormatException` quotes the value it could not read.
-- **Mutations** carry the header `X-Incremental-Admin: 1`, take `dryRun=true` (the answer
+- **Mutations** carry the header `X-Dbsp-Admin: 1`, take `dryRun=true` (the answer
   is the plan and nothing happens), and — reset, remove, table and plugin deletion,
   takeover, step-down — `confirm=<the id>`. A pipeline mutation may carry
   `If-Match: "<generation>"` and gets 412 if the pipeline has moved. On a standby they are
@@ -1530,12 +1546,12 @@ app.MapIncrementalHealth("/health");        // /live, /ready, /status: for a loa
 The UI is the same API in a browser — overview, pipelines (metrics, topology, config,
 faults, dead letters), tables (loader, readers, rows), plugins, cluster, audit — and is
 embedded in the package: nothing to build, nothing fetched from elsewhere.
-`dotnet run --project tests/Incremental.Service.AdminHost` runs it with data.
+`dotnet run --project tests/Dbsp.Service.AdminHost` runs it with data.
 
 **Files, dead letters, and a test harness.** Besides `kafka` and `memory` a slot can be
 bound to the built-in `files` connector: JSON-lines objects under a prefix of an
 `IObjectStore` the host registered (a local directory is built in; an S3 bucket is the
-optional package `Incremental.Service.S3`, `AddS3ObjectStore`, tested against MinIO and
+optional package `Dbsp.Service.S3`, `AddS3ObjectStore`, tested against MinIO and
 not against Amazon S3). As a source it reads objects in name order with
 the object and line in the checkpoint, asks only for names after its position, and
 waits `settle` for an object to be left alone so that one arriving a little late is
@@ -1552,26 +1568,27 @@ is a warning at the dry run and a visible *waiting* state, and after a grace per
 connector as the pipeline's dead-letter sink: dropped records are delivered there, at
 least once, before the checkpoint that passes them, and a sink that will not take them
 stops the pipeline and says why. And `PipelineTestHarness` (the
-`Incremental.Service.Testing` package) runs one definition in a test — settings bound as the service binds them, tables the
+`Dbsp.Service.Testing` package) runs one definition in a test — settings bound as the service binds them, tables the
 test fills, inputs it feeds, steps it takes, sinks and dead letters it reads — with no
 node and no HTTP.
 
 **A guide and a complete host.** [enrichment-service.md](enrichment-service.md) walks
 through writing a contract, a definition, a plugin project and its tests, the host and
 its adapters (table sources with and without positions, a source connector, a sink
-connector), the UI, and operating notes. It is written around `examples/Incremental.EnrichmentService`,
-which runs in memory (`dotnet run --project examples/Incremental.EnrichmentService`), as
+connector), the UI, and operating notes. It is written around `examples/Dbsp.EnrichmentService`,
+which runs in memory (`dotnet run --project examples/Dbsp.EnrichmentService`), as
 two processes on Kafka with reference data arriving from Postgres through Debezium
 (`-- --kafka --node a`, `-- --kafka --node b`), and as a smoke test that checks every sink
-against a model (`-- --headless`). `examples/Incremental.TradeEnrichment` shows the table
+against a model (`-- --headless`). `examples/Dbsp.TradeEnrichment` shows the table
 operators on their own, without the service.
 
 What is built and what is not is in
 [design/enrichment-service.md](design/enrichment-service.md), *As built*.
 
-> **TODO:** cluster deployment (multi-process exchange over a transport), checkpoint
-> operations guide, observability/metrics reference. The engine supports all three today;
-> consumer-facing docs pending.
+Three things the engine does are described in the [README](../README.md) and not here:
+running one circuit across processes (*Cross-process exchange*), what a checkpoint commits
+and how a restart resumes (*Checkpointing and exactly-once restart*), and the logs and
+metrics a circuit emits (*Observability*).
 
 ## Escape hatches
 
@@ -1602,66 +1619,3 @@ for the cases the paved road doesn't cover:
 
 These are documented in the API reference rather than here; if you find yourself reaching for
 them routinely, that's design feedback we want to hear.
-
----
-
-## Appendix: mapping from the 0.1 surface *(delete after migration)*
-
-`CircuitBuilder`/`Circuit`/`CircuitOptions` keep their names (a `Dataflow` rename was
-considered and rejected: TPL Dataflow owns that word in .NET).
-
-| 0.1 | 0.2 |
-| --- | --- |
-| `Map` / `Filter` / `FlatMap` | `Select` / `Where` / `SelectMany` |
-| `Plus` | `Concat` (duplicate-preserving, matching LINQ `Concat`) |
-| `Minus` / `Negate` | kept, advanced (**not** renamed `Except` — LINQ semantics differ) |
-| `WithWatermark(sel, allowedLateness)` | `WithEventTime(sel, lateness)` → `EventTimeStream<T>` |
-| `IndexBy(key)` → `KeyedZStream` | `GroupBy(key)` → `GroupedZStream` (staging; exchange insertion unchanged) |
-| `TumblingWindow`/`HoppingWindow` on raw streams | removed; windows live on event-timed groupings only |
-| `SessionWindow(sel, key, gap)` | `GroupBy(key).SessionWindow(gap)` |
-| manual `IndexBy(w => (w.WindowStart, key))` + `WithEviction` | implicit in `GroupBy(…).XWindow(…)` |
-| `WithEviction(closesAt)` | `EvictWhen(closesAt)` (escape hatch) |
-| `WindowCloses()` | `OnClose()` on windowed results (emit-on-close, no flapping) |
-| `Output(name)` + `circuit.Output<T>(name)` | `ToOutput()` + `circuit.Handle(def)` (outputs unnamed) |
-| `Output(name, snapshot: true)` | automatic on table-shaped outputs (`ToOutput(bootstrap: false)` to opt out) |
-| `circuit.Input<T>(name)` string lookup | `circuit.Handle(def)` |
-| `OutputHandle.ReadAllAsync()` | `OutputHandle.Changes()` (single consumer, enforced) |
-| hand-rolled integration loops | `MaterializeInMemory()` (opt-in, cost in the name) |
-| `MapValues` / `Values` | kept on keyed/windowed results |
-
-Implementation notes (not consumer-facing):
-
-- The execution model is untouched: same operators, same exchange/barrier discipline, same
-  storage and checkpoint machinery. This is a surface rewrite that compiles to the same
-  graph. `EventTimeStream` needs no engine change: it carries the timestamp selector at
-  build time and applies it at the window site (which is why `Select` drops it — the
-  selector no longer typechecks against the reshaped record).
-- `GroupBy` must carry the exchange + stable-hash discipline of `IndexBy` unchanged.
-- Windowed **aggregation** routes by the user key only (all windows of a key on one worker;
-  eviction worker-local). Window-collapsing regroupings — `TopK`, window-sticky `GroupBy` —
-  re-exchange keyed by the window, so `DateTimeOffset` is part of the stable-hash contract,
-  and each window's ranking work lands on a single worker (as in 0.1's LogAnalytics example).
-- Table-shaped outputs' automatic resync builds on 0.1's `SnapshotOperator` (checkpointed
-  view state). The opt-out lives at `ToOutput`, not at `Changes()`: snapshot state must
-  exist *before* a crash to serve the resync after it, so it cannot be a subscribe-time
-  choice. Stream-shaped outputs never maintain it — the integrated result of an append-only
-  stream is unbounded.
-- Restructuring changes positional store names → bump the state-manifest format version
-  (no deployed checkpoints exist; the bump is hygiene).
-- Decisions settled during implementation: windowed rows are the flat
-  `WindowedValue<TKey,TValue>` record and unwindowed keyed rows stay
-  `KeyedValue<TKey,TValue>` (their equality and serialized shape are public contract, see
-  "Your records are the contract"); the composite state key is `WindowKey<TKey>` and
-  window-collapsing ops route by `WindowBounds` (both public — they name checkpointed
-  state); the event-timed types are `EventTimeStream<T>` / `GroupedEventTimeStream<TKey,T>`;
-  `TopK` output shapes are unchanged; `GroupedZStream.Distinct()` returns keyed rows
-  (continue with `.Grouped()` for a distinct count).
-- Still open: the spelling for collapsing a windowed result to the window alone
-  (aggregate-of-aggregates — window-sticky `GroupBy` to a unit key works but is ugly;
-  `TopK` doesn't need it, it ranks per window natively); keyed-input snapshot sync (retract
-  keys a full-table re-feed omits); watermark
-  idleness for a circuit's own inputs (the service's Kafka sources have it per
-  partition, `Runtime/InputEventTime.cs`); whether required input names can go too — today they are the durable
-  key for checkpointed source offsets (a reference dies with the process, positional
-  identity would re-bind offsets across topology edits), but a derived-with-optional-pin
-  scheme like store naming may be possible.

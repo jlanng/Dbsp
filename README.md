@@ -1,9 +1,12 @@
-# Incremental
+# Dbsp
 
 An incremental stream processing library for .NET, built on the ideas of
 [DBSP](https://arxiv.org/abs/2203.16684) (the theory behind Feldera): every collection is a
 **Z-set** (values with signed weights), every stream carries **deltas**, and every operator
 — including joins and aggregations — processes only the changes, never the full state.
+
+This is an independent .NET implementation, named after the theory. It is not Feldera's
+DBSP engine and is not affiliated with Feldera.
 
 ```csharp
 var builder = new CircuitBuilder(new CircuitOptions { Workers = 4 });
@@ -339,30 +342,30 @@ exactly-once (below).
 
 **Observability.** `CircuitOptions.Name` names the circuit in its logs and as the
 `circuit` tag on every metric, so circuits sharing a process stay distinguishable;
-`CircuitOptions.LoggerFactory` receives the logs (categories `Incremental.Circuit` and
-`Incremental.Cluster`: lifecycle at Information, checkpoint commits at Debug, faults and
+`CircuitOptions.LoggerFactory` receives the logs (categories `Dbsp.Circuit` and
+`Dbsp.Cluster`: lifecycle at Information, checkpoint commits at Debug, faults and
 cluster timeouts at Error — record contents are never logged):
 
 ```csharp
 var options = new CircuitOptions { Name = "orders", LoggerFactory = loggerFactory };
 ```
 
-Metrics need no wiring: the `Incremental` `Meter` is always on and costs nothing
+Metrics need no wiring: the `Dbsp` `Meter` is always on and costs nothing
 unlistened.
 
 | Instrument | Meaning |
 | --- | --- |
-| `incremental.circuit.steps`, `.step_duration` | steps completed; wall-clock per step, drain through publish |
-| `incremental.circuit.records` | input records drained into steps (after replay dedup) |
-| `incremental.circuit.faults` | transitions to the terminal faulted state |
-| `incremental.circuit.checkpoint_commits`, `.checkpoint_commit_duration` | atomic state+offsets commits |
-| `incremental.circuit.sink_ack_wait` | seconds a commit waited for acknowledged outputs' consumers to confirm delivery, one measurement per commit |
-| `incremental.circuit.dead_letters` | records dropped under the `DeadLetter` error policy, tagged by `operator` |
-| `incremental.circuit.late_records` | insertions dropped at a `WithEventTime` declaration for being behind the watermark (`Circuit.LateRecords`) |
-| `incremental.circuit.input_queue_depth`, `.output_queue_depth` | bounded-channel depths, per port |
-| `incremental.circuit.watermark_lag` | now minus the frozen watermark, seconds |
-| `incremental.circuit.barrier_wait` | cumulative seconds each worker has spent waiting on exchange and loop barriers |
-| `incremental.cluster.frames_sent/received`, `.bytes_sent/received`, `.send_queue_depth` | exchange traffic, per peer |
+| `dbsp.circuit.steps`, `.step_duration` | steps completed; wall-clock per step, drain through publish |
+| `dbsp.circuit.records` | input records drained into steps (after replay dedup) |
+| `dbsp.circuit.faults` | transitions to the terminal faulted state |
+| `dbsp.circuit.checkpoint_commits`, `.checkpoint_commit_duration` | atomic state+offsets commits |
+| `dbsp.circuit.sink_ack_wait` | seconds a commit waited for acknowledged outputs' consumers to confirm delivery, one measurement per commit |
+| `dbsp.circuit.dead_letters` | records dropped under the `DeadLetter` error policy, tagged by `operator` |
+| `dbsp.circuit.late_records` | insertions dropped at a `WithEventTime` declaration for being behind the watermark (`Circuit.LateRecords`) |
+| `dbsp.circuit.input_queue_depth`, `.output_queue_depth` | bounded-channel depths, per port |
+| `dbsp.circuit.watermark_lag` | now minus the frozen watermark, seconds |
+| `dbsp.circuit.barrier_wait` | cumulative seconds each worker has spent waiting on exchange and loop barriers |
+| `dbsp.cluster.frames_sent/received`, `.bytes_sent/received`, `.send_queue_depth` | exchange traffic, per peer |
 
 **Keyed inputs.** `builder.KeyedInput<K,V>(name, keySelector)` declares an input with
 upsert/delete-by-key semantics: the circuit keeps the current row per key, so
@@ -401,7 +404,7 @@ deadlines of open windows and keys), created per operator *per worker*
 so implementations never see cross-thread access to one store.
 
 - `InMemoryStorageProvider` (default) — heap dictionaries.
-- `RedisStorageProvider` (`Incremental.Storage.Redis`) — state in Redis hashes; survives
+- `RedisStorageProvider` (`Dbsp.Storage.Redis`) — state in Redis hashes; survives
   restarts, can exceed the heap, and checkpoints (below). `KeyPrefix` is required and must
   be unique per circuit sharing the Redis instance — two circuits under one prefix would
   silently interleave state:
@@ -426,7 +429,7 @@ so implementations never see cross-thread access to one store.
   what was built:
   [docs/design/durability-and-standby.md](docs/design/durability-and-standby.md).
 
-- `Incremental.Service` is what makes the set of tables and pipelines change while the
+- `Dbsp.Service` is what makes the set of tables and pipelines change while the
   process runs: a registry that owns the shared tables and their loaders, a supervisor
   that runs one circuit per pipeline and deploys, replaces, resets and removes them one at
   a time, pipeline definitions loaded from plugin assemblies at runtime, and a catalog — a
@@ -438,17 +441,17 @@ so implementations never see cross-thread access to one store.
   connector and the `kafka` and `debezium` table loaders bind slots and tables to topics
   through named connections). A replace that keeps state is checked against the committed
   checkpoint before anything stops and rolled back if the state turns out not to fit; the
-  service publishes a meter, `Incremental.Service`, for a monitoring system; and the
+  service publishes a meter, `Dbsp.Service`, for a monitoring system; and the
   admin API says what a deploy needs — a definition's slots and settings, the registered
   connectors and connections, a starting spec. A `files` connector reads and writes
   JSON-lines objects through `IObjectStore` (a directory is built in; an S3 bucket is
-  the optional package `Incremental.Service.S3`, tested against MinIO and not against
+  the optional package `Dbsp.Service.S3`, tested against MinIO and not against
   Amazon S3), with a paged listing, a settle time for late objects, deletes, retention
   and compaction; an input that is not there is a dry-run warning and a *waiting*
   state; a spec's `deadLetters` keeps dropped records in any append sink, at least
   once and across a takeover, and `PipelineTestHarness` (package
-  `Incremental.Service.Testing`) tests a definition with no node. A plugin compiles
-  against `Incremental.Service.Abstractions` and the core only — nothing of hosting or
+  `Dbsp.Service.Testing`) tests a definition with no node. A plugin compiles
+  against `Dbsp.Service.Abstractions` and the core only — nothing of hosting or
   Kafka — and a host can give the `kafka` connector a record format of its own (Avro,
   a schema registry's framing) through `IRecordFormat`. Nodes are upgraded one at a
   time, even across a change of a persisted format (format levels: the leader writes
@@ -459,15 +462,15 @@ so implementations never see cross-thread access to one store.
   [docs/intro.md](docs/intro.md) and
   [docs/design/enrichment-service.md](docs/design/enrichment-service.md), *As built*.
 
-- `Incremental.Service.Admin` is the service's admin surface: a JSON API and a web UI on
+- `Dbsp.Service.Admin` is the service's admin surface: a JSON API and a web UI on
   top of it, mounted with two calls in any ASP.NET Core host.
 
   ```csharp
-  builder.Services.AddIncrementalService(o => o.AdvertisedAdminUrl = "http://node-a:5180/admin/");
-  builder.Services.AddIncrementalAdmin(o => o.ExposeRowData = true);
+  builder.Services.AddDbspService(o => o.AdvertisedAdminUrl = "http://node-a:5180/admin/");
+  builder.Services.AddDbspAdmin(o => o.ExposeRowData = true);
   var app = builder.Build();
-  app.MapIncrementalAdmin("/admin");      // UI at /admin/, API at /admin/api
-  app.MapIncrementalHealth("/health");    // /health/live, /ready, /status
+  app.MapDbspAdmin("/admin");      // UI at /admin/, API at /admin/api
+  app.MapDbspHealth("/health");    // /health/live, /ready, /status
   ```
 
   ![The overview: the node's role, throughput, pipelines by state, tables, events](docs/images/admin/overview.png)
@@ -505,12 +508,12 @@ so implementations never see cross-thread access to one store.
   ticks and then its connection, never the server's memory. The UI is hand-written HTML,
   CSS and JavaScript embedded in the assembly: no build step, no CDN, no web font.
 
-  `dotnet run --project tests/Incremental.Service.AdminHost` runs it against three tables
+  `dotnet run --project tests/Dbsp.Service.AdminHost` runs it against three tables
   and eight pipelines on the in-memory backend (`-- --nodes 2` for a leader and a standby
   on ports 5180 and 5181, a replaced node started again in the process as the standby;
   `--read-only`, `--no-rows`).
 
-  How it behaves at size is measured by `benchmarks/Incremental.Service.Scale`: two node
+  How it behaves at size is measured by `benchmarks/Dbsp.Service.Scale`: two node
   processes on Kafka, a table of millions of wide rows shared by twenty pipelines, large
   join and aggregate state, and then `kill -9` of the leader. The standby builds every
   pipeline's circuit on the state it follows, so a takeover starts circuits rather than
@@ -542,12 +545,12 @@ so implementations never see cross-thread access to one store.
   definition, the project file, a spec, a test — then the host and its adapters, the
   built-in connectors, the admin UI, and operating notes (failover, reset, retention,
   dead letters, MSK). Its code is quoted
-  from `examples/Incremental.EnrichmentService`, a complete host:
+  from `examples/Dbsp.EnrichmentService`, a complete host:
 
   ```bash
-  dotnet run --project examples/Incremental.EnrichmentService                 # one node, in memory: http://127.0.0.1:5180/admin/
-  dotnet run --project examples/Incremental.EnrichmentService -- --nodes 2    # with a standby on 5181
-  dotnet run --project examples/Incremental.EnrichmentService -- --headless   # its smoke test; add --nodes 2, or --kafka
+  dotnet run --project examples/Dbsp.EnrichmentService                 # one node, in memory: http://127.0.0.1:5180/admin/
+  dotnet run --project examples/Dbsp.EnrichmentService -- --nodes 2    # with a standby on 5181
+  dotnet run --project examples/Dbsp.EnrichmentService -- --headless   # its smoke test; add --nodes 2, or --kafka
   ```
 
   With the connector stack up, `-- --kafka --node a` and `-- --kafka --node b` in two
@@ -555,7 +558,7 @@ so implementations never see cross-thread access to one store.
   arriving through Debezium; kill the first and the second leads in about three and a
   half seconds.
 
-- `Incremental.Kafka` puts both logs on Kafka. One `KafkaLog` per process owns one
+- `Dbsp.Kafka` puts both logs on Kafka. One `KafkaLog` per process owns one
   transactional producer; `log.State` is the `IStateChangelog` over the compacted topic
   `{prefix}.state`, and `log.OpenTableLogAsync<TKey, TRow>(name)` is a table's `ITableLog`
   over `{prefix}.table.{name}.changes` and `.rows`. Concurrent commits from every circuit
@@ -644,7 +647,7 @@ so implementations never see cross-thread access to one store.
 
 - `KafkaUpsertSink` (`IUpsertSink`: key → row, a delete is a tombstone, for a compacted
   topic) and `KafkaAppendSink` (`IAppendSink`: every record carries its step in the
-  header `incremental.step`) write results to Kafka, at-least-once. By default each has
+  header `dbsp.step`) write results to Kafka, at-least-once. By default each has
   an idempotent producer of its own; with `KafkaSinkOptions.Log` set it writes through
   the log's transactional producer instead and a deposed leader cannot write it at all.
   A keyed `KafkaSource` reads an upsert sink's topic back as the same table.
@@ -721,7 +724,7 @@ publish and commit therefore re-runs those steps and delivers their batches agai
 is lost, and some batches arrive twice. Sequences are step numbers, committed with the
 checkpoint (`Circuit.CommittedStep`) and continued after a restart, so a redelivery is
 recognisable as a sequence the sink has already applied. The circuit runs no step while a
-commit waits on the sink (`incremental.circuit.sink_ack_wait` measures it); use a larger
+commit waits on the sink (`dbsp.circuit.sink_ack_wait` measures it); use a larger
 `CheckpointInterval` with `CheckpointMaxDelay` — a commit at least that often in time — to
 keep steps flowing between commits. A consumer that stops reading faults the circuit rather
 than stall it. Plain outputs keep their semantics and hold no commit up. Single process
@@ -741,7 +744,7 @@ truncate to `Circuit.CommittedStep` on restart — both spelled out in
 **Per-record errors.** `CircuitOptions.ErrorPolicy` is `Fault` by default: a throwing
 delegate or a null key faults the circuit. `DeadLetter` drops the record instead, reports
 it — record, weight, operator, exception — on the bounded `circuit.DeadLetters` channel
-(which must be read) and counts it in `incremental.circuit.dead_letters`; `.OnError(policy)`
+(which must be read) and counts it in `dbsp.circuit.dead_letters`; `.OnError(policy)`
 overrides it for one operator. With `AcknowledgeDeadLetters` the checkpoint waits until
 the reader has stored each step's dropped records (`circuit.DeadLetterBatches`,
 `DeliverDeadLettersToAsync`), so a crash loses none. A dropped record's retraction is dropped too, which for
@@ -761,55 +764,55 @@ deterministic step boundaries for tests and batch jobs.
 ## Project layout
 
 ```
-src/Incremental                    core: Z-sets, builder API, operators, windows, runtime, in-memory
+src/Dbsp                    core: Z-sets, builder API, operators, windows, runtime, in-memory
                                        storage, cluster transports (TCP + in-memory)
-src/Incremental.Storage.Redis      Redis-backed IStorageProvider
-src/Incremental.Kafka              Kafka-backed state changelog and shared-table logs, written
+src/Dbsp.Storage.Redis      Redis-backed IStorageProvider
+src/Dbsp.Kafka              Kafka-backed state changelog and shared-table logs, written
                                        through one transactional producer per process; leader
                                        election and takeover (KafkaLeadership); sources into
                                        inputs and tables (KafkaSource), sinks, Debezium decoding
-src/Incremental.Service            the generic parts of an enrichment service: table registry,
+src/Dbsp.Service            the generic parts of an enrichment service: table registry,
                                        pipeline supervisor (one circuit per pipeline), plugin
                                        loading, catalog, service node, metrics and the meter
-                                       `Incremental.Service`, discovery; an in-memory backend
+                                       `Dbsp.Service`, discovery; an in-memory backend
                                        (bounded) and a Kafka one; the `kafka`, `files` and
                                        `memory` connectors; a durable dead-letter sink per
                                        pipeline; record formats for the kafka connector
-src/Incremental.Service.Abstractions  what a plugin compiles against: IPipelineDefinition,
+src/Dbsp.Service.Abstractions  what a plugin compiles against: IPipelineDefinition,
                                        PipelineBuilder, TableDefinition, IRecordFormat; the
                                        core is its only reference
-src/Incremental.Service.Testing    PipelineTestHarness for plugin authors
-src/Incremental.Service.S3         an S3 object store for the files connector (AWS SDK; tested
+src/Dbsp.Service.Testing    PipelineTestHarness for plugin authors
+src/Dbsp.Service.S3         an S3 object store for the files connector (AWS SDK; tested
                                        against MinIO in the connector stack, not against S3)
-src/Incremental.Service.Admin      the admin JSON API and web UI for a service node (ASP.NET
+src/Dbsp.Service.Admin      the admin JSON API and web UI for a service node (ASP.NET
                                        Core; the UI is embedded, hand-written, no build step)
-tests/Incremental.Tests            xunit: Z-set algebra, per-step delta semantics, multi-worker runs,
+tests/Dbsp.Tests            xunit: Z-set algebra, per-step delta semantics, multi-worker runs,
                                        Redis integration (auto-skipped when Redis is down)
-tests/Incremental.Kafka.Tests      xunit, against the local broker (`docker compose --profile
+tests/Dbsp.Kafka.Tests      xunit, against the local broker (`docker compose --profile
                                        connectors up -d`; auto-skipped when it is down): the log
                                        writer, fencing, restore, compaction, failover end to end,
                                        leadership, kill -9 failover between real processes,
                                        sources and sinks, and Postgres → Debezium → table CDC
-tests/Incremental.Kafka.FailoverApp  the process those failover tests launch twice: one pipeline,
+tests/Dbsp.Kafka.FailoverApp  the process those failover tests launch twice: one pipeline,
                                        leader or standby as its KafkaLeadership decides
-tests/Incremental.Service.Tests    xunit: registry, supervisor, plugins, catalog and two-node
+tests/Dbsp.Service.Tests    xunit: registry, supervisor, plugins, catalog and two-node
                                        takeover in memory (no broker); the admin API over real
                                        Kestrel and a smoke test of the UI; the same node on the Kafka
                                        backend, CDC through Debezium, and kill -9 failover between
                                        real processes (skipped when the broker is unreachable)
-tests/Incremental.Service.AdminHost  one or two nodes with the admin UI mounted, tables,
+tests/Dbsp.Service.AdminHost  one or two nodes with the admin UI mounted, tables,
                                        pipelines and a generator: what the admin API's tests
                                        run against, and how to look at the UI
-tests/Incremental.Service.FailoverApp  one service node as a process, for those failover tests
-tests/Incremental.Service.TestPlugins  contract and pipeline assemblies those tests load at
+tests/Dbsp.Service.FailoverApp  one service node as a process, for those failover tests
+tests/Dbsp.Service.TestPlugins  contract and pipeline assemblies those tests load at
                                        runtime from their output directories; built, never referenced
-examples/Incremental.Example       joined + aggregated order analytics with live retraction
-examples/Incremental.LogAnalytics  simulated clickstream → 5s tumbling windows → counts → live top-3
+examples/Dbsp.Example       joined + aggregated order analytics with live retraction
+examples/Dbsp.LogAnalytics  simulated clickstream → 5s tumbling windows → counts → live top-3
                                        per window, rendered as an in-place Spectre.Console dashboard
                                        (bar gauges per window, watermark in the header);
                                        `--redis` keeps operator state in Redis. The hosted
-                                       example: a worker service on `Incremental.Hosting`
-examples/Incremental.TradeEnrichment trades enriched from shared tables, as a narrative that checks
+                                       example: a worker service on `Dbsp.Hosting`
+examples/Dbsp.TradeEnrichment trades enriched from shared tables, as a narrative that checks
                                        itself: four reference tables held once (`SharedTable`), a
                                        derived table written by a small circuit (`ToTable`), a
                                        trade circuit that looks the symbol up on arrival (`Lookup`)
@@ -817,7 +820,7 @@ examples/Incremental.TradeEnrichment trades enriched from shared tables, as a na
                                        on the acknowledged-output path. A trader moves desk, an
                                        instrument is renamed, a trade is amended; every claim it
                                        prints is checked against a model, and a wrong one exits 1
-examples/Incremental.EnrichmentService  a host for Incremental.Service with the admin UI: a contract
+examples/Dbsp.EnrichmentService  a host for Dbsp.Service with the admin UI: a contract
                                        assembly, a pipeline plugin in two versions (five
                                        definitions: joins and a lookup, event-time windows, a derived
                                        table, two inputs joined to each other, an append sink with dead
@@ -830,7 +833,7 @@ examples/Incremental.EnrichmentService  a host for Incremental.Service with the 
                                        against a model, through a replace keeping state, one resetting
                                        it, a removal and a takeover (on Kafka: a kill -9).
                                        docs/enrichment-service.md is written around it
-examples/Incremental.Showcase      the all-features demo: a marketplace payments desk, served as a
+examples/Dbsp.Showcase      the all-features demo: a marketplace payments desk, served as a
                                        local web app (`dotnet run`, then http://localhost:5170) in
                                        five tabs — enrichment joins (inner/left/full/anti) and
                                        aggregates with one upsert re-attributing history, event-time
@@ -848,7 +851,7 @@ examples/Incremental.Showcase      the all-features demo: a marketplace payments
                                        and buttons that fire its scripted moments; a sidebar
                                        streams the raw enriched changefeed with z-set weights, so
                                        retract-then-assert is visible rather than described; the
-                                       footer reads the `Incremental` meter. `--workers N` sets the thread count
+                                       footer reads the `Dbsp` meter. `--workers N` sets the thread count
                                        (default 2, so the other tabs really exercise the exchange
                                        path). No NuGet dependency beyond
                                        the library: `Microsoft.NET.Sdk.Web` resolves ASP.NET Core
@@ -861,19 +864,19 @@ examples/Incremental.Showcase      the all-features demo: a marketplace payments
                                        hatches (Minus/Negate, EvictWhen, WindowCloses, Rows,
                                        weighted SendAsync) — reference material (docs/intro.md),
                                        not headline features
-examples/Incremental.TaxiAnalytics genuine big data: ~13M real NYC yellow-taxi trips (parquet, read
+examples/Dbsp.TaxiAnalytics genuine big data: ~13M real NYC yellow-taxi trips (parquet, read
                                        via Parquet.Net, downloaded and cached on first run, ~50MB/month;
                                        `--months N`, `--synthetic`) through join + counts + revenue +
                                        top-5 zones per borough; narrated phases, then continuous
                                        single-row churn with a live view until you press a key —
                                        ~1M rows/s bulk load; single-row updates in ~250 µs,
                                        thousands of × cheaper than a full recompute
-benchmarks/Incremental.Benchmarks  BenchmarkDotNet suite (Z-set primitives, stateless pipeline,
+benchmarks/Dbsp.Benchmarks  BenchmarkDotNet suite (Z-set primitives, stateless pipeline,
                                        join / sum / min / top-k delta cost vs state size), plus
                                        `-- --assert`: CI performance contracts that check scaling
                                        ratios (delta cost must not grow with state size) instead of
                                        wall-clock numbers, so they hold on noisy shared runners
-benchmarks/Incremental.Torture     throughput rig: the showcase pipeline flat out over a sliding
+benchmarks/Dbsp.Torture     throughput rig: the showcase pipeline flat out over a sliding
                                        order population — records/s, process CPU split (workers vs
                                        GC), allocation per record; see Benchmarks below
 ```
@@ -881,9 +884,9 @@ benchmarks/Incremental.Torture     throughput rig: the showcase pipeline flat ou
 ## Benchmarks
 
 ```sh
-dotnet run -c Release --project benchmarks/Incremental.Benchmarks -- --filter '*'   # full BenchmarkDotNet suite
-dotnet run -c Release --project benchmarks/Incremental.Benchmarks -- --assert      # CI performance contracts
-dotnet run -c Release --project benchmarks/Incremental.Torture -- --workers 4      # sustained throughput
+dotnet run -c Release --project benchmarks/Dbsp.Benchmarks -- --filter '*'   # full BenchmarkDotNet suite
+dotnet run -c Release --project benchmarks/Dbsp.Benchmarks -- --assert      # CI performance contracts
+dotnet run -c Release --project benchmarks/Dbsp.Torture -- --workers 4      # sustained throughput
 ```
 
 The `--assert` mode is what CI gates on. Shared runners are too noisy for absolute timing
@@ -894,7 +897,7 @@ shows up as a ~64× ratio, so the check is high-signal without being flaky. The 
 runs on demand via the *Benchmarks* GitHub workflow (`workflow_dispatch`), which uploads
 the BenchmarkDotNet artifacts.
 
-`Incremental.Torture` answers the other question — what a whole graph costs per record when
+`Dbsp.Torture` answers the other question — what a whole graph costs per record when
 it is running flat out, rather than what one operator costs per delta row. It runs the
 showcase pipeline over a sliding population of orders (inserting order *N* retracts order
 *N−live*, so state settles at a fixed size and retractions are on every step), reports the
@@ -925,21 +928,37 @@ its own project; `docs/intro.md` has them under *Running it fast*.
 
 ## Packaging
 
-MIT-licensed (see `LICENSE`). The five shipped libraries (`Incremental`,
-`Incremental.Storage.Redis`, `Incremental.Kafka`, `Incremental.Hosting` — generic-host
-and DI integration, see *Hosting it* in `docs/intro.md` — and `Incremental.Service`, see
-*Running many pipelines* there) multi-target **net8.0 and net10.0** and carry full NuGet
-metadata — `dotnet pack` produces consumable packages with XML docs, SourceLink, and
-symbol packages (not yet published to nuget.org; consume by project reference or a local
-feed). The only runtime dependency of the core library is
-`Microsoft.Extensions.Logging.Abstractions`.
+MIT-licensed (see `LICENSE`). Version 0.2.0. Four packages are released to nuget.org —
+`Dbsp`, `Dbsp.Storage.Redis`, `Dbsp.Kafka` and `Dbsp.Hosting`
+(generic-host and DI integration, see *Hosting it* in `docs/intro.md`):
+
+```sh
+dotnet add package Dbsp
+```
+
+The service's five (`Dbsp.Service`, `.Abstractions`, `.Testing`, `.Admin`, `.S3`;
+see *Running many pipelines* in `docs/intro.md`) are packed by CI and not released yet:
+consume them by project reference or a local feed. All nine multi-target **net8.0 and
+net10.0** and carry full NuGet metadata, XML docs, SourceLink and symbol packages. The
+only runtime dependency of the core library is `Microsoft.Extensions.Logging.Abstractions`.
+
+The packages are built together and each depends on exactly the version of the others it
+was built with (`[0.2.0]`): use one version of all of them. Each released package's
+nuget.org readme is the `README.md` beside its project.
+
+To release: set `<Version>` in `src/Directory.Build.props`, merge to `main`, and push the
+tag `v<Version>`. `.github/workflows/release.yml` builds, tests, packs, restores the
+packages into a clean project and runs it, then pushes to nuget.org and makes the GitHub
+release. Run by hand it stops before the push. No API key is stored: the push uses
+nuget.org's trusted publishing, which needs a policy there naming this repository and
+`release.yml`, and the repository variable `NUGET_USER` (the nuget.org user name).
 
 ## Running with Redis
 
 ```sh
 docker compose up -d        # starts Redis on localhost:6379
 dotnet test                 # Redis integration tests now run instead of skipping
-dotnet run --project examples/Incremental.LogAnalytics -- --redis
+dotnet run --project examples/Dbsp.LogAnalytics -- --redis
 ```
 
 ## Status / roadmap
@@ -1004,7 +1023,7 @@ disclosed trade-offs (below), not missing semantics:
       unnamed), changefeed-first outputs with automatic table-shaped resync and
       `MaterializeInMemory` views
 
-- [x] Generic-host and DI integration (`Incremental.Hosting`: `AddIncremental<TDefinition>()`
+- [x] Generic-host and DI integration (`Dbsp.Hosting`: `AddDbsp<TDefinition>()`
       keys a circuit by its definition class; the host owns start/recovery, a draining
       shutdown that outlives the circuit with its consumers, fault policy — stop the
       application by default — configuration binding, shared in-memory views and a health
@@ -1017,7 +1036,7 @@ disclosed trade-offs (below), not missing semantics:
 
 ### Known limitations (deliberate, disclosed)
 
-- `Incremental.Hosting` does not host clustered circuits yet (no host-side lockstep stepping).
+- `Dbsp.Hosting` does not host clustered circuits yet (no host-side lockstep stepping).
 
 - The TCP cluster transport is **unauthenticated cleartext** — trusted, isolated networks
   only; TLS/authentication is deferred.
@@ -1052,7 +1071,7 @@ disclosed trade-offs (below), not missing semantics:
 ### Headroom
 
 - [x] All-singing, all-dancing demo showing every feature together
-      (`examples/Incremental.Showcase` — see Project layout)
+      (`examples/Dbsp.Showcase` — see Project layout)
 - [x] Keyed-input restart story: the current row per key is checkpointed circuit state,
       so keyed inputs re-feed safely after a restore (the Showcase's Act 4 re-feeds every
       reference table and verifies nothing double-counts) and take source offsets
@@ -1061,16 +1080,16 @@ disclosed trade-offs (below), not missing semantics:
 - [ ] Shared tables (`docs/design/shared-tables.md`): built so far — the table, its
       writer and change log seam, retroactive `Join`/`LeftJoin`, `Lookup`, secondary
       indexes, `ReplaceAllAsync`, `Changes()`, derived tables (`ToTable`), a Kafka log
-      (`KafkaTableLog` in `Incremental.Kafka`); to come — registration in
-      `Incremental.Hosting`
+      (`KafkaTableLog` in `Dbsp.Kafka`); to come — registration in
+      `Dbsp.Hosting`
 - [ ] Durability and warm standby (`docs/design/durability-and-standby.md`): built so
       far — commit after delivery, acknowledged outputs and sinks, the state changelog seam
       (`IStateChangelog`), `ChangelogStorage` with follower mode and promotion, table
       followers, and both logs on Kafka through one transactional producer with group
-      commit and `transactional.id` fencing (`Incremental.Kafka`), and leader heartbeats,
+      commit and `transactional.id` fencing (`Dbsp.Kafka`), and leader heartbeats,
       election, takeover, step down and the delivery lease (`KafkaLeadership`), tested by
       `kill -9` between real processes, and Kafka sources, sinks and Debezium CDC
       (`KafkaSource`, `KafkaUpsertSink`, `KafkaAppendSink`, `Debezium`); to come —
-      active/standby roles in `Incremental.Hosting`, gRPC and file source adapters
+      active/standby roles in `Dbsp.Hosting`, gRPC and file source adapters
 - [ ] Investigate off-heap in-process storage to reduce GC (RocksDB, SQLite candidates)
 - [ ] Cluster transport TLS/authentication

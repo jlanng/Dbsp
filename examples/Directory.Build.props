@@ -3,7 +3,7 @@
   <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
 
   <!--
-    The GC configuration the throughput work landed on (benchmarks/Incremental.Torture/README.md).
+    The GC configuration the throughput work landed on (benchmarks/Dbsp.Torture/README.md).
     A circuit keeps a large, mostly-static live set and allocates per step, so the GC's share of
     process CPU is the thing to tune; on the torture rig this configuration is worth more than any
     single code change (16.6 -> 11.6 us of CPU per record). Every example gets it by default so
@@ -27,7 +27,7 @@
     collection threads, most of them for memory no worker ever touches. It is startup
     configuration, so each example declares the worker count it builds its circuit with and it is
     baked into the runtimeconfig here. An example that takes the worker count from the command
-    line has to set DOTNET_GCHeapCount instead (see Incremental.Showcase).
+    line has to set DOTNET_GCHeapCount instead (see Dbsp.Showcase).
   -->
   <ItemGroup Condition="'$(CircuitWorkers)' != ''">
     <RuntimeHostConfigurationOption Include="System.GC.HeapCount" Value="$(CircuitWorkers)" Trim="false" />

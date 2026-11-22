@@ -27,9 +27,9 @@ builders:
 | Check | Result |
 |---|---|
 | `dotnet build` | 0 warnings, 0 errors (Debug; Release also builds) |
-| `tests/Incremental.Tests` | 765 total, 764 passed, 1 skipped (opt-in soak); 1 min 44 s |
-| `tests/Incremental.Kafka.Tests` | 166 total, 164 passed, 2 skipped (the two `*ABrokerLost*`, need three brokers); 4 min 58 s |
-| `tests/Incremental.Service.Tests` (`INCREMENTAL_OLDER_BUILD` from `9de8da9`) | 337 total, 329 passed, 8 skipped (six three-broker tests; two admin UI tests, no Chrome); two-build test ran; 4 min 40 s |
+| `tests/Dbsp.Tests` | 765 total, 764 passed, 1 skipped (opt-in soak); 1 min 44 s |
+| `tests/Dbsp.Kafka.Tests` | 166 total, 164 passed, 2 skipped (the two `*ABrokerLost*`, need three brokers); 4 min 58 s |
+| `tests/Dbsp.Service.Tests` (`DBSP_OLDER_BUILD` from `9de8da9`) | 337 total, 329 passed, 8 skipped (six three-broker tests; two admin UI tests, no Chrome); two-build test ran; 4 min 40 s |
 | `S3FileConnectorTests` on MinIO | 46 of 46, 0 skipped |
 | kafka3 profile | `KafkaPartitionWatermarkTests` 6 of 6; service `*broker*` tests 7 of 7 |
 | `examples/…/Pipelines.Tests` | 21 of 21 |
@@ -50,7 +50,7 @@ Where the critic's finding differs from the builder's claim, the critic's is tak
 | B2 Paced bulk loads | Partial | `TableLoadPacing`, on by default. Five million rows not shown: every 5M run, paced or not, stopped 3.1-3.8 s in a full gen2 under memory pressure on this machine. At 3M the builder recorded 554-810 ms down to 190-200 ms (141 ms after the review fix); the critic measured 765-1,211 ms down to 470-630 ms, the pacer standing aside on a third of its steps for memory. Pacing about halves the stop; the recorded figures did not reproduce. |
 | B3 Limit on a pipeline's state | Done | `circuit.maxStateEntries`; `StateLimitTests`; critic used it through the admin API: limit 0 refused, the limited pipeline Failed with no restarts, neighbours untouched, raise with `state=keep` resumes. Overshoots by up to a second's growth (8,080 against 300 in the critic's run), as stated. Two guide slips (below). |
 | B4 Record format seam | Done | `IRecordFormat`, `AddRecordFormat`; `KafkaRecordFormatTests` (source, keyed source, loader, both sink kinds, unreadable records go JSON's way, codecs per generation, plugin unloads). Critic did not write a second format. |
-| B5 S3 object store | Done locally | `Incremental.Service.S3`; files connector tests 92 of 92 (46 local, 46 S3 on MinIO). "CI runs them" is true of `ci.yml`, false of history: no CI run has started MinIO. Real S3 unverified (decision 7). Guide's IAM list omits `s3:AbortMultipartUpload`. |
+| B5 S3 object store | Done locally | `Dbsp.Service.S3`; files connector tests 92 of 92 (46 local, 46 S3 on MinIO). "CI runs them" is true of `ci.yml`, false of history: no CI run has started MinIO. Real S3 unverified (decision 7). Guide's IAM list omits `s3:AbortMultipartUpload`. |
 | B6 Rolling upgrades | Done | Format levels (`PersistedFormat`); two real builds (`9de8da9` and head) through standby upgrade, takeovers and the raise, sinks equal to the model in 4 runs; `RollingUpgradeTests`, `FormatLevelTests`, `KafkaFormatLevelTests`. Critic followed the guide's four steps by hand with the example's event-time pipelines: clean. State manifest said plainly: formats 7 and 8 read; format 6 with event time stays refused, needs `state=reset`. |
 | K1 Watermark per partition | Done | Least over partitions with an idle rule, checkpointed (manifest format 8, level 2). Backlog on 3 partitions 0 late (951-1,188 of 1,800 before); broker killed or frozen under 6 partitions 0 late. Critic: 75 s backlog over three partitions read with 0 late by hand. Review fixes E1, E3 apply. |
 | K3 Future bound | Done | `MaxEventTimeAhead`, default one day in the service: beyond it a dead letter or fault at the port. Tests pass; not exercised by hand. A change of default behaviour. |
@@ -134,7 +134,7 @@ Most important first. Each says what James has to decide.
     run for hours (K4). A standby must be upgraded before the leader (format 8); a plugin
     built against the new abstractions does not load on a pre-round-five node, so nodes
     are upgraded before plugins are rebuilt; test projects using the harness must
-    reference `Incremental.Service.Testing`.
+    reference `Dbsp.Service.Testing`.
 
 ## How to merge
 

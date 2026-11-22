@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Dbsp.Hosting</PackageId>
+    <Description>Generic Host and dependency-injection integration for Dbsp: register a circuit definition with AddDbsp, and the host owns its lifecycle — start and checkpoint recovery, draining shutdown, output consumers, fault policy, configuration binding and a health check.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Dbsp\Dbsp.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks" Version="8.0.11" />
+  </ItemGroup>
+
+</Project>

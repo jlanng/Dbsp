@@ -1,0 +1,150 @@
+name: Release
+
+# Publishes the library packages to nuget.org when a version tag is pushed:
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# The tag must equal <Version> in src/Directory.Build.props, on a commit of main.
+# No API key is stored: nuget.org's trusted publishing gives this workflow a key that
+# lasts an hour, in exchange for GitHub's own token for the run. It needs a trusted
+# publishing policy on nuget.org naming this repository and this file (release.yml), and
+# the repository variable NUGET_USER, the nuget.org user name (not the email) that owns
+# the policy. Run by hand (workflow_dispatch) it does everything but push: the
+# packages are left as an artifact to look at.
+#
+# The service's packages (Dbsp.Service*) are not released yet; add them to
+# PACKAGES when they are.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  PACKAGES: >-
+    Dbsp
+    Dbsp.Storage.Redis
+    Dbsp.Hosting
+    Dbsp.Kafka
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # the GitHub release
+      id-token: write   # GitHub's token for the run, which nuget.org exchanges for a key
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Version
+        id: version
+        run: |
+          version=$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' src/Directory.Build.props)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match <Version> $version"; exit 1
+            fi
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "::error::the tagged commit is not on main"; exit 1
+            fi
+          fi
+      - name: Build
+        run: dotnet build -c Release
+      - name: Test
+        run: dotnet test --project tests/Dbsp.Tests -c Release --no-build
+      # No broker here: the integration tests skip. CI's connector-stack job is where
+      # they run; release from a commit it has passed.
+      - name: Test Kafka
+        run: dotnet test --project tests/Dbsp.Kafka.Tests -c Release --no-build
+      - name: Pack
+        run: |
+          for p in $PACKAGES; do
+            dotnet pack "src/$p" -c Release --no-build -o artifacts/packages
+          done
+          ls -l artifacts/packages
+      # A project that references the packages from the folder just written, and nothing
+      # from the repository: what someone installing them gets. Built for both target
+      # frameworks, run on the one whose runtime this job installed.
+      - name: Consume the packages from a clean project
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          dir=$(mktemp -d)
+          cd "$dir"
+          cat > nuget.config <<EOF
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="local" value="$GITHUB_WORKSPACE/artifacts/packages" />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+            </packageSources>
+          </configuration>
+          EOF
+          {
+            echo '<Project Sdk="Microsoft.NET.Sdk">'
+            echo '  <PropertyGroup>'
+            echo '    <OutputType>Exe</OutputType>'
+            echo '    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>'
+            echo '    <ImplicitUsings>enable</ImplicitUsings>'
+            echo '    <Nullable>enable</Nullable>'
+            echo '    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>'
+            echo '  </PropertyGroup>'
+            echo '  <ItemGroup>'
+            for p in $PACKAGES; do
+              echo "    <PackageReference Include=\"$p\" Version=\"$VERSION\" />"
+            done
+            echo '  </ItemGroup>'
+            echo '</Project>'
+          } > Consumer.csproj
+          cat > Program.cs <<'EOF'
+          using Dbsp;
+
+          var builder = new CircuitBuilder(new CircuitOptions());
+          var numbers = builder.Input<int>("numbers");
+          var evens = numbers.Where(n => n % 2 == 0).ToOutput();
+          await using var circuit = builder.Build();
+          circuit.Start();
+          await circuit.Handle(numbers).InsertAsync(2);
+          await foreach (var batch in circuit.Handle(evens).Changes())
+          {
+              Console.WriteLine(batch);
+              break;
+          }
+          EOF
+          dotnet build
+          dotnet run --no-build -f net10.0 | grep -F '{2 => +1}'
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: packages
+          path: |
+            artifacts/packages/*.nupkg
+            artifacts/packages/*.snupkg
+      - name: Log in to nuget.org
+        if: github.ref_type == 'tag'
+        id: nuget
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USER }}
+      - name: Push to nuget.org
+        if: github.ref_type == 'tag'
+        env:
+          NUGET_API_KEY: ${{ steps.nuget.outputs.NUGET_API_KEY }}
+        run: |
+          dotnet nuget push "artifacts/packages/*.nupkg" \
+            --source https://api.nuget.org/v3/index.json \
+            --api-key "$NUGET_API_KEY" --skip-duplicate
+      - name: GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" artifacts/packages/*.nupkg --title "$GITHUB_REF_NAME" --generate-notes

@@ -5,11 +5,11 @@
 
   <PropertyGroup>
     <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Authors>James Lanng</Authors>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageProjectUrl>https://github.com/jlanng/Incremental</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/jlanng/Incremental</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/jlanng/Dbsp</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/jlanng/Dbsp</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageTags>dbsp;incremental;streaming;dataflow</PackageTags>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
@@ -26,8 +26,26 @@
     <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
   </PropertyGroup>
 
+  <!-- A package's readme is the README.md beside its project when there is one (short, with
+       absolute links: nuget.org renders no relative link or image), else the repository's. -->
+  <PropertyGroup>
+    <PackageReadmeSource>$(MSBuildProjectDirectory)/README.md</PackageReadmeSource>
+    <PackageReadmeSource Condition="!Exists('$(PackageReadmeSource)')">$(MSBuildThisFileDirectory)../README.md</PackageReadmeSource>
+  </PropertyGroup>
+
   <ItemGroup>
-    <None Include="$(MSBuildThisFileDirectory)../README.md" Pack="true" PackagePath="/" />
+    <None Include="$(PackageReadmeSource)" Pack="true" PackagePath="/" />
   </ItemGroup>
+
+  <!-- The packages are built and released together and reach into each other's internals
+       (InternalsVisibleTo), so one depends on exactly the version of another it was built
+       with: [0.2.0], not the default "0.2.0 or later". -->
+  <Target Name="PinProjectReferenceVersions" AfterTargets="_GetProjectReferenceVersions">
+    <ItemGroup>
+      <_ProjectReferencesWithVersions>
+        <ProjectVersion>[%(ProjectVersion)]</ProjectVersion>
+      </_ProjectReferencesWithVersions>
+    </ItemGroup>
+  </Target>
 
 </Project>

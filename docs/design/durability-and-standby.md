@@ -4,9 +4,9 @@
 > delivery (with the sink side of keyed upsert delivery and the per-record error policy; see
 > the two *As built* sections under *Commit after delivery*); the state changelog seam,
 > the changelog provider, the in-memory changelog and follower mode for stores and tables
-> (see *As built (step 2)* under *Warm standby*); in `Incremental.Kafka`, the log
+> (see *As built (step 2)* under *Warm standby*); in `Dbsp.Kafka`, the log
 > writer, the state changelog and the table log on Kafka (see *As built:
-> `Incremental.Kafka`*); and the leader protocol — heartbeats, election, takeover, step
+> `Dbsp.Kafka`*); and the leader protocol — heartbeats, election, takeover, step
 > down, the delivery lease — with a kill -9 test between real processes (see *As built
 > (step 5)* under *Leadership and fencing*); and Kafka sources, sinks and Debezium change
 > data capture (see *As built (step 6)* under *Source resumption*). The gRPC and file
@@ -48,12 +48,12 @@ in-memory state of the same shape as the active's. It runs no steps and writes n
 
 Three packages:
 
-- **core `Incremental`** gains the engine change (commit after delivery), an
+- **core `Dbsp`** gains the engine change (commit after delivery), an
   `IStateChangelog` seam beside `ITableLog`, and a `ChangelogStorageProvider` written
   against it, with an in-memory changelog so every rule below is testable without Kafka.
-- **`Incremental.Kafka`** (new, depends on `Confluent.Kafka`) implements both seams, the
+- **`Dbsp.Kafka`** (new, depends on `Confluent.Kafka`) implements both seams, the
   leader protocol and the Kafka source adapter.
-- **`Incremental.Hosting`** gets the active/standby roles last.
+- **`Dbsp.Hosting`** gets the active/standby roles last.
 
 ## The log writer
 
@@ -87,14 +87,14 @@ UTF-8 `segment NUL segment …` with the user key serialized last.
 > **Decided (1): serialization.** JSON through the existing `IStateSerializer`, behind the
 > format byte, with producer compression (`zstd` or `lz4`) — one persisted format and one
 > set of type rules across Redis and Kafka, readable with stock tooling. Before
-> `Incremental.Kafka` is declared stable, benchmark log bytes and encode cost on real row
+> `Dbsp.Kafka` is declared stable, benchmark log bytes and encode cost on real row
 > shapes and decide then whether the dense codec (`ShardCodec`) is worth making a
 > persisted format; the format byte lets it be introduced per topic without rewriting
 > history. Either way record *keys* must be byte-stable for a given value, because
 > compaction compares bytes. The Redis provider already depends on that property.
 
 The benchmark has been run; the numbers, and what they suggest, are under *As built:
-`Incremental.Kafka`*. The decision itself is still open.
+`Dbsp.Kafka`*. The decision itself is still open.
 
 ## Kafka-backed table log
 
@@ -214,13 +214,13 @@ on read and tombstoned by a background sweep. Deleting a pipeline is the same sw
 > a thousand pipelines reaches MSK's recommended 1,000 partitions per broker, and MSK
 > Serverless allows only 120 compacted partitions per cluster.
 
-## As built: `Incremental.Kafka` (steps 3 and 4)
+## As built: `Dbsp.Kafka` (steps 3 and 4)
 
-Code: `src/Incremental.Kafka` — `KafkaLog.cs` (the connection, the log writer, topic
+Code: `src/Dbsp.Kafka` — `KafkaLog.cs` (the connection, the log writer, topic
 set-up, the readers), `KafkaLogOptions.cs`, `KafkaStateChangelog.cs`, `KafkaTableLog.cs`.
-Tests: `tests/Incremental.Kafka.Tests` (`KafkaLogTests.cs`, `KafkaTableLogTests.cs`,
+Tests: `tests/Dbsp.Kafka.Tests` (`KafkaLogTests.cs`, `KafkaTableLogTests.cs`,
 `KafkaEndToEndTests.cs`), all against the local broker and skipped when `localhost:9092`
-is unreachable. Benchmark: `benchmarks/Incremental.Benchmarks/LogSerializationBenchmarks.cs`.
+is unreachable. Benchmark: `benchmarks/Dbsp.Benchmarks/LogSerializationBenchmarks.cs`.
 Built against Confluent.Kafka 2.16.0 and tested against Apache Kafka 3.9.0 (KRaft, one
 broker).
 
@@ -471,8 +471,8 @@ strings, embedded as JSON strings. Departures from *Kafka-backed table log*:
   deserialized from the record, so rows must have value equality (records do), as
   retraction already requires.
 
-**Core changes.** One: `InternalsVisibleTo` for `Incremental.Kafka` and
-`Incremental.Benchmarks` in `Incremental.csproj`, for `JsonStateSerializer.Options`,
+**Core changes.** One: `InternalsVisibleTo` for `Dbsp.Kafka` and
+`Dbsp.Benchmarks` in `Dbsp.csproj`, for `JsonStateSerializer.Options`,
 `ByteStableEquality` and (the benchmark) the dense codec. No seam changed.
 
 **Measured** (one machine, one local broker, Debug build unless said; indicative only):
@@ -492,7 +492,7 @@ strings, embedded as JSON strings. Departures from *Kafka-backed table log*:
   topic carries on to the same sinks.
 
 **The serialization benchmark Decided (1) asked for.** `LogSerializationBenchmarks`
-(`dotnet run -c Release --project benchmarks/Incremental.Benchmarks -- --filter
+(`dotnet run -c Release --project benchmarks/Dbsp.Benchmarks -- --filter
 '*LogSerialization*'` for cost, `-- --log-sizes` for bytes), on two shapes: a trade (12
 fields: ids, a quantity, a `decimal` price, an instant, a few short strings) and a wide
 reference row (an instrument, 19 fields, mostly short strings). JSON is the format as
@@ -856,9 +856,9 @@ staged layer and view unwound correctly, and is not worth it in the first versio
 
 ### As built (step 5)
 
-Code: `src/Incremental.Kafka` — `KafkaLeadership.cs` (the coordinator, its options and
+Code: `src/Dbsp.Kafka` — `KafkaLeadership.cs` (the coordinator, its options and
 status types), `LeadershipProbe.cs` (the TCP probe), and in `KafkaLog.cs` the heartbeat,
-`ResignAsync` and the lease clock. Test app: `tests/Incremental.Kafka.FailoverApp`. Tests:
+`ResignAsync` and the lease clock. Test app: `tests/Dbsp.Kafka.FailoverApp`. Tests:
 `KafkaLeadershipTests.cs` (one process, real broker) and `KafkaFailoverProcessTests.cs`
 (real processes).
 
@@ -935,7 +935,7 @@ commit on MSK.
 **One coordinator per process: `KafkaLeadership`.** Roles: `Standby → Promoting → Leader`,
 ending in `Fenced` or `Resigned`. Both ends are final: the process exits and its
 supervisor starts it again as a standby, as *A fenced active exits* decided. The
-coordinator does not exit the process and does not depend on `Incremental.Hosting`; it
+coordinator does not exit the process and does not depend on `Dbsp.Hosting`; it
 raises `Changed`, completes `WhenFinished`, and reports `Status` (role, own term, leader
 node and term, heartbeat age, whether the lease is held, follower lag, the last
 takeover's timings, the fault). Step 7 wires those into the host.
@@ -1062,7 +1062,7 @@ the transaction marker behind the last record. No metric is published yet.
 **Core change.** One: `ChangelogStorage.FollowedOffsets()` and `PartitionCount`, public,
 so that lag can be computed outside the core. No seam changed.
 
-**The kill -9 test.** `tests/Incremental.Kafka.FailoverApp` is a console program that is
+**The kill -9 test.** `tests/Dbsp.Kafka.FailoverApp` is a console program that is
 the wiring above and nothing else. Its pipeline: a keyed input of orders, joined to a
 shared `products` table (on Kafka, written by the leader), summed per customer; and the
 same records once more as facts, counted per bucket. Three keyed upsert sinks — the
@@ -1238,7 +1238,7 @@ steps are redelivered on restart.
 Code: `Circuit.cs` (`GatesCommits`, `AwaitAcknowledgementsAsync`, `CommitCheckpointAsync`),
 `Runtime/Ports.cs` (`AcknowledgedOutputPort`), `Io/Handles.cs`
 (`AcknowledgedOutputHandle`, `OutputBatch`), `Storage/IStorageProvider.cs` (`CommitAsync`),
-`Incremental.Hosting` (`AddAcknowledgedOutputConsumer`). Tests:
+`Dbsp.Hosting` (`AddAcknowledgedOutputConsumer`). Tests:
 `CommitAfterDeliveryTests.cs`, `HostingAcknowledgedOutputTests.cs`.
 
 The gate is as specified above. What was decided while building it, and where it departs
@@ -1296,7 +1296,7 @@ from the text:
   faults. Redis implements it with `ExecuteAsync`; its monitor is held only while the
   transaction is built and while the overlays are discarded, which relies on the circuit
   running no step during a commit.
-- **Metric.** `incremental.circuit.sink_ack_wait` (histogram, seconds, `circuit` tag): one
+- **Metric.** `dbsp.circuit.sink_ack_wait` (histogram, seconds, `circuit` tag): one
   measurement per commit of a gated circuit, the time from the step's flush landing to the
   last acknowledgement. This is the number Decided (5) asks for.
 - **A failed flush faults an idle circuit.** An auto-stepping circuit's flush runs beside
@@ -1317,7 +1317,7 @@ from the text:
 Code: `Io/Sinks.cs` (`IUpsertSink`, `IAppendSink`, `SinkDelivery`, `UpsertDelivery`,
 `AppendDelivery`, the in-memory sinks), `RecordErrors.cs` (`RecordErrorPolicy`,
 `DeadLetter`, `RecordErrors`, `DeadLetterPort`), the guarded loops in the operators,
-`Incremental.Hosting` (`AddUpsertSink`, `AddAppendSink`, `AddDeadLetterConsumer`). Tests:
+`Dbsp.Hosting` (`AddUpsertSink`, `AddAppendSink`, `AddDeadLetterConsumer`). Tests:
 `SinkDeliveryTests.cs`, `RecordErrorPolicyTests.cs`, `HostingSinkTests.cs`.
 
 **Keyed upsert delivery.** The contract — at-least-once, keyed upserts — is delivered on
@@ -1406,7 +1406,7 @@ step — on `Circuit.DeadLetters`.
   is a separate loop or method selected once per step (the joins branch on a local per
   pair). Under `DeadLetter` a record that does not throw allocates nothing; a test compares
   allocation with and without the guard. The perf contracts are unchanged.
-- **Metric.** `incremental.circuit.dead_letters` (counter, `circuit` and `operator` tags).
+- **Metric.** `dbsp.circuit.dead_letters` (counter, `circuit` and `operator` tags).
 - **`MapValues` returning null** is a dead letter like a null from `Select`. As first built
   the null check saw the keyed row the operator wraps the result in, which is never null,
   and the row went downstream with a null value.
@@ -1450,7 +1450,7 @@ step — on `Circuit.DeadLetters`.
 
 ### As built (step 6)
 
-Code: `src/Incremental.Kafka` — `KafkaSource.cs` (the source, its options, lag),
+Code: `src/Dbsp.Kafka` — `KafkaSource.cs` (the source, its options, lag),
 `KafkaRecord.cs` (the record, deserializers, the keyed decoder), `KafkaSinks.cs`
 (`KafkaUpsertSink`, `KafkaAppendSink`), `Debezium.cs` (the change-event decoder),
 `KafkaConnect.cs` (the Connect REST helper and the Postgres connector configuration).
@@ -1610,8 +1610,8 @@ after a restart, harmlessly — but only until the loader has been idle for
 above).
 
 **Sinks, and which producer.** `KafkaUpsertSink` (key → row, delete → tombstone) and
-`KafkaAppendSink` (one record each). Both stamp `incremental.step` on every record and
-`incremental.term` when given `Term`. Both place a keyed record by the Java client's
+`KafkaAppendSink` (one record each). Both stamp `dbsp.step` on every record and
+`dbsp.term` when given `Term`. Both place a keyed record by the Java client's
 murmur2, computed here, so placement does not depend on which producer wrote it (checked
 against librdkafka's own `murmur2` partitioner). A sink does not create its topic.
 
@@ -1770,7 +1770,7 @@ Against the local stack (`docker compose --profile connectors up -d`; tests skip
   against a generous bound and that the killed process's term never appears after the
   new one. A variant pauses the active with `SIGSTOP` and resumes it after takeover, to
   prove a zombie cannot commit. *Built* (`KafkaFailoverProcessTests`, with
-  `tests/Incremental.Kafka.FailoverApp`), with two differences: the source is a
+  `tests/Dbsp.Kafka.FailoverApp`), with two differences: the source is a
   deterministic generator whose position is the checkpointed offset, because the Kafka
   source adapter is step 6; and the reference is a model computed from the generator
   rather than a second run, with a no-failure run checked against it. Also built: manual
@@ -1831,8 +1831,8 @@ soak run on a real cluster before the failover number is believed.
    `StableHash(pipeline id) mod P`; that `Append` copies its spans, so the writer owns the
    batching; and that a storage reads every partition from offset 0 whichever role it
    starts in.
-3. **Done.** `Incremental.Kafka`: the log writer, the changelog over `{p}.state`, restore.
-   See *As built: `Incremental.Kafka`*.
+3. **Done.** `Dbsp.Kafka`: the log writer, the changelog over `{p}.state`, restore.
+   See *As built: `Dbsp.Kafka`*.
 4. **Done.** Kafka `ITableLog`: both topics, restore, durable range reads, retention by
    `TrimBeforeAsync`. Same section. Step 5 should know: `{p}.leader` exists (one
    partition, compacted) and already holds the term under the key `term`, written by
@@ -1849,7 +1849,7 @@ soak run on a real cluster before the failover number is believed.
    *Leadership and fencing*. Steps 6 and 7 should know: every node starts as a standby
    and `KafkaLeadership` calls `StartLeadingAsync(term)` when it leads — that is where a
    source adapter connects, at `circuit.CommittedOffsets`; the failover app's generator
-   stands where the Kafka source will (`tests/Incremental.Kafka.FailoverApp/Program.cs`,
+   stands where the Kafka source will (`tests/Dbsp.Kafka.FailoverApp/Program.cs`,
    `RunAsync`), and swapping it for a real source topic is the test's next form; exact
    sinks need replay to cut the same steps, which the generator gets by construction and
    a real source will not (*A gap in "keyed upserts converge"*); `Fenced` and `Resigned`
@@ -1871,12 +1871,12 @@ soak run on a real cluster before the failover number is believed.
    records stall the circuit once the channel is full; external sinks go through
    `leadership.Leased`, with `Term = () => leadership.Term`; and the failover app's
    generator can now be replaced by a source topic.
-7. **Done**, in `Incremental.Service` rather than `Incremental.Hosting`: a service node
+7. **Done**, in `Dbsp.Service` rather than `Dbsp.Hosting`: a service node
    on `KafkaServiceBackend` is an active or a standby, and the notes addressed to this
    step are answered one by one in *As built: step 7* at the end of this document.
-   `Incremental.Hosting`'s `CircuitHost<TDefinition>` still knows nothing of roles: one
+   `Dbsp.Hosting`'s `CircuitHost<TDefinition>` still knows nothing of roles: one
    compiled-in circuit that needs a standby is wired by hand, as
-   `tests/Incremental.Kafka.FailoverApp` does, or run as a one-pipeline service.
+   `tests/Dbsp.Kafka.FailoverApp` does, or run as a one-pipeline service.
 8. A soak on MSK to replace the estimates above with measurements.
 
 ## Out of scope
@@ -1906,7 +1906,7 @@ soak run on a real cluster before the failover number is believed.
   on MSK, are still unknown.
 - ~~How `Confluent.Kafka` surfaces fencing.~~ Verified against the local broker:
   `Local_Fenced`, fatal from the transaction calls, not flagged fatal on a later
-  `Produce`. See *Fencing, verified* under *As built: `Incremental.Kafka`*. Still not
+  `Produce`. See *Fencing, verified* under *As built: `Dbsp.Kafka`*. Still not
   verified: that MSK's broker version reports it the same way, and what a producer sees
   when the broker itself aborts a timed-out transaction (the code treats any fatal error
   as a fence, which is safe either way).
@@ -1980,8 +1980,8 @@ soak run on a real cluster before the failover number is believed.
 
 ## As built: seams for the enrichment service (2026-11-10)
 
-Three additions to `ChangelogStorageProvider`, made for `Incremental.Service`
-(enrichment-service.md, *As built*), tested in `tests/Incremental.Tests/ChangelogReleaseTests.cs`:
+Three additions to `ChangelogStorageProvider`, made for `Dbsp.Service`
+(enrichment-service.md, *As built*), tested in `tests/Dbsp.Tests/ChangelogReleaseTests.cs`:
 
 - `CommittedOffsets`: the last commit's offsets as a copy, in either role and with no
   circuit built. A registry reads the table versions a stopped pipeline's checkpoint still
@@ -2008,8 +2008,8 @@ detects the unsafe case.
 
 ## As built: step 7 — roles in the service (2026-11-10)
 
-Step 7 is `Incremental.Service` on `KafkaServiceBackend`
-(`src/Incremental.Service/KafkaBackend.cs`; enrichment-service.md, *As built*, S2). What
+Step 7 is `Dbsp.Service` on `KafkaServiceBackend`
+(`src/Dbsp.Service/KafkaBackend.cs`; enrichment-service.md, *As built*, S2). What
 this document asked of it, and where each request went:
 
 | Asked here | Built as |
@@ -2023,7 +2023,7 @@ this document asked of it, and where each request went:
 | A faulted source is a faulted circuit | The supervisor watches `source.Completion` with the circuit and the deliveries; any of them failing tears the generation down and restarts it under the backoff policy |
 | `circuit.DeadLetters` must be read | Always read, into a ring per pipeline |
 | External sinks go through `leadership.Leased`, with the term | Every sink a connector creates is wrapped; the `kafka` connector passes `Term = () => leadership.Term` |
-| The failover app's generator replaced by a source topic | `tests/Incremental.Service.FailoverApp`: a Kafka source topic, a table loaded from a topic, Kafka sinks, pipelines from a plugin assembly; `KafkaServiceProcessTests` |
+| The failover app's generator replaced by a source topic | `tests/Dbsp.Service.FailoverApp`: a Kafka source topic, a table loaded from a topic, Kafka sinks, pipelines from a plugin assembly; `KafkaServiceProcessTests` |
 
 Tables are **not** tracked with `KafkaLeadership.Track(table, log)`: it promotes them one
 after another and any one throwing ends the takeover. The service promotes them itself in
@@ -2031,7 +2031,7 @@ after another and any one throwing ends the takeover. The service promotes them 
 `KafkaLeadership`. `TakeoverTimings.Tables` is therefore zero for a service node and the
 table stage is inside `Prepare`; `ServiceTakeoverTimings` splits it out.
 
-**Four changes to `Incremental.Kafka`, made for this step.**
+**Four changes to `Dbsp.Kafka`, made for this step.**
 
 - *The probe's line has a fourth token* (K1). `LeadershipProbe.Listen(leadership,
   endpoint, detail)` asks the host for a token each time it answers and appends it when it
@@ -2064,7 +2064,7 @@ table stage is inside `Prepare`; `ServiceTakeoverTimings` splits it out.
   assignment removes the wait: a standby following 21 tables went from 45 s to under 7,
   and a step-down's hand-over from 1.2 s to about 0.3. A new consumer's first assignment
   never paid this, which is why followers, restores and step 5's one-table measurements
-  did not show it. The suite in `tests/Incremental.Kafka.Tests` runs half a minute
+  did not show it. The suite in `tests/Dbsp.Kafka.Tests` runs half a minute
   faster for it.
   *Corrected 2026-11-14:* that metadata request was put through an admin client made
   for it on the consumer's handle and disposed at once, and disposing an admin client
@@ -2182,7 +2182,7 @@ committed — and from the follower's typed stores at the same moment, since the
 same types reading the same records. The log keeps an entry's old bytes until that entry
 is next written.
 
-Tests: `tests/Incremental.Tests/ChangelogLayoutTests.cs` (seven). The service's use of it
+Tests: `tests/Dbsp.Tests/ChangelogLayoutTests.cs` (seven). The service's use of it
 is in enrichment-service.md, *As built*, S6.
 
 ## As built: what three brokers and an authorizing broker found (2026-11-11)
@@ -2364,7 +2364,7 @@ A checkpointing provider that does not implement `CreateDeadlineStore` is refuse
 `Build()` by the interface's default (`NotSupportedException`); a provider that does not
 checkpoint gets the heap store from it.
 
-**Tests** (`tests/Incremental.Tests`).
+**Tests** (`tests/Dbsp.Tests`).
 
 - `EventTimeRestartTests`: one seeded workload run twice, uninterrupted and killed at
   random steps, over six definitions — tumbling, hopping and session windows with
@@ -2413,7 +2413,7 @@ results are in enrichment-service.md, *As built*, S7.
 ### What the stall was made of
 
 Read from the Kafka client's debug log of a leader (`debug=eos,broker,protocol`, through
-`INCREMENTAL_KAFKA_CLIENT` and `INCREMENTAL_LOG_LEVEL=Debug` on the test's node
+`DBSP_KAFKA_CLIENT` and `DBSP_LOG_LEVEL=Debug` on the test's node
 process) and from the brokers' own logs. One 36 s stall was three things one after
 another, and only the first is Kafka's.
 
@@ -2763,7 +2763,7 @@ can touch. In the test the same log acquires at term 1 on its second attempt.
 A node that has been the writer and is fenced, or has resigned, still ends its process
 (exit code 3 or 4; 5 when it could not lead). Something has to start it again, or one
 takeover later the deployment has one node. That was said in the guide and done by
-nothing: the tests restarted nodes by hand. `NodeSupervisor` (in `Incremental.Service`)
+nothing: the tests restarted nodes by hand. `NodeSupervisor` (in `Dbsp.Service`)
 is the contract in code — start the process again after every exit but 0 and 2, at once
 after 3 and 4, with a doubling delay while it keeps ending within a minute, pass
 SIGTERM on and wait — and the example's Kafka mode, the scale rig and the broker tests

@@ -1,11 +1,11 @@
 # The enrichment service: a guide
 
-`Incremental.Service` runs many pipelines in one process — each a circuit, deployed and
+`Dbsp.Service` runs many pipelines in one process — each a circuit, deployed and
 replaced while the process runs — against reference tables they all share, and keeps a
-second process ready to take over. `Incremental.Service.Admin` puts a JSON API and a web
+second process ready to take over. `Dbsp.Service.Admin` puts a JSON API and a web
 UI over it. This guide goes from nothing to a running pipeline plugin, then through
 running and operating the service. Everything it shows is in
-[`examples/Incremental.EnrichmentService`](../examples/Incremental.EnrichmentService),
+[`examples/Dbsp.EnrichmentService`](../examples/Dbsp.EnrichmentService),
 and every block of C# below is a region of that example's sources, quoted: a test
 (`DocSnippetTests`) fails if the two drift apart, and CI builds the example.
 
@@ -66,11 +66,11 @@ Three things: a contract assembly, a plugin assembly, and a spec.
 Row types of shared tables, and the tables' definitions. The host compiles this assembly
 in; plugins reference it.
 
-<!-- snippet: examples/Incremental.EnrichmentService/Contracts/Contracts.cs#contract -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Contracts/Contracts.cs#contract -->
 ```csharp
 // A contract assembly: the row types of shared tables and the tables' definitions. It is
 // loaded once per process and never unloaded, so every plugin version sees the same types.
-[assembly: IncrementalContract]
+[assembly: DbspContract]
 
 namespace Enrichment.Contracts;
 
@@ -100,11 +100,11 @@ public sealed class InstrumentsTable : TableDefinition<int, Instrument>
 A definition class is declared once and may be declared as a table under several names.
 A static holder (`Reference.Instruments` in the example) saves writing `new
 InstrumentsTable()` in every pipeline. Do not call it `Tables` if your namespaces start
-with `Incremental.`: it collides with `Incremental.Tables`.
+with `Dbsp.`: it collides with `Dbsp.Tables`.
 
 ### 2. A definition
 
-<!-- snippet: examples/Incremental.EnrichmentService/Pipelines/TradeEnrichment.cs#trade-enrichment -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Pipelines/TradeEnrichment.cs#trade-enrichment -->
 ```csharp
 /// <summary>
 /// Trades enriched from three shared tables, each join of the kind its column needs: the
@@ -238,7 +238,7 @@ What is going on:
 Two more definitions, for the other shapes. An aggregate over event-time windows, on an
 append input:
 
-<!-- snippet: examples/Incremental.EnrichmentService/Pipelines/DeskExposure.cs#desk-exposure -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Pipelines/DeskExposure.cs#desk-exposure -->
 ```csharp
 /// <summary>
 /// Notional per desk in tumbling windows of execution time. Each execution is an event: it
@@ -290,7 +290,7 @@ public sealed record Exposure(string Group, DateTimeOffset WindowStart, DateTime
 
 A derived table, with no input and no sink:
 
-<!-- snippet: examples/Incremental.EnrichmentService/Pipelines/TraderDesks.cs#trader-desks -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Pipelines/TraderDesks.cs#trader-desks -->
 ```csharp
 /// <summary>
 /// A derived table: traders joined to desks once, for every pipeline that wants a trade's
@@ -316,7 +316,7 @@ spec to a connector of its own, and the two streams are joined with the core's s
 join. This one joins executions to the reference price quoted for their instrument and
 minute, then looks the instrument up in a table:
 
-<!-- snippet: examples/Incremental.EnrichmentService/Pipelines/ExecutionQuality.cs#execution-quality -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Pipelines/ExecutionQuality.cs#execution-quality -->
 ```csharp
 /// <summary>
 /// Two inputs joined to each other: every execution meets the reference price quoted for
@@ -475,7 +475,7 @@ What a second input changes:
 
 Its spec binds two slots:
 
-<!-- snippet: examples/Incremental.EnrichmentService/Host/World.cs#spec-two-inputs -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Host/World.cs#spec-two-inputs -->
 ```csharp
 public PipelineSpec ExecutionQuality(string version = "") => new()
 {
@@ -492,7 +492,7 @@ public PipelineSpec ExecutionQuality(string version = "") => new()
 
 #### An append sink, dead letters, one definition on two tables
 
-<!-- snippet: examples/Incremental.EnrichmentService/Pipelines/WatchlistAlerts.cs#watchlist-alerts -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Pipelines/WatchlistAlerts.cs#watchlist-alerts -->
 ```csharp
 /// <summary>
 /// An alert for every execution with a counterparty on a watchlist: an append-only result,
@@ -556,7 +556,7 @@ public sealed record Alert(long TradeId, DateTimeOffset ExecutedAt, string Count
   (`AddTable(Reference.Watchlist, loader, name: "sanctions")` and `"credit-watch"`), and
   each deployment's spec says which one it reads:
 
-<!-- snippet: examples/Incremental.EnrichmentService/Host/World.cs#spec-alerts -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Host/World.cs#spec-alerts -->
 ```csharp
 public PipelineSpec WatchlistAlerts(string id, string watchlist, decimal minNotional, string severity, string version = "") => new()
 {
@@ -566,7 +566,7 @@ public PipelineSpec WatchlistAlerts(string id, string watchlist, decimal minNoti
     Definition = "watchlist-alerts",
     Settings = Json($$"""{ "minNotional": {{minNotional.ToString(System.Globalization.CultureInfo.InvariantCulture)}}, "severity": "{{severity}}" }"""),
     // A record the definition throws on is dropped and reported, not fatal…
-    Circuit = new PipelineCircuitOptions { ErrorPolicy = Incremental.RecordErrorPolicy.DeadLetter },
+    Circuit = new PipelineCircuitOptions { ErrorPolicy = Dbsp.RecordErrorPolicy.DeadLetter },
     // …and kept: any append sink connector will do. Files in memory, a topic on Kafka.
     DeadLetters = kafka is null
         ? Files($"dead-letters/{id}/")
@@ -618,8 +618,8 @@ directory, or a zip of it, is the package.
     <!-- Provided by the host: compile against them, copy nothing of them. These two are
          all a plugin needs of the service: the definition interfaces, PipelineBuilder and
          table definitions are in the abstractions, and nothing of hosting or Kafka is. -->
-    <ProjectReference Include="…/src/Incremental.Service.Abstractions/Incremental.Service.Abstractions.csproj" Private="false" ExcludeAssets="runtime;native" />
-    <ProjectReference Include="…/src/Incremental/Incremental.csproj" Private="false" ExcludeAssets="runtime;native" />
+    <ProjectReference Include="…/src/Dbsp.Service.Abstractions/Dbsp.Service.Abstractions.csproj" Private="false" ExcludeAssets="runtime;native" />
+    <ProjectReference Include="…/src/Dbsp/Dbsp.csproj" Private="false" ExcludeAssets="runtime;native" />
     <ProjectReference Include="../Contracts/Enrichment.Contracts.csproj" Private="false" />
     <!-- A private dependency: copied beside the plugin and loaded from there. -->
     <PackageReference Include="Some.Library" Version="1.2.3" />
@@ -627,10 +627,10 @@ directory, or a zip of it, is the package.
 </Project>
 ```
 
-The example's [`Plugin.props`](../examples/Incremental.EnrichmentService/Plugin.props)
+The example's [`Plugin.props`](../examples/Dbsp.EnrichmentService/Plugin.props)
 is this, shared by its three plugin projects (which reference no package of their own).
 Look at the output directory before you ship it: it should hold your assembly, your
-dependencies and nothing named `Incremental*`, `Confluent*` or `runtimes/`.
+dependencies and nothing named `Dbsp*`, `Confluent*` or `runtimes/`.
 
 The plugin's name is its assembly's name in lower case (`enrichment.pipelines`); its
 version is a hash of its files, so the same build imported twice is one version. The
@@ -642,7 +642,7 @@ Where a plugin's references are loaded from:
 1. A **contract assembly** the process has loaded — always that one, even if the plugin
    ships its own copy.
 2. The **host**, for the assemblies whose types cross between host and plugin —
-   `Incremental*`, `Microsoft.Extensions.*` and the framework — whatever the plugin
+   `Dbsp*`, `Microsoft.Extensions.*` and the framework — whatever the plugin
    ships.
 3. The **host**, for any other assembly it happens to carry, if the host's version is at
    least the one the plugin was built against. If the plugin was built against a newer
@@ -651,7 +651,7 @@ Where a plugin's references are loaded from:
 
 ### 4. A spec
 
-<!-- snippet: examples/Incremental.EnrichmentService/Host/World.cs#specs -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Host/World.cs#specs -->
 ```csharp
 public PipelineSpec TraderDesks(string version = "") => new()
 {
@@ -711,7 +711,7 @@ added to the host later is applied by the next leader), or over the admin API:
 
 ```bash
 curl -X PUT http://127.0.0.1:5180/admin/api/pipelines/big-trades \
-  -H 'X-Incremental-Admin: 1' -H 'Content-Type: application/json' -d '{
+  -H 'X-Dbsp-Admin: 1' -H 'Content-Type: application/json' -d '{
     "plugin": "enrichment.pipelines", "definition": "trade-enrichment",
     "settings": { "minNotional": 30000000 },
     "inputs": { "trades":   { "connector": "trade-feed" } },
@@ -762,12 +762,12 @@ registered there, and a spec that names it is refused at the dry run.
 ### 5. A test
 
 A definition is tested without a node. `PipelineTestHarness`
-(the `Incremental.Service.Testing` package) binds the settings
+(the `Dbsp.Service.Testing` package) binds the settings
 and runs `Build` exactly as the service does, over tables the test fills, with inputs
 the test feeds and sinks it reads. Steps are the test's to take, and a step returns when
 the sinks hold what it produced — so there is nothing to wait for and nothing to poll.
 
-<!-- snippet: examples/Incremental.EnrichmentService/Pipelines.Tests/TradeEnrichmentTests.cs#test-trade-enrichment -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Pipelines.Tests/TradeEnrichmentTests.cs#test-trade-enrichment -->
 ```csharp
 public class TradeEnrichmentTests
 {
@@ -931,7 +931,7 @@ behind an exchange on its key is only wrong with more than one worker.
 Two inputs are two handles. The order in which a test sends is the order of arrival
 within a step, and the watermark is read between steps:
 
-<!-- snippet: examples/Incremental.EnrichmentService/Pipelines.Tests/ExecutionQualityTests.cs#test-two-inputs -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Pipelines.Tests/ExecutionQualityTests.cs#test-two-inputs -->
 ```csharp
 [Fact]
 public async Task An_execution_meets_the_quote_of_its_interval_whichever_of_the_two_arrives_first()
@@ -986,7 +986,7 @@ public async Task A_quote_prices_only_its_own_interval_and_a_closed_interval_is_
 
 And the error policy is the harness's to set, as it is the spec's:
 
-<!-- snippet: examples/Incremental.EnrichmentService/Pipelines.Tests/WatchlistAlertsTests.cs#test-dead-letters -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Pipelines.Tests/WatchlistAlertsTests.cs#test-dead-letters -->
 ```csharp
 [Fact]
 public async Task An_execution_that_cannot_be_sized_is_a_dead_letter_and_the_rest_carry_on()
@@ -1025,12 +1025,12 @@ public async Task Under_the_default_policy_the_same_execution_stops_the_pipeline
 ```
 
 The test project is an ordinary one that references the plugin and the contract
-([`Pipelines.Tests`](../examples/Incremental.EnrichmentService/Pipelines.Tests); xunit
+([`Pipelines.Tests`](../examples/Dbsp.EnrichmentService/Pipelines.Tests); xunit
 here, but the harness knows no test framework):
 
 ```xml
 <ItemGroup>
-  <PackageReference Include="Incremental.Service.Testing" Version="…" />
+  <PackageReference Include="Dbsp.Service.Testing" Version="…" />
   <PackageReference Include="xunit.v3" Version="4.0.1" />
   <ProjectReference Include="..\Contracts\Enrichment.Contracts.csproj" />
   <ProjectReference Include="..\Pipelines\Enrichment.Pipelines.csproj" />
@@ -1048,9 +1048,9 @@ this example.
 The host is an ordinary generic-host application. It registers the service, the
 contract, and whatever is specific to its surroundings:
 
-<!-- snippet: examples/Incremental.EnrichmentService/Host/Node.cs#host -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Host/Node.cs#host -->
 ```csharp
-var service = builder.Services.AddIncrementalService(o =>
+var service = builder.Services.AddDbspService(o =>
     {
         o.PluginDirectory = Path.Combine(AppContext.BaseDirectory, "plugins");     // imported at first lead
         o.CacheDirectory = Path.Combine(world.DataDirectory, "cache-" + nodeId);    // one per node
@@ -1077,7 +1077,7 @@ Tables are seeded the same way pipelines are — written to the catalog once, by
 first leader that finds the seed not yet applied, and after that the catalog is the
 record (a seeded table that is removed is not declared again):
 
-<!-- snippet: examples/Incremental.EnrichmentService/Host/World.cs#tables -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Host/World.cs#tables -->
 ```csharp
 service
     .AddTable(Reference.Instruments, new TableLoaderSpec("instrument-feed"))        // a custom source, with positions
@@ -1089,9 +1089,9 @@ service
 
 And the admin surface:
 
-<!-- snippet: examples/Incremental.EnrichmentService/Host/Node.cs#admin -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Host/Node.cs#admin -->
 ```csharp
-builder.Services.AddIncrementalAdmin(o =>
+builder.Services.AddDbspAdmin(o =>
 {
     // With no authorization policy the admin API answers loopback requests only.
     o.ExposeRowData = true;             // off by default: rows and exception messages are tenant data
@@ -1100,8 +1100,8 @@ builder.Services.AddIncrementalAdmin(o =>
 });
 
 var app = builder.Build();
-app.MapIncrementalAdmin("/admin");      // the UI at /admin/, the API at /admin/api
-app.MapIncrementalHealth("/health");    // /health/live, /health/ready, /health/status — outside the loopback rule
+app.MapDbspAdmin("/admin");      // the UI at /admin/, the API at /admin/api
+app.MapDbspHealth("/health");    // /health/live, /health/ready, /health/status — outside the loopback rule
 ```
 
 ### Adapters
@@ -1113,7 +1113,7 @@ four small interfaces. The example has one of each kind.
 from the positions the table's last committed version carries. After a restart or a
 takeover it continues; it never reloads.
 
-<!-- snippet: examples/Incremental.EnrichmentService/Host/Adapters.cs#table-source-positions -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Host/Adapters.cs#table-source-positions -->
 ```csharp
 /// <summary>
 /// A table source for a feed with positions. It stamps every change with the feed's
@@ -1149,7 +1149,7 @@ public sealed class InstrumentFeedSource(PositionedFeed<Instrument> feed) : ITab
 **A table source without positions** makes the table equal to the system's current rows
 on every start, then applies changes as it hears of them.
 
-<!-- snippet: examples/Incremental.EnrichmentService/Host/Adapters.cs#table-source-snapshot -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Host/Adapters.cs#table-source-snapshot -->
 ```csharp
 /// <summary>
 /// A table source for a system with no positions. Every start makes the table equal to
@@ -1192,7 +1192,7 @@ it, as the table's `onUnreadable` says.
 committed offsets it is handed are where to resume; it stamps a partition and an offset
 on every record so that the next checkpoint carries them.
 
-<!-- snippet: examples/Incremental.EnrichmentService/Host/Adapters.cs#source-connector -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Host/Adapters.cs#source-connector -->
 ```csharp
 /// <summary>
 /// A source connector for the trade feed, as an append input (every record an execution)
@@ -1298,7 +1298,7 @@ public sealed class TradeFeedConnector(PositionedFeed<Trade> feed) : IAppendSour
 service wraps it in the delivery loop: one batch at a time, retried with backoff, the
 checkpoint committed only after the write returns.
 
-<!-- snippet: examples/Incremental.EnrichmentService/Host/Adapters.cs#sink-connector -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Host/Adapters.cs#sink-connector -->
 ```csharp
 /// <summary>
 /// A sink connector: an upsert sink that keeps each key's latest row as JSON, to be read
@@ -1399,7 +1399,7 @@ values are: `json` (the default), `debezium` (change events, on a keyed input on
 Protobuf or JSON behind a schema registry's framing. A `kafka` table loader takes the
 same `format` (the `debezium` loader takes none: it is the format).
 
-A record format is an `IRecordFormat` (in `Incremental.Service.Abstractions`), registered
+A record format is an `IRecordFormat` (in `Dbsp.Service.Abstractions`), registered
 under a name with `AddRecordFormat("avro", services => new MyAvroFormat(…))`. The service
 asks it for one `IRecordCodec<T>` per slot, per key or value, each time a pipeline's
 generation starts its connectors (and each time a table loader runs): `Read` turns bytes
@@ -1415,7 +1415,7 @@ static or in the format object. The codec is the generation's and may keep what 
 likes; whatever must outlive it (a schema registry's client, a cache of schemas by id)
 keeps text. This one, from the service's tests, frames JSON as a registry does:
 
-<!-- snippet: tests/Incremental.Service.Tests/KafkaRecordFormatTests.cs#framed-format -->
+<!-- snippet: tests/Dbsp.Service.Tests/KafkaRecordFormatTests.cs#framed-format -->
 ```csharp
 /// <summary>
 /// A test host's record format: JSON behind the framing a schema registry puts in front of
@@ -1467,7 +1467,7 @@ internal sealed class FramedFormat : IRecordFormat
 
 **`files`** reads and writes JSON-lines objects under a prefix of an object store the
 host registered (`AddObjectStore(name, …)`: `LocalObjectStore` for a directory; an S3
-bucket through the optional package `Incremental.Service.S3`, below; anything else is an
+bucket through the optional package `Dbsp.Service.S3`, below; anything else is an
 `IObjectStore` you write — five methods, and a sixth, `ListPageAsync`, worth writing;
 see below):
 
@@ -1525,11 +1525,11 @@ What reading in name order asks of whoever writes the objects:
   and is read at once when a newer object is listed;
 - old objects can be deleted. The position does not need the object it names.
 
-**An S3 bucket** is the optional package `Incremental.Service.S3`, which a host
+**An S3 bucket** is the optional package `Dbsp.Service.S3`, which a host
 references when it wants one (the service itself does not, so the AWS SDK reaches no
 host that has not asked for it):
 
-<!-- snippet: tests/Incremental.Service.Tests/S3FileConnectorTests.cs#s3-store -->
+<!-- snippet: tests/Dbsp.Service.Tests/S3FileConnectorTests.cs#s3-store -->
 ```csharp
 builder.AddS3ObjectStore("lake", new S3ObjectStoreOptions
 {
@@ -1676,13 +1676,13 @@ pipeline whose input is quiet is shown the same way).
 ## Run the example
 
 ```bash
-dotnet run --project examples/Incremental.EnrichmentService
+dotnet run --project examples/Dbsp.EnrichmentService
 ```
 
 Stop it with Ctrl+C. Started in the background — by a script, a test harness, an agent —
 `dotnet run` does not pass SIGINT on to the host, and a signal sent to the `dotnet run`
 wrapper does not stop the host either: there, run the built binary
-(`examples/Incremental.EnrichmentService/bin/Debug/net10.0/Incremental.EnrichmentService`)
+(`examples/Dbsp.EnrichmentService/bin/Debug/net10.0/Dbsp.EnrichmentService`)
 and stop it with SIGTERM. A host left behind keeps its ports and its memory.
 
 One node on the in-memory backend, no docker. Open <http://127.0.0.1:5180/admin/>. Seven
@@ -1711,7 +1711,7 @@ directory the program prints as `files:`.
 | `--no-supervise` | with `--kafka`: run the node alone. Without it the process is the node's supervisor and starts the node again whenever it ends |
 | `--otlp` | export the meters over OTLP ([monitoring](#operating-it-monitoring)) |
 | `--poison N` | one generated trade in N has no quantity, which `watchlist-alerts` refuses: the dead letters. Default 200; 0 for none |
-| `--ui-dir src/Incremental.Service.Admin/wwwroot` | serve the admin UI's files from the checkout: an edit is a browser reload away |
+| `--ui-dir src/Dbsp.Service.Admin/wwwroot` | serve the admin UI's files from the checkout: an edit is a browser reload away |
 | `--trade-ids N` | the generated feed's trade ids come round again after N, a later trade amending the earlier one; 0, the default, gives every trade an id of its own, as a real feed does |
 | `--port N`, `--rate N`, `--prefix name`, `--no-generate`, `--no-pipelines`, `--verbose` | |
 
@@ -1781,9 +1781,9 @@ Things to try in the UI, in the default mode:
 docker compose --profile connectors up -d      # Kafka, Postgres, Debezium's Kafka Connect
 
 # terminal 1 — it prepares the stack, waits 3 s for a leader to speak, then leads
-dotnet run --project examples/Incremental.EnrichmentService -- --kafka --node a
+dotnet run --project examples/Dbsp.EnrichmentService -- --kafka --node a
 # terminal 2 — once a is up
-dotnet run --project examples/Incremental.EnrichmentService --no-build -- --kafka --node b
+dotnet run --project examples/Dbsp.EnrichmentService --no-build -- --kafka --node b
 ```
 
 Node `a` is at <http://127.0.0.1:5180/admin/>, node `b` at <http://127.0.0.1:5181/admin/>.
@@ -1811,7 +1811,7 @@ Nobody restarted `a` in step 3, and that is the point of the supervisor. A node 
 led and no longer does ends its process, by design; what it comes back as is the
 standby, and something has to bring it back:
 
-<!-- snippet: examples/Incremental.EnrichmentService/Program.cs#supervisor -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Program.cs#supervisor -->
 ```csharp
 // A node that has led and no longer does ends its process (exit code 3 fenced, 4 resigned,
 // 5 cannot lead), and something must start it again: then it is the standby. Under
@@ -1833,7 +1833,7 @@ on addresses the other node can reach.
 
 The backend is configured in one place:
 
-<!-- snippet: examples/Incremental.EnrichmentService/Host/Node.cs#kafka-backend -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Host/Node.cs#kafka-backend -->
 ```csharp
 // Two processes are configured alike except for the node id and the probe ports.
 // The log's cluster is also the Kafka connection "log", which specs may name.
@@ -1857,7 +1857,7 @@ service.UseKafkaBackend(new KafkaServiceBackendOptions
 
 `-- --headless` drives the service through its admin API and checks every sink against a
 model computed without the pipelines
-([`Host/Model.cs`](../examples/Incremental.EnrichmentService/Host/Model.cs)): deploy,
+([`Host/Model.cs`](../examples/Dbsp.EnrichmentService/Host/Model.cs)): deploy,
 2,000 trades and the quotes for them, a desk move, a multiplier correction, a
 counterparty rename, an addition to a watchlist, an upload of version 2, two replaces
 keeping state (one of them the two-input pipeline), a replace resetting it, a removal,
@@ -2018,7 +2018,7 @@ the fence, and its circuits stopping on the fenced log, are at Information.
 authenticated (`AuthorizationPolicy`), or what `ServiceAdminOptions.CallerName` returns
 for the request — a claim, a gateway's header. With neither, as on a loopback admin
 surface, it is `local`; the button in the header takes a name, which the UI then sends
-as `X-Incremental-Operator` and the audit records as `name (self-declared)`: a courtesy
+as `X-Dbsp-Operator` and the audit records as `name (self-declared)`: a courtesy
 between colleagues, not evidence, and switched off with `AcceptOperatorHeader = false`.
 
 The theme and that name are kept per node, since each node is its own origin; the links
@@ -2106,7 +2106,7 @@ pods. What each part is for:
   never run under one id, which would fence each other. The peer probe of `node-0` is
   `node-1.node:5191` and the other way round, through the headless `Service` the
   `StatefulSet` names. The host reads both from its environment.
-- *Probes.* Map them to the node's health endpoint (`MapIncrementalHealth`, outside the
+- *Probes.* Map them to the node's health endpoint (`MapDbspHealth`, outside the
   admin API's loopback rule): `startupProbe` and `livenessProbe` on `/health/live`, which
   fails only when the node has not started or has been disposed — give the startup probe
   as long as a cold node takes to restore its tables (*How large, how fast*), and the
@@ -2176,7 +2176,7 @@ disposes the node's host and starts it again under the same name and address, at
 after 3 and 4 and with the growing delay otherwise. The node's `ExitOnLeadershipLoss`
 must be off. The example:
 
-<!-- snippet: examples/Incremental.EnrichmentService/Program.cs#in-process-supervisor -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Program.cs#in-process-supervisor -->
 ```csharp
 // Two nodes in one process: a node that lost the leadership cannot end the
 // process, so it is started again in it, on the same cluster, port and name, and
@@ -2263,16 +2263,12 @@ Three cases outside the four steps:
   deadlines, and no reader can supply what was never written. That pipeline needs
   `state=reset`, as before; see the limits.
 
-- *Plugins built against the version before this one.* They compiled against
-  `Incremental.Service`, where the definition interfaces, `PipelineBuilder` and the
-  table definitions lived; those are in `Incremental.Service.Abstractions` now, and
-  the service forwards each type there, so a stored plugin version loads and runs on
-  the new build unchanged (the two-build test runs the older build's own plugin on
-  both builds). The reverse does not hold: a plugin compiled against the abstractions
-  does not load on a build from before them. Upgrade the nodes first; rebuild plugins
-  against the abstractions after. A test project compiled against the old harness
-  (`Incremental.Service.Testing` inside `Incremental.Service`) is rebuilt against the
-  `Incremental.Service.Testing` package; its source does not change.
+- *Builds from before the rename.* The project was named `Incremental` until version
+  0.2, its first release. A build from before that shares no assembly name and no
+  namespace with this one: its plugins do not load here, and the state it wrote names
+  types this build does not have. There is no upgrade from one; start a new deployment.
+  From 0.2 on, a type that moves between assemblies keeps a forward where it was, so
+  a stored plugin version loads on the next build unchanged.
 
 What an upgrade does not cover is what a format level does not name: a new build's
 *definitions* (a plugin version is deployed, not rolled), and behaviour that differs
@@ -2286,7 +2282,7 @@ and the real action needs `confirm=<node id>` — the id of the node the request
 to, as for reset and remove:
 
 ```bash
-curl -X POST 'http://127.0.0.1:5181/admin/api/node/takeover?confirm=b' -H 'X-Incremental-Admin: 1'
+curl -X POST 'http://127.0.0.1:5181/admin/api/node/takeover?confirm=b' -H 'X-Dbsp-Admin: 1'
 ```
 
 **When a standby is warm.** A standby says it is ready (`GET node`, the probe, the
@@ -2528,9 +2524,9 @@ under an index key are paged with `skip`.
 
 The libraries publish two `System.Diagnostics.Metrics` meters and reference no exporter:
 
-- **`Incremental.Service`** — the service's own: pipelines, tables, the node's role and
+- **`Dbsp.Service`** — the service's own: pipelines, tables, the node's role and
   readiness, takeovers. What to alert on is here.
-- **`Incremental`** — the core's, one series per circuit (the `circuit` tag is the
+- **`Dbsp`** — the core's, one series per circuit (the `circuit` tag is the
   pipeline id): steps, records, step and commit durations, queue depths, watermark lag.
   What to look at when an alert has fired.
 
@@ -2539,7 +2535,7 @@ The host chooses where they go. The example exports both over OTLP when started 
 variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL`,
 `OTEL_METRIC_EXPORT_INTERVAL`):
 
-<!-- snippet: examples/Incremental.EnrichmentService/Host/Node.cs#monitoring -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Host/Node.cs#monitoring -->
 ```csharp
 // The libraries publish two System.Diagnostics.Metrics meters and reference no
 // exporter; the host chooses one. OTLP here, to whatever collector the standard
@@ -2548,8 +2544,8 @@ variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL`,
 builder.Services.AddOpenTelemetry()
     .ConfigureResource(resource => resource.AddService("enrichment-service", serviceInstanceId: nodeId))
     .WithMetrics(metrics => metrics
-        .AddMeter(ServiceMeter.Name)        // "Incremental.Service": pipelines, tables, role, readiness, takeovers
-        .AddMeter("Incremental")            // the core: steps, records, durations and queues per circuit
+        .AddMeter(ServiceMeter.Name)        // "Dbsp.Service": pipelines, tables, role, readiness, takeovers
+        .AddMeter("Dbsp")            // the core: steps, records, durations and queues per circuit
         .AddOtlpExporter());
 ```
 
@@ -2558,40 +2554,40 @@ That needs the packages `OpenTelemetry.Extensions.Hosting` and
 or any other exporter is the same two `AddMeter` calls. Every node exports: the standby's
 series are how you know it is ready.
 
-**The instruments of `Incremental.Service`.** Tags are `node`, `pipeline`, `table` and
+**The instruments of `Dbsp.Service`.** Tags are `node`, `pipeline`, `table` and
 four closed sets (`state`, `role`, `stage`, `part`) — never a key, an offset or a message.
 Gauges are read from a snapshot each node refreshes once a second (tables every five).
 
 | Instrument | Tags | |
 |---|---|---|
-| `incremental.service.node.role` | node, role | 1 for the role the node has, 0 for the other four |
-| `incremental.service.node.term` | node | the leader term it holds or last saw |
-| `incremental.service.node.health` | node | 0 healthy, 1 degraded, 2 unhealthy — `/health/status` as a number |
-| `incremental.service.node.standby_ready` | node | on a standby: 1 when a takeover now would be warm; on a leader with a peer configured: 1 when the peer is a ready standby |
-| `incremental.service.node.state_lag` | node | on a standby: state-log records not yet applied |
-| `incremental.service.catalog.version` | node | |
-| `incremental.service.takeovers` (counter) | node | times this node became the leader |
-| `incremental.service.takeover.duration` (histogram, s) | node, stage | `catalog`, `tables`, `pipelines`, `start_leading`; on Kafka also `silence`, `fence`, `storage`, `total` |
-| `incremental.service.pipelines` | node, state | pipelines in each state; every state is reported, zeros included |
-| `incremental.service.pipeline.up` | node, pipeline | leader only, for a pipeline that should run: 1 when it is `Running` |
-| `incremental.service.pipeline.source_lag` | node, pipeline | records its sources have still to read |
-| `incremental.service.pipeline.checkpoint_age` (s) | node, pipeline | since the running generation last committed |
-| `incremental.service.pipeline.sink_ack_wait` (s) | node, pipeline | how long the oldest sink write in flight has waited; 0 with none |
-| `incremental.service.pipeline.dead_letters` (counter) | node, pipeline | records dropped under `errorPolicy: DeadLetter` |
-| `incremental.service.pipeline.late_records` (counter) | node, pipeline | insertions dropped at an event-time declaration for being behind the watermark — not dead letters: a record is late by its event time alone |
-| `incremental.service.pipeline.faults`, `.restarts`, `.rollbacks` (counters) | node, pipeline | faults; restarts scheduled after one; replaces rolled back |
-| `incremental.service.tables` | node, state | tables in each state |
-| `incremental.service.table.rows`, `.version` | node, table | |
-| `incremental.service.table.lag` | node, table | on a standby: versions of the table's log not yet applied. No value while the log cannot say where it ends — the brokers that hold the table's partitions are away: the question is given two seconds, and the status and the table pages say "not known" rather than wait |
-| `incremental.service.table.loader_lag` | node, table | on the leader: what the loader reports it has still to read |
-| `incremental.service.table.memory` (bytes) | node, table, part | the table on this node's heap, estimated, by part: `rows` (with the key map), `indexes`, `history` (superseded rows kept for readers) |
-| `incremental.service.pipeline.state_entries` | node, pipeline | entries its state holds on this node, counted — on a standby too |
-| `incremental.service.pipeline.state_memory` (bytes) | node, pipeline | the same state on this node's heap, estimated |
-| `incremental.service.pipeline.state_growing` | node, pipeline | 1 while one of its stores has grown without a pause for `ServiceOptions.StateGrowthAlarmAfter` (30 min): not one fall, and a rise at twelve of the fifteen samples. A store that closes on the watermark counts only if the watermark has not moved in that time |
-| `incremental.service.process.working_set` (bytes) | node | what the operating system counts for the process: the figure to set against a container's limit |
-| `incremental.service.process.gc.live`, `.gc.committed` (bytes) | node | what the managed heap held at its last collection, and what the collector has committed for it |
-| `incremental.service.process.other` (bytes) | node | resident memory that is not the collector's: the Kafka client, the runtime, stacks (Linux) |
-| `incremental.service.process.gc.pause_ratio` | node | the share of the last minute spent paused in collections, 0 to 1 |
+| `dbsp.service.node.role` | node, role | 1 for the role the node has, 0 for the other four |
+| `dbsp.service.node.term` | node | the leader term it holds or last saw |
+| `dbsp.service.node.health` | node | 0 healthy, 1 degraded, 2 unhealthy — `/health/status` as a number |
+| `dbsp.service.node.standby_ready` | node | on a standby: 1 when a takeover now would be warm; on a leader with a peer configured: 1 when the peer is a ready standby |
+| `dbsp.service.node.state_lag` | node | on a standby: state-log records not yet applied |
+| `dbsp.service.catalog.version` | node | |
+| `dbsp.service.takeovers` (counter) | node | times this node became the leader |
+| `dbsp.service.takeover.duration` (histogram, s) | node, stage | `catalog`, `tables`, `pipelines`, `start_leading`; on Kafka also `silence`, `fence`, `storage`, `total` |
+| `dbsp.service.pipelines` | node, state | pipelines in each state; every state is reported, zeros included |
+| `dbsp.service.pipeline.up` | node, pipeline | leader only, for a pipeline that should run: 1 when it is `Running` |
+| `dbsp.service.pipeline.source_lag` | node, pipeline | records its sources have still to read |
+| `dbsp.service.pipeline.checkpoint_age` (s) | node, pipeline | since the running generation last committed |
+| `dbsp.service.pipeline.sink_ack_wait` (s) | node, pipeline | how long the oldest sink write in flight has waited; 0 with none |
+| `dbsp.service.pipeline.dead_letters` (counter) | node, pipeline | records dropped under `errorPolicy: DeadLetter` |
+| `dbsp.service.pipeline.late_records` (counter) | node, pipeline | insertions dropped at an event-time declaration for being behind the watermark — not dead letters: a record is late by its event time alone |
+| `dbsp.service.pipeline.faults`, `.restarts`, `.rollbacks` (counters) | node, pipeline | faults; restarts scheduled after one; replaces rolled back |
+| `dbsp.service.tables` | node, state | tables in each state |
+| `dbsp.service.table.rows`, `.version` | node, table | |
+| `dbsp.service.table.lag` | node, table | on a standby: versions of the table's log not yet applied. No value while the log cannot say where it ends — the brokers that hold the table's partitions are away: the question is given two seconds, and the status and the table pages say "not known" rather than wait |
+| `dbsp.service.table.loader_lag` | node, table | on the leader: what the loader reports it has still to read |
+| `dbsp.service.table.memory` (bytes) | node, table, part | the table on this node's heap, estimated, by part: `rows` (with the key map), `indexes`, `history` (superseded rows kept for readers) |
+| `dbsp.service.pipeline.state_entries` | node, pipeline | entries its state holds on this node, counted — on a standby too |
+| `dbsp.service.pipeline.state_memory` (bytes) | node, pipeline | the same state on this node's heap, estimated |
+| `dbsp.service.pipeline.state_growing` | node, pipeline | 1 while one of its stores has grown without a pause for `ServiceOptions.StateGrowthAlarmAfter` (30 min): not one fall, and a rise at twelve of the fifteen samples. A store that closes on the watermark counts only if the watermark has not moved in that time |
+| `dbsp.service.process.working_set` (bytes) | node | what the operating system counts for the process: the figure to set against a container's limit |
+| `dbsp.service.process.gc.live`, `.gc.committed` (bytes) | node | what the managed heap held at its last collection, and what the collector has committed for it |
+| `dbsp.service.process.other` (bytes) | node | resident memory that is not the collector's: the Kafka client, the runtime, stacks (Linux) |
+| `dbsp.service.process.gc.pause_ratio` | node | the share of the last minute spent paused in collections, 0 to 1 |
 
 The process's instruments are the node's own view of what *Sizing a node* is about;
 the runtime's meter (`System.Runtime`, .NET 9 and later) has the collector's in more
@@ -2624,7 +2620,7 @@ commit every step; a pipeline with `checkpointMaxDelay` or slow sinks needs its 
 
 ## How large, how fast
 
-Measured with `benchmarks/Incremental.Service.Scale` (its README has the method): two
+Measured with `benchmarks/Dbsp.Service.Scale` (its README has the method): two
 node processes on Kafka, Release build, one local broker, a 20-thread machine. The table
 is one of wide reference rows — 21 columns, about 520 bytes of JSON, one index — shared
 by twenty pipelines: two that join keyed orders to it (two state entries per order), two
@@ -2823,7 +2819,7 @@ four entries per trade, for ever.
 each operator:
 
 1. *The source deletes.* A book of positions or live orders, where a settlement or a
-   cancellation is a delete, is bounded by what is live. `examples/Incremental.TradeEnrichment`
+   cancellation is a delete, is bounded by what is live. `examples/Dbsp.TradeEnrichment`
    is one: its last act settles the book and the state goes with it.
 2. *The key closes.* When the join key carries a time — an instrument and a quote
    interval — `EvictWhen` drops a key's state when the watermark passes it.
@@ -3221,7 +3217,7 @@ not the collector's.
 ### The collector's settings
 
 They are startup configuration, so they belong to the host's project file. The example
-and the scale rig import them from `src/Incremental.Service/Node.Gc.props`; copy the
+and the scale rig import them from `src/Dbsp.Service/Node.Gc.props`; copy the
 file or its four settings:
 
 | setting | value | why (a million rows and a million orders of state, per node) |
@@ -3289,19 +3285,19 @@ the host's, given once for the backend's log and once per extra connection; a sp
 `"connection": "market-data"` and a topic. The settings are passed through to librdkafka
 unchanged, and the builder callbacks are where an IAM token refresh goes:
 
-<!-- snippet: examples/Incremental.EnrichmentService/Host/Node.cs#msk -->
+<!-- snippet: examples/Dbsp.EnrichmentService/Host/Node.cs#msk -->
 ```csharp
 /// <param name="token">Returns a signed IAM token and its expiry — from the
 /// AWS.MSK.Auth package's <c>AWSMSKAuthTokenGenerator</c>, which this repository does not reference.</param>
 public static void UseMsk(
-    IncrementalServiceBuilder service, string bootstrapServers, string nodeId, Func<(string Token, long ExpiryMs)> token)
+    DbspServiceBuilder service, string bootstrapServers, string nodeId, Func<(string Token, long ExpiryMs)> token)
 {
     void Refresh(IClient client, string _)
     {
         try
         {
             var (value, expiryMs) = token();
-            client.OAuthBearerSetToken(value, expiryMs, "incremental-service");
+            client.OAuthBearerSetToken(value, expiryMs, "dbsp-service");
         }
         catch (Exception ex)
         {
@@ -3392,7 +3388,7 @@ it, on local brokers:
 
 **The permissions a node needs.** Worked out against the deny-by-default broker — the
 node's principal held exactly this and nothing else
-(`benchmarks/Incremental.Service.Scale/grant-acls.sh`) — and translated to IAM by the
+(`benchmarks/Dbsp.Service.Scale/grant-acls.sh`) — and translated to IAM by the
 equivalences in the MSK documentation. The translation has not been run.
 
 | On | Kafka ACL operations | MSK IAM actions | Why |
@@ -3404,7 +3400,7 @@ equivalences in the MSK documentation. The translation has not been run.
 | topics a pipeline or a table loader reads | `Describe`, `Read` | `DescribeTopic`, `ReadData` | |
 | topics a sink writes | `Describe`, `Write` | `DescribeTopic`, `WriteData` | the service does not create them |
 | topic `__transaction_state` (optional) | `Describe`, `DescribeConfigs` | `DescribeTopic`, `DescribeTopicDynamicConfiguration` | lets a standby at the takeover ceiling see that the transaction coordinator's own partition cannot be written; without it that check looks at the leader topic alone |
-| consumer groups | none | none | nothing joins a group. The client still asks for the coordinator of `{prefix}.reader`, `{prefix}.svc.blobs.{node}` and `incremental.source` about once a second per consumer, and the broker logs each refusal; `Describe` on those three (`DescribeGroup`) quiets its log and changes nothing else |
+| consumer groups | none | none | nothing joins a group. The client still asks for the coordinator of `{prefix}.reader`, `{prefix}.svc.blobs.{node}` and `dbsp.source` about once a second per consumer, and the broker logs each refusal; `Describe` on those three (`DescribeGroup`) quiets its log and changes nothing else |
 
 The IAM actions are all `kafka-cluster:…`. `{prefix}.writer` is
 `KafkaLogOptions.TransactionalId` when you set one. On MSK the

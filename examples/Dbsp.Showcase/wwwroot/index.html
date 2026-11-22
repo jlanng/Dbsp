@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dbsp showcase</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='13'%3E%E2%97%A7%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #0e1116;  --panel: #161b22;  --panel-2: #1c222b;  --line: #2b323d;
+    --ink: #d7dde5; --dim: #8b95a3;    --faint: #5f6874;
+    --accent: #5ec8f2; --good: #5ad19a; --warn: #e8bb5a;   --bad: #f0776a;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 13px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  a { color: var(--accent); }
+
+  /* ── chrome ─────────────────────────────────────────────────────────── */
+  header {
+    display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: baseline;
+    padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { margin: 0; font-size: 14px; font-weight: 600; letter-spacing: .01em; }
+  header h1 span { color: var(--dim); font-weight: 400; }
+  .chips { margin-left: auto; display: flex; flex-wrap: wrap; gap: 14px; font-family: var(--mono); font-size: 11.5px; color: var(--dim); }
+  .chips b { color: var(--ink); font-weight: 600; }
+  .state { padding: 1px 8px; border-radius: 999px; font-weight: 600; }
+  .state.live { background: rgba(90,209,154,.14); color: var(--good); }
+  .state.paused { background: rgba(232,187,90,.14); color: var(--warn); }
+  .state.gone { background: rgba(240,119,106,.14); color: var(--bad); }
+
+  nav { display: flex; gap: 2px; padding: 0 18px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  nav button {
+    appearance: none; border: 0; border-bottom: 2px solid transparent; background: none;
+    color: var(--dim); font: inherit; padding: 9px 14px; cursor: pointer;
+  }
+  nav button:hover { color: var(--ink); }
+  nav button[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); }
+  nav button i { font-style: normal; color: var(--faint); margin-right: 6px; }
+
+  main { display: grid; grid-template-columns: minmax(0,1fr) 400px; gap: 16px; padding: 16px 18px 64px; }
+  @media (max-width: 1100px) { main { grid-template-columns: minmax(0,1fr); } }
+
+  /* ── controls ───────────────────────────────────────────────────────── */
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: center; }
+  button.act {
+    appearance: none; background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 11px; font: inherit; cursor: pointer;
+  }
+  button.act:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button.act:disabled { opacity: .35; cursor: default; }
+  button.act.on { border-color: var(--accent); color: var(--accent); }
+  td.run { color: var(--accent); font-weight: 600; }
+  button.act.trigger { border-color: rgba(232,187,90,.35); }
+  button.act.trigger:hover:not(:disabled) { border-color: var(--warn); color: var(--warn); }
+  .controls .sep { width: 1px; height: 20px; background: var(--line); margin: 0 4px; }
+  /* tab 5: running / target configuration */
+  .config { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; align-items: center; }
+  .config > div { display: contents; }
+  .config .k { color: var(--dim); font-size: 12px; }
+  .config b { font-weight: 600; }
+  .config .d { color: var(--faint); font-size: 12px; margin-left: 8px; }
+  .config select {
+    appearance: auto; background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 8px; font: inherit; max-width: 100%;
+  }
+  ul.diff { margin: 10px 0 0; padding-left: 18px; color: var(--dim); font-size: 12px; }
+
+  /* ── panels ─────────────────────────────────────────────────────────── */
+  details.note { border: 1px solid var(--line); border-radius: 8px; margin-bottom: 14px; background: var(--panel); }
+  details.note > summary { cursor: pointer; padding: 8px 12px; color: var(--dim); font-size: 12px; user-select: none; }
+  details.note > summary:hover { color: var(--ink); }
+  details.note > div { padding: 0 14px 12px; color: var(--dim); max-width: 96ch; white-space: pre-wrap; }
+  details.note pre { font-family: var(--mono); font-size: 11.5px; color: #a9b6c6; margin: 0; overflow-x: auto; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 14px; align-items: start; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .slot { display: contents; }               /* per-panel diff container; the grid still sees the panels */
+  .panel > h2 {
+    margin: 0; padding: 9px 12px; font-size: 12px; font-weight: 600;
+    border-bottom: 1px solid var(--line); background: var(--panel-2);
+  }
+  .panel > h2 em { font-style: normal; color: var(--faint); font-weight: 400; margin-left: 6px; }
+  .panel .body { padding: 10px 12px; }
+  .span2 { grid-column: span 2; }
+  @media (max-width: 800px) { .span2 { grid-column: span 1; } }
+
+  /* Wide tables scroll inside their own panel; the page itself never scrolls sideways. */
+  .tw { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 11.5px; }
+  th { text-align: left; color: var(--faint); font-weight: 500; padding: 6px 10px 5px; border-bottom: 1px solid var(--line); }
+  td { padding: 3px 10px; border-bottom: 1px solid rgba(43,50,61,.45); white-space: nowrap; }
+  tr:last-child td { border-bottom: 0; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.wrap { white-space: normal; }
+  .empty { padding: 10px 12px; color: var(--faint); font-family: var(--mono); font-size: 11.5px; }
+
+  /* a cell whose value differs from the previous frame */
+  @keyframes flash { from { background: rgba(94,200,242,.30); } to { background: transparent; } }
+  td.chg { animation: flash 1.1s ease-out; }
+
+  .kv { display: flex; justify-content: space-between; gap: 12px; font-family: var(--mono); font-size: 11.5px; padding: 3px 0; }
+  .kv span:last-child { font-variant-numeric: tabular-nums; }
+  .bar { height: 6px; border-radius: 3px; background: var(--panel-2); overflow: hidden; margin-top: 3px; }
+  .bar > i { display: block; height: 100%; background: var(--good); }
+
+  /* ── sidebar ────────────────────────────────────────────────────────── */
+  aside { display: flex; flex-direction: column; gap: 14px; position: sticky; top: 96px; }
+  .notice { padding: 5px 12px; border-bottom: 1px solid rgba(43,50,61,.45); font-size: 11.5px; }
+  .notice:last-child { border-bottom: 0; }
+  .notice time { font-family: var(--mono); color: var(--faint); margin-right: 8px; font-size: 10.5px; }
+  .notice.good { color: var(--good); } .notice.warn { color: var(--warn); }
+  .notice.bad  { color: var(--bad); }  .notice.log  { color: var(--faint); }
+  .feed { max-height: 300px; overflow: auto; }
+  .feed td.w { font-weight: 600; }
+  .feed td.pos { color: var(--good); } .feed td.neg { color: var(--bad); }
+
+  footer {
+    position: fixed; bottom: 0; left: 0; right: 0; padding: 7px 18px;
+    background: var(--panel); border-top: 1px solid var(--line);
+    font-family: var(--mono); font-size: 11px; color: var(--dim);
+    display: flex; flex-wrap: wrap; gap: 16px;
+  }
+  footer b { color: var(--ink); font-weight: 600; }
+  .verdict { font-family: var(--mono); font-size: 11.5px; padding: 8px 12px; border-radius: 6px; }
+  .verdict.ok { background: rgba(90,209,154,.10); color: var(--good); }
+  .verdict.no { background: rgba(240,119,106,.10); color: var(--bad); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Dbsp showcase <span>· a marketplace payments desk</span></h1>
+  <div class="chips" id="chips"></div>
+</header>
+
+<nav id="tabs"></nav>
+
+<main>
+  <section>
+    <div class="controls" id="controls"></div>
+    <details class="note" id="explainer"><summary>what you're watching</summary><div></div></details>
+    <details class="note" id="code"><summary>the code that runs this tab</summary><div><pre></pre></div></details>
+    <div class="grid" id="panels"></div>
+  </section>
+
+  <aside>
+    <div class="panel">
+      <h2>changefeed <em id="feedsub">· enriched orders, raw deltas</em></h2>
+      <div class="feed" id="feed"></div>
+    </div>
+    <div class="panel">
+      <h2>notices</h2>
+      <div id="notices"></div>
+    </div>
+  </aside>
+</main>
+
+<footer id="meter"></footer>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const n0 = (v) => Number(v).toLocaleString(undefined, { maximumFractionDigits: 0 });
+const n2 = (v) => Number(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const pct = (v) => (v * 100).toFixed(1) + "%";
+
+let tabs = [], active = null, last = null, connected = false;
+const prevCells = new Map();   // table id -> Map(rowKey -> [cell text]) from the previous frame
+
+// Only touch the DOM when the markup actually changed. This is not an optimisation: a
+// button replaced between mousedown and mouseup never emits a click at all, so rewriting
+// the controls on every frame silently swallowed every press slower than one frame.
+// Keeping unchanged nodes alive also lets people select and copy text.
+const lastHTML = new Map();
+function setHTML(el, html) {
+  if (lastHTML.get(el) === html) return;
+  lastHTML.set(el, html);
+  el.innerHTML = html;
+}
+function setText(el, text) {
+  if (lastHTML.get(el) === text) return;
+  lastHTML.set(el, text);
+  el.textContent = text;
+}
+
+// ── tables ────────────────────────────────────────────────────────────────
+// Rebuilt from scratch each frame; cells whose text changed since the previous
+// frame get .chg, which is the only "what just moved" cue the page needs.
+function table(id, cols, rows, keyOf) {
+  if (!rows.length) return `<div class="empty">nothing here yet</div>`;
+  const before = prevCells.get(id) || new Map();
+  const after = new Map();
+  const head = cols.map((c) => `<th class="${c.num ? "num" : ""}">${esc(c.label)}</th>`).join("");
+  const body = rows.map((row, i) => {
+    const key = keyOf ? keyOf(row, i) : String(i);
+    const cells = cols.map((c) => c.get(row));
+    after.set(key, cells);
+    const was = before.get(key);
+    const tds = cells.map((text, j) => {
+      const changed = was && was[j] !== text;
+      const cls = [cols[j].num ? "num" : "", cols[j].wrap ? "wrap" : "",
+        cols[j].cls ? cols[j].cls(row) : "", changed ? "chg" : ""].filter(Boolean).join(" ");
+      return `<td${cls ? ` class="${cls}"` : ""}>${esc(text)}</td>`;
+    }).join("");
+    return `<tr>${tds}</tr>`;
+  }).join("");
+  prevCells.set(id, after);
+  return `<div class="tw"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+const panel = (title, sub, inner, wide) =>
+  `<div class="panel${wide ? " span2" : ""}"><h2>${esc(title)}${sub ? `<em>· ${esc(sub)}</em>` : ""}</h2>${inner}</div>`;
+const boxed = (inner) => `<div class="body">${inner}</div>`;
+
+const us = (micros) => micros >= 10000 ? (micros / 1000).toFixed(1) + " ms" : n0(micros) + " µs";
+
+// ── tab 5 history: the live numbers of every configuration this browser has run ─────
+// Kept in localStorage because a relaunch is a new process: it is the only place the
+// previous configuration's p50 can survive to be compared with the next one's.
+const HISTORY_KEY = "showcase:topology-history";
+const topologyKey = (t) => `${t.workers}w·${t.nodes}n`;
+function loadHistory() {
+  try { return JSON.parse(localStorage.getItem(HISTORY_KEY)) || {}; } catch { return {}; }
+}
+let historyFrames = 0;
+function rememberHistory(h) {
+  if (h.stepWindow < 100 || !h.running) return;            // warm and moving, not a paused snapshot
+  if (++historyFrames % 12 !== 0) return;                  // ~2 s at the browser's pace
+  try {
+    const history = loadHistory();
+    history[topologyKey(h)] = {
+      workers: h.workers, nodes: h.nodes, build: h.build,
+      p50: h.stepP50, p95: h.stepP95, wait: h.workers === 1 ? null : h.syncWaitPct, steps: h.stepWindow, at: Date.now(),
+    };
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+  } catch { /* private mode or storage disabled: the table just stays empty */ }
+}
+function historyPanel(h) {
+  const rows = Object.values(loadHistory()).sort((a, b) => a.p50 - b.p50);
+  const key = topologyKey(h);
+  const age = (t) => { const s = (Date.now() - t) / 1000; return s < 90 ? "just now" : s < 5400 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`; };
+  return panel("configurations tried", "live step time, this machine, this browser", rows.length
+    ? table("hist", [
+        { label: "configuration", cls: (r) => (topologyKey(r) === key ? "run" : ""), get: (r) => `${r.workers}w × ${r.nodes}n · barrier${topologyKey(r) === key ? "  ← running" : ""}` },
+        { label: "step p50", num: 1, get: (r) => us(r.p50) },
+        { label: "step p95", num: 1, get: (r) => us(r.p95) },
+        { label: "exchange wait", num: 1, get: (r) => r.wait == null ? "—" : r.wait.toFixed(0) + "%" },
+        { label: "build", get: (r) => r.build },
+        { label: "measured", get: (r) => age(r.at) },
+      ], rows, (r) => topologyKey(r))
+      + boxed(`<div class="controls" style="margin:0"><button class="act" data-forget="1">forget these</button>
+          <span style="color:var(--faint)">Rows update while a configuration runs (after its first 100 steps); sorted by p50. Compare Debug with Debug and Release with Release.</span></div>`)
+    : `<div class="body" style="color:var(--dim)">Nothing remembered yet — the running configuration's numbers land here after its first 100 steps; apply another one and the two sit side by side.</div>`,
+    true);
+}
+
+// ── per-tab panel rendering ───────────────────────────────────────────────
+const render = {
+  living(s) {
+    const a = s.act1;
+    return [
+      panel("revenue by category", "AggregateLinear + Min/Max", table("cat", [
+        { label: "category", get: (r) => r.category },
+        { label: "orders", num: 1, get: (r) => n0(r.orders) },
+        { label: "gross", num: 1, get: (r) => n2(r.gross) },
+        { label: "fee take", num: 1, get: (r) => n2(r.fees) },
+        { label: "min", num: 1, get: (r) => (r.min == null ? "—" : n2(r.min)) },
+        { label: "max", num: 1, get: (r) => (r.max == null ? "—" : n2(r.max)) },
+      ], a.categories, (r) => r.category)),
+
+      panel("top merchants", "Distinct().Grouped().Count()", table("mer", [
+        { label: "merchant", get: (r) => r.merchant },
+        { label: "orders", num: 1, get: (r) => n0(r.orders) },
+        { label: "items", num: 1, get: (r) => n0(r.items) },
+        { label: "buyers", num: 1, get: (r) => n0(r.buyers) },
+        { label: "revenue", num: 1, get: (r) => n2(r.revenue) },
+      ], a.merchants, (r) => r.merchant)),
+
+      panel("largest orders", "grouped TopK(3)", table("top", [
+        { label: "category", get: (r) => r.category },
+        { label: "top order amounts", get: (r) => r.amounts.map(n2).join("  ·  ") },
+      ], a.top, (r) => r.category)),
+
+      panel("recon", "FullJoin", boxed(a.recon.map((r) => {
+        const tone = r.bucket === "matched" ? "good" : r.bucket === "orphan payment" ? "bad" : "warn";
+        return `<div class="kv"><span style="color:var(--${tone})">${esc(r.bucket)}</span><span>${n0(r.count)}</span></div>`;
+      }).join(""))),
+
+      panel("regions", "LeftJoin", a.regions.length
+        ? boxed(a.regions.map((r) => `<div class="kv"><span>${esc(r.region)}</span><span>${n2(r.revenue)}</span></div>`).join(""))
+        : `<div class="empty">no traffic yet</div>`),
+
+      panel("compliance queue", "AntiJoin", boxed(a.compliance.held === 0
+        ? `<span style="color:var(--good)">empty — every order matched a known merchant</span>`
+        : a.compliance.recent.map((l) => `<div style="color:var(--dim)">${esc(l)}</div>`).join("") +
+          `<div class="kv" style="margin-top:6px;color:var(--warn)"><span>orders held</span><span>${n0(a.compliance.held)}</span></div>`)),
+    ];
+  },
+
+  time(s) {
+    const a = s.act2;
+    const board = (id, rows) => table(id, [
+      { label: "window", get: (r) => r.window },
+      { label: "merchant", get: (r) => r.merchant },
+      { label: "revenue", num: 1, get: (r) => n2(r.revenue) },
+    ], rows, (r) => r.window + "/" + r.merchant);
+
+    return [
+      panel("live leaderboard", "10s tumbling · flaps by design", board("live", a.live)),
+      panel("finalized", "OnClose() · exactly once", board("fin", a.finals)),
+      panel("acceptance rate", "HoppingWindow(30s, hop 5s)", a.acceptance.length ? boxed(a.acceptance.map((r) => {
+        const tone = r.rate >= 0.9 ? "good" : r.rate >= 0.8 ? "warn" : "bad";
+        return `<div style="margin-bottom:7px">
+            <div class="kv"><span>${esc(r.window)}</span><span>${pct(r.rate)} <span style="color:var(--faint)">(${r.approved}/${r.total})</span></span></div>
+            <div class="bar"><i style="width:${(r.rate * 100).toFixed(1)}%;background:var(--${tone})"></i></div>
+          </div>`;
+      }).join("")) : `<div class="empty">no payments yet</div>`),
+      panel("shopper sessions", "SessionWindow(gap 20s)", table("ses", [
+        { label: "customer", get: (r) => r.customer },
+        { label: "orders", num: 1, get: (r) => n0(r.orders) },
+        { label: "spend", num: 1, get: (r) => n2(r.amount) },
+        { label: "span", get: (r) => r.span },
+        { label: "state", get: (r) => (r.open ? "open" : "closing") },
+      ], a.sessions, (r) => r.customer + "/" + r.span)),
+    ];
+  },
+
+  graph(s) {
+    const a = s.act3;
+    return [
+      panel("connected fraud rings", "Recurse · transitive closure", table("ring", [
+        { label: "ring", get: (r) => "#" + r.ring },
+        { label: "size", num: 1, get: (r) => n0(r.size) },
+        { label: "flagged exposure", num: 1, get: (r) => n2(r.exposure) },
+        { label: "linked accounts", wrap: 1, get: (r) => r.accounts.join(", ") },
+      ], a.rings, (r) => String(r.ring)), true),
+      panel("linkage evidence", "keyed upsert input", a.edges.length
+        ? boxed(a.edges.map((e) => `<div class="kv"><span>${e.a} ↔ ${e.b}</span><span style="color:var(--faint)">${esc(e.reason)}</span></div>`).join(""))
+        : `<div class="empty">no edges yet — the triggers add them</div>`),
+    ];
+  },
+
+  kill(s) {
+    const r = s.recovery;
+    const body = !r
+      ? `<div class="body" style="color:var(--dim)">Nothing killed yet. The trigger abandons the circuit object mid-flight — no dispose, no flush: a simulated kill -9 — then rebuilds against the same storage provider, replays the offset-stamped source logs from offset 0, and everything at-or-below the committed offsets is dropped on arrival. Checkpoints commit every 4 steps: all operator state + consumed input offsets, one atomic write.</div>`
+      : boxed(`
+          <div class="kv"><span>generation</span><span>${r.generation}</span></div>
+          ${Object.entries(r.committed).map(([k, v]) =>
+            `<div class="kv"><span style="color:var(--faint)">committed offset · ${esc(k)}</span><span>${v == null ? "—" : n0(v)}</span></div>`).join("")}
+          <div class="kv"><span>replayed</span><span>${n0(r.replayed)}</span></div>
+          <div class="kv"><span>deduplicated on arrival</span><span>${n0(r.deduped)}</span></div>
+          <div class="kv"><span>reapplied (uncommitted tail)</span><span>${n0(r.replayed - r.deduped)}</span></div>
+          <div class="kv"><span>reference rows re-fed (keyed upserts)</span><span>${n0(r.referenceRows)}</span></div>
+          <div class="verdict ${r.matched ? "ok" : "no"}" style="margin-top:10px">${r.matched
+            ? `✓ rebuilt state matches the pre-crash snapshot (${r.rows} rows, gross ${n2(r.gross)}) — consumers rebootstrapped themselves`
+            : `✗ rebuilt state does NOT match (gross ${n2(r.gross)} vs ${n2(r.expectedGross)}) — that would be a bug`}</div>
+          <div style="color:var(--faint);margin-top:8px">Keyed inputs were re-fed whole (${n0(r.referenceRows)} reference rows): their current rows are checkpointed state, so only what the lost tail swallowed was reapplied.</div>`);
+
+    return [
+      panel("crash & recovery", "CommittedOffset-driven replay", body, true),
+      panel("the state being verified", "revenue by category", table("cat4", [
+        { label: "category", get: (r2) => r2.category },
+        { label: "orders", num: 1, get: (r2) => n0(r2.orders) },
+        { label: "gross", num: 1, get: (r2) => n2(r2.gross) },
+        { label: "fee take", num: 1, get: (r2) => n2(r2.fees) },
+      ], s.act4Categories, (r2) => r2.category), true),
+    ];
+  },
+
+  cluster(s) {
+    const h = s.header, sc = s.scaling, c = s.cluster;
+    const out = [];
+    rememberHistory(h);
+    const running = { workers: h.workers, nodes: h.nodes };
+    if (!target) target = { ...running };
+    const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+
+    // ── running vs target configuration ──────────────────────────────────
+    const changed = target.workers !== running.workers || target.nodes !== running.nodes;
+    const sel = (axis, options, value, labelOf) =>
+      `<select data-target="${axis}">${options.map((o) =>
+        `<option value="${o}"${String(o) === String(value) ? " selected" : ""}>${esc(labelOf(o))}</option>`).join("")}</select>`;
+    const diff = (axis, from, to, labelOf) => from === to ? "" : `<li>${esc(axis)}: ${esc(labelOf(from))} → <b>${esc(labelOf(to))}</b></li>`;
+    out.push(panel("running configuration", `generation ${h.generation} · ${h.build} build`, boxed(
+      `<div class="config">
+         <div><span class="k">workers per node</span><b>${h.workers}</b></div>
+         <div><span class="k">nodes</span><b>${h.nodes}</b><span class="d">${h.nodes === 1 ? "this process only" : `this process + ${plural(h.nodes - 1, "peer")} (cluster act)`}</span></div>
+         <div><span class="k">exchange</span><b>barrier</b><span class="d">rendezvous at every exchange</span></div>
+         <div><span class="k">storage</span><b>${esc(h.storage)}</b></div>
+         <div><span class="k">circuit</span><b>${esc(h.circuit)}</b></div>
+       </div>
+       <div class="config" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
+         <div><span class="k">live step time</span><b>p50 ${us(h.stepP50)} · p95 ${us(h.stepP95)}</b><span class="d">last ${n0(h.stepWindow)} steps of the real pipeline, ${plural(h.workers, "worker")}</span></div>
+         <div><span class="k">exchange wait</span><b>${h.workers === 1 ? "—" : h.syncWaitPct.toFixed(0) + "% of worker time"}</b><span class="d">${h.workers === 1 ? "no exchanges with one worker" : "blocked at exchanges, not computing (last ~20 s)"}</span></div>
+       </div>
+       <div style="color:var(--dim);margin-top:10px">What to look for: at this batch size (a handful of orders per tick) a step is mostly
+       exchange synchronization: the barrier makes every worker wait for every worker at each of the pipeline's exchanges. More workers
+       per node add exchanges: they buy bulk throughput (measured below), not live latency. The history table remembers each
+       configuration's numbers so a relaunch can be compared with the one before.</div>`)));
+    out.push(historyPanel(h));
+    out.push(panel("target configuration", changed ? "differs from running — apply to relaunch" : "same as running", boxed(
+      `<div class="config">
+         <div><span class="k">workers per node</span>${sel("workers", [1, 2, 4, 8, 16], target.workers, (w) => plural(w, "worker"))}</div>
+         <div><span class="k">nodes</span>${sel("nodes", [1, 2, 3, 4], target.nodes, (n) => n === 1 ? "1 node (this process)" : `${n} nodes (OS processes over TCP)`)}</div>
+       </div>
+       <ul class="diff">${changed
+         ? diff("workers per node", running.workers, target.workers, String)
+           + diff("nodes", running.nodes, target.nodes, String)
+         : `<li style="color:var(--faint)">change any axis above; all changes apply in one relaunch</li>`}</ul>
+       <div class="controls" style="margin:8px 0 0">
+         <button class="act${changed ? " trigger" : ""}" data-apply="1"${changed && !relaunching ? "" : " disabled"}>${relaunching ? "relaunching…" : "apply → relaunch"}</button>
+         <button class="act" data-reset="1"${changed ? "" : " disabled"}>reset to running</button>
+       </div>
+       <div style="color:var(--dim);margin-top:8px">Worker count decides how operator state is sharded, so nothing here can change under a live circuit — the showcase relaunches itself into the target and this page reconnects on its own. Nodes above one arm the multi-process act below (barrier-synchronized over TCP); the live pipeline stays in this process because Recurse is rejected in clustered circuits.</div>`)));
+
+    // ── threads: measured, not asserted ──────────────────────────────────
+    out.push(panel("threads · one process", `live batch ${sc ? sc.liveBatch : 8} rows/step`, sc
+      ? table("scale", [
+          { label: "topology", cls: (r) => (r.highlight ? "run" : ""), get: (r) => r.label + (r.highlight ? "  ← running" : "") },
+          { label: "p50 latency", num: 1, get: (r) => r.latencyP50.toFixed(1) + " µs" },
+          { label: "p99 latency", num: 1, get: (r) => r.latencyP99.toFixed(1) + " µs" },
+          { label: "bulk throughput", num: 1, get: (r) => n0(r.bulkRowsPerSec) + " rows/s" },
+          { label: "sync wait live · bulk", num: 1, get: (r) => r.barrierPctLive.toFixed(0) + "% · " + r.barrierPctBulk.toFixed(0) + "%" },
+        ], sc.samples, (r) => r.label)
+        + boxed(`<div style="color:var(--faint)">Measured on this machine (${sc.cores} logical cores): latency from ${
+            n0(sc.liveBatch)}-row steps, throughput from ${n0(sc.bulkBatch)}-row steps, same declaration throughout.
+            Sync wait is the share of worker time spent blocked at exchanges, not computing —
+            measured over the live-batch section and the bulk section separately, because it amortizes with batch size.
+            Every multi-worker row rendezvous all workers at each exchange barrier.
+            Lowest latency at ${sc.samples.reduce((a, b) => (a.latencyP50 <= b.latencyP50 ? a : b)).label};
+            highest throughput at ${sc.samples.reduce((a, b) => (a.bulkRowsPerSec >= b.bulkRowsPerSec ? a : b)).label}.
+            The web host is serving this page while it measures, which costs the p99 a little.</div>`
+          + (sc.debugBuild
+            ? `<div class="verdict no" style="margin-top:8px">Debug build — treat the throughput column as a lower bound. Debug penalises per-row work, which is exactly what extra workers parallelise, so the spread between 1 and 4 workers collapses here. Re-run with <code>dotnet run -c Release</code> for representative numbers.</div>`
+            : ""))
+      : `<div class="body" style="color:var(--dim)">Not measured yet. The trigger runs the identical pipeline at 1, 2 and 4 workers and reports p50/p99 latency at the live batch size next to bulk throughput — the two numbers point in opposite directions, which is the whole point of the tab.</div>`,
+      true));
+
+    // ── processes ────────────────────────────────────────────────────────
+    out.push(!c
+      ? panel("processes · TCP exchange", null, `<div class="body" style="color:var(--dim)">${
+          h.nodes > 1
+            ? `Not run yet. The trigger respawns this binary as ${plural(h.nodes - 1, "peer process")}: all ${h.nodes} build the identical circuit at ${plural(h.workers, "worker")} each, every GroupBy exchange ships remote shards over TCP, steps run in lockstep, and the merged shards are verified against a single-process reference.`
+            : "Needs more than one node — set nodes in the target configuration and apply (or <code>-- --nodes 2</code> on the command line)."
+        }</div>`, true)
+      : panel(`one circuit, ${c.nodes} OS processes × ${plural(c.workersPerNode, "worker")}`, "TCP exchange", table("clu", [
+          { label: "process", get: (r) => r.process },
+          { label: "workers", get: (r) => r.workers },
+          { label: "merchants on shard", num: 1, get: (r) => r.merchants },
+          { label: "exchange frames", num: 1, get: (r) => r.frames },
+        ], c.processes, (r) => r.process) + boxed(`
+            <div style="color:var(--faint)">${n0(c.orders)} orders fed on p0 only; ${c.steps} lockstep steps on every process; avg step ${c.avgStepMs.toFixed(1)} ms (includes TCP round trips)</div>
+            <div class="verdict ${c.correct ? "ok" : "no"}" style="margin-top:8px">${c.correct
+              ? `✓ shards are pairwise disjoint (${n0(c.localRows)} + ${n0(c.remoteRows)} merchants) and their union matches the single-process answer exactly`
+              : "✗ merged shards did NOT match the expected totals — this is a bug worth reporting"}</div>`), true));
+
+    return out;                             // one slot per panel (see paint)
+  },
+};
+
+// ── frame ─────────────────────────────────────────────────────────────────
+function paint(s) {
+  last = s;
+  const h = s.header;
+
+  setHTML($("chips"), [
+    `<span class="state ${connected ? (h.running ? "live" : "paused") : "gone"}">${connected ? (h.running ? "▶ live" : "⏸ paused") : "⚠ disconnected"}</span>`,
+    `tick <b>${n0(h.tick)}</b>`,
+    `virtual clock <b>${h.virtualNow}</b>`,
+    `watermark <b>${h.watermark ?? "—"}</b>${h.watermarkBehind == null ? "" : ` <span style="color:var(--faint)">(${h.watermarkBehind.toFixed(1)}s behind)</span>`}`,
+    `step p50 <b>${us(h.stepP50)}</b> · p95 <b>${us(h.stepP95)}</b>${h.workers > 1 ? ` · exchange wait <b>${h.syncWaitPct.toFixed(0)}%</b>` : ""}`,
+    `${h.storage} · <b>${h.workers}</b> worker${h.workers === 1 ? "" : "s"} × <b>${h.nodes}</b> node${h.nodes === 1 ? "" : "s"} · barrier · gen <b>${h.generation}</b>`,
+  ].join(""));
+
+  const tab = tabs.find((t) => t.id === active);
+  setText($("explainer").querySelector("div"), tab.explainer);
+  setText($("code").querySelector("pre"), tab.code || "");
+  $("code").style.display = tab.code ? "" : "none";
+  // Each panel gets its own slot and its own setHTML diff — the same fix as the controls:
+  // a panel whose markup did not change keeps its DOM, so an open <select> on the target
+  // configuration card survives the frames that redraw the running card next to it.
+  const parts = render[active](s);
+  const panels = $("panels");
+  const list = Array.isArray(parts) ? parts : [parts];
+  if (panels.children.length !== list.length) {
+    for (const slot of panels.children) lastHTML.delete(slot);
+    panels.innerHTML = list.map(() => `<div class="slot"></div>`).join("");
+  }
+  list.forEach((html, i) => setHTML(panels.children[i], html));
+
+  const beats = s.beats[active] || [];
+  setHTML($("controls"),
+    `<button class="act" data-run="${h.running ? "pause" : "play"}">${h.running ? "⏸ pause" : "▶ play"}</button>` +
+    `<button class="act" data-run="step">⏭ step</button>` +
+    (beats.length ? `<span class="sep"></span>` : "") +
+    beats.map((b) => `<button class="act trigger" data-beat="${esc(b.id)}" title="${esc(b.reason || b.label)}"${
+      b.armed ? "" : " disabled"}>${esc(b.label)}</button>`).join(""));
+
+  setHTML($("notices"), s.notices.map((x) =>
+    `<div class="notice ${x.level.toLowerCase()}"><time>${x.stamp}</time>${esc(x.text)}</div>`).join("")
+    || `<div class="empty">…</div>`);
+
+  setText($("feedsub"), `· enriched orders, raw deltas · last step emitted ${n0(h.lastEnrichedDelta)}`);
+  // The order id pairs a retraction with its assertion; the category is the column that
+  // actually differs between the two when a master-data correction re-files history.
+  setHTML($("feed"), table("feed", [
+    { label: "±", cls: (r) => (r.weight > 0 ? "w pos" : "w neg"),
+      get: (r) => (r.weight > 0 ? "+" + r.weight : String(r.weight)) },
+    { label: "order", get: (r) => "#" + r.orderId },
+    { label: "merchant", get: (r) => (r.merchant.length > 12 ? r.merchant.slice(0, 11) + "…" : r.merchant) },
+    { label: "category", get: (r) => r.category },
+    { label: "amount", num: 1, get: (r) => n2(r.amount) },
+  ], s.feed, (r) => String(r.seq)));
+
+  const m = s.meter;
+  setHTML($("meter"), [
+    `meter <b>Dbsp</b> · circuit=<b>${esc(h.circuit)}</b>`,
+    `steps <b>${n0(m.steps)}</b>`,
+    `records <b>${n0(m.records)}</b>`,
+    `last step <b>${m.stepMs.toFixed(2)} ms</b>`,
+    `commits <b>${n0(m.commits)}</b>`,
+    `queues in/out <b>${n0(m.inputQueue)}/${n0(m.outputQueue)}</b>`,
+    // The meter measures watermark lag against the wall clock. The demo's event-time clock
+    // is simulated and runs faster than wall time, so the watermark is legitimately ahead
+    // of it — say so rather than hide the sign.
+    `watermark lag <b>${m.watermarkLag.toFixed(1)} s</b> <span style="color:var(--faint)">${
+      m.watermarkLag < 0 ? "(ahead — the demo clock runs fast)" : "(vs wall clock)"}</span>`,
+  ].join(" · "));
+}
+
+// ── wiring ────────────────────────────────────────────────────────────────
+// The target configuration on tab 5 lives here, not in the DOM: panels are re-rendered on
+// every frame, so a select's pending value has to survive the repaint.
+let target = null, relaunching = false;
+
+document.addEventListener("click", async (e) => {
+  const beat = e.target.closest("[data-beat]");
+  if (beat) {
+    beat.disabled = true;
+    const res = await fetch(`/api/trigger/${beat.dataset.beat}`, { method: "POST" });
+    if (!res.ok) beat.disabled = false;
+    return;
+  }
+  const apply = e.target.closest("[data-apply]");
+  if (apply && target) {
+    apply.disabled = true;
+    relaunching = true;                 // the reconnect after this one reloads the page
+    const q = new URLSearchParams({ workers: target.workers, nodes: target.nodes });
+    const res = await fetch(`/api/relaunch?${q}`, { method: "POST" });
+    if (!res.ok) { relaunching = false; apply.disabled = false; }
+    if (last) paint(last);
+    return;
+  }
+  const forget = e.target.closest("[data-forget]");
+  if (forget) {
+    try { localStorage.removeItem(HISTORY_KEY); } catch { /* nothing to forget */ }
+    if (last) paint(last);
+    return;
+  }
+  const reset = e.target.closest("[data-reset]");
+  if (reset) {
+    target = null;                      // the next paint re-seeds it from the running header
+    if (last) paint(last);
+    return;
+  }
+  const run = e.target.closest("[data-run]");
+  if (run) await fetch(`/api/run/${run.dataset.run}`, { method: "POST" });
+});
+
+document.addEventListener("change", (e) => {
+  const axis = e.target.closest("[data-target]");
+  if (!axis || !target) return;
+  const v = e.target.value;
+  target = { ...target, [axis.dataset.target]: Number(v) };
+  if (last) paint(last);
+});
+
+function selectTab(id) {
+  active = id;
+  prevCells.clear();                        // don't flash every cell of a tab you just opened
+  for (const b of $("tabs").children) b.setAttribute("aria-selected", String(b.dataset.tab === id));
+  const first = !sessionStorage.getItem("seen:" + id);
+  $("explainer").open = first;
+  $("code").open = first;
+  sessionStorage.setItem("seen:" + id, "1");
+  if (last) paint(last);
+}
+
+(async () => {
+  const meta = await (await fetch("/api/tabs")).json();
+  tabs = meta.tabs;
+  $("tabs").innerHTML = tabs.map((t, i) =>
+    `<button data-tab="${esc(t.id)}"><i>${i + 1}</i>${esc(t.title)}</button>`).join("");
+  for (const b of $("tabs").children) b.onclick = () => selectTab(b.dataset.tab);
+  active = tabs[0].id;
+  selectTab(active);
+
+  const source = new EventSource("/api/stream");
+  source.onopen = () => { connected = true; };
+  source.onerror = () => { connected = false; if (last) paint(last); };   // EventSource retries on its own
+  source.onmessage = (e) => {
+    // A relaunch swaps the process underneath us, so the static /api/tabs metadata may now
+    // be stale. Reconnecting after one is the cue to start clean.
+    if (relaunching) { location.reload(); return; }
+    connected = true;
+    paint(JSON.parse(e.data));
+  };
+
+  document.addEventListener("keydown", (e) => {
+    if (e.target.tagName === "INPUT") return;
+    const i = "12345".indexOf(e.key);
+    if (i >= 0 && tabs[i]) selectTab(tabs[i].id);
+    if (e.key === " ") { e.preventDefault(); fetch(`/api/run/${last?.header.running ? "pause" : "play"}`, { method: "POST" }); }
+    if (e.key.toLowerCase() === "s") fetch("/api/run/step", { method: "POST" });
+  });
+})();
+</script>
+</body>
+</html>

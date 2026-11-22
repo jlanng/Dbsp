@@ -1,6 +1,6 @@
 # Backlog: gaps blocking adoption in financial firms
 
-Findings from a review (2026-09-23) of Incremental through the eyes of a .NET developer at a
+Findings from a review (2026-09-23) of Dbsp through the eyes of a .NET developer at a
 financial firm evaluating it. Ordered by how hard each item blocks adoption, not by effort.
 
 **Suggested first three:** keyed-input restart (F4), Kafka connector with transactional sink
@@ -65,4 +65,4 @@ to "worth a proof of concept".
 Retractions everywhere (corrections/cancels are native); checked integer sums and
 `decimal` guidance; atomic state + offset checkpoints with state manifests; property-based
 differential tests; `ILogger` + `Meter`; an honest known-limitations section; and
-`examples/Incremental.TradeEnrichment`, which deserves top billing for this audience.
+`examples/Dbsp.TradeEnrichment`, which deserves top billing for this audience.

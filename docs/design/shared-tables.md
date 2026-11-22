@@ -303,7 +303,7 @@ buffers: `TryGet(key, version, out row)` and `GetManyInto(keys, version, rows, f
 **Alternative considered: persistent (structure-sharing) map.** Each version is an
 immutable root, a pin is a reference, and the runtime's GC does the trimming. Simpler to
 get right, but slower to probe and heavier to write. Measured by
-`benchmarks/Incremental.Benchmarks/TableBenchmarks.cs` (short job, one machine; a plain
+`benchmarks/Dbsp.Benchmarks/TableBenchmarks.cs` (short job, one machine; a plain
 `Dictionary` is what probing a join's private copy costs today):
 
 | 1,000,000 rows | plain `Dictionary` | version chains | persistent map |
@@ -422,14 +422,14 @@ no longer holds the version it needs next) cannot be promoted and must be reopen
 without being promoted.
 
 **The Kafka log** (built with durability steps 3 and 4) is `KafkaTableLog` in
-`Incremental.Kafka`: `await kafkaLog.OpenTableLogAsync<TKey, TRow>(name)`. It is the
+`Dbsp.Kafka`: `await kafkaLog.OpenTableLogAsync<TKey, TRow>(name)`. It is the
 durable log this section keeps referring to; what it adds and where it departs from the
-durability design is recorded there (*As built: `Incremental.Kafka`*). Two things a table
+durability design is recorded there (*As built: `Dbsp.Kafka`*). Two things a table
 owner must know: the key type must serialize equal values alike (it is refused
 otherwise), and nothing trims the log unless the host calls `TrimBeforeAsync`.
 
 **The Kafka adapter** (built with durability step 6) is `KafkaSource.StartTableLoaderAsync`
-in `Incremental.Kafka`: it reads a topic as the table's writer, stages each change with
+in `Dbsp.Kafka`: it reads a topic as the table's writer, stages each change with
 its partition and offset, commits a version whenever it has read all that was fetched,
 and resumes from `table.CommittedOffsets`. With `Debezium.Changes<TKey, TRow>()` as its
 decoder the topic is a database table's change stream. Recorded in
@@ -765,9 +765,9 @@ As built (`Tables/DerivedTable.cs`: `ToTable`, `DerivedTablePort`, `TableLineage
   rule above, where a source adapter would chunk. The port and the writer give their
   scratch back after a step of more than 65,536 keys; a `--assert` contract holds a small
   change after a million-row bootstrap to the cost of one after a thousand.
-- **Not done.** `Incremental.Hosting` knows nothing of this: a `CircuitHost`'s
+- **Not done.** `Dbsp.Hosting` knows nothing of this: a `CircuitHost`'s
   shutdown timeout cannot abandon a table commit that is waiting on a lagging reader.
-  (`Incremental.Service` bounds it: step 7 below.)
+  (`Dbsp.Service` bounds it: step 7 below.)
   `OnError(DeadLetter)` does not apply to a row `ToTable` rejects. Nothing stamps a
   version with the step that wrote it.
 
@@ -856,7 +856,7 @@ rules as an adapter.
 ## Build order
 
 1. **Done.** `SharedTable` core: view, writer, pins, trimming
-   (`src/Incremental/Tables/SharedTable.cs`), benchmarked against the persistent-map
+   (`src/Dbsp/Tables/SharedTable.cs`), benchmarked against the persistent-map
    alternative.
 2. **Done.** `ITableLog` and `InMemoryTableLog` (`Tables/TableLog.cs`); the staged,
    offset-stamped writer with append-before-publish; the tail, attached readers and the
@@ -899,7 +899,7 @@ rules as an adapter.
    convenient — readers attach at whatever version the table is at; include
    `CommittedVersion(derivedTable)` of the writing circuit in the log's retention floor;
    and a stalled table commit is not ended by the host's shutdown timeout.
-7. **Done** for registration, in `Incremental.Service` rather than `Incremental.Hosting`:
+7. **Done** for registration, in `Dbsp.Service` rather than `Dbsp.Hosting`:
    the table registry (enrichment-service.md, *Table registry* and *As built*). What this
    list asked of the step: a derived table's circuit is built once per generation and the
    old one disposed first (the supervisor's generation); tables are opened or promoted
@@ -908,7 +908,7 @@ rules as an adapter.
    checkpoint so that a stopped pipeline counts; indexes are declared when a table is
    opened, before any loader runs; and a table commit stalled behind a reader is bounded
    by the supervisor's `StopTimeout`, then `Abandon()`, then `Wedged`, not by the host's
-   shutdown timeout. The worked example is `examples/Incremental.TradeEnrichment`,
+   shutdown timeout. The worked example is `examples/Dbsp.TradeEnrichment`,
    moved onto tables with the service's step S4: four `SharedTable`s, `trader-desks`
    derived by a small circuit, a `Lookup` for the symbol and `Join`s for desk and rating,
    two sinks through `DeliverToAsync`, every printed claim checked against a model. It is
@@ -916,7 +916,7 @@ rules as an adapter.
 
 ## As built: seams for the enrichment service (2026-11-10)
 
-Two small public reads, made for `Incremental.Service` (enrichment-service.md, *As built*):
+Two small public reads, made for `Dbsp.Service` (enrichment-service.md, *As built*):
 
 - `TableSnapshot.Rows()`: every row as of the pinned version, the public form of the
   internal scan (`RowsAt`). It throws rather than end short if the pin is revoked
