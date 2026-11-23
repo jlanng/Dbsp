@@ -12,7 +12,11 @@ to "worth a proof of concept".
 - [ ] **F1 — Governance and supply chain.** Publish to NuGet with signed packages and an
       SBOM; add `SECURITY.md` (disclosure process), a release/changelog cadence, and a
       stated support/maintenance policy. Single maintainer at 0.x fails most firm OSS
-      approval processes regardless of code quality.
+      approval processes regardless of code quality. *Done so far:* on nuget.org since
+      0.2.0 (2026-11-22), released by tag through trusted publishing; `SECURITY.md` with
+      private reporting through GitHub; `CHANGELOG.md`, which the release's notes are
+      taken from. Still to do: signed packages, an SBOM, a release cadence and a support
+      policy beyond "the latest release".
 - [ ] **F2 — Transport security.** TLS with mutual authentication (mTLS) on the TCP cluster
       transport; "trusted network only" does not pass zero-trust infosec review. Also
       consider encryption at rest for Redis state (currently plain JSON).

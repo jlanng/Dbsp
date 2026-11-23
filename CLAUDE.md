@@ -855,4 +855,7 @@ net8.0/net10.0; tests/examples net10.0; SDK pinned via mise.toml).
   beside its project, with absolute links only (nuget.org renders no relative link or
   image); a project without one ships the repository's. Released by tag
   (`.github/workflows/release.yml`, `v<Version>`): the four library packages; the
-  service's are packed by CI and not released.
+  service's are packed by CI and not released. A release's notes are its section of
+  `CHANGELOG.md` (`## <version> - <date>`), and the workflow refuses a version without
+  one: what a change means to someone using the packages goes under *Unreleased* with
+  the change.
